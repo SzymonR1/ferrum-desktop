@@ -7,3 +7,5 @@ The canonical records live in `docs/decisions/` and are included here so the web
 {{#include ../../decisions/0002-engine-client.md}}
 
 {{#include ../../decisions/0003-linux-docker-contexts.md}}
+
+{{#include ../../decisions/0004-bounded-engine-http.md}}

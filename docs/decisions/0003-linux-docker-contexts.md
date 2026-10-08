@@ -1,6 +1,6 @@
 # ADR 0003: Linux Docker context selection
 
-- **Status:** Accepted for the Linux local-Unix context-selection slice; issue #10 remains open.
+- **Status:** Accepted for the Linux local-Unix context-selection slice; issue #10 remains open. Its Bollard response-transport, version, and list details are superseded by [ADR 0004: Bounded engine HTTP](0004-bounded-engine-http.md).
 - **Date:** 2026-10-08
 
 ## Context

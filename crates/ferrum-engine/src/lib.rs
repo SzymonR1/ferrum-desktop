@@ -10,9 +10,9 @@ pub use contexts::{ContextTransport, DockerContext};
 use std::{env, path::PathBuf, time::Duration};
 
 #[cfg(target_os = "linux")]
-use http_body_util::{BodyExt, Limited};
+use http_body_util::{BodyExt, Empty, Limited};
 #[cfg(target_os = "linux")]
-use hyper::{Method, Request};
+use hyper::{Method, Request, body::Bytes};
 #[cfg(target_os = "linux")]
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 #[cfg(target_os = "linux")]
@@ -28,15 +28,36 @@ use contexts::{
 
 #[cfg(target_os = "linux")]
 use bollard::API_DEFAULT_VERSION;
-use bollard::{Docker, errors::Error as BollardError, query_parameters::ListContainersOptions};
 use ferrum_core::{ContainerDetails, ContainerMount, ContainerState, ContainerSummary};
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(target_os = "linux")]
 const MAX_INSPECT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_LIST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_VERSION_RESPONSE_BYTES: usize = 64 * 1024;
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct VersionResponse {
+    version: Option<String>,
+    api_version: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ContainerListItem {
+    id: Option<String>,
+    names: Option<Vec<String>>,
+    image: Option<String>,
+    state: Option<String>,
+    status: Option<String>,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -77,7 +98,6 @@ struct InspectMount {
 struct InspectConfig {
     image: Option<String>,
 }
-
 /// Version information reported by the connected engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineInfo {
@@ -139,7 +159,7 @@ pub enum EngineError {
     ContextInspectResponseUnavailable,
     /// A configured endpoint or socket path cannot be represented safely.
     #[error(
-        "The configured local engine endpoint is not valid UTF-8 and cannot be passed to the Docker API client."
+        "The configured local engine endpoint is not valid UTF-8 and cannot be passed to the HTTP client."
     )]
     InvalidEndpointEncoding,
     /// The configured or discovered engine did not answer the API request.
@@ -149,9 +169,12 @@ pub enum EngineError {
     Unavailable {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
-        /// Underlying client error, omitted from user-facing display to avoid leaking endpoint data.
-        #[source]
-        source: BollardError,
+    },
+    /// The engine reported an API version that cannot be negotiated safely.
+    #[error("The engine at the {endpoint_label} reported an invalid API version.")]
+    InvalidApiVersion {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
     },
     /// The engine did not report its software version.
     #[error("The engine at the {endpoint_label} did not report its software version.")]
@@ -180,9 +203,6 @@ pub enum EngineError {
     InventoryRequest {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
-        /// Underlying client error, omitted from user-facing display to avoid leaking endpoint data.
-        #[source]
-        source: BollardError,
     },
     /// An inspection response omitted its required container identifier.
     #[error("The engine at the {endpoint_label} returned container details without an identifier.")]
@@ -195,8 +215,8 @@ pub enum EngineError {
 /// An asynchronous connection to one local Docker-compatible engine.
 #[derive(Clone)]
 pub struct EngineClient {
-    docker: Docker,
     info: EngineInfo,
+    api_version: String,
     selected_context: Option<String>,
     #[cfg(target_os = "linux")]
     socket_path: PathBuf,
@@ -415,30 +435,33 @@ impl EngineClient {
     /// Returns an API error when the engine cannot provide the inventory or a
     /// response omits a container identifier.
     pub async fn list_containers(&self) -> Result<Vec<ContainerSummary>, EngineError> {
-        let options = ListContainersOptions {
-            all: true,
-            ..Default::default()
-        };
-        let endpoint_label = self.info.endpoint_label;
-        let containers = self
-            .docker
-            .list_containers(Some(options))
+        #[cfg(target_os = "linux")]
+        {
+            let endpoint_label = self.info.endpoint_label;
+            let path = format!("/v{}/containers/json?all=true", self.api_version);
+            let containers: Vec<ContainerListItem> = request_json(
+                &self.socket_path,
+                &path,
+                MAX_LIST_RESPONSE_BYTES,
+                REQUEST_TIMEOUT,
+            )
             .await
-            .map_err(|source| {
+            .map_err(|()| {
                 if self.selected_context.is_some() {
                     EngineError::ContextInventoryRequest
                 } else {
-                    EngineError::InventoryRequest {
-                        endpoint_label,
-                        source,
-                    }
+                    EngineError::InventoryRequest { endpoint_label }
                 }
             })?;
-
-        containers
-            .into_iter()
-            .map(|container| map_container(container, endpoint_label))
-            .collect()
+            containers
+                .into_iter()
+                .map(|container| map_container_summary(container, endpoint_label))
+                .collect()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(EngineError::UnsupportedPlatform)
+        }
     }
     /// Returns read-only details for a container identified by its engine ID.
     ///
@@ -453,30 +476,16 @@ impl EngineClient {
     pub async fn inspect_container(&self, id: &str) -> Result<ContainerDetails, EngineError> {
         #[cfg(target_os = "linux")]
         {
-            let body = request_inspect(
+            let path = inspect_request_path(&self.api_version, id)
+                .map_err(|()| self.inspection_error())?;
+            let response: InspectResponse = request_json(
                 &self.socket_path,
-                &self.docker.client_version().to_string(),
-                id,
+                &path,
+                MAX_INSPECT_RESPONSE_BYTES,
+                REQUEST_TIMEOUT,
             )
             .await
-            .map_err(|()| {
-                if self.selected_context.is_some() {
-                    EngineError::ContextInspectResponseUnavailable
-                } else {
-                    EngineError::InspectResponseUnavailable {
-                        endpoint_label: self.info.endpoint_label,
-                    }
-                }
-            })?;
-            let response: InspectResponse = serde_json::from_slice(&body).map_err(|_| {
-                if self.selected_context.is_some() {
-                    EngineError::ContextInspectResponseUnavailable
-                } else {
-                    EngineError::InspectResponseUnavailable {
-                        endpoint_label: self.info.endpoint_label,
-                    }
-                }
-            })?;
+            .map_err(|()| self.inspection_error())?;
             map_container_details(response, self.info.endpoint_label)
         }
         #[cfg(not(target_os = "linux"))]
@@ -491,57 +500,49 @@ impl EngineClient {
         path: &std::path::Path,
         endpoint_label: &'static str,
     ) -> Result<Self, EngineError> {
+        path.to_str().ok_or(EngineError::InvalidEndpointEncoding)?;
         let socket_path = path.to_path_buf();
-        let path = path.to_str().ok_or(EngineError::InvalidEndpointEncoding)?;
-        let docker =
-            Docker::connect_with_unix(path, REQUEST_TIMEOUT.as_secs(), API_DEFAULT_VERSION)
-                .map_err(|source| EngineError::Unavailable {
-                    endpoint_label,
-                    source,
-                })?;
-        Self::from_client(docker, endpoint_label, socket_path).await
-    }
-
-    #[cfg(target_os = "linux")]
-    async fn from_client(
-        docker: Docker,
-        endpoint_label: &'static str,
-        socket_path: PathBuf,
-    ) -> Result<Self, EngineError> {
-        let docker = docker
-            .with_timeout(REQUEST_TIMEOUT)
-            .negotiate_version()
-            .await
-            .map_err(|source| EngineError::Unavailable {
-                endpoint_label,
-                source,
-            })?;
-        let server_version = docker
-            .version()
-            .await
-            .map_err(|source| EngineError::Unavailable {
-                endpoint_label,
-                source,
-            })?;
-        let version = server_version
+        let response: VersionResponse = request_json(
+            &socket_path,
+            "/version",
+            MAX_VERSION_RESPONSE_BYTES,
+            REQUEST_TIMEOUT,
+        )
+        .await
+        .map_err(|()| EngineError::Unavailable { endpoint_label })?;
+        let version = response
             .version
             .filter(|value| !value.trim().is_empty())
             .ok_or(EngineError::MissingEngineVersion { endpoint_label })?;
-        let api_version = server_version
+        let api_version = response
             .api_version
             .filter(|value| !value.trim().is_empty())
             .ok_or(EngineError::MissingApiVersion { endpoint_label })?;
+        let client_api_version = API_DEFAULT_VERSION.to_string();
+        let negotiated_api_version = negotiate_api_version(&client_api_version, &api_version)
+            .ok_or(EngineError::InvalidApiVersion { endpoint_label })?;
 
         Ok(Self {
-            docker,
             info: EngineInfo {
                 version,
                 api_version,
                 endpoint_label,
             },
+            api_version: negotiated_api_version,
             selected_context: None,
             socket_path,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn inspection_error(&self) -> EngineError {
+        if self.selected_context.is_some() {
+            EngineError::ContextInspectResponseUnavailable
+        } else {
+            EngineError::InspectResponseUnavailable {
+                endpoint_label: self.info.endpoint_label,
+            }
+        }
     }
 }
 
@@ -580,25 +581,40 @@ fn is_remote_endpoint(host: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-async fn request_inspect(
+async fn request_json<T: DeserializeOwned>(
     socket_path: &std::path::Path,
-    api_version: &str,
-    id: &str,
-) -> Result<hyper::body::Bytes, ()> {
-    if id.is_empty()
-        || id.len() > 4096
-        || !api_version
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'.')
-    {
+    request_path: &str,
+    max_response_bytes: usize,
+    request_timeout: Duration,
+) -> Result<T, ()> {
+    timeout(request_timeout, async {
+        let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(Uri::new(socket_path, request_path))
+            .body(Empty::<Bytes>::new())
+            .map_err(|_| ())?;
+        let response = client.request(request).await.map_err(|_| ())?;
+        if !response.status().is_success() {
+            return Err(());
+        }
+        let body = Limited::new(response.into_body(), max_response_bytes)
+            .collect()
+            .await
+            .map_err(|_| ())?
+            .to_bytes();
+        serde_json::from_slice(&body).map_err(|_| ())
+    })
+    .await
+    .map_err(|_| ())?
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_request_path(api_version: &str, id: &str) -> Result<String, ()> {
+    if id.is_empty() || id.len() > 4096 {
         return Err(());
     }
-    let mut path = String::with_capacity(
-        api_version
-            .len()
-            .saturating_add(id.len().saturating_mul(3))
-            .saturating_add(32),
-    );
+    let mut path = String::with_capacity(api_version.len() + id.len().saturating_mul(3) + 32);
     path.push_str("/v");
     path.push_str(api_version);
     path.push_str("/containers/");
@@ -611,30 +627,32 @@ async fn request_inspect(
         }
     }
     path.push_str("/json");
-    let uri = Uri::new(socket_path, &path);
-    timeout(REQUEST_TIMEOUT, async {
-        let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri(uri)
-            .body(http_body_util::Empty::<hyper::body::Bytes>::new())
-            .map_err(|_| ())?;
-        let response = client.request(request).await.map_err(|_| ())?;
-        if !response.status().is_success() {
-            return Err(());
-        }
-        Limited::new(response.into_body(), MAX_INSPECT_RESPONSE_BYTES)
-            .collect()
-            .await
-            .map(|body| body.to_bytes())
-            .map_err(|_| ())
-    })
-    .await
-    .map_err(|_| ())?
+    Ok(path)
 }
 
-fn map_container(
-    container: bollard::models::ContainerSummary,
+fn negotiate_api_version(client: &str, server: &str) -> Option<String> {
+    fn components(version: &str) -> Option<(u64, u64)> {
+        let (major, minor) = version.split_once('.')?;
+        if major.is_empty()
+            || minor.is_empty()
+            || !major.bytes().all(|byte| byte.is_ascii_digit())
+            || !minor.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        Some((major.parse().ok()?, minor.parse().ok()?))
+    }
+    let client_components = components(client)?;
+    let server_components = components(server)?;
+    Some(if client_components <= server_components {
+        client.to_owned()
+    } else {
+        server.to_owned()
+    })
+}
+
+fn map_container_summary(
+    container: ContainerListItem,
     endpoint_label: &'static str,
 ) -> Result<ContainerSummary, EngineError> {
     let id = container
@@ -645,10 +663,7 @@ fn map_container(
         .and_then(|names| names.into_iter().next())
         .and_then(normalize_container_name)
         .unwrap_or_else(|| id.chars().take(12).collect());
-    let state = container
-        .state
-        .map(|value| ContainerState::parse(value.as_ref()));
-
+    let state = container.state.map(|value| ContainerState::parse(&value));
     Ok(ContainerSummary {
         id,
         name,
@@ -863,6 +878,153 @@ mod container_inspection_tests {
                 .expect("id is present");
         assert_eq!(details.name, None);
     }
+    #[test]
+    fn maps_list_summary_without_exposing_command_or_labels() {
+        let item: ContainerListItem = serde_json::from_str(
+            r#"{"Id":"container-id","Names":["/web"],"Image":"registry/app:tag","State":"running","Status":"Up 5 minutes","Command":"secret-command","Labels":{"credential":"secret-label"}}"#,
+        )
+        .expect("list item should deserialize");
+
+        let summary = map_container_summary(item, ENDPOINT).expect("id is present");
+        assert_eq!(summary.id, "container-id");
+        assert_eq!(summary.name, "web");
+        assert_eq!(summary.image, Some("registry/app:tag".to_owned()));
+        assert_eq!(summary.state, Some(ContainerState::Running));
+        assert_eq!(summary.status, Some("Up 5 minutes".to_owned()));
+
+        let debug = format!("{summary:?}");
+        assert!(!debug.contains("secret-command"));
+        assert!(!debug.contains("secret-label"));
+        assert!(!debug.contains("credential"));
+    }
+
+    #[test]
+    fn negotiates_the_lower_valid_api_version() {
+        assert_eq!(
+            negotiate_api_version("1.41", "1.45"),
+            Some("1.41".to_owned())
+        );
+        assert_eq!(
+            negotiate_api_version("1.49", "1.45"),
+            Some("1.45".to_owned())
+        );
+        assert_eq!(negotiate_api_version("1.invalid", "1.45"), None);
+        assert_eq!(negotiate_api_version("1.49", "bad"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    mod request_json_tests {
+        use super::*;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::UnixListener,
+        };
+
+        async fn fixture(
+            response: Vec<u8>,
+        ) -> (
+            std::path::PathBuf,
+            tokio::task::JoinHandle<()>,
+            std::path::PathBuf,
+        ) {
+            let directory = std::env::temp_dir().join(format!(
+                "ferrum-request-json-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock should be after the Unix epoch")
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).expect("temporary directory should be created");
+            let socket_path = directory.join("engine.sock");
+            let listener = UnixListener::bind(&socket_path).expect("Unix socket should bind");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("client should connect");
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request).await;
+                stream
+                    .write_all(&response)
+                    .await
+                    .expect("fixture response should be written");
+            });
+            (socket_path, server, directory)
+        }
+
+        async fn cleanup(
+            socket_path: &std::path::Path,
+            server: tokio::task::JoinHandle<()>,
+            directory: &std::path::Path,
+        ) {
+            server.await.expect("fixture server should finish");
+            std::fs::remove_file(socket_path).expect("socket should be removed");
+            std::fs::remove_dir(directory).expect("temporary directory should be removed");
+        }
+
+        fn chunked(body: &[u8]) -> Vec<u8> {
+            let body = std::str::from_utf8(body).expect("fixture JSON is UTF-8");
+            format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{body}\r\n0\r\n\r\n",
+                body.len()
+            )
+            .into_bytes()
+        }
+
+        #[tokio::test]
+        async fn accepts_chunked_response_and_deserializes_body() {
+            let (socket, server, directory) = fixture(chunked(br#"{"value":"decoded"}"#)).await;
+            let result: Result<serde_json::Value, ()> =
+                request_json(&socket, "/version", 1024, Duration::from_secs(1)).await;
+            cleanup(&socket, server, &directory).await;
+            assert_eq!(
+                result.expect("chunked body should decode")["value"],
+                "decoded"
+            );
+        }
+
+        #[tokio::test]
+        async fn rejects_response_over_body_limit() {
+            let body = br#"{"value":"response exceeds limit"}"#;
+            let (socket, server, directory) = fixture(chunked(body)).await;
+            let result: Result<serde_json::Value, ()> =
+                request_json(&socket, "/version", 8, Duration::from_secs(1)).await;
+            cleanup(&socket, server, &directory).await;
+            assert!(result.is_err(), "oversized body must be rejected");
+        }
+
+        #[tokio::test]
+        async fn rejects_delayed_body_after_timeout() {
+            let directory = std::env::temp_dir().join(format!(
+                "ferrum-request-json-timeout-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock should be after the Unix epoch")
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).expect("temporary directory should be created");
+            let socket = directory.join("engine.sock");
+            let listener = UnixListener::bind(&socket).expect("Unix socket should bind");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("client should connect");
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("headers should be written");
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                let _ = stream.write_all(br#"{"value":"slow"}"#).await;
+            });
+
+            let result: Result<serde_json::Value, ()> =
+                request_json(&socket, "/version", 1024, Duration::from_millis(10)).await;
+            cleanup(&socket, server, &directory).await;
+            assert!(result.is_err(), "delayed response body must time out");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn request_inspect_accepts_chunked_http_and_preserves_unknown_state() {
@@ -905,12 +1067,17 @@ mod container_inspection_tests {
                 .expect("chunked response should be written");
         });
 
-        let result = request_inspect(&socket_path, "1.45", "container-id").await;
+        let result: Result<InspectResponse, ()> = request_json(
+            &socket_path,
+            "/v1.45/containers/container-id/json",
+            MAX_INSPECT_RESPONSE_BYTES,
+            REQUEST_TIMEOUT,
+        )
+        .await;
         server.await.expect("fixture server should finish");
         std::fs::remove_file(&socket_path).expect("socket should be removed");
-        std::fs::remove_dir(&directory).expect("temporary directory should be removed");
-        let body = result.expect("chunked inspect response should decode");
-        let response: InspectResponse = serde_json::from_slice(&body).expect("body should be JSON");
+        std::fs::remove_dir(&directory).expect("directory should be removed");
+        let response = result.expect("chunked inspect response should deserialize");
         let details = map_container_details(response, ENDPOINT).expect("ID is present");
         assert_eq!(
             details.state,

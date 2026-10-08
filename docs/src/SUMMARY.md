@@ -13,6 +13,7 @@
 
 # Architecture
 
+- [Architecture overview](architecture/overview.md)
 - [Architecture decisions, including Docker context selection](architecture/decisions.md)
 
 # Security

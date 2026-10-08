@@ -1,14 +1,13 @@
 # Architecture overview
 
-Ferrum keeps native presentation, engine-independent domain values, and Docker-compatible transport in separate workspace crates. The engine adapter uses Bollard for version negotiation and inventory requests; inspection uses a bounded, timed HTTP request over the selected local Linux Unix socket and an allowlisted internal DTO. The UI receives Ferrum-owned `ContainerSummary` and `ContainerDetails` values.
+Ferrum keeps native presentation, engine-independent domain values, and Docker-compatible transport in separate workspace crates. The engine adapter uses one private Hyper/Hyperlocal JSON request path for version negotiation, inventory, and inspection over the selected local Linux Unix socket. Each response is subject to an 8-second total timeout and an operation-specific body limit; the UI receives Ferrum-owned `ContainerSummary` and `ContainerDetails` values.
 
 ```mermaid
 flowchart LR
     UI[eframe native UI] --> APP[Application state]
     APP --> CORE[Engine-independent domain]
     APP --> CLIENT[EngineClient]
-    CLIENT --> BOLLARD[Bollard inventory/version client]
-    CLIENT -->|bounded inspect request| SOCKET[Selected local Linux Unix socket]
+    CLIENT -->|bounded version, inventory, inspect requests| SOCKET[Selected local Linux Unix socket]
     SOCKET --> ENGINE[Docker-compatible engine]
     APP -->|bounded async event channel| UI
 ```
@@ -20,12 +19,13 @@ inventory request includes stopped containers. A successful empty response, a
 connection failure, and an API failure remain distinct states.
 Filtering and sorting operate on application-owned summary values; inspection
 requests are issued on demand through the engine client. The UI receives typed
-`ContainerDetails` rather than Bollard response objects. Inspect responses are
-decoded only into an allowlisted DTO containing detail fields; environment
-variables, labels, command arguments, and unrelated properties are ignored.
-The inspect transport and JSON body are bounded and timed, and response contents
-are never logged or included in errors. Optional fields remain absent when the
-engine omits them.
+`ContainerDetails` rather than engine response objects. Version, inventory, and
+inspect JSON is decoded only into allowlisted Ferrum DTOs; unrelated properties,
+including environment variables, labels, and command arguments, are ignored.
+Responses have limits of 64 KiB for version, 16 MiB for inventory, and 4 MiB for
+inspect, with an 8-second total timeout. Raw response bodies are never logged or
+included in errors. Unknown inspect states remain unknown. Optional fields remain
+absent when the engine omits them.
 
 The app owns a small Linux TOML settings store for the startup auto-connect
 preference. See [Settings](../settings.md) for path selection, migration,
