@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a user-facing capability
+labels: ["type:feature"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user need is not met?
+    validations:
+      required: true
+  - type: textarea
+    id: requirements
+    attributes:
+      label: Requirements and acceptance criteria
+      description: Describe observable behavior and how it should be verified.
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Security, platform, and documentation impact
+      description: Identify privileged engine operations, platform differences, and documentation needs.
+    validations:
+      required: true

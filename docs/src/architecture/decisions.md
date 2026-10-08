@@ -1,0 +1,7 @@
+# Architecture decisions
+
+The canonical records live in `docs/decisions/` and are included here so the website and repository use the same source.
+
+{{#include ../../decisions/0001-gui-framework.md}}
+
+{{#include ../../decisions/0002-engine-client.md}}

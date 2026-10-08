@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ferrum
+Comment=Manage local Docker-compatible containers
+Exec=ferrum
+TryExec=ferrum
+Terminal=false
+StartupNotify=true
+StartupWMClass=com.ferrum.desktop
+Categories=Development;
+Keywords=containers;Docker;

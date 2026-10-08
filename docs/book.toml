@@ -1,0 +1,14 @@
+[book]
+title = "Ferrum Documentation"
+authors = ["Ferrum contributors"]
+description = "User and developer documentation for the Ferrum native container manager."
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "coal"
+preferred-dark-theme = "coal"
