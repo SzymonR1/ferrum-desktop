@@ -15,6 +15,8 @@ flowchart LR
 
 Connection and list requests run in a Tokio task. Results arrive through a bounded channel; the worker requests a repaint after delivery. The UI callback does not perform synchronous engine I/O. The inventory request includes stopped containers. A successful empty response, a connection failure, and an API failure remain distinct states.
 
+The app owns a small Linux TOML settings store for the startup auto-connect preference. See [Settings](../settings.md) for path selection, migration, permissions, and persistence behavior.
+
 ## Current limits
 
 The first adapter is Linux-only and uses local Unix sockets. It honors a local `DOCKER_HOST`; otherwise it tries the XDG runtime Docker socket and the conventional Docker socket. Windows/macOS engine support is deferred, while Docker contexts, remote transports, and Podman parity remain future work. See [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10), [issue #11](https://github.com/SzymonR1/ferrum-desktop/issues/11), and [issue #21](https://github.com/SzymonR1/ferrum-desktop/issues/21).
