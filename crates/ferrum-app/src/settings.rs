@@ -78,12 +78,17 @@ impl SettingsStore {
             return (Settings::default(), Some(SettingsError::Read));
         }
         let mut content = String::new();
-        if file
+        let bytes_read = match file
             .take(MAX_SETTINGS_BYTES + 1)
             .read_to_string(&mut content)
-            .is_err()
-            || content.len() as u64 > MAX_SETTINGS_BYTES
         {
+            Ok(bytes_read) => bytes_read,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return (Settings::default(), Some(SettingsError::Invalid));
+            }
+            Err(_) => return (Settings::default(), Some(SettingsError::Read)),
+        };
+        if bytes_read as u64 > MAX_SETTINGS_BYTES {
             return (Settings::default(), Some(SettingsError::Invalid));
         }
         match toml::from_str::<Settings>(&content) {
