@@ -24,14 +24,14 @@ An ignored integration test also connects to the Docker CLI's current local
 Unix context:
 
 ```sh
-cargo test -p ferrum-engine --test live_engine current_local_docker_context_connects_and_returns_a_valid_inventory -- --ignored
+cargo test -p ferrum-engine --test live_engine current_local_docker_context_connects_and_returns_a_valid_inventory -- --exact --ignored
 ```
 
 To verify selection of a different, non-current context, set
 `FERRUM_TEST_DOCKER_CONTEXT` to an existing local Unix-socket context name:
 
 ```sh
-FERRUM_TEST_DOCKER_CONTEXT=my-local-context cargo test -p ferrum-engine --test live_engine named_noncurrent_local_docker_context_connects_and_returns_a_valid_inventory -- --ignored
+FERRUM_TEST_DOCKER_CONTEXT=my-local-context cargo test -p ferrum-engine --test live_engine named_noncurrent_local_docker_context_connects_and_returns_a_valid_inventory -- --exact --ignored
 ```
 
 The Docker-context tests require the Docker CLI; the non-current test also

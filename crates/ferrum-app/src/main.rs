@@ -1,11 +1,13 @@
+mod inventory;
 mod settings;
 
 use std::{error::Error, time::Duration};
 
 use eframe::egui::{self, Color32, RichText};
-use ferrum_core::{ContainerState, ContainerSummary};
+use ferrum_core::{ContainerDetails, ContainerState, ContainerSummary};
 use ferrum_engine::{ContextTransport, DockerContext, EngineClient, EngineError, EngineInfo};
-use tokio::{runtime::Runtime, sync::mpsc};
+use inventory::InventoryView;
+use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};
 use tracing_subscriber::EnvFilter;
 
 const EVENT_CHANNEL_CAPACITY: usize = 4;
@@ -45,12 +47,26 @@ enum ConnectionState {
     Connected,
     Disconnected(String),
 }
-
 enum EngineEvent {
     Connected(Result<(EngineClient, EngineInfo, Vec<ContainerSummary>), EngineError>),
     Refreshed(Result<Vec<ContainerSummary>, EngineError>),
     Contexts(Result<Vec<DockerContext>, EngineError>),
     ContextSwitched(Result<(EngineClient, EngineInfo, Vec<ContainerSummary>), EngineError>),
+    Inspected {
+        generation: u64,
+        result: Result<ContainerDetails, EngineError>,
+    },
+}
+
+struct Inspection {
+    generation: u64,
+    container_id: String,
+    container_name: String,
+    loading: bool,
+    details: Option<ContainerDetails>,
+    restart_count_display: Option<String>,
+    exit_code_display: Option<String>,
+    error: bool,
 }
 
 struct FerrumApp {
@@ -61,12 +77,16 @@ struct FerrumApp {
     engine: Option<EngineClient>,
     engine_info: Option<EngineInfo>,
     containers: Vec<ContainerSummary>,
+    inventory_view: InventoryView,
     loading: bool,
     refresh_error: Option<String>,
     contexts: Vec<DockerContext>,
     selected_context: Option<String>,
     context_error: Option<String>,
     contexts_error: Option<String>,
+    inspection: Option<Inspection>,
+    inspection_task: Option<JoinHandle<()>>,
+    next_inspection_generation: u64,
     settings_store: settings::SettingsStore,
     settings: settings::Settings,
     settings_draft: settings::Settings,
@@ -109,12 +129,16 @@ impl FerrumApp {
             engine: None,
             engine_info: None,
             containers: Vec::new(),
+            inventory_view: InventoryView::default(),
             loading: false,
             refresh_error: None,
             contexts: Vec::new(),
             selected_context: None,
             context_error: None,
             contexts_error: None,
+            inspection: None,
+            inspection_task: None,
+            next_inspection_generation: 0,
             settings_store,
             settings_draft: settings.clone(),
             settings,
@@ -138,7 +162,6 @@ impl FerrumApp {
         }
         app
     }
-
     fn connect(&mut self, context: egui::Context) {
         if self.loading {
             return;
@@ -177,6 +200,7 @@ impl FerrumApp {
         if self.loading {
             return;
         }
+        self.cancel_inspection();
         self.loading = true;
         self.context_error = None;
         let sender = self.sender.clone();
@@ -247,12 +271,13 @@ impl FerrumApp {
                     self.loading = false;
                     match result {
                         Ok((engine, info, containers)) => {
-                            self.apply_connection_success(engine, info, containers);
+                            self.apply_connection_success(engine, info, containers)
                         }
                         Err(error) => {
                             self.engine = None;
                             self.engine_info = None;
                             self.containers.clear();
+                            self.inventory_view.inventory_changed(&self.containers);
                             self.selected_context = None;
                             self.connection = ConnectionState::Disconnected(error.to_string());
                         }
@@ -262,7 +287,7 @@ impl FerrumApp {
                     self.loading = false;
                     match result {
                         Ok((engine, info, containers)) => {
-                            self.apply_connection_success(engine, info, containers);
+                            self.apply_connection_success(engine, info, containers)
                         }
                         Err(error) => self.context_error = Some(error.to_string()),
                     }
@@ -272,9 +297,32 @@ impl FerrumApp {
                     match result {
                         Ok(containers) => {
                             self.containers = containers;
+                            self.inventory_view.inventory_changed(&self.containers);
                             self.refresh_error = None;
                         }
                         Err(error) => self.refresh_error = Some(error.to_string()),
+                    }
+                }
+                EngineEvent::Inspected { generation, result } => {
+                    if let Some(inspection) = &mut self.inspection
+                        && inspection.generation == generation
+                    {
+                        self.inspection_task = None;
+                        match result {
+                            Ok(details) => {
+                                inspection.restart_count_display =
+                                    details.restart_count.map(|value| value.to_string());
+                                inspection.exit_code_display =
+                                    details.exit_code.map(|value| value.to_string());
+                                inspection.details = Some(details);
+                                inspection.loading = false;
+                                inspection.error = false;
+                            }
+                            Err(_) => {
+                                inspection.loading = false;
+                                inspection.error = true;
+                            }
+                        }
                     }
                 }
             }
@@ -287,15 +335,58 @@ impl FerrumApp {
         info: EngineInfo,
         containers: Vec<ContainerSummary>,
     ) {
+        self.cancel_inspection();
         self.selected_context = engine.selected_context_name().map(str::to_owned);
         self.engine = Some(engine);
         self.engine_info = Some(info);
         self.containers = containers;
+        self.inventory_view.inventory_changed(&self.containers);
         self.connection = ConnectionState::Connected;
         self.refresh_error = None;
         self.context_error = None;
     }
 
+    fn cancel_inspection(&mut self) {
+        if let Some(task) = self.inspection_task.take() {
+            task.abort();
+        }
+        self.inspection = None;
+    }
+
+    fn inspect_container(
+        &mut self,
+        container_id: &str,
+        container_name: &str,
+        context: egui::Context,
+    ) {
+        self.cancel_inspection();
+        self.next_inspection_generation = self.next_inspection_generation.wrapping_add(1);
+        let generation = self.next_inspection_generation;
+        self.inspection = Some(Inspection {
+            generation,
+            container_id: container_id.to_owned(),
+            container_name: container_name.to_owned(),
+            loading: true,
+            details: None,
+            restart_count_display: None,
+            exit_code_display: None,
+            error: false,
+        });
+        if let Some(engine) = self.engine.clone() {
+            let sender = self.sender.clone();
+            let container_id = container_id.to_owned();
+            self.inspection_task = Some(self.runtime.spawn(async move {
+                let result = engine.inspect_container(&container_id).await;
+                if sender
+                    .send(EngineEvent::Inspected { generation, result })
+                    .await
+                    .is_ok()
+                {
+                    context.request_repaint();
+                }
+            }));
+        }
+    }
     fn draw_sidebar(&self, ui: &mut egui::Ui) {
         egui::Panel::left("navigation")
             .resizable(false)
@@ -436,7 +527,7 @@ impl FerrumApp {
             });
     }
 
-    fn draw_inventory(&self, ui: &mut egui::Ui) {
+    fn draw_inventory(&mut self, ui: &mut egui::Ui) -> Option<usize> {
         if let Some(error) = &self.contexts_error {
             ui.horizontal(|ui| {
                 ui.colored_label(
@@ -466,6 +557,9 @@ impl FerrumApp {
             ui.add_space(10.0);
         }
 
+        if matches!(&self.connection, ConnectionState::Connected) && !self.containers.is_empty() {
+            self.inventory_view.show_controls(ui, &self.containers);
+        }
         match &self.connection {
             ConnectionState::Connecting => {
                 ui.vertical_centered(|ui| {
@@ -475,6 +569,7 @@ impl FerrumApp {
                     ui.heading("Connecting to a local container engine");
                     ui.label("The container inventory will appear when the engine responds.");
                 });
+                None
             }
             ConnectionState::Disconnected(message) => {
                 ui.vertical_centered(|ui| {
@@ -483,6 +578,7 @@ impl FerrumApp {
                     ui.add_space(8.0);
                     ui.label(message);
                 });
+                None
             }
             ConnectionState::Connected if self.containers.is_empty() => {
                 ui.vertical_centered(|ui| {
@@ -490,18 +586,26 @@ impl FerrumApp {
                     ui.heading("No containers found");
                     ui.label("The connected engine reported an empty inventory, including stopped containers.");
                 });
+                None
+            }
+            ConnectionState::Connected if self.inventory_view.visible().is_empty() => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(96.0);
+                    ui.heading("No matching containers");
+                    ui.label("Try a different search.");
+                });
+                None
             }
             ConnectionState::Connected => self.draw_container_table(ui),
         }
     }
 
-    fn draw_container_table(&self, ui: &mut egui::Ui) {
+    fn draw_container_table(&self, ui: &mut egui::Ui) -> Option<usize> {
         let available_width = ui.available_width();
         let name_width = available_width * 0.24;
         let image_width = available_width * 0.34;
         let state_width = available_width * 0.15;
         let status_width = available_width - name_width - image_width - state_width;
-
         ui.horizontal(|ui| {
             add_cell(ui, "Name", name_width);
             add_cell(ui, "Image", image_width);
@@ -509,24 +613,31 @@ impl FerrumApp {
             add_cell(ui, "Status", status_width);
         });
         ui.separator();
-
+        let visible = self.inventory_view.visible();
+        let mut selected = None;
         egui::ScrollArea::vertical().show_rows(
             ui,
             ROW_HEIGHT,
-            self.containers.len(),
+            visible.len(),
             |ui, visible_rows| {
-                for index in visible_rows {
+                for row in visible_rows {
+                    let index = visible[row];
                     let container = &self.containers[index];
                     ui.horizontal(|ui| {
-                        let name_response = ui.add_sized(
-                            [name_width, CELL_HEIGHT],
-                            egui::Label::new(RichText::new(&container.name).strong())
-                                .truncate()
-                                .show_tooltip_when_elided(true),
-                        );
-                        name_response.on_hover_text(&container.id);
-
-                        let image = container.image.as_deref().unwrap_or("Image not reported");
+                        let name_button = ui
+                            .add_enabled_ui(!self.loading, |ui| {
+                                ui.add_sized(
+                                    [name_width, CELL_HEIGHT],
+                                    egui::Button::new(RichText::new(&container.name).strong())
+                                        .frame(false),
+                                )
+                            })
+                            .inner;
+                        if name_button.clicked() {
+                            selected = Some(index);
+                        }
+                        name_button.on_hover_text(&container.id);
+                        let image = container.image.as_deref().unwrap_or("Not reported");
                         let image_response = ui.add_sized(
                             [image_width, CELL_HEIGHT],
                             egui::Label::new(image)
@@ -534,11 +645,10 @@ impl FerrumApp {
                                 .show_tooltip_when_elided(true),
                         );
                         image_response.on_hover_text(image);
-
                         let state_text = container
                             .state
                             .as_ref()
-                            .map_or("State not reported", ContainerState::label);
+                            .map_or("Not reported", ContainerState::label);
                         ui.add_sized(
                             [state_width, CELL_HEIGHT],
                             egui::Label::new(
@@ -548,8 +658,7 @@ impl FerrumApp {
                             .truncate()
                             .show_tooltip_when_elided(true),
                         );
-
-                        let status = container.status.as_deref().unwrap_or("Status not reported");
+                        let status = container.status.as_deref().unwrap_or("Not reported");
                         ui.add_sized(
                             [status_width, CELL_HEIGHT],
                             egui::Label::new(status)
@@ -561,6 +670,83 @@ impl FerrumApp {
                 }
             },
         );
+        selected
+    }
+    fn draw_inspection(&mut self, context: egui::Context) {
+        let Some(inspection) = &self.inspection else {
+            return;
+        };
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("Container details")
+            .id(egui::Id::new("container-inspection"))
+            .open(&mut open)
+            .resizable(true)
+            .show(&context, |ui| {
+                ui.heading(&inspection.container_name);
+                detail_row(ui, "ID", Some(&inspection.container_id));
+                if inspection.loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading inspection…");
+                    });
+                } else if inspection.error {
+                    ui.colored_label(Color32::from_rgb(227, 113, 102), "Inspection unavailable");
+                    ui.label("The engine could not provide container details.");
+                }
+                if let Some(details) = &inspection.details {
+                    detail_row(ui, "Name", details.name.as_deref());
+                    detail_row(ui, "Image", details.image.as_deref());
+                    detail_row(ui, "Created", details.created.as_deref());
+                    detail_row(
+                        ui,
+                        "State",
+                        details.state.as_ref().map(ContainerState::label),
+                    );
+                    detail_row(
+                        ui,
+                        "Restart count",
+                        inspection.restart_count_display.as_deref(),
+                    );
+                    detail_row(ui, "Exit code", inspection.exit_code_display.as_deref());
+                    detail_row(ui, "Started at", details.started_at.as_deref());
+                    detail_row(ui, "Finished at", details.finished_at.as_deref());
+                    ui.separator();
+                    ui.strong("Mounts");
+                    match &details.mounts {
+                        None => {
+                            ui.label("Not reported");
+                        }
+                        Some(mounts) if mounts.is_empty() => {
+                            ui.label("No mounts reported");
+                        }
+                        Some(mounts) => {
+                            for mount in mounts {
+                                ui.group(|ui| {
+                                    ui.strong("Mount");
+                                    detail_row(ui, "Type", mount.kind.as_deref());
+                                    detail_row(ui, "Source", mount.source.as_deref());
+                                    detail_row(ui, "Destination", mount.destination.as_deref());
+                                    detail_row(ui, "Mode", mount.mode.as_deref());
+                                    detail_row(
+                                        ui,
+                                        "Read/write",
+                                        mount
+                                            .read_write
+                                            .map(|value| if value { "Yes" } else { "No" }),
+                                    );
+                                });
+                            }
+                        }
+                    }
+                }
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        if !open || close {
+            self.cancel_inspection();
+        }
     }
     fn draw_settings(&mut self, context: egui::Context) {
         if !self.settings_open {
@@ -600,6 +786,20 @@ impl FerrumApp {
         self.settings_open = open && !close_requested;
     }
 }
+fn detail_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
+    ui.horizontal(|ui| {
+        ui.strong(label);
+        ui.label(value.unwrap_or("Not reported"));
+    });
+}
+
+impl Drop for FerrumApp {
+    fn drop(&mut self) {
+        if let Some(task) = self.inspection_task.take() {
+            task.abort();
+        }
+    }
+}
 
 impl eframe::App for FerrumApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -625,9 +825,17 @@ impl eframe::App for FerrumApp {
             self.settings_draft = self.settings.clone();
             self.settings_open = true;
         }
+        let mut inspect_index = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 18)))
-            .show(ui, |ui| self.draw_inventory(ui));
+            .show(ui, |ui| inspect_index = self.draw_inventory(ui));
+        if let Some(index) = inspect_index {
+            let container = &self.containers[index];
+            let id = container.id.clone();
+            let name = container.name.clone();
+            self.inspect_container(&id, &name, context.clone());
+        }
+        self.draw_inspection(context.clone());
         self.draw_settings(context.clone());
 
         if refresh_requested {

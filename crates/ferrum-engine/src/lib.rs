@@ -18,7 +18,7 @@ use contexts::{
 #[cfg(target_os = "linux")]
 use bollard::API_DEFAULT_VERSION;
 use bollard::{Docker, errors::Error as BollardError, query_parameters::ListContainersOptions};
-use ferrum_core::{ContainerState, ContainerSummary};
+use ferrum_core::{ContainerDetails, ContainerMount, ContainerState, ContainerSummary};
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
@@ -118,6 +118,28 @@ pub enum EngineError {
         /// Underlying client error, omitted from user-facing display to avoid leaking endpoint data.
         #[source]
         source: BollardError,
+    },
+    /// The selected Docker context could not inspect a container.
+    #[error(
+        "The selected Docker context could not inspect the container. Check its engine health and access permissions."
+    )]
+    ContextInspectContainerRequest,
+    /// The engine failed to inspect a container.
+    #[error(
+        "The engine at the {endpoint_label} could not inspect the container. Check its health and access permissions."
+    )]
+    InspectContainerRequest {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+        /// Underlying client error, omitted from user-facing display.
+        #[source]
+        source: BollardError,
+    },
+    /// An inspection response omitted its required container identifier.
+    #[error("The engine at the {endpoint_label} returned container details without an identifier.")]
+    MissingInspectedContainerId {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
     },
 }
 
@@ -368,6 +390,33 @@ impl EngineClient {
             .map(|container| map_container(container, endpoint_label))
             .collect()
     }
+    /// Returns read-only details for a container identified by its engine ID.
+    ///
+    /// The engine response is reduced to the documented domain fields; secret-
+    /// bearing configuration such as environment variables and labels is not
+    /// exposed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe typed error if inspection fails or the response omits
+    /// the container identifier.
+    pub async fn inspect_container(&self, id: &str) -> Result<ContainerDetails, EngineError> {
+        let response = self
+            .docker
+            .inspect_container(id, None)
+            .await
+            .map_err(|source| {
+                if self.selected_context.is_some() {
+                    EngineError::ContextInspectContainerRequest
+                } else {
+                    EngineError::InspectContainerRequest {
+                        endpoint_label: self.info.endpoint_label,
+                        source,
+                    }
+                }
+            })?;
+        map_container_details(response, self.info.endpoint_label)
+    }
 
     #[cfg(target_os = "linux")]
     async fn connect_unix_socket(
@@ -469,8 +518,7 @@ fn map_container(
     let name = container
         .names
         .and_then(|names| names.into_iter().next())
-        .map(|name| name.trim_start_matches('/').to_owned())
-        .filter(|name| !name.is_empty())
+        .and_then(normalize_container_name)
         .unwrap_or_else(|| id.chars().take(12).collect());
     let state = container
         .state
@@ -483,6 +531,203 @@ fn map_container(
         state,
         status: container.status,
     })
+}
+fn map_container_details(
+    response: bollard::models::ContainerInspectResponse,
+    endpoint_label: &'static str,
+) -> Result<ContainerDetails, EngineError> {
+    let id = response
+        .id
+        .ok_or(EngineError::MissingInspectedContainerId { endpoint_label })?;
+    let name = response.name.and_then(normalize_container_name);
+    let (state, exit_code, started_at, finished_at) =
+        response.state.map_or((None, None, None, None), |state| {
+            let exit_code = state.exit_code;
+            let started_at = state.started_at;
+            let finished_at = state.finished_at;
+            let state = state.status.and_then(map_inspected_state);
+            (state, exit_code, started_at, finished_at)
+        });
+
+    let image = response
+        .config
+        .and_then(|config| config.image)
+        .or(response.image);
+
+    Ok(ContainerDetails {
+        id,
+        name,
+        image,
+        created: response.created,
+        state,
+        restart_count: response.restart_count,
+        exit_code,
+        started_at,
+        finished_at,
+        mounts: response.mounts.map(|mounts| {
+            mounts
+                .into_iter()
+                .map(|mount| ContainerMount {
+                    kind: mount.typ,
+                    source: mount.source,
+                    destination: mount.destination,
+                    mode: mount.mode,
+                    read_write: mount.rw,
+                })
+                .collect()
+        }),
+    })
+}
+
+fn map_inspected_state(
+    status: bollard::config::ContainerStateStatusEnum,
+) -> Option<ContainerState> {
+    use bollard::config::ContainerStateStatusEnum as Status;
+
+    match status {
+        Status::EMPTY => None,
+        Status::CREATED => Some(ContainerState::Created),
+        Status::RESTARTING => Some(ContainerState::Restarting),
+        Status::RUNNING => Some(ContainerState::Running),
+        Status::PAUSED => Some(ContainerState::Paused),
+        Status::EXITED => Some(ContainerState::Exited),
+        Status::REMOVING => Some(ContainerState::Removing),
+        Status::DEAD => Some(ContainerState::Dead),
+        Status::STOPPING => Some(ContainerState::Stopping),
+    }
+}
+
+fn normalize_container_name(name: String) -> Option<String> {
+    let name = if name.starts_with('/') {
+        name.trim_start_matches('/').to_owned()
+    } else {
+        name
+    };
+    (!name.is_empty()).then_some(name)
+}
+
+#[cfg(test)]
+mod container_inspection_tests {
+    use super::*;
+
+    const ENDPOINT: &str = "test endpoint";
+
+    fn response(json: &str) -> bollard::models::ContainerInspectResponse {
+        serde_json::from_str(json).expect("inspect response should deserialize")
+    }
+
+    #[test]
+    fn maps_reported_details_without_exposing_other_response_fields() {
+        let response = response(
+            r#"{
+                "Id":"container-id",
+                "Name":"/web",
+                "Image":"sha256:digest",
+                "RestartCount":3,
+                "State":{"Status":"running","ExitCode":0,"StartedAt":"started","FinishedAt":"finished"},
+                "Mounts":[{"Type":"bind","Source":"/host/data","Destination":"/data","Mode":"ro","RW":false}],
+                "Created":"2024-01-02T03:04:05Z",
+                "Config":{"Image":"image-ref","Env":["SECRET=value"],"Labels":{"secret":"value"},"Cmd":["secret"]}
+            }"#,
+        );
+
+        let details = map_container_details(response, ENDPOINT).expect("id is present");
+        assert_eq!(
+            details,
+            ContainerDetails {
+                id: "container-id".to_owned(),
+                name: Some("web".to_owned()),
+                image: Some("image-ref".to_owned()),
+                created: Some("2024-01-02T03:04:05Z".to_owned()),
+                state: Some(ContainerState::Running),
+                restart_count: Some(3),
+                exit_code: Some(0),
+                started_at: Some("started".to_owned()),
+                finished_at: Some("finished".to_owned()),
+                mounts: Some(vec![ContainerMount {
+                    kind: Some("bind".to_owned()),
+                    source: Some("/host/data".to_owned()),
+                    destination: Some("/data".to_owned()),
+                    mode: Some("ro".to_owned()),
+                    read_write: Some(false),
+                }]),
+            }
+        );
+        let debug = format!("{details:?}");
+        assert!(!debug.contains("SECRET=value"));
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("Cmd"));
+    }
+
+    #[test]
+    fn prefers_configured_image_reference_and_falls_back_to_digest() {
+        let configured = map_container_details(
+            response(
+                r#"{"Id":"container-id","Image":"sha256:digest","Config":{"Image":"registry/app:tag"}}"#,
+            ),
+            ENDPOINT,
+        )
+        .expect("id is present");
+        assert_eq!(configured.image.as_deref(), Some("registry/app:tag"));
+
+        let digest_only = map_container_details(
+            response(r#"{"Id":"container-id","Image":"sha256:digest","Config":{}}"#),
+            ENDPOINT,
+        )
+        .expect("id is present");
+        assert_eq!(digest_only.image.as_deref(), Some("sha256:digest"));
+    }
+
+    #[test]
+    fn retains_absent_values_and_distinguishes_missing_from_empty_mounts() {
+        let absent = response(r#"{"Id":"container-id"}"#);
+        let details = map_container_details(absent, ENDPOINT).expect("id is present");
+        assert_eq!(details.name, None);
+        assert_eq!(details.image, None);
+        assert_eq!(details.created, None);
+        assert_eq!(details.state, None);
+        assert_eq!(details.restart_count, None);
+        assert_eq!(details.exit_code, None);
+        assert_eq!(details.started_at, None);
+        assert_eq!(details.finished_at, None);
+        assert_eq!(details.mounts, None);
+
+        let empty_mounts = response(r#"{"Id":"container-id","Mounts":[]}"#);
+        assert_eq!(
+            map_container_details(empty_mounts, ENDPOINT)
+                .expect("id is present")
+                .mounts,
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn treats_empty_state_as_unreported() {
+        let details = map_container_details(
+            response(r#"{"Id":"container-id","State":{"Status":""}}"#),
+            ENDPOINT,
+        )
+        .expect("id is present");
+
+        assert_eq!(details.state, None);
+    }
+
+    #[test]
+    fn rejects_missing_identifier_and_normalizes_empty_names() {
+        let error = map_container_details(response(r#"{"Name":"/ignored"}"#), ENDPOINT)
+            .expect_err("inspection ID is required");
+        assert!(matches!(
+            error,
+            EngineError::MissingInspectedContainerId {
+                endpoint_label: ENDPOINT
+            }
+        ));
+
+        let details =
+            map_container_details(response(r#"{"Id":"container-id","Name":"///"}"#), ENDPOINT)
+                .expect("id is present");
+        assert_eq!(details.name, None);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

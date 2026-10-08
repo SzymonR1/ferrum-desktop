@@ -43,6 +43,11 @@ async fn local_engine_returns_a_well_formed_container_inventory() {
             .as_deref()
             .is_some_and(|status| !status.trim().is_empty())
     );
+    let details = engine
+        .inspect_container(&first.id)
+        .await
+        .expect("a listed container should be inspectable");
+    assert_eq!(details.id, first.id);
 }
 
 #[tokio::test]
