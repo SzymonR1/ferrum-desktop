@@ -648,7 +648,7 @@ impl FerrumApp {
                         let state_text = container
                             .state
                             .as_ref()
-                            .map_or("Not reported", ContainerState::label);
+                            .map_or("Not reported", container_state_display);
                         ui.add_sized(
                             [state_width, CELL_HEIGHT],
                             egui::Label::new(
@@ -701,7 +701,7 @@ impl FerrumApp {
                     detail_row(
                         ui,
                         "State",
-                        details.state.as_ref().map(ContainerState::label),
+                        details.state.as_ref().map(container_state_display),
                     );
                     detail_row(
                         ui,
@@ -863,5 +863,29 @@ fn state_color(state: Option<&ContainerState>) -> Color32 {
         }
         Some(ContainerState::Dead) => Color32::from_rgb(227, 113, 102),
         Some(_) | None => Color32::from_rgb(164, 177, 188),
+    }
+}
+
+fn container_state_display(state: &ContainerState) -> &str {
+    match state {
+        ContainerState::Unknown(value) if value.is_empty() => r#""""#,
+        _ => state.label(),
+    }
+}
+
+#[cfg(test)]
+mod container_state_display_tests {
+    use super::*;
+
+    #[test]
+    fn displays_unknown_state_text_exactly() {
+        assert_eq!(
+            container_state_display(&ContainerState::Unknown(String::new())),
+            r#""""#
+        );
+        assert_eq!(
+            container_state_display(&ContainerState::Unknown("checkpointing".to_owned())),
+            "checkpointing"
+        );
     }
 }

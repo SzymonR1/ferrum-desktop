@@ -33,6 +33,17 @@ use serde::{Deserialize, de::DeserializeOwned};
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestJsonError {
+    RequestBuild,
+    Transport,
+    UnsuccessfulStatus,
+    BodyRead,
+    BodyTooLarge,
+    JsonDecode,
+    Timeout,
+}
+#[cfg(target_os = "linux")]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(target_os = "linux")]
 const MAX_INSPECT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -446,7 +457,7 @@ impl EngineClient {
                 REQUEST_TIMEOUT,
             )
             .await
-            .map_err(|()| {
+            .map_err(|_| {
                 if self.selected_context.is_some() {
                     EngineError::ContextInventoryRequest
                 } else {
@@ -476,8 +487,8 @@ impl EngineClient {
     pub async fn inspect_container(&self, id: &str) -> Result<ContainerDetails, EngineError> {
         #[cfg(target_os = "linux")]
         {
-            let path = inspect_request_path(&self.api_version, id)
-                .map_err(|()| self.inspection_error())?;
+            let path =
+                inspect_request_path(&self.api_version, id).map_err(|_| self.inspection_error())?;
             let response: InspectResponse = request_json(
                 &self.socket_path,
                 &path,
@@ -485,7 +496,7 @@ impl EngineClient {
                 REQUEST_TIMEOUT,
             )
             .await
-            .map_err(|()| self.inspection_error())?;
+            .map_err(|_| self.inspection_error())?;
             map_container_details(response, self.info.endpoint_label)
         }
         #[cfg(not(target_os = "linux"))]
@@ -509,7 +520,7 @@ impl EngineClient {
             REQUEST_TIMEOUT,
         )
         .await
-        .map_err(|()| EngineError::Unavailable { endpoint_label })?;
+        .map_err(|_| EngineError::Unavailable { endpoint_label })?;
         let version = response
             .version
             .filter(|value| !value.trim().is_empty())
@@ -586,33 +597,45 @@ async fn request_json<T: DeserializeOwned>(
     request_path: &str,
     max_response_bytes: usize,
     request_timeout: Duration,
-) -> Result<T, ()> {
-    timeout(request_timeout, async {
+) -> Result<T, RequestJsonError> {
+    match timeout(request_timeout, async {
         let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
         let request = Request::builder()
             .method(Method::GET)
             .uri(Uri::new(socket_path, request_path))
             .body(Empty::<Bytes>::new())
-            .map_err(|_| ())?;
-        let response = client.request(request).await.map_err(|_| ())?;
+            .map_err(|_| RequestJsonError::RequestBuild)?;
+        let response = client
+            .request(request)
+            .await
+            .map_err(|_| RequestJsonError::Transport)?;
         if !response.status().is_success() {
-            return Err(());
+            return Err(RequestJsonError::UnsuccessfulStatus);
         }
         let body = Limited::new(response.into_body(), max_response_bytes)
             .collect()
             .await
-            .map_err(|_| ())?
+            .map_err(|error| {
+                if error.is::<http_body_util::LengthLimitError>() {
+                    RequestJsonError::BodyTooLarge
+                } else {
+                    RequestJsonError::BodyRead
+                }
+            })?
             .to_bytes();
-        serde_json::from_slice(&body).map_err(|_| ())
+        serde_json::from_slice(&body).map_err(|_| RequestJsonError::JsonDecode)
     })
     .await
-    .map_err(|_| ())?
+    {
+        Ok(result) => result,
+        Err(_) => Err(RequestJsonError::Timeout),
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn inspect_request_path(api_version: &str, id: &str) -> Result<String, ()> {
+fn inspect_request_path(api_version: &str, id: &str) -> Result<String, RequestJsonError> {
     if id.is_empty() || id.len() > 4096 {
-        return Err(());
+        return Err(RequestJsonError::RequestBuild);
     }
     let mut path = String::with_capacity(api_version.len() + id.len().saturating_mul(3) + 32);
     path.push_str("/v");
@@ -623,7 +646,7 @@ fn inspect_request_path(api_version: &str, id: &str) -> Result<String, ()> {
             path.push(char::from(byte));
         } else {
             use std::fmt::Write as _;
-            write!(path, "%{byte:02X}").map_err(|_| ())?;
+            write!(path, "%{byte:02X}").map_err(|_| RequestJsonError::RequestBuild)?;
         }
     }
     path.push_str("/json");
@@ -685,13 +708,9 @@ fn map_container_details(
             let exit_code = state.exit_code;
             let started_at = state.started_at;
             let finished_at = state.finished_at;
-            let state = state
-                .status
-                .filter(|status| !status.is_empty())
-                .map(|status| ContainerState::parse(&status));
+            let state = state.status.map(|status| ContainerState::parse(&status));
             (state, exit_code, started_at, finished_at)
         });
-
     let image = response
         .config
         .and_then(|config| config.image)
@@ -827,14 +846,14 @@ mod container_inspection_tests {
     }
 
     #[test]
-    fn treats_empty_state_as_unreported() {
+    fn preserves_explicitly_empty_state_status() {
         let details = map_container_details(
             response(r#"{"Id":"container-id","State":{"Status":""}}"#),
             ENDPOINT,
         )
         .expect("id is present");
 
-        assert_eq!(details.state, None);
+        assert_eq!(details.state, Some(ContainerState::Unknown(String::new())));
     }
 
     #[test]
@@ -972,7 +991,7 @@ mod container_inspection_tests {
         #[tokio::test]
         async fn accepts_chunked_response_and_deserializes_body() {
             let (socket, server, directory) = fixture(chunked(br#"{"value":"decoded"}"#)).await;
-            let result: Result<serde_json::Value, ()> =
+            let result: Result<serde_json::Value, RequestJsonError> =
                 request_json(&socket, "/version", 1024, Duration::from_secs(1)).await;
             cleanup(&socket, server, &directory).await;
             assert_eq!(
@@ -985,7 +1004,7 @@ mod container_inspection_tests {
         async fn rejects_response_over_body_limit() {
             let body = br#"{"value":"response exceeds limit"}"#;
             let (socket, server, directory) = fixture(chunked(body)).await;
-            let result: Result<serde_json::Value, ()> =
+            let result: Result<serde_json::Value, RequestJsonError> =
                 request_json(&socket, "/version", 8, Duration::from_secs(1)).await;
             cleanup(&socket, server, &directory).await;
             assert!(result.is_err(), "oversized body must be rejected");
@@ -1018,7 +1037,7 @@ mod container_inspection_tests {
                 let _ = stream.write_all(br#"{"value":"slow"}"#).await;
             });
 
-            let result: Result<serde_json::Value, ()> =
+            let result: Result<serde_json::Value, RequestJsonError> =
                 request_json(&socket, "/version", 1024, Duration::from_millis(10)).await;
             cleanup(&socket, server, &directory).await;
             assert!(result.is_err(), "delayed response body must time out");
@@ -1067,7 +1086,7 @@ mod container_inspection_tests {
                 .expect("chunked response should be written");
         });
 
-        let result: Result<InspectResponse, ()> = request_json(
+        let result: Result<InspectResponse, RequestJsonError> = request_json(
             &socket_path,
             "/v1.45/containers/container-id/json",
             MAX_INSPECT_RESPONSE_BYTES,
