@@ -346,6 +346,7 @@ impl FerrumApp {
 
     fn receive_events(&mut self, context: egui::Context) {
         let mut selected_container_changed = false;
+        let mut action_error_after_reinspection = None;
         while let Ok(event) = self.receiver.try_recv() {
             match event {
                 EngineEvent::Contexts(Ok(contexts)) => {
@@ -428,12 +429,13 @@ impl FerrumApp {
                         .inspection
                         .as_ref()
                         .is_some_and(|inspection| inspection.generation == generation);
+                    let action_error = result.as_ref().err().map(ToString::to_string);
                     if let Some(inspection) = self.inspection.as_mut()
                         && inspection.generation == generation
                     {
                         inspection.action_busy = false;
                         inspection.confirming_remove = false;
-                        inspection.action_error = result.as_ref().err().map(ToString::to_string);
+                        inspection.action_error = action_error.clone();
                     }
 
                     let removed =
@@ -441,6 +443,7 @@ impl FerrumApp {
                     if removed {
                         self.cancel_inspection();
                     } else if matches_inspection {
+                        action_error_after_reinspection = action_error;
                         selected_container_changed = true;
                     }
                     self.event_refresh_pending = true;
@@ -495,6 +498,11 @@ impl FerrumApp {
             })
         {
             self.inspect_container(&id, &name, context);
+            if let Some(action_error) = action_error_after_reinspection.take()
+                && let Some(inspection) = self.inspection.as_mut()
+            {
+                inspection.action_error = Some(action_error);
+            }
         }
     }
 
@@ -1504,6 +1512,35 @@ mod event_reconciliation_tests {
 
         retries.reset();
         assert_eq!(retries.next_delay(), Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn lifecycle_failure_survives_followup_inspection_refresh() {
+        let (mut app, sender) = app_with_open_inspection();
+        let action_error = EngineError::ContainerActionRejected {
+            action: ContainerAction::Stop,
+            endpoint_label: "test endpoint",
+            status: 409,
+        };
+        let expected_error = action_error.to_string();
+        assert!(
+            sender
+                .try_send(EngineEvent::ActionFinished {
+                    generation: 4,
+                    action: ContainerAction::Stop,
+                    result: Err(action_error),
+                })
+                .is_ok()
+        );
+
+        app.receive_events(egui::Context::default());
+
+        let inspection = app.inspection.as_ref().expect("inspection remains open");
+        assert_reinspection_is_pending(&app);
+        assert_eq!(
+            inspection.action_error.as_deref(),
+            Some(expected_error.as_str())
+        );
     }
 
     fn assert_reinspection_is_pending(app: &FerrumApp) {
