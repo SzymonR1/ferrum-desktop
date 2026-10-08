@@ -23,6 +23,7 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+vt100 = "0.16.2"
 
 [dev-dependencies]
 egui_kittest = "0.36.2"

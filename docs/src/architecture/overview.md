@@ -48,6 +48,17 @@ manual Refresh starts a fresh bounded session. Reconnect reloads recent history
 and clears buffered rows to avoid replay duplicates. Closing Logs or inspection,
 context switch, or app teardown cancels log streaming.
 
+The experimental embedded terminal uses Docker exec create/start with an
+argument array and attached stdin/stdout/stderr in TTY mode, then upgrades the
+HTTP/1.1 connection to a bidirectional stream over the selected local Unix
+socket. Terminal resize uses the API-versioned exec resize endpoint. The
+terminal view handles interactive input and terminal rendering; terminal bytes
+are untrusted and never logged. OSC 52 clipboard and title requests are
+ignored, while clipboard controls are user initiated. Closing the session
+closes only its exec connection; it does not stop or remove the container.
+This remains Linux local Docker-compatible Unix sockets only; issue #10 stays
+open for Podman/rootless and remote compatibility.
+
 The inventory includes stopped containers. Filtering and sorting operate on
 application-owned summary values; inspection requests are issued on demand.
 Lifecycle actions are restricted to safe known states in the inspection dialog,

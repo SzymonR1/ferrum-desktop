@@ -2,17 +2,23 @@
 
 Ferrum is a native Rust desktop application for managing existing
 Docker-compatible container engines. It does not bundle an engine, install
-privileged services, launch an external terminal, or use Electron or Node.js.
+privileged services, or use Electron or Node.js. Its experimental embedded
+terminal does not launch an external terminal.
 
 ## Current status
 
 The Linux local-engine implementation provides container inventory, filtering,
 sorting, inspection, historical and live container logs, lifecycle actions, and
-external-change synchronization. Actions are offered only for safe known
-container states; Remove requires confirmation. Container-only event updates
-use bounded delivery and report when synchronization is unavailable, while
-manual refresh remains available. Logs are plain text, bounded in memory, and
-stream only from the selected local Unix socket.
+external-change synchronization. An experimental embedded terminal provides an
+interactive exec session for an explicitly selected container. Terminal access
+is limited to the selected local Docker-compatible Unix socket; closing a
+session does not stop or remove its container. Terminal output is untrusted:
+OSC 52 clipboard and title requests are ignored, and clipboard operations are
+user initiated. Terminal contents are never logged. Actions are offered only
+for safe known container states; Remove requires confirmation. Container-only
+event updates use bounded delivery and report when synchronization is
+unavailable, while manual refresh remains available. Logs are plain text,
+bounded in memory, and stream only from the selected local Unix socket.
 
 An X11-backend screenshot captured via XWayland showed actual container names,
 images, states, and statuses. A no-engine X11 launch showed a connection error
@@ -35,7 +41,9 @@ explicit `DOCKER_CONTEXT` (a local Unix-socket Docker CLI context), a local
 `DOCKER_HOST`, the current non-default Docker CLI context, then
 `$XDG_RUNTIME_DIR/docker.sock` and `/var/run/docker.sock`. Context selection
 requires Docker CLI. Remote endpoints remain unsupported; Podman/rootless
-behavior is unvalidated. Windows and macOS remain deferred to issue #21/M8.
+behavior is unvalidated. The terminal does not extend this scope: issue #10
+remains open for Podman/rootless and remote compatibility. Windows and macOS
+remain deferred to issue #21/M8.
 
 ## Checks
 
@@ -63,6 +71,7 @@ An ignored lifecycle integration test is mutating; see the testing guide for its
 - [Security threat model](docs/security/threat-model.md)
 - [Platform support](docs/src/platform-support.md)
 - [Architecture decisions](docs/decisions/)
+- [Embedded terminal guide](docs/src/user-guide/terminal.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 
 No release artifacts or installers have been published.
