@@ -8,4 +8,4 @@ Please use the private vulnerability-reporting feature for this repository in Gi
 
 ## Current scope
 
-The initial application slice performs read-only local container inventory requests. Remote engine connections, credentials, lifecycle operations, Compose, logs, terminal streams, archive handling, managed engines, and release updates are not implemented. See [`docs/security/threat-model.md`](docs/security/threat-model.md) for current risks and planned controls.
+The Linux application provides container inventory, inspection, and state-gated lifecycle actions over the selected local Docker-compatible Unix socket. Remove requires explicit confirmation and does not force-remove containers or remove volumes. Remote engine connections, credentials, Compose, logs, terminal streams, archive handling, managed engines, and release updates are not implemented. See [`docs/security/threat-model.md`](docs/security/threat-model.md) for current risks and controls.

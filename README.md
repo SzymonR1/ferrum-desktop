@@ -6,16 +6,19 @@ privileged services, launch an external terminal, or use Electron or Node.js.
 
 ## Current status
 
-The initial implementation contains a native eframe window and an asynchronous,
-read-only local Docker Engine inventory. The live smoke test returned the same
-15-container count as `docker ps -aq`. An X11-backend screenshot captured via
-XWayland showed actual container names, images, states, and statuses. A
-no-engine X11 launch showed a connection error rather than an empty list.
+The Linux local-engine implementation provides container inventory, filtering,
+sorting, inspection, lifecycle actions, and external-change synchronization.
+Actions are offered only for safe known container states; Remove requires
+confirmation. Container-only event updates use bounded delivery and report when
+synchronization is unavailable, while manual refresh remains available.
 
-The default app launch on this Wayland-configured host also connected and
-loaded the same inventory, but the local desktop inspection provider does not
-support native accessibility or screenshots, so the Wayland surface itself
-has not been visually verified. See the [platform support matrix](docs/src/platform-support.md)
+An X11-backend screenshot captured via XWayland showed actual container names,
+images, states, and statuses. A no-engine X11 launch showed a connection error
+rather than an empty list. The default app launch on this Wayland-configured
+host connected and loaded inventory, but the local desktop inspection provider
+does not support native accessibility or screenshots, so the Wayland surface
+itself has not been visually verified. UI lifecycle action clicks have not
+been visually validated. See the [platform support matrix](docs/src/platform-support.md)
 for evidence and limitations. This is not a release or platform-support claim.
 
 ## Build and run
@@ -25,11 +28,12 @@ cargo build --workspace
 cargo run -p ferrum-app
 ```
 
-The current engine adapter targets Linux and uses local Unix sockets.
-`DOCKER_HOST`, when set, must identify a local Unix socket. Otherwise the app
-tries `$XDG_RUNTIME_DIR/docker.sock` and `/var/run/docker.sock`. Windows and
-macOS are intentionally out of scope for this slice; remote endpoints, Docker
-contexts, and Podman compatibility are also deferred.
+The engine adapter targets Linux local Unix sockets. Startup precedence is an
+explicit `DOCKER_CONTEXT` (a local Unix-socket Docker CLI context), a local
+`DOCKER_HOST`, the current non-default Docker CLI context, then
+`$XDG_RUNTIME_DIR/docker.sock` and `/var/run/docker.sock`. Context selection
+requires Docker CLI. Remote endpoints remain unsupported; Podman/rootless
+behavior is unvalidated. Windows and macOS remain deferred to issue #21/M8.
 
 ## Checks
 
@@ -42,10 +46,13 @@ cargo doc --workspace --no-deps
 mdbook build docs
 ```
 
-A read-only live-engine test is available with
-`cargo test -p ferrum-engine --test live_engine -- --ignored`. It requires a
-local Docker-compatible engine and at least one existing container; it does
-not create or modify resources.
+A read-only live-engine inventory test uses this exact filter:
+```sh
+cargo test -p ferrum-engine --test live_engine local_engine_returns_a_well_formed_container_inventory -- --exact --ignored
+```
+It reads version and inventory and may inspect one existing container; it does not mutate resources.
+
+A separate ignored lifecycle integration test is mutating and must be run explicitly; see the testing guide for its exact command. It requires `FERRUM_TEST_IMAGE` to name a locally present image containing `/bin/sleep`; tests do not pull images and clean up only the created container by its returned full ID.
 
 ## Documentation
 

@@ -1,10 +1,64 @@
+#[cfg(target_os = "linux")]
+const EVENT_RETRY_DELAYS_MS: [u64; 3] = [250, 500, 1_000];
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct EventRetryBudget {
+    next_attempt: usize,
+}
+#[cfg(target_os = "linux")]
+impl EventRetryBudget {
+    fn next_delay(&mut self) -> Option<Duration> {
+        let delay = EVENT_RETRY_DELAYS_MS.get(self.next_attempt).copied()?;
+        self.next_attempt += 1;
+        Some(Duration::from_millis(delay))
+    }
+
+    fn reset(&mut self) {
+        self.next_attempt = 0;
+    }
+}
+#[cfg(target_os = "linux")]
+async fn wait_for_event_retry(retries: &mut EventRetryBudget) -> bool {
+    let Some(delay) = retries.next_delay() else {
+        return false;
+    };
+    tokio::time::sleep(delay).await;
+    true
+}
+#[cfg(target_os = "linux")]
+async fn send_event_snapshot(
+    engine: &EngineClient,
+    sender: &mpsc::Sender<EngineEvent>,
+    context: &egui::Context,
+    generation: u64,
+) {
+    let result = engine.list_containers().await;
+    let _ = sender
+        .send(EngineEvent::EventSnapshot { generation, result })
+        .await;
+    context.request_repaint();
+}
+fn available_container_actions(state: Option<&ContainerState>) -> &'static [ContainerAction] {
+    use ContainerAction::*;
+    match state {
+        Some(ContainerState::Created) => &[Start, Remove],
+        Some(ContainerState::Running) => &[Stop, Restart, Pause],
+        Some(ContainerState::Paused) => &[Unpause],
+        Some(ContainerState::Exited) => &[Start, Restart, Remove],
+        Some(ContainerState::Dead) => &[Remove],
+        _ => &[],
+    }
+}
+fn action_requires_confirmation(action: ContainerAction) -> bool {
+    action.is_destructive()
+}
 mod inventory;
 mod settings;
 
 use std::{error::Error, time::Duration};
 
 use eframe::egui::{self, Color32, RichText};
-use ferrum_core::{ContainerDetails, ContainerState, ContainerSummary};
+use ferrum_core::{ContainerAction, ContainerDetails, ContainerState, ContainerSummary};
 use ferrum_engine::{ContextTransport, DockerContext, EngineClient, EngineError, EngineInfo};
 use inventory::InventoryView;
 use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};
@@ -56,6 +110,22 @@ enum EngineEvent {
         generation: u64,
         result: Result<ContainerDetails, EngineError>,
     },
+    ActionFinished {
+        generation: u64,
+        action: ContainerAction,
+        result: Result<(), EngineError>,
+    },
+    ContainerChanged {
+        generation: u64,
+        container_id: String,
+    },
+    EventSnapshot {
+        generation: u64,
+        result: Result<Vec<ContainerSummary>, EngineError>,
+    },
+    EventStreamEnded {
+        generation: u64,
+    },
 }
 
 struct Inspection {
@@ -67,6 +137,9 @@ struct Inspection {
     restart_count_display: Option<String>,
     exit_code_display: Option<String>,
     error: bool,
+    action_error: Option<String>,
+    action_busy: bool,
+    confirming_remove: bool,
 }
 
 struct FerrumApp {
@@ -85,8 +158,13 @@ struct FerrumApp {
     context_error: Option<String>,
     contexts_error: Option<String>,
     inspection: Option<Inspection>,
+    action_task: Option<JoinHandle<()>>,
     inspection_task: Option<JoinHandle<()>>,
     next_inspection_generation: u64,
+    event_generation: u64,
+    event_task: Option<JoinHandle<()>>,
+    event_warning: Option<String>,
+    event_refresh_pending: bool,
     settings_store: settings::SettingsStore,
     settings: settings::Settings,
     settings_draft: settings::Settings,
@@ -139,6 +217,11 @@ impl FerrumApp {
             inspection: None,
             inspection_task: None,
             next_inspection_generation: 0,
+            event_generation: 0,
+            event_task: None,
+            action_task: None,
+            event_warning: None,
+            event_refresh_pending: false,
             settings_store,
             settings_draft: settings.clone(),
             settings,
@@ -161,6 +244,11 @@ impl FerrumApp {
             app.connect(creation_context.egui_ctx.clone());
         }
         app
+    }
+    fn action_busy(&self) -> bool {
+        self.inspection
+            .as_ref()
+            .is_some_and(|inspection| inspection.action_busy)
     }
     fn connect(&mut self, context: egui::Context) {
         if self.loading {
@@ -197,7 +285,7 @@ impl FerrumApp {
         });
     }
     fn switch_context(&mut self, selected: Option<String>, context: egui::Context) {
-        if self.loading {
+        if self.loading || self.action_busy() {
             return;
         }
         self.cancel_inspection();
@@ -256,7 +344,9 @@ impl FerrumApp {
         });
     }
 
-    fn receive_events(&mut self) {
+    fn receive_events(&mut self, context: egui::Context) {
+        let mut selected_container_changed = false;
+        let mut action_error_after_reinspection = None;
         while let Ok(event) = self.receiver.try_recv() {
             match event {
                 EngineEvent::Contexts(Ok(contexts)) => {
@@ -271,7 +361,7 @@ impl FerrumApp {
                     self.loading = false;
                     match result {
                         Ok((engine, info, containers)) => {
-                            self.apply_connection_success(engine, info, containers)
+                            self.apply_connection_success(engine, info, containers, context.clone())
                         }
                         Err(error) => {
                             self.engine = None;
@@ -287,7 +377,7 @@ impl FerrumApp {
                     self.loading = false;
                     match result {
                         Ok((engine, info, containers)) => {
-                            self.apply_connection_success(engine, info, containers)
+                            self.apply_connection_success(engine, info, containers, context.clone())
                         }
                         Err(error) => self.context_error = Some(error.to_string()),
                     }
@@ -299,6 +389,10 @@ impl FerrumApp {
                             self.containers = containers;
                             self.inventory_view.inventory_changed(&self.containers);
                             self.refresh_error = None;
+                            selected_container_changed |= self
+                                .inspection
+                                .as_ref()
+                                .is_some_and(|inspection| !inspection.action_busy);
                         }
                         Err(error) => self.refresh_error = Some(error.to_string()),
                     }
@@ -325,6 +419,89 @@ impl FerrumApp {
                         }
                     }
                 }
+                EngineEvent::ActionFinished {
+                    generation,
+                    action,
+                    result,
+                } => {
+                    self.action_task = None;
+                    let matches_inspection = self
+                        .inspection
+                        .as_ref()
+                        .is_some_and(|inspection| inspection.generation == generation);
+                    let action_error = result.as_ref().err().map(ToString::to_string);
+                    if let Some(inspection) = self.inspection.as_mut()
+                        && inspection.generation == generation
+                    {
+                        inspection.action_busy = false;
+                        inspection.confirming_remove = false;
+                        inspection.action_error = action_error.clone();
+                    }
+
+                    let removed =
+                        matches_inspection && result.is_ok() && action == ContainerAction::Remove;
+                    if removed {
+                        self.cancel_inspection();
+                    } else if matches_inspection {
+                        action_error_after_reinspection = action_error;
+                        selected_container_changed = true;
+                    }
+                    self.event_refresh_pending = true;
+                }
+                EngineEvent::ContainerChanged {
+                    generation,
+                    container_id,
+                } if generation == self.event_generation => {
+                    self.event_refresh_pending = true;
+                    selected_container_changed |=
+                        self.inspection.as_ref().is_some_and(|inspection| {
+                            !inspection.action_busy && inspection.container_id == container_id
+                        });
+                }
+                EngineEvent::EventSnapshot { generation, result }
+                    if generation == self.event_generation =>
+                {
+                    if self.loading {
+                        self.event_refresh_pending = true;
+                    }
+                    match result {
+                        Ok(containers) => {
+                            self.containers = containers;
+                            self.inventory_view.inventory_changed(&self.containers);
+                            self.refresh_error = None;
+                            selected_container_changed |= self
+                                .inspection
+                                .as_ref()
+                                .is_some_and(|inspection| !inspection.action_busy);
+                        }
+                        Err(error) => self.refresh_error = Some(error.to_string()),
+                    }
+                }
+                EngineEvent::EventStreamEnded { generation }
+                    if generation == self.event_generation =>
+                {
+                    self.event_warning = Some(
+                        "Container event updates are unavailable; use Refresh to update inventory."
+                            .into(),
+                    );
+                    self.event_task = None;
+                }
+                _ => {}
+            }
+        }
+        if selected_container_changed
+            && let Some((id, name)) = self.inspection.as_ref().map(|inspection| {
+                (
+                    inspection.container_id.clone(),
+                    inspection.container_name.clone(),
+                )
+            })
+        {
+            self.inspect_container(&id, &name, context);
+            if let Some(action_error) = action_error_after_reinspection.take()
+                && let Some(inspection) = self.inspection.as_mut()
+            {
+                inspection.action_error = Some(action_error);
             }
         }
     }
@@ -334,16 +511,29 @@ impl FerrumApp {
         engine: EngineClient,
         info: EngineInfo,
         containers: Vec<ContainerSummary>,
+        context: egui::Context,
     ) {
         self.cancel_inspection();
+        if let Some(task) = self.action_task.take() {
+            task.abort();
+        }
         self.selected_context = engine.selected_context_name().map(str::to_owned);
-        self.engine = Some(engine);
+        self.engine = Some(engine.clone());
         self.engine_info = Some(info);
         self.containers = containers;
         self.inventory_view.inventory_changed(&self.containers);
         self.connection = ConnectionState::Connected;
         self.refresh_error = None;
         self.context_error = None;
+        self.start_event_stream(engine, context);
+    }
+
+    fn stop_event_stream(&mut self) {
+        if let Some(task) = self.event_task.take() {
+            task.abort();
+        }
+        self.event_generation = self.event_generation.wrapping_add(1);
+        self.event_refresh_pending = false;
     }
 
     fn cancel_inspection(&mut self) {
@@ -371,10 +561,13 @@ impl FerrumApp {
             restart_count_display: None,
             exit_code_display: None,
             error: false,
+            action_error: None,
+            action_busy: false,
+            confirming_remove: false,
         });
         if let Some(engine) = self.engine.clone() {
-            let sender = self.sender.clone();
             let container_id = container_id.to_owned();
+            let sender = self.sender.clone();
             self.inspection_task = Some(self.runtime.spawn(async move {
                 let result = engine.inspect_container(&container_id).await;
                 if sender
@@ -386,6 +579,113 @@ impl FerrumApp {
                 }
             }));
         }
+    }
+
+    fn run_action(&mut self, action: ContainerAction, context: egui::Context) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        let Some(inspection) = self.inspection.as_mut() else {
+            return;
+        };
+        if inspection.action_busy
+            || inspection.loading
+            || (action_requires_confirmation(action) && !inspection.confirming_remove)
+        {
+            return;
+        }
+        inspection.action_busy = true;
+        inspection.confirming_remove = false;
+        inspection.action_error = None;
+        let id = inspection.container_id.clone();
+        let generation = inspection.generation;
+        let sender = self.sender.clone();
+        self.action_task = Some(self.runtime.spawn(async move {
+            let result = engine.perform_container_action(&id, action).await;
+            if sender
+                .send(EngineEvent::ActionFinished {
+                    generation,
+                    action,
+                    result,
+                })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
+
+    fn start_event_stream(&mut self, engine: EngineClient, context: egui::Context) {
+        #[cfg(target_os = "linux")]
+        {
+            self.stop_event_stream();
+            self.event_generation = self.event_generation.wrapping_add(1);
+            let generation = self.event_generation;
+            self.event_warning = None;
+            let sender = self.sender.clone();
+            self.event_task = Some(self.runtime.spawn(async move {
+                let mut retries = EventRetryBudget::default();
+                let mut stream = loop {
+                    match engine.subscribe_container_changes().await {
+                        Ok(stream) => {
+                            send_event_snapshot(&engine, &sender, &context, generation).await;
+                            retries.reset();
+                            break stream;
+                        }
+                        Err(_) => {
+                            if wait_for_event_retry(&mut retries).await {
+                                continue;
+                            }
+                            let _ = sender
+                                .send(EngineEvent::EventStreamEnded { generation })
+                                .await;
+                            context.request_repaint();
+                            return;
+                        }
+                    }
+                };
+                loop {
+                    match stream.next_change().await {
+                        Ok(Some(change)) => {
+                            if sender
+                                .send(EngineEvent::ContainerChanged {
+                                    generation,
+                                    container_id: change.container_id,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            context.request_repaint();
+                        }
+                        Ok(None) | Err(_) => {
+                            let mut reconnected = false;
+                            while wait_for_event_retry(&mut retries).await {
+                                if let Ok(new_stream) = engine.subscribe_container_changes().await {
+                                    stream = new_stream;
+                                    retries.reset();
+                                    send_event_snapshot(&engine, &sender, &context, generation)
+                                        .await;
+                                    reconnected = true;
+                                    break;
+                                }
+                            }
+                            if !reconnected {
+                                let _ = sender
+                                    .send(EngineEvent::EventStreamEnded { generation })
+                                    .await;
+                                context.request_repaint();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (engine, context);
     }
     fn draw_sidebar(&self, ui: &mut egui::Ui) {
         egui::Panel::left("navigation")
@@ -447,7 +747,7 @@ impl FerrumApp {
                             ui.colored_label(Color32::from_rgb(227, 113, 102), "Disconnected");
                         }
                     }
-                    ui.add_enabled_ui(!self.loading, |ui| {
+                    ui.add_enabled_ui(!self.loading && !self.action_busy(), |ui| {
                         let selected_name = match self.selected_context.as_deref() {
                             Some(name) => self
                                 .contexts
@@ -517,7 +817,10 @@ impl FerrumApp {
                             "Retry connection"
                         };
                         if ui
-                            .add_enabled(!self.loading, egui::Button::new(button_text))
+                            .add_enabled(
+                                !self.loading && !self.action_busy(),
+                                egui::Button::new(button_text),
+                            )
                             .clicked()
                         {
                             *refresh_requested = true;
@@ -554,6 +857,11 @@ impl FerrumApp {
                 ui.label("Showing the last successful inventory.");
             });
             ui.label(error);
+            ui.add_space(10.0);
+        }
+
+        if let Some(warning) = &self.event_warning {
+            ui.colored_label(Color32::from_rgb(224, 174, 109), warning);
             ui.add_space(10.0);
         }
 
@@ -625,7 +933,7 @@ impl FerrumApp {
                     let container = &self.containers[index];
                     ui.horizontal(|ui| {
                         let name_button = ui
-                            .add_enabled_ui(!self.loading, |ui| {
+                            .add_enabled_ui(!self.loading && !self.action_busy(), |ui| {
                                 ui.add_sized(
                                     [name_width, CELL_HEIGHT],
                                     egui::Button::new(RichText::new(&container.name).strong())
@@ -676,8 +984,12 @@ impl FerrumApp {
         let Some(inspection) = &self.inspection else {
             return;
         };
+        let action_busy = inspection.action_busy;
         let mut open = true;
         let mut close = false;
+        let mut requested_action = None;
+        let mut confirm_remove = false;
+        let mut cancel_remove = false;
         egui::Window::new("Container details")
             .id(egui::Id::new("container-inspection"))
             .open(&mut open)
@@ -685,6 +997,67 @@ impl FerrumApp {
             .show(&context, |ui| {
                 ui.heading(&inspection.container_name);
                 detail_row(ui, "ID", Some(&inspection.container_id));
+                let state = inspection
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.state.as_ref());
+                let actions = available_container_actions(state);
+                if !actions.is_empty() {
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        for action in actions {
+                            if *action == ContainerAction::Remove && inspection.confirming_remove {
+                                continue;
+                            }
+                            if ui
+                                .add_enabled(
+                                    !inspection.action_busy && !inspection.loading,
+                                    egui::Button::new(action.label()),
+                                )
+                                .clicked()
+                            {
+                                if action_requires_confirmation(*action) {
+                                    confirm_remove = true;
+                                } else {
+                                    requested_action = Some(*action);
+                                }
+                            }
+                        }
+                    });
+                    if inspection.confirming_remove {
+                        ui.colored_label(
+                            Color32::from_rgb(224, 174, 109),
+                            "Remove this container? Its volumes will not be removed.",
+                        );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !inspection.action_busy,
+                                    egui::Button::new("Confirm remove"),
+                                )
+                                .clicked()
+                            {
+                                requested_action = Some(ContainerAction::Remove);
+                            }
+                            if ui
+                                .add_enabled(!inspection.action_busy, egui::Button::new("Cancel"))
+                                .clicked()
+                            {
+                                cancel_remove = true;
+                            }
+                        });
+                    }
+                }
+                if inspection.action_busy {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Performing container action…");
+                    });
+                }
+                if let Some(error) = &inspection.action_error {
+                    ui.colored_label(Color32::from_rgb(227, 113, 102), "Container action failed");
+                    ui.label(error);
+                }
                 if inspection.loading {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -740,12 +1113,23 @@ impl FerrumApp {
                         }
                     }
                 }
-                if ui.button("Close").clicked() {
+                if ui
+                    .add_enabled(!inspection.action_busy, egui::Button::new("Close"))
+                    .clicked()
+                {
                     close = true;
                 }
             });
-        if !open || close {
+        if confirm_remove && let Some(inspection) = self.inspection.as_mut() {
+            inspection.confirming_remove = true;
+        }
+        if cancel_remove && let Some(inspection) = self.inspection.as_mut() {
+            inspection.confirming_remove = false;
+        }
+        if (!open || close) && !action_busy {
             self.cancel_inspection();
+        } else if let Some(action) = requested_action {
+            self.run_action(action, context);
         }
     }
     fn draw_settings(&mut self, context: egui::Context) {
@@ -795,7 +1179,11 @@ fn detail_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
 
 impl Drop for FerrumApp {
     fn drop(&mut self) {
+        self.stop_event_stream();
         if let Some(task) = self.inspection_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.action_task.take() {
             task.abort();
         }
     }
@@ -803,8 +1191,12 @@ impl Drop for FerrumApp {
 
 impl eframe::App for FerrumApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.receive_events();
         let context = ui.ctx().clone();
+        self.receive_events(context.clone());
+        if self.event_refresh_pending && !self.loading {
+            self.event_refresh_pending = false;
+            self.refresh(context.clone());
+        }
         self.draw_sidebar(ui);
         let mut refresh_requested = false;
         let mut settings_requested = false;
@@ -842,7 +1234,7 @@ impl eframe::App for FerrumApp {
             self.refresh(context.clone());
         }
 
-        if self.loading {
+        if self.loading || self.action_busy() {
             context.request_repaint_after(Duration::from_millis(250));
         }
     }
@@ -886,6 +1278,278 @@ mod container_state_display_tests {
         assert_eq!(
             container_state_display(&ContainerState::Unknown("checkpointing".to_owned())),
             "checkpointing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_action_tests {
+    use super::*;
+    use ferrum_core::ContainerAction;
+
+    #[test]
+    fn offers_only_state_appropriate_actions() {
+        let cases = [
+            (
+                Some(ContainerState::Created),
+                &[ContainerAction::Start, ContainerAction::Remove][..],
+            ),
+            (
+                Some(ContainerState::Running),
+                &[
+                    ContainerAction::Stop,
+                    ContainerAction::Restart,
+                    ContainerAction::Pause,
+                ][..],
+            ),
+            (
+                Some(ContainerState::Paused),
+                &[ContainerAction::Unpause][..],
+            ),
+            (
+                Some(ContainerState::Exited),
+                &[
+                    ContainerAction::Start,
+                    ContainerAction::Restart,
+                    ContainerAction::Remove,
+                ][..],
+            ),
+            (Some(ContainerState::Dead), &[ContainerAction::Remove][..]),
+        ];
+
+        for (state, expected) in cases {
+            assert_eq!(
+                available_container_actions(state.as_ref()),
+                expected,
+                "unexpected actions for {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hides_actions_for_transitional_unknown_and_missing_states() {
+        let states = [
+            Some(ContainerState::Restarting),
+            Some(ContainerState::Removing),
+            Some(ContainerState::Stopping),
+            Some(ContainerState::Unknown("checkpointing".to_owned())),
+            None,
+        ];
+
+        for state in states {
+            assert!(
+                available_container_actions(state.as_ref()).is_empty(),
+                "unexpected actions for {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_remove_requires_confirmation() {
+        for action in [
+            ContainerAction::Start,
+            ContainerAction::Stop,
+            ContainerAction::Restart,
+            ContainerAction::Pause,
+            ContainerAction::Unpause,
+        ] {
+            assert!(
+                !action_requires_confirmation(action),
+                "{action:?} should not require confirmation"
+            );
+        }
+        assert!(action_requires_confirmation(ContainerAction::Remove));
+    }
+}
+#[cfg(test)]
+mod event_reconciliation_tests {
+    use super::*;
+
+    fn app_with_open_inspection() -> (FerrumApp, mpsc::Sender<EngineEvent>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build");
+        let (sender, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let settings = settings::Settings::default();
+        let app = FerrumApp {
+            runtime,
+            sender: sender.clone(),
+            receiver,
+            connection: ConnectionState::Connected,
+            engine: None,
+            engine_info: None,
+            containers: vec![ContainerSummary {
+                id: "container-id".to_owned(),
+                name: "example".to_owned(),
+                image: Some("example:old".to_owned()),
+                state: Some(ContainerState::Running),
+                status: Some("Up".to_owned()),
+            }],
+            inventory_view: InventoryView::default(),
+            loading: false,
+            refresh_error: None,
+            contexts: Vec::new(),
+            selected_context: None,
+            context_error: None,
+            contexts_error: None,
+            inspection: Some(Inspection {
+                generation: 4,
+                container_id: "container-id".to_owned(),
+                container_name: "example".to_owned(),
+                loading: false,
+                details: Some(ContainerDetails {
+                    id: "container-id".to_owned(),
+                    name: Some("example".to_owned()),
+                    image: Some("example:old".to_owned()),
+                    created: None,
+                    state: Some(ContainerState::Running),
+                    restart_count: None,
+                    exit_code: None,
+                    started_at: None,
+                    finished_at: None,
+                    mounts: None,
+                }),
+                restart_count_display: None,
+                exit_code_display: None,
+                error: false,
+                action_error: None,
+                action_busy: false,
+                confirming_remove: false,
+            }),
+            action_task: None,
+            inspection_task: None,
+            next_inspection_generation: 4,
+            event_generation: 7,
+            event_task: None,
+            event_warning: None,
+            event_refresh_pending: false,
+            settings_store: settings::SettingsStore::new(),
+            settings_draft: settings.clone(),
+            settings,
+            settings_open: false,
+            settings_error: None,
+        };
+        (app, sender)
+    }
+
+    #[test]
+    fn reconnect_snapshot_discards_stale_inspection_and_schedules_a_reinspection() {
+        let (mut app, sender) = app_with_open_inspection();
+        let snapshot_container = ContainerSummary {
+            id: "container-id".to_owned(),
+            name: "example".to_owned(),
+            image: Some("example:new".to_owned()),
+            state: Some(ContainerState::Exited),
+            status: Some("Exited (0)".to_owned()),
+        };
+        assert!(
+            sender
+                .try_send(EngineEvent::EventSnapshot {
+                    generation: 7,
+                    result: Ok(vec![snapshot_container.clone()]),
+                })
+                .is_ok()
+        );
+
+        app.receive_events(egui::Context::default());
+
+        assert_eq!(app.containers, vec![snapshot_container]);
+        assert_reinspection_is_pending(&app);
+    }
+
+    #[test]
+    fn external_change_refreshes_the_matching_open_inspection() {
+        let (mut app, sender) = app_with_open_inspection();
+        assert!(
+            sender
+                .try_send(EngineEvent::ContainerChanged {
+                    generation: 7,
+                    container_id: "container-id".to_owned(),
+                })
+                .is_ok()
+        );
+
+        app.receive_events(egui::Context::default());
+
+        assert!(app.event_refresh_pending);
+        assert_reinspection_is_pending(&app);
+    }
+    #[test]
+    fn manual_refresh_revalidates_open_inspection() {
+        let (mut app, sender) = app_with_open_inspection();
+        app.loading = true;
+        let refreshed_container = ContainerSummary {
+            id: "container-id".to_owned(),
+            name: "example".to_owned(),
+            image: Some("example:new".to_owned()),
+            state: Some(ContainerState::Exited),
+            status: Some("Exited (0)".to_owned()),
+        };
+        assert!(
+            sender
+                .try_send(EngineEvent::Refreshed(Ok(vec![
+                    refreshed_container.clone()
+                ])))
+                .is_ok()
+        );
+
+        app.receive_events(egui::Context::default());
+
+        assert!(!app.loading);
+        assert_eq!(app.containers, vec![refreshed_container]);
+        assert_reinspection_is_pending(&app);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn event_retry_budget_is_bounded_and_resets_after_successful_subscription() {
+        let mut retries = EventRetryBudget::default();
+        for delay in [250, 500, 1_000] {
+            assert_eq!(retries.next_delay(), Some(Duration::from_millis(delay)));
+        }
+        assert_eq!(retries.next_delay(), None);
+
+        retries.reset();
+        assert_eq!(retries.next_delay(), Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn lifecycle_failure_survives_followup_inspection_refresh() {
+        let (mut app, sender) = app_with_open_inspection();
+        let action_error = EngineError::ContainerActionRejected {
+            action: ContainerAction::Stop,
+            endpoint_label: "test endpoint",
+            status: 409,
+        };
+        let expected_error = action_error.to_string();
+        assert!(
+            sender
+                .try_send(EngineEvent::ActionFinished {
+                    generation: 4,
+                    action: ContainerAction::Stop,
+                    result: Err(action_error),
+                })
+                .is_ok()
+        );
+
+        app.receive_events(egui::Context::default());
+
+        let inspection = app.inspection.as_ref().expect("inspection remains open");
+        assert_reinspection_is_pending(&app);
+        assert_eq!(
+            inspection.action_error.as_deref(),
+            Some(expected_error.as_str())
+        );
+    }
+
+    fn assert_reinspection_is_pending(app: &FerrumApp) {
+        let inspection = app.inspection.as_ref().expect("inspection stays open");
+        assert_eq!(inspection.generation, 5);
+        assert!(inspection.loading);
+        assert!(
+            inspection.details.is_none(),
+            "event changes must not leave stale details or action availability"
         );
     }
 }

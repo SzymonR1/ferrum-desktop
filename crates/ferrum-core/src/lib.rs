@@ -24,6 +24,56 @@ pub enum ContainerState {
     /// The engine reported a state Ferrum does not yet recognize.
     Unknown(String),
 }
+/// An action that can be performed on a container.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContainerAction {
+    /// Start a stopped container.
+    Start,
+    /// Stop a running container.
+    Stop,
+    /// Restart a container.
+    Restart,
+    /// Pause a running container.
+    Pause,
+    /// Resume a paused container.
+    Unpause,
+    /// Remove a container without deleting its volumes.
+    Remove,
+}
+
+impl ContainerAction {
+    /// Returns safe user-facing text for this action.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Start => "Start",
+            Self::Stop => "Stop",
+            Self::Restart => "Restart",
+            Self::Pause => "Pause",
+            Self::Unpause => "Unpause",
+            Self::Remove => "Remove",
+        }
+    }
+
+    /// Returns whether this action is destructive.
+    #[must_use]
+    pub const fn is_destructive(self) -> bool {
+        matches!(self, Self::Remove)
+    }
+}
+
+impl std::fmt::Display for ContainerAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+/// A container lifecycle change reported by the engine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContainerChange {
+    /// Identifier of the container that changed.
+    pub container_id: String,
+}
 
 impl ContainerState {
     /// Converts an engine state into a known lifecycle state without discarding

@@ -4,8 +4,15 @@ Ferrum is a native Rust desktop application for managing existing Docker-compati
 
 ## Current status
 
-The current implementation provides a real, read-only container inventory with search, sorting, and inspection. Supported behavior and validation evidence are tracked in the [platform matrix](platform-support.md). Do not infer Podman, remote-engine, lifecycle, logs, or embedded-terminal support from the product plan.
-
+Ferrum provides a Linux local-engine container inventory with search, sorting,
+inspection, state-gated lifecycle actions, and bounded synchronization of
+external container events. Remove requires confirmation. The app supports local
+Unix-socket connections, including session-only Docker CLI contexts that select
+local Unix sockets. Remote engines and Podman/rootless behavior are unsupported
+or unvalidated; Windows and macOS remain deferred. Supported behavior and
+validation evidence are tracked in the [platform matrix](platform-support.md).
+The native UI surface and lifecycle action clicks have not been visually
+validated.
 ## Documentation map
 
 - [Build and run](developer-guide/building.md)
