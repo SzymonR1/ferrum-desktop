@@ -4,12 +4,15 @@
 
 mod contexts;
 #[cfg(target_os = "linux")]
+mod exec;
+#[cfg(target_os = "linux")]
 mod logs;
 
 pub use contexts::{ContextTransport, DockerContext};
 #[cfg(target_os = "linux")]
+pub use exec::{ExecResizeHandle, ExecSession, TerminalSize};
+#[cfg(target_os = "linux")]
 pub use logs::{ContainerLogStream, ContainerLogsOptions};
-
 #[cfg(target_os = "linux")]
 use std::{env, path::PathBuf, time::Duration};
 
@@ -313,6 +316,51 @@ pub enum EngineError {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
     },
+    /// A terminal exec request or session could not be opened safely.
+    #[cfg(target_os = "linux")]
+    #[error("A terminal session could not be opened at the {endpoint_label}.")]
+    ExecSessionUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The exec request was rejected by the engine.
+    #[cfg(target_os = "linux")]
+    #[error("A terminal session was rejected at the {endpoint_label} (HTTP {status}).")]
+    ExecSessionRejected {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+        /// HTTP response status.
+        status: u16,
+    },
+    /// A terminal session handshake exceeded its bounded wait.
+    #[cfg(target_os = "linux")]
+    #[error("Opening a terminal session at the {endpoint_label} timed out.")]
+    ExecSessionTimedOut {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The terminal exec identifier or command is invalid.
+    #[cfg(target_os = "linux")]
+    #[error("The terminal exec request is invalid.")]
+    InvalidExecRequest,
+    /// A terminal session resize request could not be completed.
+    #[cfg(target_os = "linux")]
+    #[error("The terminal could not be resized at the {endpoint_label}.")]
+    ExecResizeUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// A terminal session resize request exceeded its bounded wait.
+    #[cfg(target_os = "linux")]
+    #[error("Resizing a terminal at the {endpoint_label} timed out.")]
+    ExecResizeTimedOut {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// Terminal dimensions must contain nonzero rows and columns.
+    #[cfg(target_os = "linux")]
+    #[error("Terminal rows and columns must be nonzero.")]
+    InvalidTerminalSize,
 }
 
 /// An asynchronous connection to one local Docker-compatible engine.
@@ -325,6 +373,28 @@ pub struct EngineClient {
     socket_path: PathBuf,
 }
 
+impl EngineClient {
+    /// Creates and starts an attached TTY exec session for a container.
+    ///
+    /// The command is passed as an exact argument array. The returned stream
+    /// is raw bidirectional terminal data; dropping it closes only that exec.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EngineError::InvalidExecRequest` for invalid identifiers or
+    /// commands, `EngineError::InvalidTerminalSize` for zero dimensions, or
+    /// `EngineError::ExecSessionRejected`, `EngineError::ExecSessionUnavailable`,
+    /// or `EngineError::ExecSessionTimedOut` for engine failures.
+    #[cfg(target_os = "linux")]
+    pub async fn open_exec_session(
+        &self,
+        container_id: &str,
+        command: &[String],
+        initial_size: TerminalSize,
+    ) -> Result<ExecSession, EngineError> {
+        exec::open_exec_session(self, container_id, command, initial_size).await
+    }
+}
 impl EngineClient {
     /// Connects to a local Docker-compatible engine on Linux. Remote transports
     /// and non-Linux engine support are out of scope for this implementation.

@@ -5,6 +5,7 @@
 # User guide
 
 - [Containers](user-guide/containers.md)
+- [Embedded terminal](user-guide/terminal.md)
 
 # Developer guide
 

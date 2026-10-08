@@ -30,22 +30,37 @@ mod logs;
 mod retry;
 mod search;
 #[cfg(target_os = "linux")]
+mod terminal;
+#[cfg(target_os = "linux")]
 const LOG_CHANNEL_CAPACITY: usize = 16;
 mod settings;
 
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 use std::{error::Error, time::Duration};
 
+use crate::inventory::InventoryView;
 use eframe::egui::{self, Color32, RichText};
 #[cfg(target_os = "linux")]
 use ferrum_core::ContainerLogLine;
 use ferrum_core::{ContainerAction, ContainerDetails, ContainerState, ContainerSummary};
 #[cfg(target_os = "linux")]
 use ferrum_engine::ContainerLogsOptions;
+#[cfg(target_os = "linux")]
+use ferrum_engine::TerminalSize;
 use ferrum_engine::{ContextTransport, DockerContext, EngineClient, EngineError, EngineInfo};
-use inventory::InventoryView;
 use logs::LogBuffer;
 #[cfg(target_os = "linux")]
 use retry::RetryBudget;
+#[cfg(target_os = "linux")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+#[cfg(target_os = "linux")]
+use terminal::TerminalModel;
+#[cfg(target_os = "linux")]
+use tokio::sync::watch;
 use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};
 use tracing_subscriber::EnvFilter;
 
@@ -140,6 +155,363 @@ enum LogEvent {
     Ended {
         generation: u64,
         error: Option<String>,
+    },
+}
+#[cfg(target_os = "linux")]
+const TERMINAL_OUTPUT_MESSAGES_PER_FRAME: usize = 16;
+#[cfg(target_os = "linux")]
+const TERMINAL_OUTPUT_CHUNK_BYTES: usize = 4096;
+#[cfg(target_os = "linux")]
+const TERMINAL_INPUT_CAPACITY: usize = 64;
+#[cfg(target_os = "linux")]
+const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
+
+#[cfg(target_os = "linux")]
+struct PasteAuthorization {
+    accept_after_frame: u64,
+    expires_at: Instant,
+}
+
+#[cfg(target_os = "linux")]
+struct TerminalView {
+    model: TerminalModel,
+    input: Option<mpsc::Sender<Vec<u8>>>,
+    output: mpsc::Receiver<Vec<u8>>,
+    resize_sender: Option<watch::Sender<TerminalSize>>,
+    resize_failed: Arc<AtomicBool>,
+    io_task: Option<JoinHandle<()>>,
+    resize_task: Option<JoinHandle<()>>,
+    ended: bool,
+    paste_authorization: Option<PasteAuthorization>,
+    input_notice: Option<&'static str>,
+}
+#[cfg(target_os = "linux")]
+impl TerminalView {
+    fn send_input(&mut self, bytes: &[u8]) {
+        if bytes.len() > MAX_TERMINAL_INPUT_BYTES {
+            self.input_notice = Some("Input exceeds the 64 KiB terminal limit.");
+            return;
+        }
+        self.send_input_owned(bytes.to_vec());
+    }
+
+    fn send_paste(&mut self, text: &str) {
+        if !self.model.bracketed_paste() {
+            self.send_input(text.as_bytes());
+            return;
+        }
+        const PASTE_START: &[u8] = b"\x1b[200~";
+        const PASTE_END: &[u8] = b"\x1b[201~";
+        let size = text
+            .len()
+            .saturating_add(PASTE_START.len() + PASTE_END.len());
+        if size > MAX_TERMINAL_INPUT_BYTES {
+            self.input_notice = Some("Input exceeds the 64 KiB terminal limit.");
+            return;
+        }
+        let mut bytes = Vec::with_capacity(size);
+        bytes.extend_from_slice(PASTE_START);
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(PASTE_END);
+        self.send_input_owned(bytes);
+    }
+    fn request_paste(&mut self, context: &egui::Context) {
+        if self.ended {
+            return;
+        }
+        let frame = context.cumulative_frame_nr();
+        self.paste_authorization = Some(PasteAuthorization {
+            accept_after_frame: frame.saturating_add(1),
+            expires_at: Instant::now() + Duration::from_secs(3),
+        });
+        context.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+    }
+
+    fn deliver_paste_event(&mut self, text: &str, focused: bool, frame: u64, now: Instant) -> bool {
+        if !focused {
+            self.paste_authorization = None;
+            return false;
+        }
+        let Some(authorization) = &self.paste_authorization else {
+            return false;
+        };
+        if now >= authorization.expires_at {
+            self.paste_authorization = None;
+            return false;
+        }
+        if frame < authorization.accept_after_frame {
+            return false;
+        }
+        self.paste_authorization = None;
+        self.send_paste(text);
+        true
+    }
+
+    fn send_input_owned(&mut self, bytes: Vec<u8>) {
+        if self.ended {
+            return;
+        }
+        let Some(input) = &self.input else {
+            return;
+        };
+        if input.capacity() == 0 {
+            self.input_notice = Some("Terminal input is busy; retry after it clears.");
+            return;
+        }
+        match input.try_send(bytes) {
+            Ok(()) => self.input_notice = None,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.input_notice = Some("Terminal input is busy; retry after it clears.");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => self.end_session(),
+        }
+    }
+
+    fn end_session(&mut self) {
+        self.ended = true;
+        self.input.take();
+        self.resize_sender.take();
+        if let Some(task) = self.io_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.resize_task.take() {
+            task.abort();
+        }
+        self.paste_authorization = None;
+        self.input_notice = Some("Terminal session ended; input is disabled.");
+    }
+
+    fn show(&mut self, context: &egui::Context) -> bool {
+        let mut open = true;
+        let mut terminal_focused = false;
+        let mut copy_output = false;
+        let mut request_paste = false;
+        let mut request_input_focus = false;
+
+        let mut output_messages = 0;
+        while output_messages < TERMINAL_OUTPUT_MESSAGES_PER_FRAME {
+            match self.output.try_recv() {
+                Ok(bytes) => {
+                    output_messages += 1;
+                    self.model.feed(&bytes);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    if !self.ended {
+                        self.end_session();
+                    }
+                    break;
+                }
+            }
+        }
+        if output_messages == TERMINAL_OUTPUT_MESSAGES_PER_FRAME {
+            context.request_repaint();
+        }
+
+        egui::Window::new("Container terminal")
+            .id(egui::Id::new("container-terminal"))
+            .open(&mut open)
+            .resizable(true)
+            .default_size([820.0, 520.0])
+            .show(context, |ui| {
+                let focus_id = ui.id().with("terminal-input");
+                ui.horizontal(|ui| {
+                    ui.label("Ctrl+C sends ETX.");
+                    if ui.button("Copy output").clicked() {
+                        copy_output = true;
+                    }
+                    if ui
+                        .add_enabled(!self.ended, egui::Button::new("Paste from clipboard"))
+                        .clicked()
+                    {
+                        request_paste = true;
+                        request_input_focus = true;
+                    }
+                    if self.model.alternate_screen() {
+                        ui.label("Alternate screen");
+                    }
+                });
+                if self.ended {
+                    ui.label("Terminal session ended. Input is disabled.");
+                }
+                if let Some(notice) = self.input_notice {
+                    ui.label(notice);
+                }
+                if self.resize_failed.load(Ordering::Acquire) {
+                    ui.colored_label(
+                        Color32::from_rgb(224, 174, 109),
+                        "Terminal resize failed; it will retry after the next window resize.",
+                    );
+                }
+                let available = ui.available_size();
+                let cell = ui.text_style_height(&egui::TextStyle::Monospace);
+                let columns = (available.x / (cell * 0.62)).floor().max(1.0) as u16;
+                let rows = (available.y / cell).floor().max(1.0) as u16;
+                if self.model.dimensions() != (rows, columns) && !self.ended {
+                    self.model.resize(rows, columns);
+                    if let Some(resize) = &self.resize_sender {
+                        resize.send_replace(TerminalSize { rows, columns });
+                    }
+                }
+                let focused = ui.memory(|memory| memory.has_focus(focus_id));
+                if ui
+                    .add_enabled(
+                        !self.ended,
+                        egui::Button::new(if focused {
+                            "Terminal focused"
+                        } else {
+                            "Focus terminal"
+                        }),
+                    )
+                    .clicked()
+                {
+                    request_input_focus = true;
+                }
+                let scroll = egui::ScrollArea::both()
+                    .stick_to_bottom(self.model.scrollback_position() == 0)
+                    .show(ui, |ui| self.model.render(ui));
+                let response = ui.interact(scroll.inner_rect, focus_id, egui::Sense::click());
+                if (response.clicked() || request_input_focus) && !self.ended {
+                    response.request_focus();
+                }
+                terminal_focused =
+                    (response.has_focus() || response.clicked() || request_input_focus)
+                        && !self.ended;
+            });
+
+        if !open {
+            return false;
+        }
+        if copy_output {
+            context.copy_text(self.model.contents());
+        }
+        let frame = context.cumulative_frame_nr();
+        let now = Instant::now();
+        if !terminal_focused {
+            self.paste_authorization = None;
+        }
+        if request_paste && terminal_focused {
+            self.request_paste(context);
+        }
+        if terminal_focused {
+            let mut copy_shortcut = false;
+            let mut scroll_changed = false;
+            context.input(|input| {
+                let has_native_copy = input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Copy));
+                let has_ctrl_shift_c_key = input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::C,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if modifiers.ctrl && modifiers.shift
+                    )
+                });
+                for event in &input.events {
+                    match event {
+                        egui::Event::Text(text) => self.send_input(text.as_bytes()),
+                        egui::Event::Copy => {
+                            if input.modifiers.shift || has_ctrl_shift_c_key {
+                                copy_shortcut = true;
+                            } else {
+                                self.send_input(&[0x03]);
+                            }
+                        }
+                        egui::Event::Paste(text) => {
+                            self.deliver_paste_event(text, true, frame, now);
+                        }
+                        egui::Event::MouseWheel { delta, .. }
+                            if delta.y != 0.0 && !self.model.alternate_screen() =>
+                        {
+                            self.model.scrollback_by(if delta.y > 0.0 { 3 } else { -3 });
+                            scroll_changed = true;
+                        }
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } => {
+                            if modifiers.ctrl && *key == egui::Key::C {
+                                if modifiers.shift {
+                                    copy_shortcut = true;
+                                } else if !has_native_copy {
+                                    self.send_input(&[0x03]);
+                                }
+                            } else if matches!(key, egui::Key::PageUp | egui::Key::PageDown)
+                                && !modifiers.ctrl
+                                && !self.model.alternate_screen()
+                            {
+                                let rows = isize::try_from(self.model.dimensions().0)
+                                    .unwrap_or(isize::MAX);
+                                self.model.scrollback_by(if *key == egui::Key::PageUp {
+                                    rows
+                                } else {
+                                    -rows
+                                });
+                                scroll_changed = true;
+                            } else if let Some(bytes) = terminal::key_bytes(
+                                *key,
+                                *modifiers,
+                                self.model.application_cursor(),
+                            ) {
+                                self.model.scroll_to_bottom();
+                                self.send_input(&bytes);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            if scroll_changed {
+                context.request_repaint();
+            }
+            if copy_shortcut {
+                context.copy_text(self.model.contents());
+            }
+        }
+        if self
+            .paste_authorization
+            .as_ref()
+            .is_some_and(|request| now >= request.expires_at)
+        {
+            self.paste_authorization = None;
+        }
+        true
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TerminalView {
+    fn drop(&mut self) {
+        if let Some(task) = self.io_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.resize_task.take() {
+            task.abort();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum TerminalOpened {
+    Opened {
+        attempt_id: u64,
+        input: mpsc::Sender<Vec<u8>>,
+        output: mpsc::Receiver<Vec<u8>>,
+        resize: watch::Sender<TerminalSize>,
+        resize_failed: Arc<AtomicBool>,
+        io_task: JoinHandle<()>,
+        resize_task: JoinHandle<()>,
+    },
+    Failed {
+        attempt_id: u64,
+        message: String,
     },
 }
 
@@ -339,6 +711,22 @@ struct FerrumApp {
     log_stdout: bool,
     #[cfg(target_os = "linux")]
     log_stderr: bool,
+    #[cfg(target_os = "linux")]
+    terminal_open_sender: mpsc::Sender<TerminalOpened>,
+    #[cfg(target_os = "linux")]
+    terminal: Option<TerminalView>,
+    #[cfg(target_os = "linux")]
+    terminal_opened: mpsc::Receiver<TerminalOpened>,
+    #[cfg(target_os = "linux")]
+    terminal_attempt: u64,
+    #[cfg(target_os = "linux")]
+    terminal_pending: bool,
+    #[cfg(target_os = "linux")]
+    terminal_open_task: Option<JoinHandle<()>>,
+    #[cfg(target_os = "linux")]
+    terminal_shell: String,
+    #[cfg(target_os = "linux")]
+    terminal_notice: Option<String>,
     settings_store: settings::SettingsStore,
     settings: settings::Settings,
     settings_draft: settings::Settings,
@@ -369,12 +757,30 @@ impl FerrumApp {
         let (sender, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         #[cfg(target_os = "linux")]
         let (log_sender, log_receiver) = mpsc::channel(LOG_CHANNEL_CAPACITY);
+        #[cfg(target_os = "linux")]
+        let (terminal_open_sender, terminal_opened) = mpsc::channel(1);
         let mut app = Self {
             runtime,
             sender,
             receiver,
             #[cfg(target_os = "linux")]
             log_sender,
+            #[cfg(target_os = "linux")]
+            terminal_open_sender,
+            #[cfg(target_os = "linux")]
+            terminal_opened,
+            #[cfg(target_os = "linux")]
+            terminal: None,
+            #[cfg(target_os = "linux")]
+            terminal_attempt: 0,
+            #[cfg(target_os = "linux")]
+            terminal_pending: false,
+            #[cfg(target_os = "linux")]
+            terminal_open_task: None,
+            #[cfg(target_os = "linux")]
+            terminal_shell: "/bin/sh".into(),
+            #[cfg(target_os = "linux")]
+            terminal_notice: None,
             #[cfg(target_os = "linux")]
             log_receiver,
             #[cfg(target_os = "linux")]
@@ -459,6 +865,105 @@ impl FerrumApp {
         }
         app
     }
+    #[cfg(target_os = "linux")]
+    fn start_terminal(&mut self, container_id: String, shell: String, context: egui::Context) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        self.terminal_attempt = self.terminal_attempt.wrapping_add(1);
+        let attempt_id = self.terminal_attempt;
+        self.terminal_pending = true;
+        self.terminal_notice = None;
+        let sender = self.terminal_open_sender.clone();
+        self.terminal_open_task = Some(self.runtime.spawn(async move {
+            let size = TerminalSize { rows: 24, columns: 80 };
+            let command = [shell];
+            let session = match engine.open_exec_session(&container_id, &command, size).await {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = sender
+                        .send(TerminalOpened::Failed {
+                            attempt_id,
+                            message: error.to_string(),
+                        })
+                        .await;
+                    context.request_repaint();
+                    return;
+                }
+            };
+            let resize_handle = session.resize_handle();
+            let resize_worker_handle = resize_handle.clone();
+            let resize_failed = Arc::new(AtomicBool::new(false));
+            let worker_resize_failed = Arc::clone(&resize_failed);
+            let resize_context = context.clone();
+            let (resize_sender, mut resize_receiver) = watch::channel(size);
+            let resize_task = tokio::spawn(async move {
+                while resize_receiver.changed().await.is_ok() {
+                    let size = *resize_receiver.borrow_and_update();
+                    if resize_worker_handle.resize(size).await.is_err() {
+                        worker_resize_failed.store(true, Ordering::Release);
+                    } else {
+                        worker_resize_failed.store(false, Ordering::Release);
+                    }
+                    resize_context.request_repaint();
+                }
+            });
+
+            let (mut reader, mut writer) = tokio::io::split(session);
+            let (input, mut input_rx) = mpsc::channel::<Vec<u8>>(TERMINAL_INPUT_CAPACITY);
+            let (output_tx, output) = mpsc::channel::<Vec<u8>>(64);
+            let io_context = context.clone();
+            let io_task = tokio::spawn(async move {
+                let mut buffer = [0u8; TERMINAL_OUTPUT_CHUNK_BYTES];
+                loop {
+                    tokio::select! {
+                        result = tokio::io::AsyncReadExt::read(&mut reader, &mut buffer) => {
+                            match result {
+                                Ok(0) | Err(_) => break,
+                                Ok(count) => if output_tx.send(buffer[..count].to_vec()).await.is_err() { break; },
+                            }
+                        }
+                        bytes = input_rx.recv() => match bytes {
+                            Some(bytes) => if tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes).await.is_err() { break; },
+                            None => break,
+                        }
+                    }
+                    io_context.request_repaint();
+                }
+                io_context.request_repaint();
+            });
+            let _ = sender.send(TerminalOpened::Opened {
+                attempt_id,
+                input,
+                output,
+                resize: resize_sender,
+                resize_failed,
+                io_task,
+                resize_task,
+            }).await;
+            context.request_repaint();
+        }));
+    }
+    #[cfg(target_os = "linux")]
+    fn cancel_terminal_session(&mut self) {
+        self.terminal_attempt = self.terminal_attempt.wrapping_add(1);
+        if let Some(task) = self.terminal_open_task.take() {
+            task.abort();
+        }
+        self.terminal_pending = false;
+        self.terminal.take();
+        while let Ok(opened) = self.terminal_opened.try_recv() {
+            if let TerminalOpened::Opened {
+                io_task,
+                resize_task,
+                ..
+            } = opened
+            {
+                io_task.abort();
+                resize_task.abort();
+            }
+        }
+    }
     fn action_busy(&self) -> bool {
         self.inspection
             .as_ref()
@@ -468,6 +973,8 @@ impl FerrumApp {
         if self.loading {
             return;
         }
+        #[cfg(target_os = "linux")]
+        self.cancel_terminal_session();
 
         self.loading = true;
         self.connection = ConnectionState::Connecting;
@@ -502,6 +1009,8 @@ impl FerrumApp {
         if self.loading || self.action_busy() {
             return;
         }
+        #[cfg(target_os = "linux")]
+        self.cancel_terminal_session();
         self.cancel_inspection();
         self.loading = true;
         self.context_error = None;
@@ -606,6 +1115,8 @@ impl FerrumApp {
                             self.apply_connection_success(engine, info, containers, context.clone())
                         }
                         Err(error) => {
+                            #[cfg(target_os = "linux")]
+                            self.cancel_terminal_session();
                             self.engine = None;
                             self.engine_info = None;
                             self.containers.clear();
@@ -746,8 +1257,60 @@ impl FerrumApp {
                 inspection.action_error = Some(action_error);
             }
         }
+        #[cfg(target_os = "linux")]
+        self.receive_terminal_opened();
     }
 
+    #[cfg(target_os = "linux")]
+    fn receive_terminal_opened(&mut self) {
+        while let Ok(opened) = self.terminal_opened.try_recv() {
+            match opened {
+                TerminalOpened::Opened {
+                    attempt_id,
+                    io_task,
+                    resize_task,
+                    ..
+                } if attempt_id != self.terminal_attempt => {
+                    io_task.abort();
+                    resize_task.abort();
+                }
+                TerminalOpened::Opened {
+                    input,
+                    output,
+                    resize,
+                    resize_failed,
+                    io_task,
+                    resize_task,
+                    ..
+                } => {
+                    self.terminal_pending = false;
+                    self.terminal_open_task = None;
+                    self.terminal_notice = None;
+                    self.terminal = Some(TerminalView {
+                        model: TerminalModel::default(),
+                        input: Some(input),
+                        output,
+                        resize_sender: Some(resize),
+                        resize_failed,
+                        io_task: Some(io_task),
+                        resize_task: Some(resize_task),
+                        ended: false,
+                        paste_authorization: None,
+                        input_notice: None,
+                    });
+                }
+                TerminalOpened::Failed {
+                    attempt_id,
+                    message,
+                } if attempt_id == self.terminal_attempt => {
+                    self.terminal_pending = false;
+                    self.terminal_open_task = None;
+                    self.terminal_notice = Some(message);
+                }
+                TerminalOpened::Failed { .. } => {}
+            }
+        }
+    }
     fn apply_connection_success(
         &mut self,
         engine: EngineClient,
@@ -755,6 +1318,8 @@ impl FerrumApp {
         containers: Vec<ContainerSummary>,
         context: egui::Context,
     ) {
+        #[cfg(target_os = "linux")]
+        self.cancel_terminal_session();
         self.cancel_inspection();
         if let Some(task) = self.action_task.take() {
             task.abort();
@@ -1291,6 +1856,10 @@ impl FerrumApp {
         let mut cancel_remove = false;
         #[cfg(target_os = "linux")]
         let mut open_logs = false;
+        #[cfg(target_os = "linux")]
+        let mut open_terminal = false;
+        #[cfg(target_os = "linux")]
+        let mut cancel_terminal_open = false;
         egui::Window::new("Container details")
             .id(egui::Id::new("container-inspection"))
             .open(&mut open)
@@ -1307,6 +1876,50 @@ impl FerrumApp {
                     .clicked()
                 {
                     open_logs = true;
+                }
+                #[cfg(target_os = "linux")]
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_label("Shell")
+                        .selected_text(if self.terminal_shell == "/bin/bash" {
+                            "/bin/bash"
+                        } else {
+                            "/bin/sh"
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.terminal_shell,
+                                "/bin/sh".into(),
+                                "/bin/sh",
+                            );
+                            ui.selectable_value(
+                                &mut self.terminal_shell,
+                                "/bin/bash".into(),
+                                "/bin/bash",
+                            );
+                        });
+                    let running = inspection
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.state.as_ref())
+                        .is_some_and(|state| *state == ContainerState::Running);
+                    if ui
+                        .add_enabled(
+                            running
+                                && self.engine.is_some()
+                                && !self.terminal_pending
+                                && self.terminal.is_none(),
+                            egui::Button::new("Open terminal"),
+                        )
+                        .clicked()
+                    {
+                        open_terminal = true;
+                    }
+                    if self.terminal_pending && ui.button("Cancel terminal opening").clicked() {
+                        cancel_terminal_open = true;
+                    }
+                });
+                if let Some(notice) = self.terminal_notice.as_deref() {
+                    ui.colored_label(Color32::from_rgb(227, 113, 102), notice);
                 }
                 let state = inspection
                     .details
@@ -1443,8 +2056,20 @@ impl FerrumApp {
             self.run_action(action, context.clone());
         }
         #[cfg(target_os = "linux")]
+        if cancel_terminal_open || ((!open || close) && self.terminal_pending) {
+            self.cancel_terminal_session();
+        }
+        #[cfg(target_os = "linux")]
         if open_logs && let Some(inspection) = self.inspection.as_mut() {
             inspection.logs_open = true;
+        }
+        #[cfg(target_os = "linux")]
+        if open_terminal && let Some(inspection) = &self.inspection {
+            self.start_terminal(
+                inspection.container_id.clone(),
+                self.terminal_shell.clone(),
+                context.clone(),
+            );
         }
         #[cfg(target_os = "linux")]
         self.draw_logs(context.clone());
@@ -1754,6 +2379,8 @@ impl Drop for FerrumApp {
         self.stop_event_stream();
         #[cfg(target_os = "linux")]
         self.cancel_log_stream();
+        #[cfg(target_os = "linux")]
+        self.cancel_terminal_session();
         if let Some(task) = self.inspection_task.take() {
             task.abort();
         }
@@ -1767,6 +2394,15 @@ impl eframe::App for FerrumApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
         self.receive_events(context.clone());
+        #[cfg(target_os = "linux")]
+        let terminal_closed = self
+            .terminal
+            .as_mut()
+            .is_some_and(|terminal| !terminal.show(&context));
+        #[cfg(target_os = "linux")]
+        if terminal_closed {
+            self.cancel_terminal_session();
+        }
         if self.event_refresh_pending && !self.loading {
             self.event_refresh_pending = false;
             self.refresh(context.clone());
@@ -2113,12 +2749,30 @@ mod event_reconciliation_tests {
             .expect("test runtime should build");
         let (sender, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         #[cfg(target_os = "linux")]
+        let (terminal_open_sender, terminal_opened) = mpsc::channel(1);
+        #[cfg(target_os = "linux")]
         let (log_sender, log_receiver) = mpsc::channel(LOG_CHANNEL_CAPACITY);
         let settings = settings::Settings::default();
         let app = FerrumApp {
             runtime,
             sender: sender.clone(),
             receiver,
+            #[cfg(target_os = "linux")]
+            terminal_open_sender,
+            #[cfg(target_os = "linux")]
+            terminal_opened,
+            #[cfg(target_os = "linux")]
+            terminal: None,
+            #[cfg(target_os = "linux")]
+            terminal_attempt: 0,
+            #[cfg(target_os = "linux")]
+            terminal_pending: false,
+            #[cfg(target_os = "linux")]
+            terminal_open_task: None,
+            #[cfg(target_os = "linux")]
+            terminal_shell: "/bin/sh".into(),
+            #[cfg(target_os = "linux")]
+            terminal_notice: None,
             #[cfg(target_os = "linux")]
             log_sender,
             #[cfg(target_os = "linux")]
@@ -2759,6 +3413,91 @@ mod event_reconciliation_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_shell_selector_and_open_control_are_accessible() {
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let (app, _) = app_with_open_inspection();
+        let mut harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| app.draw_inspection(ui.ctx().clone()),
+            app,
+        );
+        harness.run();
+        let _shell = harness.get_by_role_and_label(Role::ComboBox, "Shell");
+        let _open_terminal = harness.get_by_role_and_label(Role::Button, "Open terminal");
+        assert_eq!(harness.state().terminal_shell, "/bin/sh");
+        assert!(!harness.state().terminal_pending);
+        assert!(harness.state().terminal.is_none());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accessible_cancel_control_aborts_opening_without_container_actions() {
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let (mut app, _) = app_with_open_inspection();
+        app.terminal_pending = true;
+        let mut harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| app.draw_inspection(ui.ctx().clone()),
+            app,
+        );
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Cancel terminal opening")
+            .click();
+        harness.run();
+        assert!(!harness.state().terminal_pending);
+        assert!(harness.state().terminal.is_none());
+        assert!(harness.state().action_task.is_none());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn context_switch_aborts_a_pending_exec_open() {
+        let (mut app, _) = app_with_open_inspection();
+        app.terminal_pending = true;
+        app.terminal_open_task = Some(app.runtime.spawn(std::future::pending()));
+        app.switch_context(Some("other-context".to_owned()), egui::Context::default());
+        assert!(!app.terminal_pending);
+        assert!(app.terminal_open_task.is_none());
+        assert!(app.loading);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_exec_open_updates_terminal_state_and_is_visible() {
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let (mut app, _) = app_with_open_inspection();
+        app.terminal_attempt = 1;
+        app.terminal_pending = true;
+        let message = EngineError::ExecSessionRejected {
+            endpoint_label: "test socket",
+            status: 403,
+        }
+        .to_string();
+        assert!(
+            app.terminal_open_sender
+                .try_send(TerminalOpened::Failed {
+                    attempt_id: 1,
+                    message: message.clone(),
+                })
+                .is_ok()
+        );
+        app.receive_events(egui::Context::default());
+        assert!(!app.terminal_pending);
+        assert_eq!(app.terminal_notice.as_deref(), Some(message.as_str()));
+
+        let mut harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| app.draw_inspection(ui.ctx().clone()),
+            app,
+        );
+        harness.run();
+        let _notice = harness.get_by_role_and_label(Role::Label, message.as_str());
+    }
+
     fn assert_reinspection_is_pending(app: &FerrumApp) {
         let inspection = app.inspection.as_ref().expect("inspection stays open");
         assert_eq!(inspection.generation, 5);
@@ -2767,5 +3506,258 @@ mod event_reconciliation_tests {
             inspection.details.is_none(),
             "event changes must not leave stale details or action availability"
         );
+    }
+}
+#[cfg(all(test, target_os = "linux"))]
+mod terminal_ui_tests {
+    use super::*;
+    use egui::accesskit::Role;
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    struct TestTerminalUi {
+        terminal: Option<TerminalView>,
+    }
+    struct TestTerminalParts {
+        terminal: TerminalView,
+        input: mpsc::Receiver<Vec<u8>>,
+        resize: watch::Receiver<TerminalSize>,
+        output: mpsc::Sender<Vec<u8>>,
+    }
+
+    fn test_terminal(runtime: &Runtime) -> TestTerminalParts {
+        let initial_size = TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+        let (resize_sender, resize_receiver) = watch::channel(initial_size);
+        let (input, input_receiver) = mpsc::channel(TERMINAL_INPUT_CAPACITY);
+        let (output_sender, output) = mpsc::channel(64);
+        let io_task = runtime.spawn(std::future::pending());
+        let resize_task = runtime.spawn(std::future::pending());
+        TestTerminalParts {
+            terminal: TerminalView {
+                model: TerminalModel::new(1, 1),
+                input: Some(input),
+                output,
+                resize_sender: Some(resize_sender),
+                resize_failed: Arc::new(AtomicBool::new(false)),
+                io_task: Some(io_task),
+                resize_task: Some(resize_task),
+                ended: false,
+                paste_authorization: None,
+                input_notice: None,
+            },
+            input: input_receiver,
+            resize: resize_receiver,
+            output: output_sender,
+        }
+    }
+
+    fn harness_for(terminal: TerminalView) -> Harness<'static, TestTerminalUi> {
+        Harness::new_ui_state(
+            |ui, state: &mut TestTerminalUi| {
+                if state
+                    .terminal
+                    .as_mut()
+                    .is_some_and(|terminal| !terminal.show(ui.ctx()))
+                {
+                    state.terminal = None;
+                }
+            },
+            TestTerminalUi {
+                terminal: Some(terminal),
+            },
+        )
+    }
+
+    #[test]
+    fn focused_terminal_sends_ctrl_c_and_resizes_then_closes_exec_only() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let parts = test_terminal(&runtime);
+        let mut input = parts.input;
+        let resize = parts.resize;
+        let output = parts.output;
+        output.try_send(b"\x1b[?2004h".to_vec()).unwrap();
+        let mut harness = harness_for(parts.terminal);
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Focus terminal")
+            .click();
+        harness.run();
+        harness.event(egui::Event::Paste("unrequested".to_owned()));
+        harness.run();
+        assert!(matches!(
+            input.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        harness
+            .get_by_role_and_label(Role::Button, "Paste from clipboard")
+            .click();
+        harness.run();
+        harness.event(egui::Event::Paste("button paste".to_owned()));
+        harness.run();
+        assert_eq!(
+            input.try_recv().unwrap(),
+            b"\x1b[200~button paste\x1b[201~".to_vec()
+        );
+        harness.key_down_modifiers(egui::Modifiers::CTRL, egui::Key::C);
+        harness.run();
+        assert_eq!(input.try_recv().unwrap(), vec![0x03]);
+        harness.event_modifiers(egui::Event::Copy, egui::Modifiers::CTRL);
+        harness.run();
+        assert_eq!(input.try_recv().unwrap(), vec![0x03]);
+        let resized = resize.borrow();
+        assert!(resized.rows != 1 || resized.columns != 1);
+        drop(resized);
+        harness
+            .get_by_role_and_label(Role::Button, "Close window")
+            .click();
+        harness.run();
+        assert!(harness.state().terminal.is_none());
+        assert!(matches!(
+            input.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn page_up_scrolls_back_and_output_eof_disables_input_accessibly() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let parts = test_terminal(&runtime);
+        let mut input = parts.input;
+        let output = parts.output;
+        let mut harness = harness_for(parts.terminal);
+        let history = (0..40)
+            .map(|row| format!("history-{row}\r\n"))
+            .collect::<String>();
+        output.try_send(history.into_bytes()).unwrap();
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Focus terminal")
+            .click();
+        harness.run();
+        let before_scroll = harness.state().terminal.as_ref().unwrap().model.contents();
+        harness.key_down(egui::Key::PageUp);
+        harness.run();
+        let terminal = harness.state().terminal.as_ref().unwrap();
+        assert!(terminal.model.scrollback_position() > 0);
+        assert_ne!(terminal.model.contents(), before_scroll);
+        assert!(matches!(
+            input.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        harness.key_down(egui::Key::PageDown);
+        harness.run();
+        let terminal = harness.state().terminal.as_ref().unwrap();
+        assert_eq!(terminal.model.scrollback_position(), 0);
+        assert_eq!(terminal.model.contents(), before_scroll);
+
+        drop(output);
+        harness.run();
+        let _ended = harness
+            .get_by_role_and_label(Role::Label, "Terminal session ended. Input is disabled.");
+        let terminal = harness.state().terminal.as_ref().unwrap();
+        assert!(terminal.ended);
+        assert!(terminal.input.is_none());
+        assert!(terminal.resize_sender.is_none());
+        assert!(terminal.io_task.is_none());
+        assert!(terminal.resize_task.is_none());
+    }
+    #[test]
+    fn paste_requires_fresh_focus_and_wraps_bracketed_mode() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let parts = test_terminal(&runtime);
+        let mut terminal = parts.terminal;
+        let mut input = parts.input;
+        terminal.model.feed(b"\x1b[?2004h");
+        let context = egui::Context::default();
+        assert!(!terminal.deliver_paste_event("unrequested", false, 1, Instant::now(),));
+        terminal.request_paste(&context);
+        let frame = context.cumulative_frame_nr() + 1;
+        let now = Instant::now();
+        assert!(!terminal.deliver_paste_event("lost focus", false, frame, now));
+        assert!(!terminal.deliver_paste_event("after cancellation", false, frame, now));
+        assert!(matches!(
+            input.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        terminal.request_paste(&context);
+        let frame = context.cumulative_frame_nr() + 1;
+        assert!(terminal.deliver_paste_event("paste", true, frame, Instant::now()));
+        assert_eq!(
+            input.try_recv().unwrap(),
+            b"\x1b[200~paste\x1b[201~".to_vec()
+        );
+        terminal.request_paste(&context);
+        let frame = context.cumulative_frame_nr() + 1;
+        let expired = Instant::now() + Duration::from_secs(4);
+        assert!(!terminal.deliver_paste_event("expired", true, frame, expired));
+        assert!(matches!(
+            input.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn alternate_screen_keeps_page_up_and_wheel_out_of_scrollback() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let parts = test_terminal(&runtime);
+        let mut input = parts.input;
+        let output = parts.output;
+        output.try_send(b"\x1b[?1049h".to_vec()).unwrap();
+        let mut harness = harness_for(parts.terminal);
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Focus terminal")
+            .click();
+        harness.run();
+        harness.key_down(egui::Key::PageUp);
+        harness.run();
+        assert_eq!(input.try_recv().unwrap(), b"\x1b[5~".to_vec());
+        assert_eq!(
+            harness
+                .state()
+                .terminal
+                .as_ref()
+                .unwrap()
+                .model
+                .scrollback_position(),
+            0
+        );
+
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, 10.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .terminal
+                .as_ref()
+                .unwrap()
+                .model
+                .scrollback_position(),
+            0
+        );
+        assert!(matches!(
+            input.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 }

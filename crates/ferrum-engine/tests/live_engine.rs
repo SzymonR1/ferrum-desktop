@@ -210,6 +210,185 @@ async fn local_engine_logs_stream_history_follow_and_cancel() {
     container.disarm();
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires local Docker and a preinstalled FERRUM_TEST_IMAGE containing /bin/sh, /bin/sleep, and stty"]
+async fn local_engine_exec_session_is_interactive_and_preserves_container() {
+    use ferrum_engine::TerminalSize;
+    use tokio::io::AsyncWriteExt;
+
+    let image =
+        std::env::var("FERRUM_TEST_IMAGE").expect("set FERRUM_TEST_IMAGE to a preinstalled image");
+    let image = image.trim();
+    assert!(
+        valid_test_image_reference(image),
+        "FERRUM_TEST_IMAGE must be a valid image reference"
+    );
+    let contexts = EngineClient::available_contexts()
+        .await
+        .expect("Docker context discovery");
+    let context = contexts
+        .iter()
+        .find(|context| context.is_current())
+        .expect("current Docker context");
+    assert_eq!(context.transport(), ContextTransport::LocalUnix);
+    let context_name = context.name().to_owned();
+    let engine = EngineClient::connect_context(&context_name)
+        .await
+        .expect("connect local context");
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let sequence = NEXT_CONTAINER_NAME.fetch_add(1, Ordering::Relaxed);
+    let name = format!(
+        "ferrum-live-exec-{}-{timestamp}-{sequence}",
+        std::process::id()
+    );
+    let cid_directory = DisposableTempDirectory::new(&name);
+    let create = Command::new("docker")
+        .args([
+            "--context",
+            &context_name,
+            "create",
+            "--name",
+            &name,
+            "--network",
+            "none",
+            "--pull",
+            "never",
+            "--cidfile",
+        ])
+        .arg(cid_directory.cid_file())
+        .args([
+            "--entrypoint",
+            "/bin/sh",
+            "--",
+            image,
+            "-c",
+            "exec sleep 3600",
+        ])
+        .output()
+        .expect("Docker CLI create");
+    assert!(create.status.success(), "create owned disposable container");
+    let created_id = std::str::from_utf8(&create.stdout)
+        .ok()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned();
+    let mut container = DisposableContainer::new(created_id, context_name, cid_directory);
+    assert!(container.ensure_id(), "obtain exact full container ID");
+    let start = Command::new("docker")
+        .args([
+            "--context",
+            container.context_name(),
+            "start",
+            container.id(),
+        ])
+        .output()
+        .expect("Docker CLI start");
+    assert!(start.status.success(), "start owned disposable container");
+
+    let mut session = engine
+        .open_exec_session(
+            container.id(),
+            &["/bin/sh".into()],
+            TerminalSize {
+                rows: 24,
+                columns: 80,
+            },
+        )
+        .await
+        .expect("open interactive TTY exec");
+    session
+        .write_all(b"printf '\\033[31mFERRUM_EXEC_MARKER\\033[0m \\342\\230\\203\\n'\n")
+        .await
+        .expect("write marker");
+    let mut transcript = Vec::new();
+    read_until(&mut session, &mut transcript, "☃".as_bytes()).await;
+    assert!(
+        transcript
+            .windows(b"FERRUM_EXEC_MARKER".len())
+            .any(|window| window == b"FERRUM_EXEC_MARKER"),
+        "command output marker"
+    );
+    assert!(
+        transcript.windows(2).any(|window| window == b"\x1b["),
+        "ANSI color escape preserved"
+    );
+    assert!(
+        transcript.windows(3).any(|window| window == "☃".as_bytes()),
+        "Unicode preserved"
+    );
+    session
+        .resize_handle()
+        .resize(TerminalSize {
+            rows: 37,
+            columns: 101,
+        })
+        .await
+        .expect("resize TTY");
+    session
+        .write_all(b"stty size\n")
+        .await
+        .expect("write size command");
+    let mut size_output = Vec::new();
+    read_until(&mut session, &mut size_output, b"37 101").await;
+    session
+        .write_all(b"sleep 30\n")
+        .await
+        .expect("write sleeping command");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    session.write_all(&[3]).await.expect("send Ctrl+C");
+    session.write_all(b"printf '\\106\\105\\122\\122\\125\\115\\137\\101\\106\\124\\105\\122\\137\\111\\116\\124\\105\\122\\122\\125\\120\\124\\n'\n").await.expect("write post-interrupt command");
+    let mut interrupt_output = Vec::new();
+    read_until(
+        &mut session,
+        &mut interrupt_output,
+        b"FERRUM_AFTER_INTERRUPT",
+    )
+    .await;
+    drop(session);
+    assert_owned_container_state(&engine, container.id(), ContainerState::Running).await;
+    perform_action(&engine, container.id(), ContainerAction::Stop).await;
+    perform_action(&engine, container.id(), ContainerAction::Remove).await;
+    container.disarm();
+}
+
+#[cfg(target_os = "linux")]
+async fn read_until(session: &mut ferrum_engine::ExecSession, output: &mut Vec<u8>, needle: &[u8]) {
+    use tokio::io::AsyncReadExt;
+    const MAX_EXEC_OUTPUT_BYTES: usize = 64 * 1024;
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut chunk = [0u8; 512];
+        loop {
+            if output.windows(needle.len()).any(|window| window == needle) {
+                break;
+            }
+            let count = session.read(&mut chunk).await.expect("read exec TTY");
+            assert_ne!(count, 0, "TTY closed before expected output");
+            assert!(
+                count <= MAX_EXEC_OUTPUT_BYTES.saturating_sub(output.len()),
+                "exec TTY output exceeded the 64 KiB safety limit before expected output"
+            );
+            output.extend_from_slice(&chunk[..count]);
+        }
+    })
+    .await;
+    if result.is_err() {
+        let escaped_output = output
+            .iter()
+            .take(256)
+            .flat_map(|byte| std::ascii::escape_default(*byte))
+            .map(char::from)
+            .collect::<String>();
+        panic!(
+            "exec TTY timed out waiting for {needle:?} after {} bytes; first escaped bytes: {escaped_output:?}",
+            output.len()
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires an accessible local Docker-compatible engine; reads version and inventory only"]
 async fn local_engine_returns_a_well_formed_container_inventory() {
