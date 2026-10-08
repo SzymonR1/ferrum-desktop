@@ -1,24 +1,5 @@
 #[cfg(target_os = "linux")]
-const EVENT_RETRY_DELAYS_MS: [u64; 3] = [250, 500, 1_000];
-#[cfg(target_os = "linux")]
-#[derive(Default)]
-struct EventRetryBudget {
-    next_attempt: usize,
-}
-#[cfg(target_os = "linux")]
-impl EventRetryBudget {
-    fn next_delay(&mut self) -> Option<Duration> {
-        let delay = EVENT_RETRY_DELAYS_MS.get(self.next_attempt).copied()?;
-        self.next_attempt += 1;
-        Some(Duration::from_millis(delay))
-    }
-
-    fn reset(&mut self) {
-        self.next_attempt = 0;
-    }
-}
-#[cfg(target_os = "linux")]
-async fn wait_for_event_retry(retries: &mut EventRetryBudget) -> bool {
+async fn wait_for_event_retry(retries: &mut RetryBudget) -> bool {
     let Some(delay) = retries.next_delay() else {
         return false;
     };
@@ -54,6 +35,7 @@ fn action_requires_confirmation(action: ContainerAction) -> bool {
 }
 mod inventory;
 mod logs;
+mod retry;
 mod search;
 #[cfg(target_os = "linux")]
 const LOG_CHANNEL_CAPACITY: usize = 16;
@@ -69,7 +51,8 @@ use ferrum_core::{ContainerAction, ContainerDetails, ContainerState, ContainerSu
 use ferrum_engine::ContainerLogsOptions;
 use ferrum_engine::{ContextTransport, DockerContext, EngineClient, EngineError, EngineInfo};
 use inventory::InventoryView;
-use logs::{LogBuffer, LogRetryBudget};
+use logs::LogBuffer;
+use retry::RetryBudget;
 use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};
 use tracing_subscriber::EnvFilter;
 
@@ -724,7 +707,7 @@ impl FerrumApp {
         self.log_notice = Some("Loading container logs…".into());
         self.log_reconnected = false;
         self.log_task = Some(self.runtime.spawn(async move {
-            let mut retries = LogRetryBudget::default();
+            let mut retries = RetryBudget::default();
             let mut has_reconnected = false;
             loop {
                 let mut stream = match engine
@@ -770,7 +753,7 @@ impl FerrumApp {
                 let disconnect_error = loop {
                     match stream.next_line().await {
                         Ok(Some(line)) => {
-                            retries.received_line();
+                            retries.reset();
                             if sender
                                 .send(LogEvent::Line { generation, line })
                                 .await
@@ -866,7 +849,7 @@ impl FerrumApp {
             self.event_warning = None;
             let sender = self.sender.clone();
             self.event_task = Some(self.runtime.spawn(async move {
-                let mut retries = EventRetryBudget::default();
+                let mut retries = RetryBudget::default();
                 let mut stream = loop {
                     match engine.subscribe_container_changes().await {
                         Ok(stream) => {
@@ -1878,7 +1861,7 @@ mod log_retry_budget_tests {
 
     #[test]
     fn retries_are_bounded_and_reset_only_after_a_line_is_received() {
-        let mut retry = logs::LogRetryBudget::default();
+        let mut retry = RetryBudget::default();
 
         assert_eq!(
             retry.next_delay(),
@@ -1895,7 +1878,7 @@ mod log_retry_budget_tests {
         );
         assert_eq!(retry.next_delay(), None);
 
-        retry.received_line();
+        retry.reset();
         assert_eq!(
             retry.next_delay(),
             Some(std::time::Duration::from_millis(250))
@@ -2080,7 +2063,7 @@ mod event_reconciliation_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn event_retry_budget_is_bounded_and_resets_after_successful_subscription() {
-        let mut retries = EventRetryBudget::default();
+        let mut retries = RetryBudget::default();
         for delay in [250, 500, 1_000] {
             assert_eq!(retries.next_delay(), Some(Duration::from_millis(delay)));
         }

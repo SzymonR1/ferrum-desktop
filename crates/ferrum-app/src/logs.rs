@@ -1,27 +1,7 @@
 use ferrum_core::{ContainerLogLine, ContainerLogSource};
 use std::collections::VecDeque;
-use std::time::Duration;
 
 use crate::search::CaseInsensitiveQuery;
-
-const RETRY_DELAYS_MS: [u64; 3] = [250, 500, 1_000];
-
-#[derive(Default)]
-pub(super) struct LogRetryBudget {
-    next_attempt: usize,
-}
-
-impl LogRetryBudget {
-    pub(super) fn next_delay(&mut self) -> Option<Duration> {
-        let delay = RETRY_DELAYS_MS.get(self.next_attempt).copied()?;
-        self.next_attempt += 1;
-        Some(Duration::from_millis(delay))
-    }
-
-    pub(super) fn received_line(&mut self) {
-        self.next_attempt = 0;
-    }
-}
 
 const MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RETAINED_LINES: usize = 10_000;
