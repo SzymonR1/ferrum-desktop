@@ -3,8 +3,16 @@
 **Status:** Implemented for the Linux local-engine slice.
 
 Ferrum displays the live inventory returned by the selected Docker-compatible
-engine, including stopped containers. The view is read-only: it does not start,
-stop, rename, or remove containers.
+engine, including stopped containers. The inspection dialog also offers
+state-gated lifecycle actions (Start, Stop, Restart, Pause, Unpause, Remove)
+only when the container is in a known state where that action is safe. Remove
+requires explicit confirmation. Engine response bodies are not exposed.
+
+External changes are synchronized from Docker container events. An inventory
+snapshot is fetched on initial subscription and after reconnect; any open
+inspection is reloaded so state-gated actions do not remain stale. If bounded
+reconnection is exhausted, Ferrum reports event synchronization unavailable;
+use Refresh to request a newer inventory snapshot.
 
 ## Find and sort containers
 
@@ -38,7 +46,20 @@ not display environment variables, labels, or command arguments in this view.
 Mount source paths can reveal host filesystem locations, so treat inspection
 results as sensitive even though Ferrum does not persist them.
 
-## Connection limits
+## Lifecycle and synchronization limits
+
+Lifecycle actions use the negotiated engine API version and a bounded 30-second
+wait. Stop and Restart may take longer because the engine applies its graceful
+shutdown interval. Start/Stop treat HTTP 304 as idempotent success; other
+unsuccessful statuses are safe typed errors. A timed-out action may still be
+changing the container, so refresh before retrying. Remove does not force
+removal or remove volumes. Event lines are capped at 64 KiB and each transport
+data frame at 1 MiB. Delivery uses the bounded UI channel, and processing is
+cancelled when the context changes or the app tears down.
+For each outage, Ferrum retries up to three times with waits of 250 ms, 500 ms,
+and 1 s; a successful subscription resets the retry budget. Exhaustion reports
+event synchronization unavailable. Manual Refresh revalidates the inventory
+and any open inspection.
 
 The current implementation is Linux-only. Local Unix-socket Docker CLI contexts
 can be selected for the current session. Listing and switching contexts requires

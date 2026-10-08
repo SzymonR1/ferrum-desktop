@@ -12,6 +12,8 @@ use std::{env, path::PathBuf, time::Duration};
 #[cfg(target_os = "linux")]
 use http_body_util::{BodyExt, Empty, Limited};
 #[cfg(target_os = "linux")]
+use hyper::body::Incoming;
+#[cfg(target_os = "linux")]
 use hyper::{Method, Request, body::Bytes};
 #[cfg(target_os = "linux")]
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -21,14 +23,17 @@ use hyperlocal::{UnixConnector, Uri};
 use tokio::time::timeout;
 
 #[cfg(target_os = "linux")]
+use bollard::API_DEFAULT_VERSION;
+#[cfg(target_os = "linux")]
 use contexts::{
     ContextCommandError, StartupSource, current_cli_context, discover_contexts,
     resolve_startup_source, valid_context_name,
 };
 
-#[cfg(target_os = "linux")]
-use bollard::API_DEFAULT_VERSION;
-use ferrum_core::{ContainerDetails, ContainerMount, ContainerState, ContainerSummary};
+use ferrum_core::{
+    ContainerAction, ContainerChange, ContainerDetails, ContainerMount, ContainerState,
+    ContainerSummary,
+};
 use serde::{Deserialize, de::DeserializeOwned};
 use thiserror::Error;
 
@@ -45,6 +50,8 @@ enum RequestJsonError {
 }
 #[cfg(target_os = "linux")]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(target_os = "linux")]
+const LIFECYCLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
 const MAX_INSPECT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(target_os = "linux")]
@@ -218,6 +225,48 @@ pub enum EngineError {
     /// An inspection response omitted its required container identifier.
     #[error("The engine at the {endpoint_label} returned container details without an identifier.")]
     MissingInspectedContainerId {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// A lifecycle action could not be sent to the selected engine.
+    #[error("The {action} action could not reach the {endpoint_label}; check engine access.")]
+    ContainerActionUnavailable {
+        /// Action requested by the caller.
+        action: ContainerAction,
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// A lifecycle request exceeded its bounded wait; the action may still complete.
+    #[error(
+        "The {action} action at the {endpoint_label} timed out; the container may still be changing. Refresh to confirm its state."
+    )]
+    ContainerActionTimedOut {
+        /// Action requested by the caller.
+        action: ContainerAction,
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The selected engine rejected a lifecycle action.
+    #[error(
+        "The {action} action was rejected at the {endpoint_label} (HTTP {status}); check container state and permissions."
+    )]
+    ContainerActionRejected {
+        /// Action requested by the caller.
+        action: ContainerAction,
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+        /// HTTP response status.
+        status: u16,
+    },
+    /// The container event stream could not be opened.
+    #[error("Container events are unavailable at the {endpoint_label}.")]
+    ContainerEventsUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The container event stream ended or returned invalid event data.
+    #[error("Container events from the {endpoint_label} were interrupted.")]
+    ContainerEventsInterrupted {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
     },
@@ -505,6 +554,120 @@ impl EngineClient {
             Err(EngineError::UnsupportedPlatform)
         }
     }
+    /// Performs a lifecycle action on a container.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe typed error if the action could not be sent or the
+    /// engine rejected it.
+    pub async fn perform_container_action(
+        &self,
+        id: &str,
+        action: ContainerAction,
+    ) -> Result<(), EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            let endpoint_label = self.info.endpoint_label;
+            let suffix = match action {
+                ContainerAction::Start => "/start",
+                ContainerAction::Stop => "/stop",
+                ContainerAction::Restart => "/restart",
+                ContainerAction::Pause => "/pause",
+                ContainerAction::Unpause => "/unpause",
+                ContainerAction::Remove => "",
+            };
+            let path = container_request_path(&self.api_version, id, suffix).map_err(|_| {
+                EngineError::ContainerActionUnavailable {
+                    action,
+                    endpoint_label,
+                }
+            })?;
+            let method = if action == ContainerAction::Remove {
+                Method::DELETE
+            } else {
+                Method::POST
+            };
+            let result = timeout(LIFECYCLE_REQUEST_TIMEOUT, async {
+                let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
+                let request = Request::builder()
+                    .method(method)
+                    .uri(Uri::new(&self.socket_path, &path))
+                    .body(Empty::<Bytes>::new())
+                    .map_err(|_| ())?;
+                client.request(request).await.map_err(|_| ())
+            })
+            .await;
+            let response = match result {
+                Ok(Ok(response)) => response,
+                Ok(Err(())) => {
+                    return Err(EngineError::ContainerActionUnavailable {
+                        action,
+                        endpoint_label,
+                    });
+                }
+                Err(_) => {
+                    return Err(EngineError::ContainerActionTimedOut {
+                        action,
+                        endpoint_label,
+                    });
+                }
+            };
+            let status = response.status();
+            if status.is_success()
+                || (status == hyper::StatusCode::NOT_MODIFIED
+                    && matches!(action, ContainerAction::Start | ContainerAction::Stop))
+            {
+                Ok(())
+            } else {
+                Err(EngineError::ContainerActionRejected {
+                    action,
+                    endpoint_label,
+                    status: status.as_u16(),
+                })
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (id, action);
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
+
+    /// Opens the engine's incremental container event stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unavailable error if the event endpoint cannot be opened.
+    #[cfg(target_os = "linux")]
+    pub async fn subscribe_container_changes(&self) -> Result<ContainerChangeStream, EngineError> {
+        let endpoint_label = self.info.endpoint_label;
+        let path = format!(
+            "/v{}/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D",
+            self.api_version
+        );
+        let result = timeout(REQUEST_TIMEOUT, async {
+            let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(Uri::new(&self.socket_path, &path))
+                .body(Empty::<Bytes>::new())
+                .map_err(|_| ())?;
+            client.request(request).await.map_err(|_| ())
+        })
+        .await;
+        let response = match result {
+            Ok(Ok(response)) if response.status().is_success() => response,
+            _ => return Err(EngineError::ContainerEventsUnavailable { endpoint_label }),
+        };
+        Ok(ContainerChangeStream {
+            body: response.into_body(),
+            endpoint_label,
+            pending: Vec::with_capacity(MAX_EVENT_LINE_BYTES),
+            frame: None,
+            frame_offset: 0,
+            finished: false,
+        })
+    }
 
     #[cfg(target_os = "linux")]
     async fn connect_unix_socket(
@@ -555,6 +718,136 @@ impl EngineClient {
             }
         }
     }
+}
+
+/// Incremental stream of container changes from a Docker-compatible engine.
+#[cfg(target_os = "linux")]
+pub struct ContainerChangeStream {
+    body: Incoming,
+    endpoint_label: &'static str,
+    pending: Vec<u8>,
+    frame: Option<Bytes>,
+    frame_offset: usize,
+    finished: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl ContainerChangeStream {
+    /// Returns the next container change, or `None` when the stream ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an interrupted error for transport, decoding, or size failures.
+    pub async fn next_change(&mut self) -> Result<Option<ContainerChange>, EngineError> {
+        loop {
+            if let Some(data) = self.frame.as_ref() {
+                let (parsed, consumed) =
+                    process_event_data(&mut self.pending, &data[self.frame_offset..])
+                        .map_err(|()| self.interrupted())?;
+                self.frame_offset += consumed;
+                if self.frame_offset == data.len() {
+                    self.frame = None;
+                    self.frame_offset = 0;
+                }
+                if parsed.is_some() {
+                    return Ok(parsed);
+                }
+                continue;
+            }
+            if self.finished {
+                if self.pending.is_empty() {
+                    return Ok(None);
+                }
+                let parsed =
+                    parse_container_event(&self.pending).map_err(|()| self.interrupted())?;
+                self.pending.clear();
+                return Ok(parsed);
+            }
+            match self.body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        if data.len() > MAX_EVENT_FRAME_BYTES {
+                            return Err(self.interrupted());
+                        }
+                        self.frame = Some(data.clone());
+                    }
+                }
+                Some(Err(_)) => return Err(self.interrupted()),
+                None => self.finished = true,
+            }
+        }
+    }
+
+    fn interrupted(&self) -> EngineError {
+        EngineError::ContainerEventsInterrupted {
+            endpoint_label: self.endpoint_label,
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+const MAX_EVENT_LINE_BYTES: usize = 64 * 1024;
+
+#[cfg(target_os = "linux")]
+// Reject unusually large aggregated Hyper frames instead of retaining or scanning them.
+const MAX_EVENT_FRAME_BYTES: usize = 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+struct ContainerEvent<'a> {
+    #[serde(rename = "Type", borrow)]
+    event_type: Option<&'a str>,
+    #[serde(rename = "Actor", borrow)]
+    actor: Option<ContainerEventActor<'a>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+struct ContainerEventActor<'a> {
+    #[serde(rename = "ID", borrow)]
+    id: Option<&'a str>,
+}
+
+#[cfg(target_os = "linux")]
+fn process_event_data(
+    pending: &mut Vec<u8>,
+    data: &[u8],
+) -> Result<(Option<ContainerChange>, usize), ()> {
+    let mut remaining = data;
+    while let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') {
+        if pending.len() + newline > MAX_EVENT_LINE_BYTES {
+            return Err(());
+        }
+        pending.extend_from_slice(&remaining[..newline]);
+        remaining = &remaining[newline + 1..];
+        if pending.last() == Some(&b'\r') {
+            pending.pop();
+        }
+        let parsed = parse_container_event(pending)?;
+        pending.clear();
+        if parsed.is_some() {
+            return Ok((parsed, data.len() - remaining.len()));
+        }
+    }
+    if pending.len() + remaining.len() > MAX_EVENT_LINE_BYTES {
+        return Err(());
+    }
+    pending.extend_from_slice(remaining);
+    Ok((None, data.len()))
+}
+
+fn parse_container_event(line: &[u8]) -> Result<Option<ContainerChange>, ()> {
+    let event: ContainerEvent<'_> = serde_json::from_slice(line).map_err(|_| ())?;
+    if event.event_type != Some("container") {
+        return Ok(None);
+    }
+    let container_id = event
+        .actor
+        .and_then(|actor| actor.id)
+        .filter(|id| !id.is_empty())
+        .ok_or(())?;
+    Ok(Some(ContainerChange {
+        container_id: container_id.to_owned(),
+    }))
 }
 
 #[cfg(target_os = "linux")]
@@ -634,10 +927,20 @@ async fn request_json<T: DeserializeOwned>(
 
 #[cfg(target_os = "linux")]
 fn inspect_request_path(api_version: &str, id: &str) -> Result<String, RequestJsonError> {
+    container_request_path(api_version, id, "/json")
+}
+
+#[cfg(target_os = "linux")]
+fn container_request_path(
+    api_version: &str,
+    id: &str,
+    suffix: &str,
+) -> Result<String, RequestJsonError> {
     if id.is_empty() || id.len() > 4096 {
         return Err(RequestJsonError::RequestBuild);
     }
-    let mut path = String::with_capacity(api_version.len() + id.len().saturating_mul(3) + 32);
+    let mut path =
+        String::with_capacity(api_version.len() + id.len().saturating_mul(3) + 24 + suffix.len());
     path.push_str("/v");
     path.push_str(api_version);
     path.push_str("/containers/");
@@ -649,7 +952,7 @@ fn inspect_request_path(api_version: &str, id: &str) -> Result<String, RequestJs
             write!(path, "%{byte:02X}").map_err(|_| RequestJsonError::RequestBuild)?;
         }
     }
-    path.push_str("/json");
+    path.push_str(suffix);
     Ok(path)
 }
 
@@ -1023,24 +1326,56 @@ mod container_inspection_tests {
             std::fs::create_dir(&directory).expect("temporary directory should be created");
             let socket = directory.join("engine.sock");
             let listener = UnixListener::bind(&socket).expect("Unix socket should bind");
+            let (headers_sent, headers_written) = tokio::sync::oneshot::channel();
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("client should connect");
                 let mut request = [0_u8; 2048];
                 let _ = stream.read(&mut request).await;
-                stream
+                let headers_result = stream
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n",
                     )
-                    .await
-                    .expect("headers should be written");
-                tokio::time::sleep(Duration::from_millis(40)).await;
-                let _ = stream.write_all(br#"{"value":"slow"}"#).await;
+                    .await;
+                let _ = headers_sent.send(headers_result.is_ok());
+                if headers_result.is_ok() {
+                    let mut buffer = [0_u8; 128];
+                    loop {
+                        match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buffer))
+                            .await
+                        {
+                            Ok(Ok(0)) => break,
+                            Ok(Ok(_)) => {}
+                            Ok(Err(_)) | Err(_) => {
+                                panic!("client should close after the body-read timeout")
+                            }
+                        }
+                    }
+                }
             });
 
-            let result: Result<serde_json::Value, RequestJsonError> =
-                request_json(&socket, "/version", 1024, Duration::from_millis(10)).await;
+            let request_socket = socket.clone();
+            let request = tokio::spawn(async move {
+                request_json::<serde_json::Value>(
+                    &request_socket,
+                    "/version",
+                    1024,
+                    Duration::from_millis(250),
+                )
+                .await
+            });
+            assert!(
+                headers_written
+                    .await
+                    .expect("server should report its header write"),
+                "response headers should reach the client before body timeout"
+            );
+            let result = request.await.expect("request task should finish");
             cleanup(&socket, server, &directory).await;
-            assert!(result.is_err(), "delayed response body must time out");
+            assert_eq!(
+                result,
+                Err(RequestJsonError::Timeout),
+                "body read must be included in the total request timeout"
+            );
         }
     }
 
@@ -1102,6 +1437,426 @@ mod container_inspection_tests {
             details.state,
             Some(ContainerState::Unknown("checkpointing".to_owned()))
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod container_lifecycle_http_tests {
+    use super::*;
+    use ferrum_core::ContainerAction;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixListener,
+    };
+
+    fn temporary_directory() -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "ferrum-lifecycle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).expect("temporary directory should be created");
+        directory
+    }
+
+    fn client(socket_path: std::path::PathBuf) -> EngineClient {
+        EngineClient {
+            info: EngineInfo {
+                version: "fixture".to_owned(),
+                api_version: "1.45".to_owned(),
+                endpoint_label: "test endpoint",
+            },
+            api_version: "1.45".to_owned(),
+            selected_context: None,
+            socket_path,
+        }
+    }
+
+    async fn read_request(stream: &mut tokio::net::UnixStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream
+                .read(&mut buffer)
+                .await
+                .expect("request should be readable");
+            assert_ne!(count, 0, "client should send HTTP headers");
+            request.extend_from_slice(&buffer[..count]);
+        }
+        String::from_utf8(request).expect("HTTP request should be UTF-8")
+    }
+
+    async fn fixture_socket() -> (std::path::PathBuf, std::path::PathBuf, UnixListener) {
+        let directory = temporary_directory();
+        let socket_path = directory.join("engine.sock");
+        let listener = UnixListener::bind(&socket_path).expect("Unix socket should bind");
+        (socket_path, directory, listener)
+    }
+
+    fn cleanup(socket_path: &std::path::Path, directory: &std::path::Path) {
+        std::fs::remove_file(socket_path).expect("socket should be removed");
+        std::fs::remove_dir(directory).expect("temporary directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_actions_use_the_expected_http_method_and_path() {
+        let (socket_path, directory, listener) = fixture_socket().await;
+        let server = tokio::spawn(async move {
+            let requests = [
+                (
+                    ContainerAction::Start,
+                    "POST",
+                    "/v1.45/containers/cid/start",
+                ),
+                (ContainerAction::Stop, "POST", "/v1.45/containers/cid/stop"),
+                (
+                    ContainerAction::Restart,
+                    "POST",
+                    "/v1.45/containers/cid/restart",
+                ),
+                (
+                    ContainerAction::Pause,
+                    "POST",
+                    "/v1.45/containers/cid/pause",
+                ),
+                (
+                    ContainerAction::Unpause,
+                    "POST",
+                    "/v1.45/containers/cid/unpause",
+                ),
+                (ContainerAction::Remove, "DELETE", "/v1.45/containers/cid"),
+            ];
+            for (action, method, path) in requests {
+                let (mut stream, _) = listener.accept().await.expect("client should connect");
+                let request = read_request(&mut stream).await;
+                assert!(
+                    request.starts_with(&format!("{method} {path} HTTP/1.1\r\n")),
+                    "unexpected lifecycle request: {request}"
+                );
+                assert!(
+                    !request.lines().next().unwrap_or_default().contains('?'),
+                    "lifecycle request must not add query parameters"
+                );
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("success response should be written");
+                let _ = action;
+            }
+        });
+
+        let engine = client(socket_path.clone());
+        for action in [
+            ContainerAction::Start,
+            ContainerAction::Stop,
+            ContainerAction::Restart,
+            ContainerAction::Pause,
+            ContainerAction::Unpause,
+            ContainerAction::Remove,
+        ] {
+            engine
+                .perform_container_action("cid", action)
+                .await
+                .expect("204 should succeed for every lifecycle action");
+        }
+        server.await.expect("fixture server should finish");
+        cleanup(&socket_path, &directory);
+    }
+
+    #[tokio::test]
+    async fn start_and_stop_treat_not_modified_as_idempotent_success() {
+        for action in [ContainerAction::Start, ContainerAction::Stop] {
+            let (socket_path, directory, listener) = fixture_socket().await;
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("client should connect");
+                let _ = read_request(&mut stream).await;
+                stream
+                    .write_all(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("304 response should be written");
+            });
+            client(socket_path.clone())
+                .perform_container_action("cid", action)
+                .await
+                .expect("start and stop should treat 304 as success");
+            server.await.expect("fixture server should finish");
+            cleanup(&socket_path, &directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_action_error_is_typed_and_does_not_expose_response_body() {
+        let (socket_path, directory, listener) = fixture_socket().await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let _ = read_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 409 Conflict\r\nContent-Length: 32\r\nConnection: close\r\n\r\nprivate engine response body",
+                )
+                .await
+                .expect("rejection response should be written");
+        });
+
+        let error = client(socket_path.clone())
+            .perform_container_action("cid", ContainerAction::Pause)
+            .await
+            .expect_err("409 should be rejected");
+        assert!(matches!(
+            error,
+            EngineError::ContainerActionRejected {
+                action: ContainerAction::Pause,
+                endpoint_label: "test endpoint",
+                status: 409
+            }
+        ));
+        assert!(
+            !error.to_string().contains("private engine response body"),
+            "user-facing errors must not expose untrusted response bodies"
+        );
+        server.await.expect("fixture server should finish");
+        cleanup(&socket_path, &directory);
+    }
+
+    #[tokio::test]
+    async fn action_path_escapes_container_id_and_remove_has_no_force_or_volume_query() {
+        let (socket_path, directory, listener) = fixture_socket().await;
+        let server = tokio::spawn(async move {
+            for (method, expected_path) in [
+                ("POST", "/v1.45/containers/id%2Fwith%20space/start"),
+                ("DELETE", "/v1.45/containers/cid"),
+            ] {
+                let (mut stream, _) = listener.accept().await.expect("client should connect");
+                let request = read_request(&mut stream).await;
+                assert!(
+                    request.starts_with(&format!("{method} {expected_path} HTTP/1.1\r\n")),
+                    "unexpected escaped lifecycle request: {request}"
+                );
+                assert!(
+                    !request.lines().next().unwrap_or_default().contains('?'),
+                    "remove must not include force or volume query parameters"
+                );
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("success response should be written");
+            }
+        });
+
+        let engine = client(socket_path.clone());
+        engine
+            .perform_container_action("id/with space", ContainerAction::Start)
+            .await
+            .expect("escaped ID action should succeed");
+        engine
+            .perform_container_action("cid", ContainerAction::Remove)
+            .await
+            .expect("remove without query parameters should succeed");
+        server.await.expect("fixture server should finish");
+        cleanup(&socket_path, &directory);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod container_change_stream_tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixListener,
+    };
+
+    fn temporary_directory() -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "ferrum-events-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).expect("temporary directory should be created");
+        directory
+    }
+
+    fn client(socket_path: std::path::PathBuf) -> EngineClient {
+        EngineClient {
+            info: EngineInfo {
+                version: "fixture".to_owned(),
+                api_version: "1.45".to_owned(),
+                endpoint_label: "test endpoint",
+            },
+            api_version: "1.45".to_owned(),
+            selected_context: None,
+            socket_path,
+        }
+    }
+
+    async fn request_headers(stream: &mut tokio::net::UnixStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream
+                .read(&mut buffer)
+                .await
+                .expect("request should be readable");
+            assert_ne!(count, 0, "client should send HTTP headers");
+            request.extend_from_slice(&buffer[..count]);
+        }
+        assert!(
+            request.starts_with(
+                b"GET /v1.45/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D HTTP/1.1\r\n"
+            ),
+            "event subscription must filter to container events"
+        );
+    }
+
+    fn cleanup(socket_path: &std::path::Path, directory: &std::path::Path) {
+        std::fs::remove_file(socket_path).expect("socket should be removed");
+        std::fs::remove_dir(directory).expect("temporary directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn parses_split_jsonl_events_incrementally_and_skips_irrelevant_types() {
+        let directory = temporary_directory();
+        let socket_path = directory.join("engine.sock");
+        let listener = UnixListener::bind(&socket_path).expect("Unix socket should bind");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            request_headers(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("event response headers should be written");
+            for part in [
+                br#"{"Type":"network","Action":"connect","Actor":{"ID":"ignored"}}"#.as_slice(),
+                b"\n",
+                br#"{"Type":"container","Action":"start","Actor":{"ID":"cont"#.as_slice(),
+                br#"ainer-42"}}"#.as_slice(),
+                b"\n",
+            ] {
+                let chunk = format!("{:X}\r\n", part.len());
+                stream
+                    .write_all(chunk.as_bytes())
+                    .await
+                    .expect("chunk header should be written");
+                stream
+                    .write_all(part)
+                    .await
+                    .expect("event fragment should be written");
+                stream
+                    .write_all(b"\r\n")
+                    .await
+                    .expect("chunk terminator should be written");
+            }
+            stream
+                .write_all(b"0\r\n\r\n")
+                .await
+                .expect("chunked stream should finish");
+        });
+
+        let mut changes = client(socket_path.clone())
+            .subscribe_container_changes()
+            .await
+            .expect("event subscription should start");
+        let change = changes
+            .next_change()
+            .await
+            .expect("event line should parse")
+            .expect("container event should be emitted");
+        assert_eq!(change.container_id, "container-42");
+        assert_eq!(
+            changes.next_change().await.expect("stream should finish"),
+            None
+        );
+        server.await.expect("fixture server should finish");
+        cleanup(&socket_path, &directory);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_jsonl_line_over_the_size_limit() {
+        let directory = temporary_directory();
+        let socket_path = directory.join("engine.sock");
+        let listener = UnixListener::bind(&socket_path).expect("Unix socket should bind");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            request_headers(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65538\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("event response headers should be written");
+            let mut oversized_line = vec![b' '; 65 * 1024 + 1];
+            oversized_line.push(b'\n');
+            stream
+                .write_all(&oversized_line)
+                .await
+                .expect("oversized event line should be written");
+        });
+
+        let mut changes = client(socket_path.clone())
+            .subscribe_container_changes()
+            .await
+            .expect("event subscription should start");
+        let error = changes
+            .next_change()
+            .await
+            .expect_err("oversized event line should fail");
+        assert!(matches!(
+            error,
+            EngineError::ContainerEventsInterrupted {
+                endpoint_label: "test endpoint"
+            }
+        ));
+        server.await.expect("fixture server should finish");
+        cleanup(&socket_path, &directory);
+    }
+
+    #[tokio::test]
+    async fn dropping_event_stream_cancels_the_http_body() {
+        let directory = temporary_directory();
+        let socket_path = directory.join("engine.sock");
+        let listener = UnixListener::bind(&socket_path).expect("Unix socket should bind");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            request_headers(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n")
+                .await
+                .expect("event response headers should be written");
+            let mut response = [0; 1];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read(&mut response),
+            )
+            .await
+            .expect("dropping stream should promptly cancel response body")
+            .expect("socket read should succeed")
+        });
+
+        let changes = client(socket_path.clone())
+            .subscribe_container_changes()
+            .await
+            .expect("event subscription should start");
+        drop(changes);
+        assert_eq!(server.await.expect("fixture server should finish"), 0);
+        cleanup(&socket_path, &directory);
+    }
+    #[test]
+    fn rejects_oversized_aggregated_event_frames() {
+        let mut pending = Vec::new();
+        let frame = vec![b' '; MAX_EVENT_FRAME_BYTES + 1];
+        assert!(process_event_data(&mut pending, &frame).is_err());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn rejects_container_events_without_a_nonempty_id() {
+        assert!(parse_container_event(br#"{"Type":"container","Actor":{"ID":""}}"#).is_err());
+        assert!(parse_container_event(br#"{"Type":"container","Actor":{}}"#).is_err());
     }
 }
 

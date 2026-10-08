@@ -23,4 +23,8 @@ cargo doc --workspace --no-deps
 mdbook build docs
 ```
 
-A read-only live engine smoke test is available with `cargo test -p ferrum-engine --test live_engine -- --ignored`; it requires an accessible local Docker-compatible engine and does not mutate resources.
+The read-only live inventory test requires an exact filter:
+`cargo test -p ferrum-engine --test live_engine local_engine_returns_a_well_formed_container_inventory -- --exact --ignored`.
+A separate ignored lifecycle test mutates one owned disposable container and
+requires `FERRUM_TEST_IMAGE`; see the testing guide. Do not run all ignored
+live tests together.

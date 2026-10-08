@@ -11,31 +11,29 @@ cargo doc --workspace --no-deps
 mdbook build docs
 ```
 
-The default suite does not require a host engine. Ignored live tests read engine
-version and inventory; the general local-engine test also inspects one existing
-container without mutating resources. Run it only on a host with an accessible
-Docker-compatible engine and at least one container:
+The default suite does not require a host engine. Ignored live-engine tests for
+version, inventory, and Docker CLI contexts are read-only. The general
+local-engine inventory test may inspect an existing container; these tests do
+not mutate resources.
+
+The lifecycle integration test is a separate opt-in, ignored test and mutates
+the engine by creating one disposable container and exercising its lifecycle.
+It requires `FERRUM_TEST_IMAGE` to name an image already present locally that
+contains `/bin/sleep`. The test never pulls an image. A manual prerequisite, if
+needed, is to pull a suitable image yourself, for example:
 
 ```sh
-cargo test -p ferrum-engine --test live_engine local_engine_returns_a_well_formed_container_inventory -- --ignored
+docker pull busybox:1.37.0
 ```
 
-An ignored integration test also connects to the Docker CLI's current local
-Unix context:
+Run only the exact ignored lifecycle test (the default suite skips it):
 
 ```sh
-cargo test -p ferrum-engine --test live_engine current_local_docker_context_connects_and_returns_a_valid_inventory -- --exact --ignored
+FERRUM_TEST_IMAGE=busybox:1.37.0 cargo test -p ferrum-engine --test live_engine local_engine_lifecycle_actions_emit_events_and_update_state -- --exact --ignored
 ```
 
-To verify selection of a different, non-current context, set
-`FERRUM_TEST_DOCKER_CONTEXT` to an existing local Unix-socket context name:
+The test creates one uniquely named container with `--pull never`, `--network none`, no host mounts, and no published ports. It uses the full ID from the Docker create response/cidfile as its only cleanup authority. On failure, best-effort cleanup may force-remove only that validated ID; it never removes volumes. The successful EngineClient Remove action is exercised after stopping the container and does not force-remove or delete volumes. Run only against a disposable local engine.
 
-```sh
-FERRUM_TEST_DOCKER_CONTEXT=my-local-context cargo test -p ferrum-engine --test live_engine named_noncurrent_local_docker_context_connects_and_returns_a_valid_inventory -- --exact --ignored
-```
-
-The Docker-context tests require the Docker CLI; the non-current test also
-requires that its named context be local and reachable. Podman/rootless behavior
-and remote TLS/SSH policy remain open in
-[issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10). Windows named
-pipes and macOS remain deferred to issue #21/M8.
+The engine integration targets Linux local Unix sockets. Podman/rootless
+behavior remains unvalidated, remote transports remain unsupported, and Windows
+named pipes and macOS remain deferred to issue #21/M8.
