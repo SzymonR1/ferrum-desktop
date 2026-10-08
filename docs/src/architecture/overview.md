@@ -8,7 +8,7 @@ flowchart LR
     APP --> CORE[Engine-independent domain]
     APP --> CLIENT[EngineClient]
     CLIENT --> BOLLARD[Bollard API client]
-    BOLLARD --> SOCKET[Local Unix socket or named pipe]
+    BOLLARD --> SOCKET[Local Linux Unix socket]
     SOCKET --> ENGINE[Docker-compatible engine]
     APP -->|bounded async event channel| UI
 ```
@@ -17,6 +17,6 @@ Connection and list requests run in a Tokio task. Results arrive through a bound
 
 ## Current limits
 
-The first adapter supports local Unix sockets and the default local named-pipe path. On Unix, it honors an explicitly configured local `DOCKER_HOST`; otherwise it tries the XDG runtime Docker socket and the conventional Docker socket. It does not parse Docker contexts, use remote transports, or claim Podman parity. These are tracked in [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10) and [issue #11](https://github.com/SzymonR1/ferrum-desktop/issues/11).
+The first adapter is Linux-only and uses local Unix sockets. It honors a local `DOCKER_HOST`; otherwise it tries the XDG runtime Docker socket and the conventional Docker socket. Windows/macOS engine support is deferred, while Docker contexts, remote transports, and Podman parity remain future work. See [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10), [issue #11](https://github.com/SzymonR1/ferrum-desktop/issues/11), and [issue #21](https://github.com/SzymonR1/ferrum-desktop/issues/21).
 
 See the [architecture decisions](decisions.md) for framework and transport tradeoffs.

@@ -4,7 +4,7 @@
 
 ## Trust boundaries
 
-Ferrum runs as the logged-in desktop user and communicates with a Docker-compatible engine through a local socket or named pipe. Access to a Docker socket is effectively host-level control; a read-only GUI screen does not make the endpoint unprivileged. Engine responses, container names, image references, state strings, and status text are untrusted input.
+Ferrum runs as the logged-in desktop user and communicates with a Docker-compatible engine through a local Linux Unix socket. Access to a Docker socket is effectively host-level control; a read-only GUI screen does not make the endpoint unprivileged. Windows/macOS engine APIs are not implemented here. Engine responses, container names, image references, state strings, and status text are untrusted input.
 
 ## Current mitigations
 

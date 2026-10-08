@@ -2,7 +2,7 @@
 
 ## Development setup
 
-Install the stable Rust toolchain and the native GUI development libraries for your platform. See the [build guide](docs/src/developer-guide/building.md).
+Install the stable Rust toolchain and Linux native GUI development libraries. See the [build guide](docs/src/developer-guide/building.md). This slice implements Linux only; Windows/macOS work is deferred to the cross-platform milestone.
 
 ## Workflow
 

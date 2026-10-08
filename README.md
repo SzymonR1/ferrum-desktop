@@ -25,10 +25,11 @@ cargo build --workspace
 cargo run -p ferrum-app
 ```
 
-The app uses `DOCKER_HOST` when it selects a local Unix socket or named pipe.
-Without it, Unix builds try `$XDG_RUNTIME_DIR/docker.sock` and
-`/var/run/docker.sock`. Remote TCP, HTTP, TLS, SSH, Docker contexts, and Podman
-compatibility are not enabled in this first slice.
+The current engine adapter targets Linux and uses local Unix sockets.
+`DOCKER_HOST`, when set, must identify a local Unix socket. Otherwise the app
+tries `$XDG_RUNTIME_DIR/docker.sock` and `/var/run/docker.sock`. Windows and
+macOS are intentionally out of scope for this slice; remote endpoints, Docker
+contexts, and Podman compatibility are also deferred.
 
 ## Checks
 

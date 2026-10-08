@@ -1,6 +1,6 @@
 # Security policy
 
-Ferrum treats access to a Docker-compatible engine socket or named pipe as privileged. The application must not elevate privileges, relax socket permissions, store plaintext credentials, or send remote engine traffic without explicit secure transport and identity validation.
+Ferrum treats access to a Linux Docker-compatible Unix socket as privileged. Windows/macOS engine integration is outside the current scope. The application must not elevate privileges, relax socket permissions, store plaintext credentials, or send remote engine traffic without explicit secure transport and identity validation.
 
 ## Reporting a vulnerability
 

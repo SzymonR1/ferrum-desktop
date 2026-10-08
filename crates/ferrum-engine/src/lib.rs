@@ -2,15 +2,19 @@
 
 //! Docker-compatible API access kept separate from Ferrum's UI and domain model.
 
-use std::{env, path::PathBuf, time::Duration};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
-use bollard::{
-    API_DEFAULT_VERSION, Docker, errors::Error as BollardError,
-    query_parameters::ListContainersOptions,
-};
+#[cfg(target_os = "linux")]
+use std::{env, path::PathBuf};
+
+#[cfg(target_os = "linux")]
+use bollard::API_DEFAULT_VERSION;
+use bollard::{Docker, errors::Error as BollardError, query_parameters::ListContainersOptions};
 use ferrum_core::{ContainerState, ContainerSummary};
 use thiserror::Error;
 
+#[cfg(target_os = "linux")]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Version information reported by the connected engine.
@@ -32,9 +36,12 @@ pub enum EngineError {
         "No local Docker socket was found. Start Docker Engine or set DOCKER_HOST to a local Unix socket."
     )]
     NoLocalSocket,
+    /// Engine connectivity is intentionally unsupported outside Linux in this release.
+    #[error("Ferrum currently supports Linux local-engine connections only.")]
+    UnsupportedPlatform,
     /// The configured endpoint requires an unimplemented remote transport.
     #[error(
-        "This build supports local Unix sockets and Windows named pipes only; remote TCP, HTTP, TLS, and SSH endpoints are not enabled."
+        "This Linux build supports local Unix sockets only; remote TCP, HTTP, TLS, and SSH endpoints are not enabled."
     )]
     UnsupportedRemoteTransport,
     /// A configured endpoint or socket path cannot be represented safely.
@@ -94,39 +101,44 @@ pub struct EngineClient {
 }
 
 impl EngineClient {
-    /// Connects to an explicitly configured local socket or discovers common
-    /// local Docker sockets. Remote transports are rejected in this build.
+    /// Connects to a local Docker-compatible engine on Linux. Remote transports
+    /// and non-Linux engine support are out of scope for this implementation.
     ///
-    /// `DOCKER_HOST`, when set, takes precedence. On Unix, the default search
-    /// checks `$XDG_RUNTIME_DIR/docker.sock` before `/var/run/docker.sock`.
-    /// All API requests have an eight-second timeout. Socket permissions are
-    /// left to the operating system; this method never elevates privileges.
+    /// `DOCKER_HOST`, when set, must identify a local Unix socket. Otherwise
+    /// the default search checks `$XDG_RUNTIME_DIR/docker.sock` before
+    /// `/var/run/docker.sock`. All API requests have an eight-second timeout.
+    /// Socket permissions are left to the operating system; this method never
+    /// elevates privileges.
     ///
     /// # Errors
     ///
-    /// Returns a typed error when no socket is found, the endpoint is
-    /// unsupported/unreachable, API negotiation fails, or version data is
-    /// missing.
+    /// Returns a typed error for unsupported platforms/endpoints, missing or
+    /// inaccessible sockets, failed API negotiation, or incomplete version data.
     pub async fn connect_default() -> Result<Self, EngineError> {
-        if let Some(host) = env::var_os("DOCKER_HOST") {
-            let host = host
-                .into_string()
-                .map_err(|_| EngineError::InvalidEndpointEncoding)?;
-            if is_remote_endpoint(&host) {
-                return Err(EngineError::UnsupportedRemoteTransport);
-            }
-
-            let endpoint_label = configured_endpoint_label(&host);
-            let docker =
-                Docker::connect_with_defaults().map_err(|source| EngineError::Unavailable {
-                    endpoint_label,
-                    source,
-                })?;
-            return Self::from_client(docker, endpoint_label).await;
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(EngineError::UnsupportedPlatform);
         }
 
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
+            if let Some(host) = env::var_os("DOCKER_HOST") {
+                let host = host
+                    .into_string()
+                    .map_err(|_| EngineError::InvalidEndpointEncoding)?;
+                if is_remote_endpoint(&host) {
+                    return Err(EngineError::UnsupportedRemoteTransport);
+                }
+
+                let endpoint_label = configured_endpoint_label(&host);
+                let docker =
+                    Docker::connect_with_defaults().map_err(|source| EngineError::Unavailable {
+                        endpoint_label,
+                        source,
+                    })?;
+                return Self::from_client(docker, endpoint_label).await;
+            }
+
             let mut last_error = None;
             let mut found_socket = false;
 
@@ -150,17 +162,6 @@ impl EngineClient {
             }
 
             Err(EngineError::NoLocalSocket)
-        }
-
-        #[cfg(windows)]
-        {
-            let endpoint_label = "default Windows named pipe";
-            let docker =
-                Docker::connect_with_defaults().map_err(|source| EngineError::Unavailable {
-                    endpoint_label,
-                    source,
-                })?;
-            Self::from_client(docker, endpoint_label).await
         }
     }
 
@@ -198,6 +199,7 @@ impl EngineClient {
             .collect()
     }
 
+    #[cfg(target_os = "linux")]
     async fn connect_unix_socket(
         path: &std::path::Path,
         endpoint_label: &'static str,
@@ -212,6 +214,7 @@ impl EngineClient {
         Self::from_client(docker, endpoint_label).await
     }
 
+    #[cfg(target_os = "linux")]
     async fn from_client(
         docker: Docker,
         endpoint_label: &'static str,
@@ -251,7 +254,7 @@ impl EngineClient {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn local_socket_candidates() -> Vec<(&'static str, PathBuf)> {
     let mut candidates = Vec::with_capacity(2);
     if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR") {
@@ -266,16 +269,16 @@ fn local_socket_candidates() -> Vec<(&'static str, PathBuf)> {
     ));
     candidates
 }
+#[cfg(target_os = "linux")]
 fn configured_endpoint_label(host: &str) -> &'static str {
     if host.starts_with("unix://") {
         "configured Unix socket"
-    } else if host.starts_with("npipe://") {
-        "configured Windows named pipe"
     } else {
-        "configured local endpoint"
+        "configured endpoint"
     }
 }
 
+#[cfg(target_os = "linux")]
 fn is_remote_endpoint(host: &str) -> bool {
     ["tcp://", "http://", "https://", "ssh://"]
         .iter()

@@ -1,10 +1,5 @@
 [graph]
-targets = [
-    "x86_64-unknown-linux-gnu",
-    "x86_64-pc-windows-msvc",
-    "x86_64-apple-darwin",
-    "aarch64-apple-darwin",
-]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [advisories]
 version = 2
@@ -23,10 +18,8 @@ allow = [
 ]
 confidence-threshold = 0.8
 
-# These package-specific exceptions correspond to their distributed license texts.
+# The font package includes its license text.
 exceptions = [
-    { crate = "clipboard-win", allow = ["BSL-1.0"] },
-    { crate = "error-code", allow = ["BSL-1.0"] },
     { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
 ]
 

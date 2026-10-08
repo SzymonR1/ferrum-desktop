@@ -29,12 +29,8 @@ jobs:
         run: cargo fmt --all -- --check
 
   rust:
-    name: Rust checks (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+    name: Rust checks (Linux)
+    runs-on: ubuntu-latest
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -44,10 +40,10 @@ jobs:
           toolchain: stable
           components: clippy
       - name: Install Linux GUI development headers
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
+            desktop-file-utils \
             libgl1-mesa-dev \
             libwayland-dev \
             libx11-dev \
@@ -64,6 +60,8 @@ jobs:
         run: cargo test --workspace
       - name: Build workspace
         run: cargo build --workspace
+      - name: Validate Linux desktop entry
+        run: desktop-file-validate packaging/linux/com.ferrum.desktop
       - name: Build Rust documentation
         run: cargo doc --workspace --no-deps
 
