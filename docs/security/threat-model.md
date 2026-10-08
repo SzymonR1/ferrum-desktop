@@ -20,7 +20,7 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 
 ## Deferred attack surfaces
 
-- Docker contexts and remote TLS/SSH trust, credentials, and identity validation.
+- Linux local Unix-socket Docker CLI context selection is session-only; endpoint paths remain private. Remote TLS/SSH trust, credentials, and identity validation remain deferred.
 - Podman API compatibility and rootless endpoint discovery.
 - Container lifecycle confirmations and synchronization.
 - Engine log output and terminal escape sequences.
