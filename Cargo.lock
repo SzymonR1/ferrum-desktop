@@ -1072,6 +1072,8 @@ version = "0.1.0"
 dependencies = [
  "bollard",
  "ferrum-core",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -3151,6 +3153,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

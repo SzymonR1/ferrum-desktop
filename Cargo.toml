@@ -16,7 +16,8 @@ version = "0.1.0"
 bollard = { version = "0.21.1", default-features = false, features = ["pipe"] }
 eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 thiserror = "2.0"
-tokio = { version = "1.0", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.0", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
 serde = { version = "1.0", features = ["derive"] }

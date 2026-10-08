@@ -20,6 +20,17 @@ cargo run -p ferrum-app
 
 `packaging/linux/com.ferrum.desktop` is launcher metadata only; it assumes `ferrum` is on `PATH` and is not installed by the build commands.
 
-The Linux adapter uses `DOCKER_HOST` when it selects a local Unix socket. Otherwise it tries `$XDG_RUNTIME_DIR/docker.sock` and `/var/run/docker.sock`. Windows/macOS, named pipes, remote TCP/HTTP/TLS/SSH, and Docker context selection are deferred.
+The Linux adapter preserves `DOCKER_HOST` local-Unix behavior and automatic
+socket discovery. Docker CLI contexts are also listed for session-only selection;
+`DOCKER_CONTEXT` takes precedence over `DOCKER_HOST`, followed by a non-default
+current local context and then automatic local socket discovery. Only context
+endpoints using local Unix sockets are supported. Remote TCP/HTTP/TLS/SSH
+contexts are rejected. Windows named pipes and macOS support remain deferred to
+[issue #21](https://github.com/SzymonR1/ferrum-desktop/issues/21) and M8.
+Context-selection work is a slice of [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10),
+which remains open for Podman/rootless validation and remote TLS/SSH policy.
+
+Context listing and switching require the Docker CLI. Ferrum's direct local
+socket connection and automatic discovery do not require the CLI.
 
 If no engine is reachable, Ferrum opens and displays a connection diagnostic. An empty inventory is shown only after a successful engine response.

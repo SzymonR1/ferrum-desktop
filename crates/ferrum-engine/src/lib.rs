@@ -2,11 +2,18 @@
 
 //! Docker-compatible API access kept separate from Ferrum's UI and domain model.
 
-#[cfg(target_os = "linux")]
-use std::time::Duration;
+mod contexts;
+
+pub use contexts::{ContextTransport, DockerContext};
 
 #[cfg(target_os = "linux")]
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, time::Duration};
+
+#[cfg(target_os = "linux")]
+use contexts::{
+    ContextCommandError, StartupSource, current_cli_context, discover_contexts,
+    resolve_startup_source, valid_context_name,
+};
 
 #[cfg(target_os = "linux")]
 use bollard::API_DEFAULT_VERSION;
@@ -44,6 +51,27 @@ pub enum EngineError {
         "This Linux build supports local Unix sockets only; remote TCP, HTTP, TLS, and SSH endpoints are not enabled."
     )]
     UnsupportedRemoteTransport,
+    /// Docker CLI context discovery is required but unavailable.
+    #[error(
+        "Docker CLI contexts could not be read. Install Docker CLI or check its context configuration."
+    )]
+    ContextCatalogUnavailable,
+    /// The requested context is not present in the validated Docker CLI catalog.
+    #[error("Docker context not found. Choose a context reported by the Docker CLI.")]
+    UnknownContext,
+    /// The selected context uses a transport Ferrum does not support.
+    #[error(
+        "This Linux build supports local Unix-socket Docker contexts only; remote TCP, HTTP, TLS, and SSH contexts are not enabled."
+    )]
+    UnsupportedContextTransport,
+    /// The selected context does not contain a usable local Unix socket endpoint.
+    #[error("The selected Docker context does not provide a valid local Unix socket endpoint.")]
+    InvalidContextEndpoint,
+    /// The selected context could not return its container inventory.
+    #[error(
+        "The selected Docker context could not return its container inventory. Check its engine health and access permissions."
+    )]
+    ContextInventoryRequest,
     /// A configured endpoint or socket path cannot be represented safely.
     #[error(
         "The configured local engine endpoint is not valid UTF-8 and cannot be passed to the Docker API client."
@@ -98,15 +126,17 @@ pub enum EngineError {
 pub struct EngineClient {
     docker: Docker,
     info: EngineInfo,
+    selected_context: Option<String>,
 }
 
 impl EngineClient {
     /// Connects to a local Docker-compatible engine on Linux. Remote transports
     /// and non-Linux engine support are out of scope for this implementation.
     ///
-    /// `DOCKER_HOST`, when set, must identify a local Unix socket. Otherwise
-    /// the default search checks `$XDG_RUNTIME_DIR/docker.sock` before
-    /// `/var/run/docker.sock`. All API requests have an eight-second timeout.
+    /// A non-empty `DOCKER_CONTEXT` takes precedence and must name a local
+    /// Unix-socket context. Otherwise `DOCKER_HOST` retains its existing local
+    /// Unix-socket behavior; absent that, a current non-default CLI context is
+    /// used before checking `$XDG_RUNTIME_DIR/docker.sock` and `/var/run/docker.sock`.
     /// Socket permissions are left to the operating system; this method never
     /// elevates privileges.
     ///
@@ -122,21 +152,77 @@ impl EngineClient {
 
         #[cfg(target_os = "linux")]
         {
-            if let Some(host) = env::var_os("DOCKER_HOST") {
-                let host = host
-                    .into_string()
-                    .map_err(|_| EngineError::InvalidEndpointEncoding)?;
-                if is_remote_endpoint(&host) {
-                    return Err(EngineError::UnsupportedRemoteTransport);
+            let docker_context = env::var_os("DOCKER_CONTEXT")
+                .map(|value| value.into_string())
+                .transpose()
+                .map_err(|_| EngineError::InvalidEndpointEncoding)?;
+            let docker_host = env::var_os("DOCKER_HOST")
+                .map(|value| value.into_string())
+                .transpose()
+                .map_err(|_| EngineError::InvalidEndpointEncoding)?;
+            let contexts = if docker_context
+                .as_deref()
+                .is_some_and(|name| !name.is_empty())
+            {
+                Some(
+                    discover_contexts()
+                        .await
+                        .map_err(|_| EngineError::ContextCatalogUnavailable)?,
+                )
+            } else if docker_host.as_deref().is_none_or(str::is_empty) {
+                match discover_contexts().await {
+                    Ok(contexts) => Some(contexts),
+                    Err(ContextCommandError::CliUnavailable) => None,
+                    Err(_) => return Err(EngineError::ContextCatalogUnavailable),
                 }
-
-                let endpoint_label = configured_endpoint_label(&host);
-                let docker =
-                    Docker::connect_with_defaults().map_err(|source| EngineError::Unavailable {
-                        endpoint_label,
-                        source,
+            } else {
+                None
+            };
+            let current = if docker_context
+                .as_deref()
+                .is_some_and(|name| !name.is_empty())
+                || docker_host.as_deref().is_some_and(|host| !host.is_empty())
+            {
+                None
+            } else if let Some(contexts) = contexts.as_deref() {
+                Some(
+                    current_cli_context(contexts)
+                        .map_err(|_| EngineError::ContextCatalogUnavailable)?,
+                )
+            } else {
+                None
+            };
+            match resolve_startup_source(docker_context.as_deref(), docker_host.as_deref(), current)
+            {
+                StartupSource::ExplicitContext => {
+                    return Self::connect_catalog_context(
+                        contexts
+                            .as_deref()
+                            .ok_or(EngineError::ContextCatalogUnavailable)?,
+                        docker_context.as_deref().unwrap_or_default(),
+                    )
+                    .await;
+                }
+                StartupSource::CurrentContext => {
+                    if let Some(current) = current {
+                        return Self::connect_context_record(current).await;
+                    }
+                }
+                StartupSource::DockerHost => {
+                    let host = docker_host.as_deref().unwrap_or_default();
+                    if is_remote_endpoint(host) {
+                        return Err(EngineError::UnsupportedRemoteTransport);
+                    }
+                    let endpoint_label = configured_endpoint_label(host);
+                    let docker = Docker::connect_with_defaults().map_err(|source| {
+                        EngineError::Unavailable {
+                            endpoint_label,
+                            source,
+                        }
                     })?;
-                return Self::from_client(docker, endpoint_label).await;
+                    return Self::from_client(docker, endpoint_label).await;
+                }
+                StartupSource::DefaultDiscovery => {}
             }
 
             let mut last_error = None;
@@ -165,10 +251,88 @@ impl EngineClient {
         }
     }
 
+    /// Lists Docker CLI contexts without exposing their endpoint data.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe error if the Docker CLI is unavailable or cannot provide
+    /// a valid context catalog.
+    pub async fn available_contexts() -> Result<Vec<DockerContext>, EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            discover_contexts()
+                .await
+                .map_err(|_| EngineError::ContextCatalogUnavailable)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
+
+    /// Connects to one named Docker CLI context when it uses a local Unix socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe error when Docker CLI is unavailable, the context name is
+    /// unknown, its transport is unsupported, or its engine cannot be reached.
+    pub async fn connect_context(name: &str) -> Result<Self, EngineError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = name;
+            return Err(EngineError::UnsupportedPlatform);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if !valid_context_name(name) {
+                return Err(EngineError::UnknownContext);
+            }
+            let contexts = discover_contexts()
+                .await
+                .map_err(|_| EngineError::ContextCatalogUnavailable)?;
+            Self::connect_catalog_context(&contexts, name).await
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn connect_catalog_context(
+        contexts: &[DockerContext],
+        name: &str,
+    ) -> Result<Self, EngineError> {
+        let context = contexts
+            .iter()
+            .find(|context| context.name() == name)
+            .ok_or(EngineError::UnknownContext)?;
+        Self::connect_context_record(context).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn connect_context_record(context: &DockerContext) -> Result<Self, EngineError> {
+        match context.transport() {
+            ContextTransport::LocalUnix => {}
+            ContextTransport::Unsupported => {
+                return Err(EngineError::UnsupportedContextTransport);
+            }
+            ContextTransport::Invalid => return Err(EngineError::InvalidContextEndpoint),
+        }
+        let path = context
+            .socket_path()
+            .ok_or(EngineError::InvalidContextEndpoint)?;
+        let mut client = Self::connect_unix_socket(path, "selected Docker context").await?;
+        client.selected_context = Some(context.name().to_owned());
+        Ok(client)
+    }
+
     /// Returns server version details captured during connection.
     #[must_use]
     pub fn info(&self) -> &EngineInfo {
         &self.info
+    }
+
+    /// Returns the selected Docker CLI context name, if one is active.
+    #[must_use]
+    pub fn selected_context_name(&self) -> Option<&str> {
+        self.selected_context.as_deref()
     }
 
     /// Returns every container, including stopped containers, from the
@@ -188,9 +352,15 @@ impl EngineClient {
             .docker
             .list_containers(Some(options))
             .await
-            .map_err(|source| EngineError::InventoryRequest {
-                endpoint_label,
-                source,
+            .map_err(|source| {
+                if self.selected_context.is_some() {
+                    EngineError::ContextInventoryRequest
+                } else {
+                    EngineError::InventoryRequest {
+                        endpoint_label,
+                        source,
+                    }
+                }
             })?;
 
         containers
@@ -250,6 +420,7 @@ impl EngineClient {
                 api_version,
                 endpoint_label,
             },
+            selected_context: None,
         })
     }
 }
@@ -312,4 +483,34 @@ fn map_container(
         state,
         status: container.status,
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod context_selection_tests {
+    use super::*;
+    use crate::contexts::parse_context_records;
+
+    #[tokio::test]
+    async fn unknown_named_context_is_reported_without_connecting() {
+        let catalog = parse_context_records(
+            "{\"Name\":\"default\",\"Current\":true,\"DockerEndpoint\":\"unix:///tmp/unused.sock\"}",
+        )
+        .expect("the context catalog should parse");
+        assert!(matches!(
+            EngineClient::connect_catalog_context(&catalog, "missing").await,
+            Err(EngineError::UnknownContext)
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_contexts_are_rejected_without_fallback() {
+        let catalog = parse_context_records(
+            "{\"Name\":\"remote\",\"Current\":true,\"DockerEndpoint\":\"tcp://engine.example:2376\"}",
+        )
+        .expect("the context catalog should parse");
+        assert!(matches!(
+            EngineClient::connect_context_record(&catalog[0]).await,
+            Err(EngineError::UnsupportedContextTransport)
+        ));
+    }
 }
