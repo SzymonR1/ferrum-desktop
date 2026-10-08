@@ -2092,6 +2092,7 @@ mod event_reconciliation_tests {
             inspection.action_error.as_deref(),
             Some(expected_error.as_str())
         );
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn reconnect_resets_the_tail_and_preserves_search_filters() {
