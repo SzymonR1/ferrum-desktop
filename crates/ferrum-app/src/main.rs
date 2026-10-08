@@ -4,7 +4,7 @@ use std::{error::Error, time::Duration};
 
 use eframe::egui::{self, Color32, RichText};
 use ferrum_core::{ContainerState, ContainerSummary};
-use ferrum_engine::{EngineClient, EngineError, EngineInfo};
+use ferrum_engine::{ContextTransport, DockerContext, EngineClient, EngineError, EngineInfo};
 use tokio::{runtime::Runtime, sync::mpsc};
 use tracing_subscriber::EnvFilter;
 
@@ -49,6 +49,8 @@ enum ConnectionState {
 enum EngineEvent {
     Connected(Result<(EngineClient, EngineInfo, Vec<ContainerSummary>), EngineError>),
     Refreshed(Result<Vec<ContainerSummary>, EngineError>),
+    Contexts(Result<Vec<DockerContext>, EngineError>),
+    ContextSwitched(Result<(EngineClient, EngineInfo, Vec<ContainerSummary>), EngineError>),
 }
 
 struct FerrumApp {
@@ -61,6 +63,10 @@ struct FerrumApp {
     containers: Vec<ContainerSummary>,
     loading: bool,
     refresh_error: Option<String>,
+    contexts: Vec<DockerContext>,
+    selected_context: Option<String>,
+    context_error: Option<String>,
+    contexts_error: Option<String>,
     settings_store: settings::SettingsStore,
     settings: settings::Settings,
     settings_draft: settings::Settings,
@@ -105,12 +111,28 @@ impl FerrumApp {
             containers: Vec::new(),
             loading: false,
             refresh_error: None,
+            contexts: Vec::new(),
+            selected_context: None,
+            context_error: None,
+            contexts_error: None,
             settings_store,
             settings_draft: settings.clone(),
             settings,
             settings_open: false,
             settings_error,
         };
+        let context_sender = app.sender.clone();
+        let context = creation_context.egui_ctx.clone();
+        app.runtime.spawn(async move {
+            let contexts = EngineClient::available_contexts().await;
+            if context_sender
+                .send(EngineEvent::Contexts(contexts))
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        });
         if app.settings.auto_connect_on_startup {
             app.connect(creation_context.egui_ctx.clone());
         }
@@ -125,6 +147,7 @@ impl FerrumApp {
         self.loading = true;
         self.connection = ConnectionState::Connecting;
         self.refresh_error = None;
+        self.context_error = None;
         let sender = self.sender.clone();
         self.runtime.spawn(async move {
             let result = async {
@@ -146,6 +169,33 @@ impl FerrumApp {
             }
 
             if sender.send(EngineEvent::Connected(result)).await.is_ok() {
+                context.request_repaint();
+            }
+        });
+    }
+    fn switch_context(&mut self, selected: Option<String>, context: egui::Context) {
+        if self.loading {
+            return;
+        }
+        self.loading = true;
+        self.context_error = None;
+        let sender = self.sender.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                let engine = match selected.as_deref() {
+                    Some(name) => EngineClient::connect_context(name).await?,
+                    None => EngineClient::connect_default().await?,
+                };
+                let info = engine.info().clone();
+                let containers = engine.list_containers().await?;
+                Ok::<_, EngineError>((engine, info, containers))
+            }
+            .await;
+            if sender
+                .send(EngineEvent::ContextSwitched(result))
+                .await
+                .is_ok()
+            {
                 context.request_repaint();
             }
         });
@@ -184,30 +234,66 @@ impl FerrumApp {
 
     fn receive_events(&mut self) {
         while let Ok(event) = self.receiver.try_recv() {
-            self.loading = false;
             match event {
-                EngineEvent::Connected(Ok((engine, info, containers))) => {
-                    self.engine = Some(engine);
-                    self.engine_info = Some(info);
-                    self.containers = containers;
-                    self.connection = ConnectionState::Connected;
-                    self.refresh_error = None;
+                EngineEvent::Contexts(Ok(contexts)) => {
+                    self.contexts = contexts;
+                    self.contexts_error = None;
                 }
-                EngineEvent::Connected(Err(error)) => {
-                    self.engine = None;
-                    self.engine_info = None;
-                    self.containers.clear();
-                    self.connection = ConnectionState::Disconnected(error.to_string());
+                EngineEvent::Contexts(Err(error)) => {
+                    self.contexts.clear();
+                    self.contexts_error = Some(error.to_string());
                 }
-                EngineEvent::Refreshed(Ok(containers)) => {
-                    self.containers = containers;
-                    self.refresh_error = None;
+                EngineEvent::Connected(result) => {
+                    self.loading = false;
+                    match result {
+                        Ok((engine, info, containers)) => {
+                            self.apply_connection_success(engine, info, containers);
+                        }
+                        Err(error) => {
+                            self.engine = None;
+                            self.engine_info = None;
+                            self.containers.clear();
+                            self.selected_context = None;
+                            self.connection = ConnectionState::Disconnected(error.to_string());
+                        }
+                    }
                 }
-                EngineEvent::Refreshed(Err(error)) => {
-                    self.refresh_error = Some(error.to_string());
+                EngineEvent::ContextSwitched(result) => {
+                    self.loading = false;
+                    match result {
+                        Ok((engine, info, containers)) => {
+                            self.apply_connection_success(engine, info, containers);
+                        }
+                        Err(error) => self.context_error = Some(error.to_string()),
+                    }
+                }
+                EngineEvent::Refreshed(result) => {
+                    self.loading = false;
+                    match result {
+                        Ok(containers) => {
+                            self.containers = containers;
+                            self.refresh_error = None;
+                        }
+                        Err(error) => self.refresh_error = Some(error.to_string()),
+                    }
                 }
             }
         }
+    }
+
+    fn apply_connection_success(
+        &mut self,
+        engine: EngineClient,
+        info: EngineInfo,
+        containers: Vec<ContainerSummary>,
+    ) {
+        self.selected_context = engine.selected_context_name().map(str::to_owned);
+        self.engine = Some(engine);
+        self.engine_info = Some(info);
+        self.containers = containers;
+        self.connection = ConnectionState::Connected;
+        self.refresh_error = None;
+        self.context_error = None;
     }
 
     fn draw_sidebar(&self, ui: &mut egui::Ui) {
@@ -247,10 +333,11 @@ impl FerrumApp {
     }
 
     fn draw_header(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         refresh_requested: &mut bool,
         settings_requested: &mut bool,
+        context_requested: &mut Option<Option<String>>,
     ) {
         egui::Panel::top("header")
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 14)))
@@ -269,6 +356,56 @@ impl FerrumApp {
                             ui.colored_label(Color32::from_rgb(227, 113, 102), "Disconnected");
                         }
                     }
+                    ui.add_enabled_ui(!self.loading, |ui| {
+                        let selected_name = match self.selected_context.as_deref() {
+                            Some(name) => self
+                                .contexts
+                                .iter()
+                                .find(|context| context.name() == name)
+                                .map(DockerContext::display_name)
+                                .unwrap_or("Selected Docker context"),
+                            None => "Automatic local discovery",
+                        };
+                        egui::ComboBox::from_id_salt("docker-context-selector")
+                            .selected_text(selected_name)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_context.is_none(),
+                                        "Automatic local discovery",
+                                    )
+                                    .clicked()
+                                {
+                                    *context_requested = Some(None);
+                                }
+                                for context in &self.contexts {
+                                    let label = match context.transport() {
+                                        ContextTransport::LocalUnix => {
+                                            context.display_name().to_owned()
+                                        }
+                                        ContextTransport::Unsupported => {
+                                            format!(
+                                                "{} (unsupported transport)",
+                                                context.display_name()
+                                            )
+                                        }
+                                        ContextTransport::Invalid => {
+                                            format!("{} (invalid endpoint)", context.display_name())
+                                        }
+                                    };
+                                    let response = ui.add_enabled(
+                                        context.transport() == ContextTransport::LocalUnix,
+                                        egui::Button::new(label).selected(
+                                            self.selected_context.as_deref()
+                                                == Some(context.name()),
+                                        ),
+                                    );
+                                    if response.clicked() {
+                                        *context_requested = Some(Some(context.name().to_owned()));
+                                    }
+                                }
+                            });
+                    });
                     if let Some(info) = &self.engine_info {
                         ui.separator();
                         ui.label("Docker-compatible API");
@@ -300,6 +437,26 @@ impl FerrumApp {
     }
 
     fn draw_inventory(&self, ui: &mut egui::Ui) {
+        if let Some(error) = &self.contexts_error {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    Color32::from_rgb(224, 174, 109),
+                    "Context selection unavailable",
+                );
+                ui.label("Automatic local socket discovery remains available.");
+            });
+            ui.label(error);
+            ui.add_space(10.0);
+        }
+        if let Some(error) = &self.context_error {
+            ui.horizontal(|ui| {
+                ui.colored_label(Color32::from_rgb(227, 113, 102), "Context switch failed");
+                ui.label("The previous engine connection and inventory are unchanged.");
+            });
+            ui.label(error);
+            ui.add_space(10.0);
+        }
+
         if let Some(error) = &self.refresh_error {
             ui.horizontal(|ui| {
                 ui.colored_label(Color32::from_rgb(227, 113, 102), "Refresh failed");
@@ -449,10 +606,21 @@ impl eframe::App for FerrumApp {
         self.receive_events();
         let context = ui.ctx().clone();
         self.draw_sidebar(ui);
-
         let mut refresh_requested = false;
         let mut settings_requested = false;
-        self.draw_header(ui, &mut refresh_requested, &mut settings_requested);
+
+        let mut context_requested = None;
+        self.draw_header(
+            ui,
+            &mut refresh_requested,
+            &mut settings_requested,
+            &mut context_requested,
+        );
+        if let Some(selected) = context_requested
+            && selected != self.selected_context
+        {
+            self.switch_context(selected, context.clone());
+        }
         if settings_requested {
             self.settings_draft = self.settings.clone();
             self.settings_open = true;
