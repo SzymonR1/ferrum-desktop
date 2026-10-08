@@ -38,11 +38,12 @@ Docker frames are limited to 1 MiB and lines to 64 KiB. Output is not written
 to disk or logged. Refresh reloads the selected tail and reapplies the current
 Follow setting. A clean EOF, such as a container stopping, ends the stream
 without an automatic retry. For request or stream failures, Follow retries at
-most three times per outage (250, 500, and 1000 ms); the retry budget resets
-only after a reconnect delivers at least one log line, not merely when the
-stream opens. After reconnect Ferrum reloads the recent tail and clears buffered
-rows to avoid duplicate replay. Closing the Logs view or inspection, switching
-engine context, or app teardown cancels the stream.
+most three times during the current Logs view session (250, 500, and 1000 ms).
+Replayed historical lines do not renew the budget. Clean EOF ends the stream
+without retry; after retry exhaustion, use Refresh to start a new bounded
+session. Reconnect reloads the recent tail and clears buffered rows to avoid
+duplicate replay. Closing the Logs view or inspection, switching engine
+context, or app teardown cancels the stream.
 
 ## Find and sort containers
 

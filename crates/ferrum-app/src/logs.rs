@@ -1,7 +1,27 @@
 use ferrum_core::{ContainerLogLine, ContainerLogSource};
 use std::collections::VecDeque;
+#[cfg(test)]
+use std::time::Duration;
 
-use crate::search::CaseInsensitiveQuery;
+use crate::{retry::RetryBudget, search::CaseInsensitiveQuery};
+
+/// Bounded automatic retries for one Logs view session.
+/// A manual refresh starts a new session with a fresh budget.
+#[derive(Default)]
+pub(super) struct LogRetryBudget {
+    budget: RetryBudget,
+}
+
+impl LogRetryBudget {
+    pub(super) async fn wait_next(&mut self) -> bool {
+        self.budget.wait_next().await
+    }
+
+    #[cfg(test)]
+    pub(super) fn next_delay(&mut self) -> Option<Duration> {
+        self.budget.next_delay()
+    }
+}
 
 const MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RETAINED_LINES: usize = 10_000;

@@ -1,12 +1,4 @@
 #[cfg(target_os = "linux")]
-async fn wait_for_event_retry(retries: &mut RetryBudget) -> bool {
-    let Some(delay) = retries.next_delay() else {
-        return false;
-    };
-    tokio::time::sleep(delay).await;
-    true
-}
-#[cfg(target_os = "linux")]
 async fn send_event_snapshot(
     engine: &EngineClient,
     sender: &mpsc::Sender<EngineEvent>,
@@ -51,7 +43,7 @@ use ferrum_core::{ContainerAction, ContainerDetails, ContainerState, ContainerSu
 use ferrum_engine::ContainerLogsOptions;
 use ferrum_engine::{ContextTransport, DockerContext, EngineClient, EngineError, EngineInfo};
 use inventory::InventoryView;
-use logs::LogBuffer;
+use logs::{LogBuffer, LogRetryBudget};
 use retry::RetryBudget;
 use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};
 use tracing_subscriber::EnvFilter;
@@ -707,7 +699,7 @@ impl FerrumApp {
         self.log_notice = Some("Loading container logs…".into());
         self.log_reconnected = false;
         self.log_task = Some(self.runtime.spawn(async move {
-            let mut retries = RetryBudget::default();
+            let mut retries = LogRetryBudget::default();
             let mut has_reconnected = false;
             loop {
                 let mut stream = match engine
@@ -735,8 +727,7 @@ impl FerrumApp {
                             context.request_repaint();
                             return;
                         }
-                        if let Some(delay) = retries.next_delay() {
-                            tokio::time::sleep(delay).await;
+                        if retries.wait_next().await {
                             has_reconnected = true;
                             continue;
                         }
@@ -753,7 +744,7 @@ impl FerrumApp {
                 let disconnect_error = loop {
                     match stream.next_line().await {
                         Ok(Some(line)) => {
-                            retries.reset();
+                            // The per-view budget is not renewed by replayed historical lines.
                             if sender
                                 .send(LogEvent::Line { generation, line })
                                 .await
@@ -788,8 +779,7 @@ impl FerrumApp {
                         }
                     }
                 };
-                if let Some(delay) = retries.next_delay() {
-                    tokio::time::sleep(delay).await;
+                if retries.wait_next().await {
                     has_reconnected = true;
                     continue;
                 }
@@ -858,7 +848,7 @@ impl FerrumApp {
                             break stream;
                         }
                         Err(_) => {
-                            if wait_for_event_retry(&mut retries).await {
+                            if retries.wait_next().await {
                                 continue;
                             }
                             let _ = sender
@@ -886,7 +876,7 @@ impl FerrumApp {
                         }
                         Ok(None) | Err(_) => {
                             let mut reconnected = false;
-                            while wait_for_event_retry(&mut retries).await {
+                            while retries.wait_next().await {
                                 if let Ok(new_stream) = engine.subscribe_container_changes().await {
                                     stream = new_stream;
                                     retries.reset();
@@ -1860,14 +1850,13 @@ mod log_retry_budget_tests {
     use super::*;
 
     #[test]
-    fn retries_are_bounded_and_reset_only_after_a_line_is_received() {
-        let mut retry = RetryBudget::default();
+    fn retries_are_bounded_for_one_view_and_refresh_starts_a_fresh_budget() {
+        let mut retry = logs::LogRetryBudget::default();
 
         assert_eq!(
             retry.next_delay(),
             Some(std::time::Duration::from_millis(250))
         );
-        // Opening another stream alone never resets the budget; only received data does.
         assert_eq!(
             retry.next_delay(),
             Some(std::time::Duration::from_millis(500))
@@ -1878,9 +1867,10 @@ mod log_retry_budget_tests {
         );
         assert_eq!(retry.next_delay(), None);
 
-        retry.reset();
+        // The view's retry budget is fixed; manual refresh starts a new task.
+        let mut refreshed = logs::LogRetryBudget::default();
         assert_eq!(
-            retry.next_delay(),
+            refreshed.next_delay(),
             Some(std::time::Duration::from_millis(250))
         );
     }

@@ -15,14 +15,14 @@ TTY output is raw combined data; stdout/stderr cannot be separated. Non-TTY data
 
 A frame is capped at 1 MiB and a line at 64 KiB. The app retains at most 8 MiB or 10,000 lines and discards oldest lines with a visible count. Delivery uses a dedicated bounded 16-message channel; the UI drains and batches messages. Output is neither persisted nor logged.
 
-Follow retries request/stream failures at most three times per outage, waiting
-250, 500, and 1000 ms. A clean EOF (for example, when a container stops) ends
-the stream without retrying. The retry budget resets only after a reconnect
-delivers at least one log line, not merely when an HTTP stream opens. Reconnect
-reloads the recent tail and clears buffered rows to avoid duplicate replay.
-Manual refresh reloads history with the current Follow setting. Closing the
-Logs view or inspection, changing engine context, or application teardown
-cancels the stream.
+Follow retries request/stream failures at most three times during one Logs
+view session, waiting 250, 500, and 1000 ms. Replayed historical lines do not
+renew the budget, so a persistent failing tail cannot restart retries
+indefinitely. A clean EOF (for example, when a container stops) ends the stream
+without retrying. After exhaustion, manual Refresh starts a fresh bounded
+session. Reconnect reloads the recent tail and clears buffered rows to avoid
+duplicate replay. Closing the Logs view or inspection, changing engine context,
+or application teardown cancels the stream.
 
 This decision applies only to local Unix-socket engines on Linux. It makes no support claim for remote engines, Podman/rootless, Windows, or macOS.
 

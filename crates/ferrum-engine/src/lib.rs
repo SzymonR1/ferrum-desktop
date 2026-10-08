@@ -1519,6 +1519,8 @@ mod container_inspection_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod container_logs_http_tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
     use ferrum_core::{ContainerLogLine, ContainerLogSource};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1526,13 +1528,14 @@ mod container_logs_http_tests {
     };
 
     fn temporary_directory() -> std::path::PathBuf {
+        let sequence = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "ferrum-logs-{}-{}",
+            "ferrum-logs-{}-{timestamp}-{sequence}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after the Unix epoch")
-                .as_nanos()
         ));
         std::fs::create_dir(&directory).expect("temporary directory should be created");
         directory

@@ -42,11 +42,11 @@ non-TTY streams use Docker's 8-byte multiplex frames to preserve stdout/stderr.
 The view is plain text, with a 1 MiB frame cap, 64 KiB line cap, and retention
 of at most 8 MiB or 10,000 lines. It discards oldest lines with a visible count
 and does not persist or log output. Follow retries request/stream failures at
-most three times per outage (250/500/1000 ms); clean EOF ends the stream without
-retrying. The budget resets only after a reconnect delivers a log line, not
-merely when its stream opens. Reconnect reloads recent history and clears
-buffered rows to avoid replay duplicates. Closing Logs or inspection, context
-switch, or app teardown cancels log streaming.
+most three times per Logs view session (250/500/1000 ms); replayed historical
+lines do not renew the budget. Clean EOF ends without retry; after exhaustion,
+manual Refresh starts a fresh bounded session. Reconnect reloads recent history
+and clears buffered rows to avoid replay duplicates. Closing Logs or inspection,
+context switch, or app teardown cancels log streaming.
 
 The inventory includes stopped containers. Filtering and sorting operate on
 application-owned summary values; inspection requests are issued on demand.
