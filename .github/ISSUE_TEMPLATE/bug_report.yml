@@ -1,0 +1,28 @@
+name: Bug report
+description: Report reproducible incorrect behavior
+labels: ["type:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include credentials, private keys, or sensitive engine endpoint data."
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: List the smallest safe steps that reproduce the behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include Ferrum version, OS/compositor, engine type/version, and support status. Redact secrets.
+    validations:
+      required: true

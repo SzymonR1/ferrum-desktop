@@ -1,0 +1,15 @@
+[package]
+name = "ferrum-engine"
+description = "Local Docker-compatible engine connectivity for Ferrum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bollard.workspace = true
+ferrum-core = { path = "../ferrum-core", version = "0.1.0" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

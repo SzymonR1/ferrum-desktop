@@ -1,0 +1,19 @@
+[package]
+name = "ferrum-app"
+description = "Ferrum's native Docker-compatible container manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ferrum"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+ferrum-core = { path = "../ferrum-core", version = "0.1.0" }
+ferrum-engine = { path = "../ferrum-engine", version = "0.1.0" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
