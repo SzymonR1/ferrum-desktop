@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use ferrum_engine::EngineClient;
+use ferrum_engine::{ContextTransport, DockerContext, EngineClient};
 
 #[tokio::test]
 #[ignore = "requires an accessible local Docker-compatible engine; reads version and inventory only"]
@@ -48,8 +48,6 @@ async fn local_engine_returns_a_well_formed_container_inventory() {
 #[tokio::test]
 #[ignore = "requires an accessible current local Docker CLI context; reads inventory only"]
 async fn current_local_docker_context_connects_and_returns_a_valid_inventory() {
-    use ferrum_engine::{ContextTransport, DockerContext};
-
     let contexts = EngineClient::available_contexts()
         .await
         .expect("Docker CLI context discovery should succeed");
@@ -57,12 +55,34 @@ async fn current_local_docker_context_connects_and_returns_a_valid_inventory() {
         .iter()
         .find(|context| context.is_current())
         .expect("Docker CLI should report its current context");
-    assert_eq!(current.transport(), ContextTransport::LocalUnix);
+    assert_context_connects_and_returns_a_valid_inventory(current).await;
+}
 
-    let engine = EngineClient::connect_context(current.name())
+#[tokio::test]
+#[ignore = "requires FERRUM_TEST_DOCKER_CONTEXT to name an accessible non-current local Docker context"]
+async fn named_noncurrent_local_docker_context_connects_and_returns_a_valid_inventory() {
+    let name = std::env::var("FERRUM_TEST_DOCKER_CONTEXT")
+        .expect("set FERRUM_TEST_DOCKER_CONTEXT to a non-current local context name");
+    let contexts = EngineClient::available_contexts()
         .await
-        .expect("the current local context should connect");
-    assert_eq!(engine.selected_context_name(), Some(current.name()));
+        .expect("Docker CLI context discovery should succeed");
+    let context = contexts
+        .iter()
+        .find(|context| context.name() == name.as_str())
+        .expect("Docker CLI should report the requested context");
+    assert!(
+        !context.is_current(),
+        "FERRUM_TEST_DOCKER_CONTEXT must identify a non-current context"
+    );
+    assert_context_connects_and_returns_a_valid_inventory(context).await;
+}
+
+async fn assert_context_connects_and_returns_a_valid_inventory(context: &DockerContext) {
+    assert_eq!(context.transport(), ContextTransport::LocalUnix);
+    let engine = EngineClient::connect_context(context.name())
+        .await
+        .expect("the selected local context should connect");
+    assert_eq!(engine.selected_context_name(), Some(context.name()));
     assert!(!engine.info().version.trim().is_empty());
     assert!(!engine.info().api_version.trim().is_empty());
     let inventory = engine
