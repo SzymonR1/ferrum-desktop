@@ -165,6 +165,28 @@ pub struct ContainerDetails {
     /// Mounts, when the engine reports the mount list. An empty list is distinct
     /// from an unavailable list.
     pub mounts: Option<Vec<ContainerMount>>,
+    /// Whether the container was created with a TTY, when reported by the engine.
+    pub tty: Option<bool>,
+}
+
+/// The output stream associated with a container log line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContainerLogSource {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+    /// Combined output, as used by containers created with a TTY.
+    Combined,
+}
+
+/// A complete line emitted by a container log stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContainerLogLine {
+    /// Stream that produced this line.
+    pub source: ContainerLogSource,
+    /// Log text without its line ending. Invalid UTF-8 is replaced lossily.
+    pub text: String,
 }
 
 /// Read-only information about a mount reported for a container.

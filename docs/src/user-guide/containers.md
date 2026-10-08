@@ -14,6 +14,36 @@ inspection is reloaded so state-gated actions do not remain stale. If bounded
 reconnection is exhausted, Ferrum reports event synchronization unavailable;
 use Refresh to request a newer inventory snapshot.
 
+## Container logs
+
+The inspection dialog provides a Logs view for historical output and optional
+live following. Logs are available only through the selected local Unix-socket
+Docker-compatible engine; remote engines, Podman/rootless, Windows, and macOS
+are not covered.
+
+Docker Engine exposes its logs endpoint only for the `json-file` and `journald`
+logging drivers. Unsupported-driver errors are reported safely without exposing
+the daemon response body.
+
+Choose a historical tail of 100, 500, 1000, or 5000 lines, toggle timestamps,
+and filter stdout/stderr. Search is case-insensitive and applies to lines
+currently retained by the view. Follow is enabled by default only when the
+inspected container is Running. For a TTY container, Docker combines output
+into a raw stream, so stdout/stderr cannot be separated; Ferrum displays the
+combined data as plain text and never as a terminal.
+
+The view is bounded to 8 MiB or 10,000 lines and discards oldest lines when
+those limits are reached, with a visible discarded-line count. Individual
+Docker frames are limited to 1 MiB and lines to 64 KiB. Output is not written
+to disk or logged. Refresh reloads the selected tail and reapplies the current
+Follow setting. A clean EOF, such as a container stopping, ends the stream
+without an automatic retry. For request or stream failures, Follow retries at
+most three times per outage (250, 500, and 1000 ms); the retry budget resets
+only after a reconnect delivers at least one log line, not merely when the
+stream opens. After reconnect Ferrum reloads the recent tail and clears buffered
+rows to avoid duplicate replay. Closing the Logs view or inspection, switching
+engine context, or app teardown cancels the stream.
+
 ## Find and sort containers
 
 Use the filter field to search case-insensitively across container name, ID,

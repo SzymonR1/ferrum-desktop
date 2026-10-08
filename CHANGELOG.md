@@ -11,3 +11,4 @@ All notable project changes are documented here. The project has not published a
 - Added Linux settings persistence for the startup auto-connect preference, with safe migration, private permissions, atomic replacement, and a settings window.
 - Added Linux Docker CLI context catalog and session-only selection for local Unix-socket contexts; remote contexts remain unsupported.
 - Added live container filtering and sorting. Podman/rootless behavior remains unvalidated; remote transports are unsupported. Windows named pipes and macOS remain deferred to issue #21/M8.
+- Added bounded historical and followed container logs in the inspection dialog for local Unix-socket engines, with TTY-aware decoding and in-memory limits.

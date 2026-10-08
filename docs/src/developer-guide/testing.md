@@ -15,6 +15,8 @@ The default suite does not require a host engine. Ignored live-engine tests for
 version, inventory, and Docker CLI contexts are read-only. The general
 local-engine inventory test may inspect an existing container; these tests do
 not mutate resources.
+The lifecycle and logs tests below are separate opt-in ignored tests and mutate
+the engine by creating one disposable container.
 
 The lifecycle integration test is a separate opt-in, ignored test and mutates
 the engine by creating one disposable container and exercising its lifecycle.
@@ -33,6 +35,23 @@ FERRUM_TEST_IMAGE=busybox:1.37.0 cargo test -p ferrum-engine --test live_engine 
 ```
 
 The test creates one uniquely named container with `--pull never`, `--network none`, no host mounts, and no published ports. It uses the full ID from the Docker create response/cidfile as its only cleanup authority. On failure, best-effort cleanup may force-remove only that validated ID; it never removes volumes. The successful EngineClient Remove action is exercised after stopping the container and does not force-remove or delete volumes. Run only against a disposable local engine.
+
+The ignored live logs test is mutating and opt-in. It requires `FERRUM_TEST_IMAGE`
+to name a locally installed image containing `/bin/sh` and `/bin/sleep`; it
+never pulls an image. Run exactly:
+
+```sh
+FERRUM_TEST_IMAGE=busybox:1.37.0 cargo test -p ferrum-engine --test live_engine local_engine_logs_stream_history_follow_and_cancel -- --exact --ignored
+```
+
+It creates one uniquely named disposable container with `--pull never`,
+`--network none`, no mounts, and no published ports. Cleanup uses only that
+container's validated full ID; failure cleanup may force-remove only that ID
+and never removes volumes. Run only against a disposable local engine.
+
+The live logs test exercises history, follow, and cancellation behavior; it
+does not require the UI or visually validate the Logs view. Closing the Logs
+view cancels its stream.
 
 The engine integration targets Linux local Unix sockets. Podman/rootless
 behavior remains unvalidated, remote transports remain unsupported, and Windows

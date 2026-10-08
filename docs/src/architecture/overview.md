@@ -1,6 +1,6 @@
 # Architecture overview
 
-Ferrum keeps native presentation, engine-independent domain values, and Docker-compatible transport in separate workspace crates. The engine adapter uses a private Hyper/Hyperlocal request path over the selected local Linux Unix socket: version negotiation, inventory, and inspection use bounded JSON responses; lifecycle actions use status-only HTTP requests. The UI receives Ferrum-owned values rather than raw engine responses.
+Ferrum keeps native presentation, engine-independent domain values, and Docker-compatible transport in separate workspace crates. The engine adapter uses a private Hyper/Hyperlocal request path over the selected local Linux Unix socket: version negotiation, inventory, and inspection use bounded JSON responses; lifecycle actions use status-only HTTP requests; logs use cancellable streaming response bodies. The UI receives Ferrum-owned values rather than raw engine responses.
 
 ```mermaid
 flowchart LR
@@ -10,9 +10,11 @@ flowchart LR
     CLIENT -->|bounded version, inventory, inspect, lifecycle requests| SOCKET[Selected local Linux Unix socket]
     SOCKET --> ENGINE[Docker-compatible engine]
     ENGINE -->|container events| SOCKET
-    SOCKET -->|chunked JSONL| CLIENT
-    CLIENT -->|ContainerChange| APP
-    APP -->|bounded async event channel| UI
+    ENGINE -->|TTY raw or multiplexed log body| SOCKET
+    SOCKET -->|chunked event JSONL| CLIENT
+    SOCKET -->|streamed log frames| CLIENT
+    CLIENT -->|ContainerChange / ContainerLogLine| APP
+    APP -->|bounded event and log channels| UI
 ```
 
 
@@ -31,6 +33,20 @@ synchronization unavailable, while manual refresh remains available. Initial
 and reconnect snapshots, plus successful manual refresh, re-inspect any open
 container so state-gated controls do not remain stale. The UI callback performs
 no synchronous engine I/O.
+
+Historical and followed container logs use a dedicated bounded 16-message
+channel, separate from event delivery; the UI drains and batches messages.
+Requests use the negotiated API version. Docker's log endpoint streams the
+response body; TTY containers are decoded as raw combined data, while
+non-TTY streams use Docker's 8-byte multiplex frames to preserve stdout/stderr.
+The view is plain text, with a 1 MiB frame cap, 64 KiB line cap, and retention
+of at most 8 MiB or 10,000 lines. It discards oldest lines with a visible count
+and does not persist or log output. Follow retries request/stream failures at
+most three times per outage (250/500/1000 ms); clean EOF ends the stream without
+retrying. The budget resets only after a reconnect delivers a log line, not
+merely when its stream opens. Reconnect reloads recent history and clears
+buffered rows to avoid replay duplicates. Closing Logs or inspection, context
+switch, or app teardown cancels log streaming.
 
 The inventory includes stopped containers. Filtering and sorting operate on
 application-owned summary values; inspection requests are issued on demand.

@@ -11,3 +11,5 @@ The canonical records live in `docs/decisions/` and are included here so the web
 {{#include ../../decisions/0004-bounded-engine-http.md}}
 
 {{#include ../../decisions/0005-container-lifecycle-events.md}}
+
+{{#include ../../decisions/0006-bounded-container-logs.md}}

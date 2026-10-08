@@ -1,6 +1,11 @@
 use std::collections::HashSet;
 
 #[cfg(target_os = "linux")]
+use ferrum_core::ContainerLogSource;
+#[cfg(target_os = "linux")]
+use ferrum_engine::ContainerLogsOptions;
+
+#[cfg(target_os = "linux")]
 use std::{
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
@@ -10,6 +15,200 @@ use std::{
 #[cfg(target_os = "linux")]
 use ferrum_core::{ContainerAction, ContainerState};
 use ferrum_engine::{ContextTransport, DockerContext, EngineClient};
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires the current local Docker context and FERRUM_TEST_IMAGE already present locally with /bin/sh and /bin/sleep"]
+async fn local_engine_logs_stream_history_follow_and_cancel() {
+    let image = std::env::var("FERRUM_TEST_IMAGE").expect(
+        "set FERRUM_TEST_IMAGE to a locally available image containing /bin/sh and /bin/sleep",
+    );
+    let image = image.trim();
+    assert!(
+        valid_test_image_reference(image),
+        "FERRUM_TEST_IMAGE must be a valid image reference, not a Docker CLI option"
+    );
+
+    let contexts = EngineClient::available_contexts()
+        .await
+        .expect("Docker CLI context discovery should succeed");
+    let context = contexts
+        .iter()
+        .find(|context| context.is_current())
+        .expect("Docker CLI should report its current context");
+    assert_eq!(
+        context.transport(),
+        ContextTransport::LocalUnix,
+        "the logs test requires a local Unix Docker context"
+    );
+    let context_name = context.name().to_owned();
+    let engine = EngineClient::connect_context(&context_name)
+        .await
+        .expect("the current local Docker context should connect");
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after the Unix epoch")
+        .as_nanos();
+    let name_sequence = NEXT_CONTAINER_NAME.fetch_add(1, Ordering::Relaxed);
+    let container_name = format!(
+        "ferrum-live-logs-{}-{timestamp}-{name_sequence}",
+        std::process::id()
+    );
+    let marker_prefix = format!(
+        "ferrum_logs_{}_{}_{}",
+        std::process::id(),
+        timestamp,
+        name_sequence
+    );
+    let history_out = format!("{marker_prefix}_history_stdout");
+    let history_err = format!("{marker_prefix}_history_stderr");
+    let follow_out = format!("{marker_prefix}_follow_stdout");
+    let follow_err = format!("{marker_prefix}_follow_stderr");
+    let script = format!(
+        "printf '%s\\n' '{history_out}'; printf '%s\\n' '{history_err}' >&2; while [ ! -f /tmp/ferrum-ready ]; do sleep 1; done; printf '%s\\n' '{follow_out}'; printf '%s\\n' '{follow_err}' >&2; exec sleep 3600"
+    );
+
+    let cid_directory = DisposableTempDirectory::new(&container_name);
+    let create = Command::new("docker")
+        .args([
+            "--context",
+            context_name.as_str(),
+            "create",
+            "--name",
+            container_name.as_str(),
+            "--network",
+            "none",
+            "--pull",
+            "never",
+            "--log-driver",
+            "json-file",
+            "--cidfile",
+        ])
+        .arg(cid_directory.cid_file())
+        .args(["--entrypoint", "/bin/sh", "--"])
+        .arg(image)
+        .args(["-c", script.as_str()])
+        .output()
+        .expect("Docker CLI should be available to create the disposable container");
+    assert!(
+        create.status.success(),
+        "Docker CLI should create the disposable container from the local image"
+    );
+    let created_id = std::str::from_utf8(&create.stdout)
+        .ok()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned();
+    let mut container = DisposableContainer::new(created_id, context_name, cid_directory);
+    assert!(
+        container.ensure_id(),
+        "Docker CLI should provide the full ID of the disposable container"
+    );
+
+    let start = Command::new("docker")
+        .args([
+            "--context",
+            container.context_name(),
+            "start",
+            container.id(),
+        ])
+        .output()
+        .expect("Docker CLI should be available to start the disposable container");
+    assert!(
+        start.status.success(),
+        "Docker CLI should start the disposable container"
+    );
+
+    let inspect = engine
+        .inspect_container(container.id())
+        .await
+        .expect("the running disposable container should be inspectable");
+    assert_eq!(inspect.id, container.id());
+    assert_eq!(inspect.tty, Some(false));
+
+    let mut logs = engine
+        .open_container_logs(
+            container.id(),
+            false,
+            ContainerLogsOptions {
+                stdout: true,
+                stderr: true,
+                timestamps: true,
+                follow: true,
+                tail: 100,
+            },
+        )
+        .await
+        .expect("the engine should open the container's historical and follow log stream");
+    let release_follow_output = Command::new("docker")
+        .args([
+            "--context",
+            container.context_name(),
+            "exec",
+            container.id(),
+            "/bin/sh",
+            "-c",
+            "printf ready > /tmp/ferrum-ready",
+        ])
+        .output()
+        .expect("Docker CLI should be available to release the disposable log process");
+    assert!(
+        release_follow_output.status.success(),
+        "Docker CLI should release the waiting disposable log process"
+    );
+
+    let mut found_history_out = false;
+    let mut found_history_err = false;
+    let mut found_follow_out = false;
+    let mut found_follow_err = false;
+    let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+        while !(found_history_out && found_history_err && found_follow_out && found_follow_err) {
+            let line = logs
+                .next_line()
+                .await
+                .expect("the real container log stream should decode");
+            let Some(line) = line else {
+                return false;
+            };
+            if line.text.contains(&history_out) {
+                assert_eq!(line.source, ContainerLogSource::Stdout);
+                found_history_out = true;
+            }
+            if line.text.contains(&history_err) {
+                assert_eq!(line.source, ContainerLogSource::Stderr);
+                found_history_err = true;
+            }
+            if line.text.contains(&follow_out) {
+                assert_eq!(line.source, ContainerLogSource::Stdout);
+                found_follow_out = true;
+            }
+            if line.text.contains(&follow_err) {
+                assert_eq!(line.source, ContainerLogSource::Stderr);
+                found_follow_err = true;
+            }
+        }
+        true
+    })
+    .await;
+    assert!(
+        matches!(outcome, Ok(true)),
+        "the stream should deliver both historical and post-open stdout/stderr markers"
+    );
+
+    drop(logs);
+    perform_action(&engine, container.id(), ContainerAction::Stop).await;
+    perform_action(&engine, container.id(), ContainerAction::Remove).await;
+    let inventory = engine
+        .list_containers()
+        .await
+        .expect("the engine should return inventory after removal");
+    assert!(
+        !inventory.iter().any(|summary| summary.id == container.id()),
+        "the removed logs-test container should be absent from inventory"
+    );
+    container.disarm();
+}
 
 #[tokio::test]
 #[ignore = "requires an accessible local Docker-compatible engine; reads version and inventory only"]

@@ -7,10 +7,12 @@ privileged services, launch an external terminal, or use Electron or Node.js.
 ## Current status
 
 The Linux local-engine implementation provides container inventory, filtering,
-sorting, inspection, lifecycle actions, and external-change synchronization.
-Actions are offered only for safe known container states; Remove requires
-confirmation. Container-only event updates use bounded delivery and report when
-synchronization is unavailable, while manual refresh remains available.
+sorting, inspection, historical and live container logs, lifecycle actions, and
+external-change synchronization. Actions are offered only for safe known
+container states; Remove requires confirmation. Container-only event updates
+use bounded delivery and report when synchronization is unavailable, while
+manual refresh remains available. Logs are plain text, bounded in memory, and
+stream only from the selected local Unix socket.
 
 An X11-backend screenshot captured via XWayland showed actual container names,
 images, states, and statuses. A no-engine X11 launch showed a connection error
@@ -52,7 +54,7 @@ cargo test -p ferrum-engine --test live_engine local_engine_returns_a_well_forme
 ```
 It reads version and inventory and may inspect one existing container; it does not mutate resources.
 
-A separate ignored lifecycle integration test is mutating and must be run explicitly; see the testing guide for its exact command. It requires `FERRUM_TEST_IMAGE` to name a locally present image containing `/bin/sleep`; tests do not pull images and clean up only the created container by its returned full ID.
+An ignored lifecycle integration test is mutating; see the testing guide for its exact command and prerequisites. It requires a locally present `FERRUM_TEST_IMAGE` containing `/bin/sleep`; tests do not pull images and clean up only the created container by its returned full ID.
 
 ## Documentation
 

@@ -1,3 +1,5 @@
+use crate::search::CaseInsensitiveQuery;
+
 use eframe::egui;
 use ferrum_core::ContainerSummary;
 
@@ -13,6 +15,7 @@ enum SortField {
 #[derive(Default)]
 pub(super) struct InventoryView {
     query: String,
+    matcher: CaseInsensitiveQuery,
     sort: SortField,
     descending: bool,
     visible: Vec<usize>,
@@ -62,26 +65,24 @@ impl InventoryView {
     }
 
     fn rebuild(&mut self, inventory: &[ContainerSummary]) {
-        let needle: Vec<char> = self.query.chars().flat_map(char::to_lowercase).collect();
-        let prefix = prefix_table(&needle);
+        self.matcher.set(&self.query);
         self.visible.clear();
         self.visible
             .extend(inventory.iter().enumerate().filter_map(|(index, item)| {
-                let matches = needle.is_empty()
-                    || contains_lowercase(&item.name, &needle, &prefix)
-                    || contains_lowercase(&item.id, &needle, &prefix)
+                let matches = self.matcher.matches(&item.name)
+                    || self.matcher.matches(&item.id)
                     || item
                         .image
                         .as_deref()
-                        .is_some_and(|v| contains_lowercase(v, &needle, &prefix))
+                        .is_some_and(|v| self.matcher.matches(v))
                     || item
                         .state
                         .as_ref()
-                        .is_some_and(|v| contains_lowercase(v.label(), &needle, &prefix))
+                        .is_some_and(|v| self.matcher.matches(v.label()))
                     || item
                         .status
                         .as_deref()
-                        .is_some_and(|v| contains_lowercase(v, &needle, &prefix));
+                        .is_some_and(|v| self.matcher.matches(v));
                 matches.then_some(index)
             }));
         let sort = self.sort;
@@ -101,40 +102,6 @@ impl InventoryView {
             }
         });
     }
-}
-
-fn prefix_table(pattern: &[char]) -> Vec<usize> {
-    let mut prefix = vec![0; pattern.len()];
-    let mut matched = 0;
-    for index in 1..pattern.len() {
-        while matched > 0 && pattern[index] != pattern[matched] {
-            matched = prefix[matched - 1];
-        }
-        if pattern[index] == pattern[matched] {
-            matched += 1;
-            prefix[index] = matched;
-        }
-    }
-    prefix
-}
-
-fn contains_lowercase(candidate: &str, needle: &[char], prefix: &[usize]) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    let mut matched = 0;
-    for character in candidate.chars().flat_map(char::to_lowercase) {
-        while matched > 0 && character != needle[matched] {
-            matched = prefix[matched - 1];
-        }
-        if character == needle[matched] {
-            matched += 1;
-            if matched == needle.len() {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 fn sort_value(item: &ContainerSummary, field: SortField) -> Option<&str> {
