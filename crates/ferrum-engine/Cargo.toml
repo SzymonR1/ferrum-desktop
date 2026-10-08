@@ -9,6 +9,10 @@ rust-version.workspace = true
 [dependencies]
 bollard.workspace = true
 ferrum-core = { path = "../ferrum-core", version = "0.1.0" }
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+hyperlocal.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true

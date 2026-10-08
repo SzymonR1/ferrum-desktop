@@ -1,6 +1,6 @@
 # ADR 0002: Docker-compatible engine client
 
-- **Status:** Accepted for the M1 read-only local container-list slice; broader endpoint and Podman compatibility remain open.
+- **Status:** Accepted for the M1 read-only local container-list slice; broader endpoint and Podman compatibility remain open. Its Bollard response-transport, version, and list details are superseded by [ADR 0004: Bounded engine HTTP](0004-bounded-engine-http.md).
 - **Date:** 2026-10-08
 
 ## Context

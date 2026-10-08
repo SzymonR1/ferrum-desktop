@@ -88,3 +88,46 @@ pub struct ContainerSummary {
     /// Human-readable engine status, when reported by the engine.
     pub status: Option<String>,
 }
+
+/// Read-only details reported for one container by a Docker-compatible engine.
+///
+/// Optional values remain absent when the engine does not report them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContainerDetails {
+    /// Full engine identifier.
+    pub id: String,
+    /// Human-readable container name, when reported.
+    pub name: Option<String>,
+    /// Image identifier or reference, when reported.
+    pub image: Option<String>,
+    /// Creation timestamp, when reported.
+    pub created: Option<String>,
+    /// Lifecycle state, when reported.
+    pub state: Option<ContainerState>,
+    /// Number of restarts, when reported.
+    pub restart_count: Option<i64>,
+    /// Last process exit code, when reported.
+    pub exit_code: Option<i64>,
+    /// Last start timestamp, when reported.
+    pub started_at: Option<String>,
+    /// Last finish timestamp, when reported.
+    pub finished_at: Option<String>,
+    /// Mounts, when the engine reports the mount list. An empty list is distinct
+    /// from an unavailable list.
+    pub mounts: Option<Vec<ContainerMount>>,
+}
+
+/// Read-only information about a mount reported for a container.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContainerMount {
+    /// Mount kind, when reported.
+    pub kind: Option<String>,
+    /// Source path or volume, when reported.
+    pub source: Option<String>,
+    /// Destination path inside the container, when reported.
+    pub destination: Option<String>,
+    /// Mount mode, when reported.
+    pub mode: Option<String>,
+    /// Whether the mount is writable, when reported.
+    pub read_write: Option<bool>,
+}

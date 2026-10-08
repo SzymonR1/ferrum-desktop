@@ -2,6 +2,10 @@
 
 - [Introduction](introduction.md)
 
+# User guide
+
+- [Containers](user-guide/containers.md)
+
 # Developer guide
 
 - [Building](developer-guide/building.md)
@@ -9,6 +13,7 @@
 
 # Architecture
 
+- [Architecture overview](architecture/overview.md)
 - [Architecture decisions, including Docker context selection](architecture/decisions.md)
 
 # Security
