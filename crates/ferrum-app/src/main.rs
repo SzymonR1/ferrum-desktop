@@ -1,3 +1,5 @@
+mod settings;
+
 use std::{error::Error, time::Duration};
 
 use eframe::egui::{self, Color32, RichText};
@@ -59,6 +61,11 @@ struct FerrumApp {
     containers: Vec<ContainerSummary>,
     loading: bool,
     refresh_error: Option<String>,
+    settings_store: settings::SettingsStore,
+    settings: settings::Settings,
+    settings_draft: settings::Settings,
+    settings_open: bool,
+    settings_error: Option<settings::SettingsError>,
 }
 
 impl FerrumApp {
@@ -73,19 +80,40 @@ impl FerrumApp {
         visuals.widgets.hovered.bg_fill = Color32::from_rgb(59, 73, 84);
         creation_context.egui_ctx.set_visuals(visuals);
 
+        let settings_store = settings::SettingsStore::new();
+        let (settings, settings_error) = settings_store.load();
+        if settings_error.is_some() {
+            tracing::warn!(
+                error_kind = "settings",
+                "Could not load application settings"
+            );
+        }
         let (sender, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let mut app = Self {
             runtime,
             sender,
             receiver,
-            connection: ConnectionState::Connecting,
+            connection: if settings.auto_connect_on_startup {
+                ConnectionState::Connecting
+            } else {
+                ConnectionState::Disconnected(
+                    "Automatic connection is disabled. Use Retry connection to connect.".into(),
+                )
+            },
             engine: None,
             engine_info: None,
             containers: Vec::new(),
             loading: false,
             refresh_error: None,
+            settings_store,
+            settings_draft: settings.clone(),
+            settings,
+            settings_open: false,
+            settings_error,
         };
-        app.connect(creation_context.egui_ctx.clone());
+        if app.settings.auto_connect_on_startup {
+            app.connect(creation_context.egui_ctx.clone());
+        }
         app
     }
 
@@ -218,7 +246,12 @@ impl FerrumApp {
             });
     }
 
-    fn draw_header(&self, ui: &mut egui::Ui, refresh_requested: &mut bool) {
+    fn draw_header(
+        &self,
+        ui: &mut egui::Ui,
+        refresh_requested: &mut bool,
+        settings_requested: &mut bool,
+    ) {
         egui::Panel::top("header")
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 14)))
             .show(ui, |ui| {
@@ -245,6 +278,9 @@ impl FerrumApp {
                         ui.label(&info.api_version);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Settings").clicked() {
+                            *settings_requested = true;
+                        }
                         let button_text = if self.loading {
                             "Loading"
                         } else if self.engine.is_some() {
@@ -369,6 +405,43 @@ impl FerrumApp {
             },
         );
     }
+    fn draw_settings(&mut self, context: egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = self.settings_open;
+        let mut close_requested = false;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .show(&context, |ui| {
+                ui.checkbox(
+                    &mut self.settings_draft.auto_connect_on_startup,
+                    "Connect automatically on startup",
+                );
+                ui.label("This setting applies the next time Ferrum starts.");
+                if let Some(error) = self.settings_error {
+                    ui.colored_label(Color32::from_rgb(227, 113, 102), error.message());
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        match self.settings_store.save(&self.settings_draft) {
+                            Ok(()) => {
+                                self.settings = self.settings_draft.clone();
+                                self.settings_error = None;
+                                close_requested = true;
+                            }
+                            Err(error) => self.settings_error = Some(error),
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.settings_draft = self.settings.clone();
+                        self.settings_error = None;
+                        close_requested = true;
+                    }
+                });
+            });
+        self.settings_open = open && !close_requested;
+    }
 }
 
 impl eframe::App for FerrumApp {
@@ -378,10 +451,16 @@ impl eframe::App for FerrumApp {
         self.draw_sidebar(ui);
 
         let mut refresh_requested = false;
-        self.draw_header(ui, &mut refresh_requested);
+        let mut settings_requested = false;
+        self.draw_header(ui, &mut refresh_requested, &mut settings_requested);
+        if settings_requested {
+            self.settings_draft = self.settings.clone();
+            self.settings_open = true;
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 18)))
             .show(ui, |ui| self.draw_inventory(ui));
+        self.draw_settings(context.clone());
 
         if refresh_requested {
             self.refresh(context.clone());

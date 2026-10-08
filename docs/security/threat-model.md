@@ -14,6 +14,8 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 - Render engine-provided strings as plain text; do not interpret metadata as markup or commands.
 - Use bounded API timeouts, keep engine I/O off the UI thread, and distinguish connection errors from an empty inventory.
 - Do not store registry credentials, TLS keys, SSH keys, or other secrets.
+- Persist only the schema version and startup auto-connect boolean; reject unknown fields, bound input size, and keep config files/private temporary files owner-only.
+- Do not include configuration paths or contents in settings errors or logs. Corrupt settings fall back to defaults and are not overwritten until explicit user save.
 - Do not start, stop, remove, prune, or otherwise mutate containers in this initial slice.
 
 ## Deferred attack surfaces

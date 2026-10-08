@@ -15,6 +15,7 @@
 # Security
 
 - [Threat model](security/threat-model.md)
+- [Settings](settings.md)
 
 # Platform support
 
