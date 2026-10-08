@@ -3,8 +3,12 @@
 //! Docker-compatible API access kept separate from Ferrum's UI and domain model.
 
 mod contexts;
+#[cfg(target_os = "linux")]
+mod logs;
 
 pub use contexts::{ContextTransport, DockerContext};
+#[cfg(target_os = "linux")]
+pub use logs::{ContainerLogStream, ContainerLogsOptions};
 
 #[cfg(target_os = "linux")]
 use std::{env, path::PathBuf, time::Duration};
@@ -115,6 +119,7 @@ struct InspectMount {
 #[serde(rename_all = "PascalCase")]
 struct InspectConfig {
     image: Option<String>,
+    tty: Option<bool>,
 }
 /// Version information reported by the connected engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -267,6 +272,44 @@ pub enum EngineError {
     /// The container event stream ended or returned invalid event data.
     #[error("Container events from the {endpoint_label} were interrupted.")]
     ContainerEventsInterrupted {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// Log options are invalid; no request was sent.
+    #[cfg(target_os = "linux")]
+    #[error("Container log options are invalid.")]
+    InvalidContainerLogsOptions,
+    /// The container identifier supplied to a log request is invalid.
+    #[cfg(target_os = "linux")]
+    #[error("The container identifier for the logs request is invalid.")]
+    InvalidContainerId,
+    /// A local logs request could not be constructed.
+    #[cfg(target_os = "linux")]
+    #[error("The container logs request could not be built for the {endpoint_label}.")]
+    ContainerLogsRequestFailed {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The engine rejected a container log request.
+    #[cfg(target_os = "linux")]
+    #[error("Container logs are unavailable at the {endpoint_label} (HTTP {status}).")]
+    ContainerLogsUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+        /// HTTP response status.
+        status: u16,
+    },
+    /// The engine did not return log response headers within the bounded wait.
+    #[cfg(target_os = "linux")]
+    #[error("Opening container logs at the {endpoint_label} timed out.")]
+    ContainerLogsTimedOut {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The log response body ended unexpectedly or violated stream bounds.
+    #[cfg(target_os = "linux")]
+    #[error("Container logs from the {endpoint_label} were interrupted.")]
+    ContainerLogStreamInterrupted {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
     },
@@ -668,6 +711,37 @@ impl EngineClient {
             finished: false,
         })
     }
+    /// Opens a historical or follow stream of container logs.
+    ///
+    /// The caller must provide the TTY setting reported by container inspect;
+    /// TTY output is a raw combined stream, while non-TTY output uses Docker's
+    /// multiplexed stdout/stderr framing. Docker exposes this endpoint for
+    /// `json-file` and `journald` logging drivers. Response headers are bounded
+    /// by an eight-second timeout; the body remains cancellable and has no
+    /// total-stream timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an options or identifier error before I/O, a safe error if the
+    /// request cannot be opened, or an interrupted error for malformed or
+    /// oversized stream data.
+    #[cfg(target_os = "linux")]
+    pub async fn open_container_logs(
+        &self,
+        id: &str,
+        tty: bool,
+        options: ContainerLogsOptions,
+    ) -> Result<ContainerLogStream, EngineError> {
+        logs::open_container_logs(
+            &self.socket_path,
+            &self.api_version,
+            self.info.endpoint_label,
+            id,
+            tty,
+            options,
+        )
+        .await
+    }
 
     #[cfg(target_os = "linux")]
     async fn connect_unix_socket(
@@ -1014,10 +1088,10 @@ fn map_container_details(
             let state = state.status.map(|status| ContainerState::parse(&status));
             (state, exit_code, started_at, finished_at)
         });
-    let image = response
+    let (config_image, tty) = response
         .config
-        .and_then(|config| config.image)
-        .or(response.image);
+        .map_or((None, None), |config| (config.image, config.tty));
+    let image = config_image.or(response.image);
 
     Ok(ContainerDetails {
         id,
@@ -1041,6 +1115,7 @@ fn map_container_details(
                 })
                 .collect()
         }),
+        tty,
     })
 }
 
@@ -1091,6 +1166,7 @@ mod container_inspection_tests {
                 exit_code: Some(0),
                 started_at: Some("started".to_owned()),
                 finished_at: Some("finished".to_owned()),
+                tty: None,
                 mounts: Some(vec![ContainerMount {
                     kind: Some("bind".to_owned()),
                     source: Some("/host/data".to_owned()),
@@ -1440,6 +1516,473 @@ mod container_inspection_tests {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod container_logs_http_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+    use ferrum_core::{ContainerLogLine, ContainerLogSource};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{UnixListener, UnixStream},
+    };
+
+    fn temporary_directory() -> std::path::PathBuf {
+        let sequence = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "ferrum-logs-{}-{timestamp}-{sequence}",
+            std::process::id(),
+        ));
+        std::fs::create_dir(&directory).expect("temporary directory should be created");
+        directory
+    }
+
+    fn client(socket_path: std::path::PathBuf) -> EngineClient {
+        EngineClient {
+            info: EngineInfo {
+                version: "fixture".to_owned(),
+                api_version: "1.45".to_owned(),
+                endpoint_label: "test endpoint",
+            },
+            api_version: "1.45".to_owned(),
+            selected_context: None,
+            socket_path,
+        }
+    }
+
+    async fn read_request(stream: &mut UnixStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream
+                .read(&mut buffer)
+                .await
+                .expect("request should be readable");
+            assert_ne!(count, 0, "client should send HTTP headers");
+            request.extend_from_slice(&buffer[..count]);
+        }
+        String::from_utf8(request).expect("HTTP request should be UTF-8")
+    }
+
+    async fn fixture_socket() -> (std::path::PathBuf, std::path::PathBuf, UnixListener) {
+        let directory = temporary_directory();
+        let socket_path = directory.join("engine.sock");
+        let listener = UnixListener::bind(&socket_path).expect("Unix socket should bind");
+        (socket_path, directory, listener)
+    }
+
+    fn cleanup(socket_path: &std::path::Path, directory: &std::path::Path) {
+        std::fs::remove_file(socket_path).expect("socket should be removed");
+        std::fs::remove_dir(directory).expect("directory should be removed");
+    }
+
+    fn frame(source: u8, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![source, 0, 0, 0];
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    async fn write_fragmented(stream: &mut UnixStream, bytes: &[u8]) {
+        for byte in bytes {
+            stream
+                .write_all(&[*byte])
+                .await
+                .expect("fragment should be written");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn line(source: ContainerLogSource, text: &str) -> ContainerLogLine {
+        ContainerLogLine {
+            source,
+            text: text.to_owned(),
+        }
+    }
+    fn inspect_response(json: &str) -> InspectResponse {
+        serde_json::from_str(json).expect("inspect response should deserialize")
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_options_and_container_ids_before_transport() {
+        let directory = temporary_directory();
+        let engine = client(directory.join("missing.sock"));
+        for options in [
+            ContainerLogsOptions {
+                stdout: false,
+                stderr: false,
+                ..ContainerLogsOptions::default()
+            },
+            ContainerLogsOptions {
+                tail: 0,
+                ..ContainerLogsOptions::default()
+            },
+            ContainerLogsOptions {
+                tail: 5_001,
+                ..ContainerLogsOptions::default()
+            },
+        ] {
+            let error = match engine
+                .open_container_logs("container", false, options)
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("invalid log options should fail before transport"),
+            };
+            assert!(matches!(error, EngineError::InvalidContainerLogsOptions));
+        }
+
+        let error = match engine
+            .open_container_logs("", false, ContainerLogsOptions::default())
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("empty container ID should fail before transport"),
+        };
+        assert!(matches!(error, EngineError::InvalidContainerId));
+
+        let error = match engine
+            .open_container_logs("container", false, ContainerLogsOptions::default())
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("missing socket should fail"),
+        };
+        assert!(matches!(
+            error,
+            EngineError::Unavailable {
+                endpoint_label: "test endpoint"
+            }
+        ));
+        std::fs::remove_dir(directory).expect("temporary directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn opens_logs_with_negotiated_path_encoded_id_and_ordered_query() {
+        let (socket, directory, listener) = fixture_socket().await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let request = read_request(&mut stream).await;
+            assert!(request.starts_with(
+                "GET /v1.45/containers/a%2Fb%20c/logs?stdout=true&stderr=false&timestamps=true&follow=false&tail=17 HTTP/1.1\r\n"
+            ), "{request}");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("response should be written");
+        });
+        let result = client(socket.clone())
+            .open_container_logs(
+                "a/b c",
+                false,
+                ContainerLogsOptions {
+                    stdout: true,
+                    stderr: false,
+                    timestamps: true,
+                    follow: false,
+                    tail: 17,
+                },
+            )
+            .await;
+        server.await.expect("fixture server should finish");
+        assert!(result.is_ok(), "empty stream should open");
+        drop(result);
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn rejects_http_500_without_exposing_response_body() {
+        let (socket, directory, listener) = fixture_socket().await;
+        let secret = "private-daemon-response";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let _ = read_request(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{secret}",
+                secret.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("response should be written");
+        });
+        let error = match client(socket.clone())
+            .open_container_logs("container", false, ContainerLogsOptions::default())
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("500 response should fail"),
+        };
+        server.await.expect("fixture server should finish");
+        assert!(matches!(
+            error,
+            EngineError::ContainerLogsUnavailable {
+                endpoint_label: "test endpoint",
+                status: 500
+            }
+        ));
+        assert!(!format!("{error:?}").contains(secret));
+        assert!(!error.to_string().contains(secret));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn decodes_interleaved_multiplexed_lines_and_preserves_timestamp_prefixes() {
+        let (socket, directory, listener) = fixture_socket().await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let _ = read_request(&mut stream).await;
+            write_fragmented(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            for (stream_id, payload) in [
+                (1, b"2026-01-02T03:04:05Z out\n".as_slice()),
+                (2, b"2026-01-02T03:04:06Z err\n".as_slice()),
+            ] {
+                let data = frame(stream_id, payload);
+                let chunk = format!("{:X}\r\n", data.len());
+                write_fragmented(&mut stream, chunk.as_bytes()).await;
+                write_fragmented(&mut stream, &data).await;
+                write_fragmented(&mut stream, b"\r\n").await;
+            }
+            write_fragmented(&mut stream, b"0\r\n\r\n").await;
+        });
+        let mut logs = client(socket.clone())
+            .open_container_logs("container", false, ContainerLogsOptions::default())
+            .await
+            .expect("stream should open");
+        let first = logs.next_line().await.expect("first line should parse");
+        let second = logs.next_line().await.expect("second line should parse");
+        let end = logs.next_line().await.expect("stream should finish");
+        server.await.expect("fixture server should finish");
+        assert_eq!(
+            first,
+            Some(line(ContainerLogSource::Stdout, "2026-01-02T03:04:05Z out"))
+        );
+        assert_eq!(
+            second,
+            Some(line(ContainerLogSource::Stderr, "2026-01-02T03:04:06Z err"))
+        );
+        assert_eq!(end, None);
+        drop(logs);
+        cleanup(&socket, &directory);
+    }
+    #[tokio::test]
+    async fn keeps_partial_stdout_and_stderr_lines_separate_across_frames() {
+        let (socket, directory, listener) = fixture_socket().await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let _ = read_request(&mut stream).await;
+            let mut body = frame(1, b"out");
+            body.extend(frame(2, b"err\n"));
+            body.extend(frame(1, b"put"));
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("headers should be written");
+            stream
+                .write_all(&body)
+                .await
+                .expect("body should be written");
+        });
+        let mut logs = client(socket.clone())
+            .open_container_logs("container", false, ContainerLogsOptions::default())
+            .await
+            .expect("stream should open");
+
+        assert_eq!(
+            logs.next_line().await.expect("stderr line should parse"),
+            Some(line(ContainerLogSource::Stderr, "err"))
+        );
+        assert_eq!(
+            logs.next_line().await.expect("stdout line should parse"),
+            Some(line(ContainerLogSource::Stdout, "output"))
+        );
+        assert_eq!(logs.next_line().await.expect("stream should finish"), None);
+        server.await.expect("fixture server should finish");
+        drop(logs);
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn decodes_raw_tty_lines_and_replaces_invalid_utf8_lossily() {
+        let (socket, directory, listener) = fixture_socket().await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let _ = read_request(&mut stream).await;
+            let body = b"hello\r\n\xffx\nlast";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            write_fragmented(&mut stream, response.as_bytes()).await;
+            write_fragmented(&mut stream, body).await;
+        });
+        let mut logs = client(socket.clone())
+            .open_container_logs("container", true, ContainerLogsOptions::default())
+            .await
+            .expect("stream should open");
+        assert_eq!(
+            logs.next_line().await.expect("line should parse"),
+            Some(line(ContainerLogSource::Combined, "hello"))
+        );
+        assert_eq!(
+            logs.next_line().await.expect("line should parse"),
+            Some(line(ContainerLogSource::Combined, "�x"))
+        );
+        assert_eq!(
+            logs.next_line()
+                .await
+                .expect("unterminated final TTY line should flush"),
+            Some(line(ContainerLogSource::Combined, "last"))
+        );
+        assert_eq!(logs.next_line().await.expect("stream should finish"), None);
+        server.await.expect("fixture server should finish");
+        drop(logs);
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_stream_headers_and_oversized_frames_or_lines() {
+        let invalid = frame(9, b"bad\n");
+        let oversized_frame = {
+            let mut bytes = vec![1, 0, 0, 0];
+            bytes.extend_from_slice(&(1024_u32 * 1024 + 1).to_be_bytes());
+            bytes
+        };
+        for response_body in [
+            invalid,
+            oversized_frame,
+            frame(1, &vec![b'x'; 64 * 1024 + 1]),
+        ] {
+            let (socket, directory, listener) = fixture_socket().await;
+            let body_len = response_body.len();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("client should connect");
+                let _ = read_request(&mut stream).await;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(headers.as_bytes())
+                    .await
+                    .expect("headers should be written");
+                stream
+                    .write_all(&response_body)
+                    .await
+                    .expect("body should be written");
+            });
+            let mut logs = client(socket.clone())
+                .open_container_logs("container", false, ContainerLogsOptions::default())
+                .await
+                .expect("stream should open");
+            assert!(
+                logs.next_line().await.is_err(),
+                "invalid header or exceeded bound should fail"
+            );
+            drop(logs);
+            server.await.expect("fixture server should finish");
+            cleanup(&socket, &directory);
+        }
+    }
+    #[tokio::test]
+    async fn rejects_lossy_expansion_beyond_the_line_output_limit() {
+        let (socket, directory, listener) = fixture_socket().await;
+        let mut payload = vec![0xff; (64 * 1024 / 3) + 1];
+        payload.push(b'\n');
+        let body = frame(1, &payload);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let _ = read_request(&mut stream).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("headers should be written");
+            stream
+                .write_all(&body)
+                .await
+                .expect("body should be written");
+        });
+        let mut logs = client(socket.clone())
+            .open_container_logs("container", false, ContainerLogsOptions::default())
+            .await
+            .expect("stream should open");
+        let error = logs
+            .next_line()
+            .await
+            .expect_err("lossy-expanded lines must remain within the UI message bound");
+        assert!(matches!(
+            error,
+            EngineError::ContainerLogStreamInterrupted {
+                endpoint_label: "test endpoint"
+            }
+        ));
+        drop(logs);
+        server.await.expect("fixture server should finish");
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn dropping_open_stream_cancels_body_read() {
+        let (socket, directory, listener) = fixture_socket().await;
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let _ = read_request(&mut stream).await;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n").await.expect("headers should be written");
+            let mut byte = [0];
+            let closed =
+                tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut byte))
+                    .await
+                    .expect("dropping stream should close socket")
+                    .map(|count| count == 0)
+                    .unwrap_or(false);
+            let _ = closed_tx.send(closed);
+        });
+        let logs = client(socket.clone())
+            .open_container_logs("container", false, ContainerLogsOptions::default())
+            .await
+            .expect("stream should open");
+        drop(logs);
+        assert!(closed_rx.await.expect("server should observe closure"));
+        server.await.expect("fixture server should finish");
+        cleanup(&socket, &directory);
+    }
+
+    #[test]
+    fn maps_config_tty_true_false_and_absence_without_defaulting() {
+        let true_details = map_container_details(
+            inspect_response(r#"{"Id":"a","Config":{"Tty":true}}"#),
+            "test",
+        )
+        .expect("id is present");
+        let false_details = map_container_details(
+            inspect_response(r#"{"Id":"b","Config":{"Tty":false}}"#),
+            "test",
+        )
+        .expect("id is present");
+        let absent_details =
+            map_container_details(inspect_response(r#"{"Id":"c","Config":{}}"#), "test")
+                .expect("id is present");
+        assert_eq!(true_details.tty, Some(true));
+        assert_eq!(false_details.tty, Some(false));
+        assert_eq!(absent_details.tty, None);
+    }
+}
 #[cfg(all(test, target_os = "linux"))]
 mod container_lifecycle_http_tests {
     use super::*;

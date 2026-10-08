@@ -14,6 +14,61 @@ inspection is reloaded so state-gated actions do not remain stale. If bounded
 reconnection is exhausted, Ferrum reports event synchronization unavailable;
 use Refresh to request a newer inventory snapshot.
 
+## Container logs
+
+The inspection dialog provides a Logs view for historical output and optional
+live following. The Container logs action becomes available after inspection
+details load; it is disabled while inspection is loading or unavailable. Logs
+are available only through the selected local Unix-socket Docker-compatible
+engine; remote engines, Podman/rootless, Windows, and macOS are not covered.
+
+Docker Engine exposes its logs endpoint only for the `json-file` and `journald`
+logging drivers. Unsupported-driver errors are reported safely without exposing
+the daemon response body.
+
+Choose a historical tail of 100, 500, 1000, or 5000 lines, toggle timestamps,
+and filter stdout/stderr. Search is case-insensitive and applies to lines
+currently retained by the view. Follow is enabled by default only when the
+inspected container is Running. For a TTY container, Docker combines output
+into a raw stream, so stdout/stderr cannot be separated; Ferrum labels each
+such row `combined`. For non-TTY containers, Ferrum labels rows `stdout` or
+`stderr` according to the stream type. Copy and Export preserve these labels,
+formatting each row as `<source>: <text>` (for example, `stdout: ...`,
+`stderr: ...`, or for TTY, `combined: ...`). Copy and Export escape terminal
+control characters as literal `\xNN`; other text and row boundaries are
+preserved.
+
+The view is bounded to 8 MiB or 10,000 lines and discards oldest lines when
+those limits are reached, with a visible discarded-line count. Individual
+Docker frames are limited to 1 MiB and lines to 64 KiB. Copy and Export include
+only rows currently visible after filtering and still retained in the buffer.
+Export writes the visible rows as plain text to the path you select in the
+native save dialog. The dialog starts at `container-logs.txt` and offers a
+text-file filter, but the selected extension is not enforced. New regular files
+are created with owner-only Unix permissions (`0600`); for existing regular
+files, ordinary rwx permission bits are preserved, though the OS may clear
+setuid/setgid bits. Final-component symlinks and non-regular targets are
+rejected before truncation or writing.
+Logs are not automatically exported or persisted. Refresh reloads the selected
+tail and reapplies the current Follow setting.
+Copy copies the visible rows to the clipboard. Clipboard contents may be
+available to other applications or clipboard history. Treat log output as
+untrusted and potentially sensitive; an export is a user-controlled file at
+the destination you choose.
+Pause suspends UI draining of the bounded 16-message stream channel. The
+resulting backpressure holds producer reads without unbounded memory growth or
+dropped lines; Resume continues delivery. Auto-scroll is independently
+toggleable.
+
+Change the Follow setting at any time. A clean EOF, such as a container
+stopping, ends the stream without an automatic retry. For request or stream
+failures, Follow retries at most three times during the current Logs view
+session (250, 500, and 1000 ms). Replayed historical lines do not renew the
+budget. After retry exhaustion, use Refresh to start a new bounded session.
+Reconnect reloads the recent tail and clears buffered rows to avoid duplicate
+replay. Closing the Logs view or inspection, switching engine context, or app
+teardown cancels the stream.
+
 ## Find and sort containers
 
 Use the filter field to search case-insensitively across container name, ID,

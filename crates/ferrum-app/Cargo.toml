@@ -15,7 +15,14 @@ eframe.workspace = true
 ferrum-core = { path = "../ferrum-core", version = "0.1.0" }
 ferrum-engine = { path = "../ferrum-engine", version = "0.1.0" }
 tokio.workspace = true
+rfd = "0.17.2"
 serde.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+egui_kittest = "0.36.2"

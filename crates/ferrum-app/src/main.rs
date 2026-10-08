@@ -1,31 +1,4 @@
 #[cfg(target_os = "linux")]
-const EVENT_RETRY_DELAYS_MS: [u64; 3] = [250, 500, 1_000];
-#[cfg(target_os = "linux")]
-#[derive(Default)]
-struct EventRetryBudget {
-    next_attempt: usize,
-}
-#[cfg(target_os = "linux")]
-impl EventRetryBudget {
-    fn next_delay(&mut self) -> Option<Duration> {
-        let delay = EVENT_RETRY_DELAYS_MS.get(self.next_attempt).copied()?;
-        self.next_attempt += 1;
-        Some(Duration::from_millis(delay))
-    }
-
-    fn reset(&mut self) {
-        self.next_attempt = 0;
-    }
-}
-#[cfg(target_os = "linux")]
-async fn wait_for_event_retry(retries: &mut EventRetryBudget) -> bool {
-    let Some(delay) = retries.next_delay() else {
-        return false;
-    };
-    tokio::time::sleep(delay).await;
-    true
-}
-#[cfg(target_os = "linux")]
 async fn send_event_snapshot(
     engine: &EngineClient,
     sender: &mpsc::Sender<EngineEvent>,
@@ -53,14 +26,26 @@ fn action_requires_confirmation(action: ContainerAction) -> bool {
     action.is_destructive()
 }
 mod inventory;
+mod logs;
+mod retry;
+mod search;
+#[cfg(target_os = "linux")]
+const LOG_CHANNEL_CAPACITY: usize = 16;
 mod settings;
 
 use std::{error::Error, time::Duration};
 
 use eframe::egui::{self, Color32, RichText};
+#[cfg(target_os = "linux")]
+use ferrum_core::ContainerLogLine;
 use ferrum_core::{ContainerAction, ContainerDetails, ContainerState, ContainerSummary};
+#[cfg(target_os = "linux")]
+use ferrum_engine::ContainerLogsOptions;
 use ferrum_engine::{ContextTransport, DockerContext, EngineClient, EngineError, EngineInfo};
 use inventory::InventoryView;
+use logs::LogBuffer;
+#[cfg(target_os = "linux")]
+use retry::RetryBudget;
 use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};
 use tracing_subscriber::EnvFilter;
 
@@ -140,6 +125,163 @@ struct Inspection {
     action_error: Option<String>,
     action_busy: bool,
     confirming_remove: bool,
+    logs_open: bool,
+}
+
+#[cfg(target_os = "linux")]
+enum LogEvent {
+    Line {
+        generation: u64,
+        line: ContainerLogLine,
+    },
+    Reset {
+        generation: u64,
+    },
+    Ended {
+        generation: u64,
+        error: Option<String>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+trait LogLineStream {
+    type Error: std::fmt::Display;
+
+    async fn next_line(&mut self) -> Result<Option<ContainerLogLine>, Self::Error>;
+}
+
+#[cfg(target_os = "linux")]
+trait LogStreamOpener {
+    type Error: std::fmt::Display;
+    type Stream: LogLineStream<Error = Self::Error>;
+
+    async fn open(&mut self) -> Result<Self::Stream, Self::Error>;
+}
+
+#[cfg(target_os = "linux")]
+struct EngineLogOpener {
+    engine: EngineClient,
+    container_id: String,
+    tty: bool,
+    options: ContainerLogsOptions,
+}
+
+#[cfg(target_os = "linux")]
+impl LogLineStream for ferrum_engine::ContainerLogStream {
+    type Error = EngineError;
+
+    async fn next_line(&mut self) -> Result<Option<ContainerLogLine>, Self::Error> {
+        ferrum_engine::ContainerLogStream::next_line(self).await
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LogStreamOpener for EngineLogOpener {
+    type Error = EngineError;
+    type Stream = ferrum_engine::ContainerLogStream;
+
+    async fn open(&mut self) -> Result<Self::Stream, Self::Error> {
+        self.engine
+            .open_container_logs(&self.container_id, self.tty, self.options)
+            .await
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn run_log_retry_loop<O: LogStreamOpener>(
+    opener: &mut O,
+    sender: &mpsc::Sender<LogEvent>,
+    context: &egui::Context,
+    generation: u64,
+    follow: bool,
+) {
+    let mut retries = RetryBudget::default();
+    let mut has_reconnected = false;
+    loop {
+        let mut stream = match opener.open().await {
+            Ok(stream) => {
+                if has_reconnected {
+                    if sender.send(LogEvent::Reset { generation }).await.is_err() {
+                        return;
+                    }
+                    context.request_repaint();
+                }
+                stream
+            }
+            Err(error) => {
+                if !follow || !retries.wait_next().await {
+                    let _ = sender
+                        .send(LogEvent::Ended {
+                            generation,
+                            error: Some(error.to_string()),
+                        })
+                        .await;
+                    context.request_repaint();
+                    return;
+                }
+                has_reconnected = true;
+                continue;
+            }
+        };
+        let disconnect_error = loop {
+            match stream.next_line().await {
+                Ok(Some(line)) => {
+                    if sender
+                        .send(LogEvent::Line { generation, line })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    context.request_repaint();
+                }
+                Ok(None) => {
+                    let _ = sender
+                        .send(LogEvent::Ended {
+                            generation,
+                            error: None,
+                        })
+                        .await;
+                    context.request_repaint();
+                    return;
+                }
+                Err(error) => {
+                    if !follow {
+                        let _ = sender
+                            .send(LogEvent::Ended {
+                                generation,
+                                error: Some(error.to_string()),
+                            })
+                            .await;
+                        context.request_repaint();
+                        return;
+                    }
+                    break error;
+                }
+            }
+        };
+        if retries.wait_next().await {
+            has_reconnected = true;
+            continue;
+        }
+        let _ = sender
+            .send(LogEvent::Ended {
+                generation,
+                error: Some(disconnect_error.to_string()),
+            })
+            .await;
+        context.request_repaint();
+        return;
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct CachedDroppedLogNotice {
+    dropped_lines: usize,
+    font_id: egui::FontId,
+    color: Color32,
+    wrap_width: f32,
+    galley: std::sync::Arc<egui::Galley>,
 }
 
 struct FerrumApp {
@@ -165,6 +307,38 @@ struct FerrumApp {
     event_task: Option<JoinHandle<()>>,
     event_warning: Option<String>,
     event_refresh_pending: bool,
+    #[cfg(target_os = "linux")]
+    log_sender: mpsc::Sender<LogEvent>,
+    #[cfg(target_os = "linux")]
+    log_receiver: mpsc::Receiver<LogEvent>,
+    #[cfg(target_os = "linux")]
+    log_task: Option<JoinHandle<()>>,
+    #[cfg(target_os = "linux")]
+    log_generation: u64,
+    #[cfg(target_os = "linux")]
+    log_buffer: LogBuffer,
+    #[cfg(target_os = "linux")]
+    log_dropped_notice: Option<CachedDroppedLogNotice>,
+    #[cfg(target_os = "linux")]
+    log_options: ContainerLogsOptions,
+    #[cfg(target_os = "linux")]
+    log_notice: Option<String>,
+    #[cfg(target_os = "linux")]
+    log_action_notice: Option<String>,
+    #[cfg(target_os = "linux")]
+    log_paused: bool,
+    #[cfg(target_os = "linux")]
+    log_auto_scroll: bool,
+    #[cfg(target_os = "linux")]
+    log_reconnected: bool,
+    #[cfg(target_os = "linux")]
+    log_started: bool,
+    #[cfg(target_os = "linux")]
+    log_search: String,
+    #[cfg(target_os = "linux")]
+    log_stdout: bool,
+    #[cfg(target_os = "linux")]
+    log_stderr: bool,
     settings_store: settings::SettingsStore,
     settings: settings::Settings,
     settings_draft: settings::Settings,
@@ -193,10 +367,50 @@ impl FerrumApp {
             );
         }
         let (sender, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        #[cfg(target_os = "linux")]
+        let (log_sender, log_receiver) = mpsc::channel(LOG_CHANNEL_CAPACITY);
         let mut app = Self {
             runtime,
             sender,
             receiver,
+            #[cfg(target_os = "linux")]
+            log_sender,
+            #[cfg(target_os = "linux")]
+            log_receiver,
+            #[cfg(target_os = "linux")]
+            log_task: None,
+            #[cfg(target_os = "linux")]
+            log_generation: 0,
+            #[cfg(target_os = "linux")]
+            log_buffer: LogBuffer::new(),
+            #[cfg(target_os = "linux")]
+            log_dropped_notice: None,
+            #[cfg(target_os = "linux")]
+            log_options: ContainerLogsOptions {
+                stdout: true,
+                stderr: true,
+                timestamps: true,
+                follow: false,
+                tail: 500,
+            },
+            #[cfg(target_os = "linux")]
+            log_notice: None,
+            #[cfg(target_os = "linux")]
+            log_action_notice: None,
+            #[cfg(target_os = "linux")]
+            log_paused: false,
+            #[cfg(target_os = "linux")]
+            log_auto_scroll: true,
+            #[cfg(target_os = "linux")]
+            log_reconnected: false,
+            #[cfg(target_os = "linux")]
+            log_started: false,
+            #[cfg(target_os = "linux")]
+            log_search: String::new(),
+            #[cfg(target_os = "linux")]
+            log_stdout: true,
+            #[cfg(target_os = "linux")]
+            log_stderr: true,
             connection: if settings.auto_connect_on_startup {
                 ConnectionState::Connecting
             } else {
@@ -347,6 +561,34 @@ impl FerrumApp {
     fn receive_events(&mut self, context: egui::Context) {
         let mut selected_container_changed = false;
         let mut action_error_after_reinspection = None;
+        #[cfg(target_os = "linux")]
+        if !self.log_paused {
+            for _ in 0..256 {
+                let Ok(event) = self.log_receiver.try_recv() else {
+                    break;
+                };
+                match event {
+                    LogEvent::Line { generation, line } if generation == self.log_generation => {
+                        self.log_buffer.append(line);
+                        self.log_notice = None;
+                    }
+                    LogEvent::Reset { generation } if generation == self.log_generation => {
+                        self.log_buffer.reset();
+                        self.log_notice = None;
+                        self.log_reconnected = true;
+                    }
+                    LogEvent::Ended { generation, error } if generation == self.log_generation => {
+                        self.log_task = None;
+                        self.log_notice = Some(match error {
+                            Some(error) => format!("Log stream ended: {error}"),
+                            None if self.log_options.follow => "The log stream is complete.".into(),
+                            None => "No more historical log lines.".into(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
         while let Ok(event) = self.receiver.try_recv() {
             match event {
                 EngineEvent::Contexts(Ok(contexts)) => {
@@ -540,6 +782,9 @@ impl FerrumApp {
         if let Some(task) = self.inspection_task.take() {
             task.abort();
         }
+        self.cancel_log_stream();
+        self.log_buffer.reset();
+        self.log_action_notice = None;
         self.inspection = None;
     }
 
@@ -564,6 +809,7 @@ impl FerrumApp {
             action_error: None,
             action_busy: false,
             confirming_remove: false,
+            logs_open: false,
         });
         if let Some(engine) = self.engine.clone() {
             let container_id = container_id.to_owned();
@@ -579,6 +825,59 @@ impl FerrumApp {
                 }
             }));
         }
+    }
+    #[cfg(target_os = "linux")]
+    fn cancel_log_stream(&mut self) {
+        if let Some(task) = self.log_task.take() {
+            task.abort();
+        }
+        self.log_generation = self.log_generation.wrapping_add(1);
+        self.log_paused = false;
+        self.log_started = false;
+        self.log_reconnected = false;
+        self.log_action_notice = None;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_log_stream(
+        &mut self,
+        id: String,
+        tty: bool,
+        options: ContainerLogsOptions,
+        context: egui::Context,
+    ) {
+        self.cancel_log_stream();
+        let Some(engine) = self.engine.clone() else {
+            self.log_started = true;
+            self.log_notice = Some("The engine connection is unavailable.".into());
+            context.request_repaint();
+            return;
+        };
+        let generation = self.log_generation;
+        let sender = self.log_sender.clone();
+        let container_id = id;
+        self.log_options = options;
+        self.log_started = true;
+        self.log_notice = Some("Loading container logs…".into());
+        self.log_reconnected = false;
+        let stream_context = context.clone();
+        self.log_task = Some(self.runtime.spawn(async move {
+            let mut opener = EngineLogOpener {
+                engine,
+                container_id,
+                tty,
+                options,
+            };
+            run_log_retry_loop(
+                &mut opener,
+                &sender,
+                &stream_context,
+                generation,
+                options.follow,
+            )
+            .await;
+        }));
+        context.request_repaint();
     }
 
     fn run_action(&mut self, action: ContainerAction, context: egui::Context) {
@@ -625,7 +924,7 @@ impl FerrumApp {
             self.event_warning = None;
             let sender = self.sender.clone();
             self.event_task = Some(self.runtime.spawn(async move {
-                let mut retries = EventRetryBudget::default();
+                let mut retries = RetryBudget::default();
                 let mut stream = loop {
                     match engine.subscribe_container_changes().await {
                         Ok(stream) => {
@@ -634,7 +933,7 @@ impl FerrumApp {
                             break stream;
                         }
                         Err(_) => {
-                            if wait_for_event_retry(&mut retries).await {
+                            if retries.wait_next().await {
                                 continue;
                             }
                             let _ = sender
@@ -662,7 +961,7 @@ impl FerrumApp {
                         }
                         Ok(None) | Err(_) => {
                             let mut reconnected = false;
-                            while wait_for_event_retry(&mut retries).await {
+                            while retries.wait_next().await {
                                 if let Ok(new_stream) = engine.subscribe_container_changes().await {
                                     stream = new_stream;
                                     retries.reset();
@@ -990,6 +1289,8 @@ impl FerrumApp {
         let mut requested_action = None;
         let mut confirm_remove = false;
         let mut cancel_remove = false;
+        #[cfg(target_os = "linux")]
+        let mut open_logs = false;
         egui::Window::new("Container details")
             .id(egui::Id::new("container-inspection"))
             .open(&mut open)
@@ -997,6 +1298,16 @@ impl FerrumApp {
             .show(&context, |ui| {
                 ui.heading(&inspection.container_name);
                 detail_row(ui, "ID", Some(&inspection.container_id));
+                #[cfg(target_os = "linux")]
+                if ui
+                    .add_enabled(
+                        !inspection.loading && !inspection.error && inspection.details.is_some(),
+                        egui::Button::new("Container logs"),
+                    )
+                    .clicked()
+                {
+                    open_logs = true;
+                }
                 let state = inspection
                     .details
                     .as_ref()
@@ -1129,7 +1440,268 @@ impl FerrumApp {
         if (!open || close) && !action_busy {
             self.cancel_inspection();
         } else if let Some(action) = requested_action {
-            self.run_action(action, context);
+            self.run_action(action, context.clone());
+        }
+        #[cfg(target_os = "linux")]
+        if open_logs && let Some(inspection) = self.inspection.as_mut() {
+            inspection.logs_open = true;
+        }
+        #[cfg(target_os = "linux")]
+        self.draw_logs(context.clone());
+    }
+    #[cfg(target_os = "linux")]
+    fn draw_logs(&mut self, context: egui::Context) {
+        let Some(inspection) = self.inspection.as_ref() else {
+            return;
+        };
+        if !inspection.logs_open {
+            return;
+        }
+        let starting_stream = !self.log_started;
+        let tty = inspection.details.as_ref().and_then(|details| details.tty);
+        let running = inspection
+            .details
+            .as_ref()
+            .and_then(|details| details.state.as_ref())
+            .is_some_and(|state| *state == ContainerState::Running);
+        if starting_stream {
+            self.log_options.follow = running;
+        }
+        if tty == Some(true) {
+            self.log_stdout = true;
+            self.log_stderr = true;
+        }
+        let mut open = true;
+        let mut refresh = false;
+        let mut options_changed = false;
+        let mut copy_logs = false;
+        let mut export_logs = false;
+        egui::Window::new("Container logs")
+            .id(egui::Id::new("container-logs"))
+            .open(&mut open)
+            .resizable(true)
+            .default_size([800.0, 520.0])
+            .show(&context, |ui| {
+                if tty.is_none() {
+                    ui.colored_label(
+                        Color32::from_rgb(224, 174, 109),
+                        "Logs are unavailable because the container TTY mode was not reported.",
+                    );
+                    return;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Search");
+                    ui.text_edit_singleline(&mut self.log_search);
+                    if tty == Some(true) {
+                        ui.add_enabled(false, egui::Checkbox::new(&mut self.log_stdout, "Stdout"));
+                        ui.add_enabled(false, egui::Checkbox::new(&mut self.log_stderr, "Stderr"));
+                        ui.label("TTY logs use combined output.");
+                    } else {
+                        let stdout_changed = ui.checkbox(&mut self.log_stdout, "Stdout").changed();
+                        let stderr_changed = ui.checkbox(&mut self.log_stderr, "Stderr").changed();
+                        options_changed |= stdout_changed || stderr_changed;
+                        if !self.log_stdout && !self.log_stderr {
+                            if stderr_changed {
+                                self.log_stderr = true;
+                            } else {
+                                self.log_stdout = true;
+                            }
+                        }
+                    }
+                    options_changed |= ui
+                        .checkbox(&mut self.log_options.timestamps, "Timestamps")
+                        .changed();
+                    let mut tail = self.log_options.tail;
+                    egui::ComboBox::from_id_salt("container-logs-tail")
+                        .selected_text(match tail {
+                            100 => "Last 100 lines",
+                            500 => "Last 500 lines",
+                            1_000 => "Last 1000 lines",
+                            5_000 => "Last 5000 lines",
+                            _ => "Custom tail",
+                        })
+                        .show_ui(ui, |ui| {
+                            for (choice, label) in [
+                                (100, "Last 100 lines"),
+                                (500, "Last 500 lines"),
+                                (1_000, "Last 1000 lines"),
+                                (5_000, "Last 5000 lines"),
+                            ] {
+                                ui.selectable_value(&mut tail, choice, label);
+                            }
+                        });
+                    if tail != self.log_options.tail {
+                        self.log_options.tail = tail;
+                        options_changed = true;
+                    }
+                    options_changed |= ui
+                        .checkbox(&mut self.log_options.follow, "Follow")
+                        .changed();
+                    if ui.button("Refresh").clicked() {
+                        refresh = true;
+                    }
+                });
+                self.log_buffer.set_filters(
+                    &self.log_search,
+                    tty == Some(true) || self.log_stdout,
+                    tty == Some(true) || self.log_stderr,
+                );
+                let has_visible_content = self.log_buffer.visible_count() > 0;
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.log_started && self.log_task.is_some(),
+                            egui::Button::new(if self.log_paused { "Resume" } else { "Pause" }),
+                        )
+                        .clicked()
+                    {
+                        self.log_paused = !self.log_paused;
+                    }
+                    if self.log_paused {
+                        ui.colored_label(Color32::from_rgb(224, 174, 109), "Paused");
+                    }
+                    ui.checkbox(&mut self.log_auto_scroll, "Auto-scroll");
+                    copy_logs = ui
+                        .add_enabled(has_visible_content, egui::Button::new("Copy"))
+                        .clicked();
+                    export_logs = ui
+                        .add_enabled(has_visible_content, egui::Button::new("Export"))
+                        .clicked();
+                });
+                if let Some(notice) = &self.log_notice {
+                    if notice.starts_with("Log stream ended:") {
+                        ui.colored_label(Color32::from_rgb(224, 174, 109), notice);
+                    } else {
+                        ui.label(notice);
+                    }
+                }
+                if let Some(notice) = &self.log_action_notice {
+                    ui.label(notice);
+                }
+                if self.log_reconnected {
+                    ui.colored_label(
+                        Color32::from_rgb(130, 194, 145),
+                        "Reconnected; displaying recent container output.",
+                    );
+                }
+                let dropped_lines = self.log_buffer.dropped_lines();
+                if dropped_lines > 0 {
+                    let color = Color32::from_rgb(224, 174, 109);
+                    let font_id = egui::TextStyle::Body.resolve(ui.style());
+                    let wrap_width = ui.available_width();
+                    let needs_rebuild = self.log_dropped_notice.as_ref().is_none_or(|notice| {
+                        notice.dropped_lines != dropped_lines
+                            || notice.font_id != font_id
+                            || notice.color != color
+                            || notice.wrap_width != wrap_width
+                    });
+                    if needs_rebuild {
+                        let text = format!(
+                            "{} older log lines dropped from the in-memory buffer.",
+                            dropped_lines
+                        );
+                        let galley = ui
+                            .painter()
+                            .layout(text, font_id.clone(), color, wrap_width);
+                        self.log_dropped_notice = Some(CachedDroppedLogNotice {
+                            dropped_lines,
+                            font_id,
+                            color,
+                            wrap_width,
+                            galley,
+                        });
+                    }
+                    if let Some(notice) = &self.log_dropped_notice {
+                        ui.add(egui::Label::new(std::sync::Arc::clone(&notice.galley)));
+                    }
+                }
+                let visible_count = self.log_buffer.visible_count();
+                if visible_count == 0 {
+                    if self.log_started && self.log_notice.is_none() {
+                        ui.label("No log lines match the current filters.");
+                    } else if !self.log_started {
+                        ui.label("Load logs to view recent container output.");
+                    }
+                } else {
+                    egui::ScrollArea::both()
+                        .stick_to_bottom(self.log_auto_scroll)
+                        .show_rows(ui, 20.0, visible_count, |ui, rows| {
+                            for row in rows {
+                                if let Some(entry) = self.log_buffer.visible_entry_at(row) {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(logs::source_label(&entry.source))
+                                                .monospace(),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&entry.text).monospace(),
+                                            )
+                                            .extend(),
+                                        );
+                                    });
+                                }
+                            }
+                        });
+                }
+            });
+        if copy_logs {
+            self.log_action_notice = None;
+            context.copy_text(self.log_buffer.visible_text());
+        }
+        if export_logs {
+            self.log_action_notice = None;
+            let text = self.log_buffer.visible_text();
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name("container-logs.txt")
+                .add_filter("Text files", &["txt"])
+                .save_file()
+            {
+                let result = logs::export_visible_logs(&path, &text);
+                self.log_action_notice = Some(match result {
+                    Ok(()) => "Visible logs exported.".into(),
+                    Err(_) => "Could not export visible logs.".into(),
+                });
+            }
+        }
+        if !open {
+            if let Some(inspection) = self.inspection.as_mut() {
+                inspection.logs_open = false;
+            }
+            self.cancel_log_stream();
+            self.log_buffer.reset();
+            self.log_reconnected = false;
+            return;
+        }
+        if self.log_buffer.entries().is_empty() && self.log_notice.is_none() && !self.log_started {
+            self.log_notice = Some("Load logs to view recent container output.".into());
+        }
+        if tty.is_none() {
+            if self.log_started || self.log_task.is_some() {
+                self.cancel_log_stream();
+            }
+            self.log_notice = Some(
+                "Logs are unavailable because the container TTY mode was not reported.".into(),
+            );
+            return;
+        }
+        if tty == Some(true) {
+            self.log_options.stdout = true;
+            self.log_options.stderr = true;
+        } else {
+            self.log_options.stdout = self.log_stdout;
+            self.log_options.stderr = self.log_stderr;
+        }
+        if (starting_stream || options_changed || refresh)
+            && let Some(id) = self
+                .inspection
+                .as_ref()
+                .map(|inspection| inspection.container_id.clone())
+        {
+            if !starting_stream {
+                self.log_buffer.reset();
+            }
+            self.start_log_stream(id, tty.unwrap_or(false), self.log_options, context);
         }
     }
     fn draw_settings(&mut self, context: egui::Context) {
@@ -1180,6 +1752,8 @@ fn detail_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
 impl Drop for FerrumApp {
     fn drop(&mut self) {
         self.stop_event_stream();
+        #[cfg(target_os = "linux")]
+        self.cancel_log_stream();
         if let Some(task) = self.inspection_task.take() {
             task.abort();
         }
@@ -1361,9 +1935,176 @@ mod lifecycle_action_tests {
         assert!(action_requires_confirmation(ContainerAction::Remove));
     }
 }
+
+#[cfg(test)]
+mod log_buffer_tests {
+    use super::*;
+    use ferrum_core::{ContainerLogLine, ContainerLogSource};
+
+    fn line(source: ContainerLogSource, text: &str) -> ContainerLogLine {
+        ContainerLogLine {
+            source,
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn evicts_oldest_lines_when_line_limit_is_exceeded() {
+        let mut buffer = logs::LogBuffer::new();
+        for index in 0..10_001 {
+            buffer.append(line(ContainerLogSource::Stdout, &index.to_string()));
+        }
+
+        assert_eq!(buffer.entries().len(), 10_000);
+        assert_eq!(buffer.dropped_lines(), 1);
+        assert_eq!(buffer.entries()[0].text, "1");
+        assert_eq!(buffer.entries()[9_999].text, "10000");
+    }
+
+    #[test]
+    fn evicts_oldest_lines_to_stay_within_retained_byte_limit() {
+        let mut buffer = logs::LogBuffer::new();
+        let text = "x".repeat(64 * 1024);
+        for _ in 0..129 {
+            buffer.append(line(ContainerLogSource::Stdout, &text));
+        }
+
+        assert_eq!(buffer.retained_bytes(), 8 * 1024 * 1024);
+        assert_eq!(buffer.entries().len(), 128);
+        assert_eq!(buffer.dropped_lines(), 1);
+        assert!(buffer.entries().iter().all(|entry| entry.text == text));
+    }
+
+    #[test]
+    fn searches_case_insensitively_with_unicode_and_returns_matching_indices() {
+        let mut buffer = logs::LogBuffer::new();
+        buffer.append(line(ContainerLogSource::Stdout, "Σervice ready"));
+        buffer.append(line(ContainerLogSource::Stderr, "connection refused"));
+        buffer.append(line(ContainerLogSource::Stdout, "SERVICE ready"));
+
+        buffer.set_filters("σERVICE", true, true);
+
+        assert_eq!(buffer.visible_indices(), vec![0]);
+        buffer.set_filters("service", true, true);
+        assert_eq!(buffer.visible_indices(), vec![2]);
+    }
+
+    #[test]
+    fn filters_stdout_stderr_and_combined_lines_by_stream_selection() {
+        let mut buffer = logs::LogBuffer::new();
+        buffer.append(line(ContainerLogSource::Stdout, "out"));
+        buffer.append(line(ContainerLogSource::Stderr, "err"));
+        buffer.append(line(ContainerLogSource::Combined, "tty"));
+
+        buffer.set_filters("", true, false);
+        assert_eq!(buffer.visible_indices(), vec![0, 2]);
+
+        buffer.set_filters("", false, true);
+        assert_eq!(buffer.visible_indices(), vec![1, 2]);
+
+        buffer.set_filters("", true, true);
+        assert_eq!(buffer.visible_indices(), vec![0, 1, 2]);
+    }
+    #[test]
+    fn visible_text_joins_filtered_rows_labels_sources_and_preserves_blank_lines() {
+        let mut buffer = logs::LogBuffer::new();
+        buffer.append(line(ContainerLogSource::Stdout, "match first"));
+        buffer.append(line(ContainerLogSource::Stderr, "hidden stream"));
+        buffer.append(line(ContainerLogSource::Combined, "combined output"));
+        buffer.append(line(ContainerLogSource::Stdout, ""));
+        buffer.append(line(ContainerLogSource::Stdout, "match second"));
+
+        buffer.set_filters("", true, false);
+
+        assert_eq!(
+            buffer.visible_text(),
+            "stdout: match first\ncombined: combined output\nstdout: \nstdout: match second"
+        );
+        buffer.set_filters("second", true, true);
+        assert_eq!(buffer.visible_text(), "stdout: match second");
+        buffer.set_filters("", true, false);
+        assert_eq!(
+            buffer.visible_text(),
+            "stdout: match first\ncombined: combined output\nstdout: \nstdout: match second"
+        );
+        buffer.set_filters("", false, true);
+        assert_eq!(
+            buffer.visible_text(),
+            "stderr: hidden stream\ncombined: combined output"
+        );
+    }
+
+    #[test]
+    fn visible_text_escapes_terminal_controls_and_preserves_rows() {
+        let mut buffer = logs::LogBuffer::new();
+        buffer.append(line(
+            ContainerLogSource::Stdout,
+            "before\u{1b}]52;c;payload\u{7}after",
+        ));
+        buffer.append(line(ContainerLogSource::Stderr, "c1\u{85}end"));
+
+        assert_eq!(
+            buffer.visible_text(),
+            "stdout: before\\x1b]52;c;payload\\x07after\nstderr: c1\\x85end"
+        );
+    }
+
+    #[test]
+    fn reset_clears_entries_and_drop_count_but_preserves_filters() {
+        let mut buffer = logs::LogBuffer::new();
+        for index in 0..10_001 {
+            buffer.append(line(ContainerLogSource::Stdout, &index.to_string()));
+        }
+        buffer.set_filters("9999", true, false);
+        assert!(!buffer.visible_indices().is_empty());
+
+        buffer.reset();
+
+        assert!(buffer.entries().is_empty());
+        assert_eq!(buffer.retained_bytes(), 0);
+        assert_eq!(buffer.dropped_lines(), 0);
+        assert!(buffer.visible_indices().is_empty());
+
+        buffer.append(line(ContainerLogSource::Stdout, "reconnected 9999"));
+        assert_eq!(buffer.visible_indices(), vec![0]);
+    }
+}
+#[cfg(all(test, target_os = "linux"))]
+mod log_retry_budget_tests {
+    use super::*;
+
+    #[test]
+    fn retries_are_bounded_for_one_view_and_refresh_starts_a_fresh_budget() {
+        let mut retry = RetryBudget::default();
+
+        assert_eq!(
+            retry.next_delay(),
+            Some(std::time::Duration::from_millis(250))
+        );
+        assert_eq!(
+            retry.next_delay(),
+            Some(std::time::Duration::from_millis(500))
+        );
+        assert_eq!(
+            retry.next_delay(),
+            Some(std::time::Duration::from_millis(1_000))
+        );
+        assert_eq!(retry.next_delay(), None);
+
+        // The view's retry budget is fixed; manual refresh starts a new task.
+        let mut refreshed = RetryBudget::default();
+        assert_eq!(
+            refreshed.next_delay(),
+            Some(std::time::Duration::from_millis(250))
+        );
+    }
+}
+
 #[cfg(test)]
 mod event_reconciliation_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use ferrum_core::ContainerLogSource;
 
     fn app_with_open_inspection() -> (FerrumApp, mpsc::Sender<EngineEvent>) {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1371,11 +2112,17 @@ mod event_reconciliation_tests {
             .build()
             .expect("test runtime should build");
         let (sender, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        #[cfg(target_os = "linux")]
+        let (log_sender, log_receiver) = mpsc::channel(LOG_CHANNEL_CAPACITY);
         let settings = settings::Settings::default();
         let app = FerrumApp {
             runtime,
             sender: sender.clone(),
             receiver,
+            #[cfg(target_os = "linux")]
+            log_sender,
+            #[cfg(target_os = "linux")]
+            log_receiver,
             connection: ConnectionState::Connected,
             engine: None,
             engine_info: None,
@@ -1408,6 +2155,7 @@ mod event_reconciliation_tests {
                     exit_code: None,
                     started_at: None,
                     finished_at: None,
+                    tty: None,
                     mounts: None,
                 }),
                 restart_count_display: None,
@@ -1416,6 +2164,7 @@ mod event_reconciliation_tests {
                 action_error: None,
                 action_busy: false,
                 confirming_remove: false,
+                logs_open: false,
             }),
             action_task: None,
             inspection_task: None,
@@ -1424,6 +2173,40 @@ mod event_reconciliation_tests {
             event_task: None,
             event_warning: None,
             event_refresh_pending: false,
+            #[cfg(target_os = "linux")]
+            log_task: None,
+            #[cfg(target_os = "linux")]
+            log_generation: 0,
+            #[cfg(target_os = "linux")]
+            log_buffer: LogBuffer::new(),
+            #[cfg(target_os = "linux")]
+            log_dropped_notice: None,
+            #[cfg(target_os = "linux")]
+            log_options: ContainerLogsOptions {
+                stdout: true,
+                stderr: true,
+                timestamps: true,
+                follow: false,
+                tail: 500,
+            },
+            #[cfg(target_os = "linux")]
+            log_notice: None,
+            #[cfg(target_os = "linux")]
+            log_action_notice: None,
+            #[cfg(target_os = "linux")]
+            log_paused: false,
+            #[cfg(target_os = "linux")]
+            log_auto_scroll: true,
+            #[cfg(target_os = "linux")]
+            log_reconnected: false,
+            #[cfg(target_os = "linux")]
+            log_started: false,
+            #[cfg(target_os = "linux")]
+            log_search: String::new(),
+            #[cfg(target_os = "linux")]
+            log_stdout: true,
+            #[cfg(target_os = "linux")]
+            log_stderr: true,
             settings_store: settings::SettingsStore::new(),
             settings_draft: settings.clone(),
             settings,
@@ -1504,7 +2287,7 @@ mod event_reconciliation_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn event_retry_budget_is_bounded_and_resets_after_successful_subscription() {
-        let mut retries = EventRetryBudget::default();
+        let mut retries = RetryBudget::default();
         for delay in [250, 500, 1_000] {
             assert_eq!(retries.next_delay(), Some(Duration::from_millis(delay)));
         }
@@ -1540,6 +2323,439 @@ mod event_reconciliation_tests {
         assert_eq!(
             inspection.action_error.as_deref(),
             Some(expected_error.as_str())
+        );
+    }
+    #[cfg(target_os = "linux")]
+    enum ScriptedLine {
+        Line(&'static str),
+        Fail,
+        Eof,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ScriptedStream(std::collections::VecDeque<ScriptedLine>);
+
+    #[cfg(target_os = "linux")]
+    impl LogLineStream for ScriptedStream {
+        type Error = String;
+        async fn next_line(&mut self) -> Result<Option<ContainerLogLine>, String> {
+            match self.0.pop_front().expect("scripted stream has an event") {
+                ScriptedLine::Line(text) => Ok(Some(ContainerLogLine {
+                    source: ContainerLogSource::Stdout,
+                    text: text.to_owned(),
+                })),
+                ScriptedLine::Fail => Err("scripted disconnect".to_owned()),
+                ScriptedLine::Eof => Ok(None),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ScriptedOpener {
+        streams: std::collections::VecDeque<ScriptedStream>,
+        opens: usize,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl LogStreamOpener for ScriptedOpener {
+        type Error = String;
+        type Stream = ScriptedStream;
+
+        async fn open(&mut self) -> Result<Self::Stream, String> {
+            self.opens += 1;
+            self.streams
+                .pop_front()
+                .ok_or_else(|| "unexpected extra open".to_owned())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_retry_loop_reopens_and_replays_tail_without_losing_filters() {
+        use std::collections::VecDeque;
+
+        let (mut app, _) = app_with_open_inspection();
+        app.log_search = "fresh".to_owned();
+        app.log_options.follow = true;
+        let generation = app.log_generation;
+        let mut opener = ScriptedOpener {
+            streams: VecDeque::from([
+                ScriptedStream(VecDeque::from([
+                    ScriptedLine::Line("old history"),
+                    ScriptedLine::Fail,
+                ])),
+                ScriptedStream(VecDeque::from([
+                    ScriptedLine::Line("replayed history"),
+                    ScriptedLine::Line("fresh output"),
+                    ScriptedLine::Eof,
+                ])),
+            ]),
+            opens: 0,
+        };
+
+        app.runtime.block_on(run_log_retry_loop(
+            &mut opener,
+            &app.log_sender,
+            &egui::Context::default(),
+            generation,
+            true,
+        ));
+
+        assert_eq!(opener.opens, 2);
+
+        app.receive_events(egui::Context::default());
+        app.log_buffer
+            .set_filters(&app.log_search, app.log_stdout, app.log_stderr);
+        assert!(app.log_reconnected);
+        assert_eq!(app.log_search, "fresh");
+        assert_eq!(app.log_buffer.entries().len(), 2);
+        assert_eq!(app.log_buffer.entries()[0].text, "replayed history");
+        assert_eq!(app.log_buffer.entries()[1].text, "fresh output");
+        assert_eq!(
+            app.log_buffer
+                .entries()
+                .iter()
+                .filter(|line| line.text == "replayed history")
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.log_buffer
+                .entries()
+                .iter()
+                .filter(|line| line.text == "fresh output")
+                .count(),
+            1
+        );
+        assert!(
+            app.log_buffer
+                .entries()
+                .iter()
+                .all(|line| line.text != "old history")
+        );
+        assert_eq!(
+            app.log_notice.as_deref(),
+            Some("The log stream is complete.")
+        );
+        assert_eq!(app.log_buffer.visible_count(), 1);
+        assert_eq!(
+            app.log_buffer.visible_entry_at(0).unwrap().text,
+            "fresh output"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paused_log_events_remain_queued_until_resume() {
+        let (mut app, _) = app_with_open_inspection();
+        app.log_paused = true;
+        let generation = app.log_generation;
+        assert!(
+            app.log_sender
+                .try_send(LogEvent::Line {
+                    generation,
+                    line: ContainerLogLine {
+                        source: ContainerLogSource::Stdout,
+                        text: "queued output".to_owned(),
+                    },
+                })
+                .is_ok()
+        );
+
+        app.receive_events(egui::Context::default());
+        assert!(app.log_buffer.entries().is_empty());
+
+        app.log_paused = false;
+        app.receive_events(egui::Context::default());
+        assert_eq!(app.log_buffer.visible_count(), 1);
+        assert_eq!(app.log_buffer.entries()[0].text, "queued output");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropped_log_count_is_accessible_in_logs_window() {
+        use egui::accesskit::Role;
+        use egui_kittest::{
+            Harness,
+            kittest::{NodeT, Queryable},
+        };
+
+        let (mut app, _) = app_with_open_inspection();
+        {
+            let inspection = app.inspection.as_mut().unwrap();
+            inspection.logs_open = true;
+            inspection.details.as_mut().unwrap().tty = Some(false);
+        }
+        for _ in 0..10_001 {
+            app.log_buffer.append(ContainerLogLine {
+                source: ContainerLogSource::Stdout,
+                text: "retained output".to_owned(),
+            });
+        }
+        assert_eq!(app.log_buffer.dropped_lines(), 1);
+
+        let mut harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| {
+                let context = ui.ctx().clone();
+                app.receive_events(context.clone());
+                app.draw_inspection(context);
+            },
+            app,
+        );
+        harness.run();
+        assert!(
+            !harness
+                .get_by_role_and_label(
+                    Role::Label,
+                    "1 older log lines dropped from the in-memory buffer."
+                )
+                .accesskit_node()
+                .is_disabled()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn logs_window_controls_expose_pause_resume_filters_copy_and_export_state() {
+        use egui::accesskit::Role;
+        use egui_kittest::{
+            Harness,
+            kittest::{NodeT, Queryable},
+        };
+
+        let (mut app, _) = app_with_open_inspection();
+        let details = app.inspection.as_mut().unwrap().details.as_mut().unwrap();
+        details.state = Some(ContainerState::Exited);
+        details.tty = Some(false);
+        app.log_started = true;
+        app.log_options.follow = true;
+        app.log_task = Some(app.runtime.spawn(std::future::pending::<()>()));
+        app.log_search = "keep".to_owned();
+        app.log_buffer.append(ContainerLogLine {
+            source: ContainerLogSource::Stdout,
+            text: "keep initial".to_owned(),
+        });
+        app.log_buffer.append(ContainerLogLine {
+            source: ContainerLogSource::Stderr,
+            text: "exclude initial".to_owned(),
+        });
+
+        let mut harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| {
+                let context = ui.ctx().clone();
+                app.receive_events(context.clone());
+                app.draw_inspection(context);
+            },
+            app,
+        );
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Container logs")
+            .click();
+        harness.run();
+        let export = harness.get_by_role_and_label(Role::Button, "Export");
+        assert!(!export.accesskit_node().is_disabled());
+
+        harness.get_by_role_and_label(Role::Button, "Pause").click();
+        harness.run();
+        assert!(harness.state().log_paused);
+        assert!(
+            harness
+                .state()
+                .log_sender
+                .try_send(LogEvent::Line {
+                    generation: harness.state().log_generation,
+                    line: ContainerLogLine {
+                        source: ContainerLogSource::Stdout,
+                        text: "keep queued".to_owned(),
+                    },
+                })
+                .is_ok()
+        );
+        assert!(
+            harness
+                .state()
+                .log_buffer
+                .entries()
+                .iter()
+                .any(
+                    |line| line.source == ContainerLogSource::Stdout && line.text == "keep initial"
+                )
+        );
+        assert!(
+            harness
+                .state()
+                .log_buffer
+                .entries()
+                .iter()
+                .any(|line| line.source == ContainerLogSource::Stderr
+                    && line.text == "exclude initial")
+        );
+        assert!(
+            !harness
+                .state()
+                .log_buffer
+                .entries()
+                .iter()
+                .any(|line| line.text == "keep queued")
+        );
+
+        harness
+            .get_by_role_and_label(Role::Button, "Resume")
+            .click();
+        harness.run();
+        assert!(!harness.state().log_paused);
+        assert!(
+            harness
+                .state()
+                .log_buffer
+                .entries()
+                .iter()
+                .any(|line| line.text == "keep queued")
+        );
+        assert!(harness.state().log_auto_scroll);
+        harness
+            .get_by_role_and_label(Role::CheckBox, "Auto-scroll")
+            .click();
+        harness.run();
+        assert!(!harness.state().log_auto_scroll);
+        harness
+            .get_by_role_and_label(Role::CheckBox, "Auto-scroll")
+            .click();
+        harness.run();
+        assert!(harness.state().log_auto_scroll);
+
+        harness.get_by_role_and_label(Role::Button, "Copy").click();
+        harness.step();
+        assert!(
+            harness
+                .output()
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    egui::OutputCommand::CopyText(text)
+                        if text == "stdout: keep initial\nstdout: keep queued"
+                ))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inspection_and_logs_dialog_expose_loading_stream_and_close_states() {
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::NodeT, kittest::Queryable};
+
+        let (mut app, _) = app_with_open_inspection();
+        let inspection = app.inspection.as_mut().unwrap();
+        inspection.loading = true;
+        inspection.details = None;
+        app.log_started = false;
+        app.log_task = None;
+
+        let mut harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| {
+                let context = ui.ctx().clone();
+                app.receive_events(context.clone());
+                app.draw_inspection(context);
+            },
+            app,
+        );
+        harness.step();
+        let _loading = harness.get_by_role_and_label(Role::Label, "Loading inspection…");
+        let logs_button = harness.get_by_role_and_label(Role::Button, "Container logs");
+        assert!(logs_button.accesskit_node().is_disabled());
+        harness.state_mut().inspection.as_mut().unwrap().loading = false;
+        harness.state_mut().inspection.as_mut().unwrap().details = Some(ContainerDetails {
+            id: "container-id".to_owned(),
+            name: Some("example".to_owned()),
+            image: Some("example:old".to_owned()),
+            created: None,
+            state: Some(ContainerState::Running),
+            restart_count: None,
+            exit_code: None,
+            started_at: None,
+            finished_at: None,
+            tty: Some(false),
+            mounts: None,
+        });
+        harness.run();
+        let logs_button = harness.get_by_role_and_label(Role::Button, "Container logs");
+        assert!(!logs_button.accesskit_node().is_disabled());
+        logs_button.click();
+        harness.run();
+        let _unavailable =
+            harness.get_by_role_and_label(Role::Label, "The engine connection is unavailable.");
+        assert!(harness.state().log_started);
+        assert!(harness.state().log_task.is_none());
+
+        harness.state_mut().log_notice = None;
+        harness.run();
+        let _empty =
+            harness.get_by_role_and_label(Role::Label, "No log lines match the current filters.");
+
+        let generation = harness.state().log_generation;
+        assert!(
+            harness
+                .state()
+                .log_sender
+                .try_send(LogEvent::Ended {
+                    generation,
+                    error: Some("scripted disconnect".into()),
+                })
+                .is_ok()
+        );
+        harness.run();
+        let _stream_error =
+            harness.get_by_role_and_label(Role::Label, "Log stream ended: scripted disconnect");
+
+        assert!(
+            harness
+                .state()
+                .log_sender
+                .try_send(LogEvent::Reset { generation })
+                .is_ok()
+        );
+        assert!(
+            harness
+                .state()
+                .log_sender
+                .try_send(LogEvent::Line {
+                    generation,
+                    line: ContainerLogLine {
+                        source: ContainerLogSource::Stdout,
+                        text: "fresh output".to_owned(),
+                    },
+                })
+                .is_ok()
+        );
+        harness.run();
+        let _reconnect = harness.get_by_role_and_label(
+            Role::Label,
+            "Reconnected; displaying recent container output.",
+        );
+
+        let app = harness.into_state();
+        let mut logs_harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| {
+                app.draw_logs(ui.ctx().clone());
+            },
+            app,
+        );
+        logs_harness.run();
+        logs_harness
+            .get_by_role_and_label(Role::Button, "Close window")
+            .click();
+        logs_harness.run();
+        assert!(!logs_harness.state().log_started);
+        assert!(logs_harness.state().log_task.is_none());
+        assert!(
+            logs_harness
+                .state()
+                .inspection
+                .as_ref()
+                .is_none_or(|inspection| !inspection.logs_open)
         );
     }
 
