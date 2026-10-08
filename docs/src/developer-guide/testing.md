@@ -11,10 +11,10 @@ cargo doc --workspace --no-deps
 mdbook build docs
 ```
 
-The default suite does not require a host engine. Live tests are ignored and
-read engine version and inventory without mutating resources. Run the general
-local-engine smoke test on a host with an accessible Docker-compatible engine
-and at least one container:
+The default suite does not require a host engine. Ignored live tests read engine
+version and inventory; the general local-engine test also inspects one existing
+container without mutating resources. Run it only on a host with an accessible
+Docker-compatible engine and at least one container:
 
 ```sh
 cargo test -p ferrum-engine --test live_engine local_engine_returns_a_well_formed_container_inventory -- --ignored

@@ -2,6 +2,10 @@
 
 - [Introduction](introduction.md)
 
+# User guide
+
+- [Containers](user-guide/containers.md)
+
 # Developer guide
 
 - [Building](developer-guide/building.md)

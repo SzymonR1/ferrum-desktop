@@ -1,6 +1,6 @@
 # Architecture overview
 
-Ferrum keeps the native presentation, engine-independent domain values, and Docker-compatible transport in separate workspace crates. Only the engine adapter understands Bollard response types; the UI receives Ferrum-owned `ContainerSummary` values.
+Ferrum keeps native presentation, engine-independent domain values, and Docker-compatible transport in separate workspace crates. Only the engine adapter understands Bollard response types; the UI receives Ferrum-owned `ContainerSummary` and `ContainerDetails` values.
 
 ```mermaid
 flowchart LR
@@ -13,11 +13,16 @@ flowchart LR
     APP -->|bounded async event channel| UI
 ```
 
-Connection, list, and context-discovery requests run in Tokio tasks. Results
-arrive through a bounded channel; the worker requests a repaint after delivery.
-The UI callback does not perform synchronous engine I/O. The inventory request
-includes stopped containers. A successful empty response, a connection failure,
-and an API failure remain distinct states.
+Connection, list, inspect, and context-discovery requests run in Tokio tasks.
+Results arrive through a bounded channel; the worker requests a repaint after
+delivery. The UI callback does not perform synchronous engine I/O. The
+inventory request includes stopped containers. A successful empty response, a
+connection failure, and an API failure remain distinct states.
+Filtering and sorting operate on application-owned summary values; inspection
+requests are issued on demand through the engine client. The UI receives typed
+`ContainerDetails` rather than Bollard response objects. Optional fields remain
+absent when the engine omits them, and inspection omits environment variables,
+labels, and command arguments.
 
 The app owns a small Linux TOML settings store for the startup auto-connect
 preference. See [Settings](../settings.md) for path selection, migration,
