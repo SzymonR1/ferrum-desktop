@@ -1072,6 +1072,10 @@ version = "0.1.0"
 dependencies = [
  "bollard",
  "ferrum-core",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "hyperlocal",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

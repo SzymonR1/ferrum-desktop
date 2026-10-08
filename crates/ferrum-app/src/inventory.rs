@@ -62,25 +62,26 @@ impl InventoryView {
     }
 
     fn rebuild(&mut self, inventory: &[ContainerSummary]) {
-        let needle = self.query.to_lowercase();
+        let needle: Vec<char> = self.query.chars().flat_map(char::to_lowercase).collect();
+        let prefix = prefix_table(&needle);
         self.visible.clear();
         self.visible
             .extend(inventory.iter().enumerate().filter_map(|(index, item)| {
                 let matches = needle.is_empty()
-                    || item.name.to_lowercase().contains(&needle)
-                    || item.id.to_lowercase().contains(&needle)
+                    || contains_lowercase(&item.name, &needle, &prefix)
+                    || contains_lowercase(&item.id, &needle, &prefix)
                     || item
                         .image
                         .as_deref()
-                        .is_some_and(|v| v.to_lowercase().contains(&needle))
+                        .is_some_and(|v| contains_lowercase(v, &needle, &prefix))
                     || item
                         .state
                         .as_ref()
-                        .is_some_and(|v| v.label().to_lowercase().contains(&needle))
+                        .is_some_and(|v| contains_lowercase(v.label(), &needle, &prefix))
                     || item
                         .status
                         .as_deref()
-                        .is_some_and(|v| v.to_lowercase().contains(&needle));
+                        .is_some_and(|v| contains_lowercase(v, &needle, &prefix));
                 matches.then_some(index)
             }));
         let sort = self.sort;
@@ -100,6 +101,40 @@ impl InventoryView {
             }
         });
     }
+}
+
+fn prefix_table(pattern: &[char]) -> Vec<usize> {
+    let mut prefix = vec![0; pattern.len()];
+    let mut matched = 0;
+    for index in 1..pattern.len() {
+        while matched > 0 && pattern[index] != pattern[matched] {
+            matched = prefix[matched - 1];
+        }
+        if pattern[index] == pattern[matched] {
+            matched += 1;
+            prefix[index] = matched;
+        }
+    }
+    prefix
+}
+
+fn contains_lowercase(candidate: &str, needle: &[char], prefix: &[usize]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let mut matched = 0;
+    for character in candidate.chars().flat_map(char::to_lowercase) {
+        while matched > 0 && character != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if character == needle[matched] {
+            matched += 1;
+            if matched == needle.len() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn sort_value(item: &ContainerSummary, field: SortField) -> Option<&str> {
@@ -176,6 +211,22 @@ mod tests {
         view.query = "not reported".to_owned();
         view.inventory_changed(&rows);
         assert!(view.visible().is_empty());
+    }
+
+    #[test]
+    fn searches_unicode_case_insensitively_with_lowercase_expansions() {
+        let rows = vec![
+            item("dotted-i", "İstanbul", None, None, None),
+            item("accent", "café", None, None, None),
+            item("other", "Berlin", None, None, None),
+        ];
+        let mut view = InventoryView::default();
+
+        for (query, expected) in [("i\u{307}STAN", vec!["dotted-i"]), ("CAFÉ", vec!["accent"])] {
+            view.query = query.to_owned();
+            view.inventory_changed(&rows);
+            assert_eq!(ids(&view, &rows), expected, "query: {query}");
+        }
     }
 
     #[test]

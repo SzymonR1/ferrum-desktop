@@ -10,6 +10,17 @@ pub use contexts::{ContextTransport, DockerContext};
 use std::{env, path::PathBuf, time::Duration};
 
 #[cfg(target_os = "linux")]
+use http_body_util::{BodyExt, Limited};
+#[cfg(target_os = "linux")]
+use hyper::{Method, Request};
+#[cfg(target_os = "linux")]
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+#[cfg(target_os = "linux")]
+use hyperlocal::{UnixConnector, Uri};
+#[cfg(target_os = "linux")]
+use tokio::time::timeout;
+
+#[cfg(target_os = "linux")]
 use contexts::{
     ContextCommandError, StartupSource, current_cli_context, discover_contexts,
     resolve_startup_source, valid_context_name,
@@ -19,10 +30,53 @@ use contexts::{
 use bollard::API_DEFAULT_VERSION;
 use bollard::{Docker, errors::Error as BollardError, query_parameters::ListContainersOptions};
 use ferrum_core::{ContainerDetails, ContainerMount, ContainerState, ContainerSummary};
+use serde::Deserialize;
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(target_os = "linux")]
+const MAX_INSPECT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct InspectResponse {
+    id: Option<String>,
+    name: Option<String>,
+    image: Option<String>,
+    created: Option<String>,
+    state: Option<InspectState>,
+    restart_count: Option<i64>,
+    mounts: Option<Vec<InspectMount>>,
+    config: Option<InspectConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct InspectState {
+    status: Option<String>,
+    exit_code: Option<i64>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct InspectMount {
+    #[serde(rename = "Type")]
+    typ: Option<String>,
+    source: Option<String>,
+    destination: Option<String>,
+    mode: Option<String>,
+    #[serde(rename = "RW")]
+    rw: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct InspectConfig {
+    image: Option<String>,
+}
 
 /// Version information reported by the connected engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +126,17 @@ pub enum EngineError {
         "The selected Docker context could not return its container inventory. Check its engine health and access permissions."
     )]
     ContextInventoryRequest,
+    /// The engine returned an invalid, oversized, or unavailable inspection response.
+    #[cfg(target_os = "linux")]
+    #[error("The engine at the {endpoint_label} could not return safe container details.")]
+    InspectResponseUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The selected context returned an invalid or unavailable inspection response.
+    #[cfg(target_os = "linux")]
+    #[error("The selected Docker context could not return safe container details.")]
+    ContextInspectResponseUnavailable,
     /// A configured endpoint or socket path cannot be represented safely.
     #[error(
         "The configured local engine endpoint is not valid UTF-8 and cannot be passed to the Docker API client."
@@ -119,22 +184,6 @@ pub enum EngineError {
         #[source]
         source: BollardError,
     },
-    /// The selected Docker context could not inspect a container.
-    #[error(
-        "The selected Docker context could not inspect the container. Check its engine health and access permissions."
-    )]
-    ContextInspectContainerRequest,
-    /// The engine failed to inspect a container.
-    #[error(
-        "The engine at the {endpoint_label} could not inspect the container. Check its health and access permissions."
-    )]
-    InspectContainerRequest {
-        /// Non-secret description of the endpoint kind.
-        endpoint_label: &'static str,
-        /// Underlying client error, omitted from user-facing display.
-        #[source]
-        source: BollardError,
-    },
     /// An inspection response omitted its required container identifier.
     #[error("The engine at the {endpoint_label} returned container details without an identifier.")]
     MissingInspectedContainerId {
@@ -149,6 +198,8 @@ pub struct EngineClient {
     docker: Docker,
     info: EngineInfo,
     selected_context: Option<String>,
+    #[cfg(target_os = "linux")]
+    socket_path: PathBuf,
 }
 
 impl EngineClient {
@@ -236,13 +287,12 @@ impl EngineClient {
                         return Err(EngineError::UnsupportedRemoteTransport);
                     }
                     let endpoint_label = configured_endpoint_label(host);
-                    let docker = Docker::connect_with_defaults().map_err(|source| {
-                        EngineError::Unavailable {
-                            endpoint_label,
-                            source,
-                        }
-                    })?;
-                    return Self::from_client(docker, endpoint_label).await;
+                    let path = host
+                        .strip_prefix("unix://")
+                        .filter(|path| !path.is_empty())
+                        .map(PathBuf::from)
+                        .ok_or(EngineError::UnsupportedRemoteTransport)?;
+                    return Self::connect_unix_socket(&path, endpoint_label).await;
                 }
                 StartupSource::DefaultDiscovery => {}
             }
@@ -401,21 +451,39 @@ impl EngineClient {
     /// Returns a safe typed error if inspection fails or the response omits
     /// the container identifier.
     pub async fn inspect_container(&self, id: &str) -> Result<ContainerDetails, EngineError> {
-        let response = self
-            .docker
-            .inspect_container(id, None)
+        #[cfg(target_os = "linux")]
+        {
+            let body = request_inspect(
+                &self.socket_path,
+                &self.docker.client_version().to_string(),
+                id,
+            )
             .await
-            .map_err(|source| {
+            .map_err(|()| {
                 if self.selected_context.is_some() {
-                    EngineError::ContextInspectContainerRequest
+                    EngineError::ContextInspectResponseUnavailable
                 } else {
-                    EngineError::InspectContainerRequest {
+                    EngineError::InspectResponseUnavailable {
                         endpoint_label: self.info.endpoint_label,
-                        source,
                     }
                 }
             })?;
-        map_container_details(response, self.info.endpoint_label)
+            let response: InspectResponse = serde_json::from_slice(&body).map_err(|_| {
+                if self.selected_context.is_some() {
+                    EngineError::ContextInspectResponseUnavailable
+                } else {
+                    EngineError::InspectResponseUnavailable {
+                        endpoint_label: self.info.endpoint_label,
+                    }
+                }
+            })?;
+            map_container_details(response, self.info.endpoint_label)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = id;
+            Err(EngineError::UnsupportedPlatform)
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -423,6 +491,7 @@ impl EngineClient {
         path: &std::path::Path,
         endpoint_label: &'static str,
     ) -> Result<Self, EngineError> {
+        let socket_path = path.to_path_buf();
         let path = path.to_str().ok_or(EngineError::InvalidEndpointEncoding)?;
         let docker =
             Docker::connect_with_unix(path, REQUEST_TIMEOUT.as_secs(), API_DEFAULT_VERSION)
@@ -430,13 +499,14 @@ impl EngineClient {
                     endpoint_label,
                     source,
                 })?;
-        Self::from_client(docker, endpoint_label).await
+        Self::from_client(docker, endpoint_label, socket_path).await
     }
 
     #[cfg(target_os = "linux")]
     async fn from_client(
         docker: Docker,
         endpoint_label: &'static str,
+        socket_path: PathBuf,
     ) -> Result<Self, EngineError> {
         let docker = docker
             .with_timeout(REQUEST_TIMEOUT)
@@ -470,6 +540,7 @@ impl EngineClient {
                 endpoint_label,
             },
             selected_context: None,
+            socket_path,
         })
     }
 }
@@ -508,6 +579,60 @@ fn is_remote_endpoint(host: &str) -> bool {
         })
 }
 
+#[cfg(target_os = "linux")]
+async fn request_inspect(
+    socket_path: &std::path::Path,
+    api_version: &str,
+    id: &str,
+) -> Result<hyper::body::Bytes, ()> {
+    if id.is_empty()
+        || id.len() > 4096
+        || !api_version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return Err(());
+    }
+    let mut path = String::with_capacity(
+        api_version
+            .len()
+            .saturating_add(id.len().saturating_mul(3))
+            .saturating_add(32),
+    );
+    path.push_str("/v");
+    path.push_str(api_version);
+    path.push_str("/containers/");
+    for byte in id.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            path.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(path, "%{byte:02X}").map_err(|_| ())?;
+        }
+    }
+    path.push_str("/json");
+    let uri = Uri::new(socket_path, &path);
+    timeout(REQUEST_TIMEOUT, async {
+        let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(http_body_util::Empty::<hyper::body::Bytes>::new())
+            .map_err(|_| ())?;
+        let response = client.request(request).await.map_err(|_| ())?;
+        if !response.status().is_success() {
+            return Err(());
+        }
+        Limited::new(response.into_body(), MAX_INSPECT_RESPONSE_BYTES)
+            .collect()
+            .await
+            .map(|body| body.to_bytes())
+            .map_err(|_| ())
+    })
+    .await
+    .map_err(|_| ())?
+}
+
 fn map_container(
     container: bollard::models::ContainerSummary,
     endpoint_label: &'static str,
@@ -533,7 +658,7 @@ fn map_container(
     })
 }
 fn map_container_details(
-    response: bollard::models::ContainerInspectResponse,
+    response: InspectResponse,
     endpoint_label: &'static str,
 ) -> Result<ContainerDetails, EngineError> {
     let id = response
@@ -545,7 +670,10 @@ fn map_container_details(
             let exit_code = state.exit_code;
             let started_at = state.started_at;
             let finished_at = state.finished_at;
-            let state = state.status.and_then(map_inspected_state);
+            let state = state
+                .status
+                .filter(|status| !status.is_empty())
+                .map(|status| ContainerState::parse(&status));
             (state, exit_code, started_at, finished_at)
         });
 
@@ -579,24 +707,6 @@ fn map_container_details(
     })
 }
 
-fn map_inspected_state(
-    status: bollard::config::ContainerStateStatusEnum,
-) -> Option<ContainerState> {
-    use bollard::config::ContainerStateStatusEnum as Status;
-
-    match status {
-        Status::EMPTY => None,
-        Status::CREATED => Some(ContainerState::Created),
-        Status::RESTARTING => Some(ContainerState::Restarting),
-        Status::RUNNING => Some(ContainerState::Running),
-        Status::PAUSED => Some(ContainerState::Paused),
-        Status::EXITED => Some(ContainerState::Exited),
-        Status::REMOVING => Some(ContainerState::Removing),
-        Status::DEAD => Some(ContainerState::Dead),
-        Status::STOPPING => Some(ContainerState::Stopping),
-    }
-}
-
 fn normalize_container_name(name: String) -> Option<String> {
     let name = if name.starts_with('/') {
         name.trim_start_matches('/').to_owned()
@@ -612,7 +722,7 @@ mod container_inspection_tests {
 
     const ENDPOINT: &str = "test endpoint";
 
-    fn response(json: &str) -> bollard::models::ContainerInspectResponse {
+    fn response(json: &str) -> InspectResponse {
         serde_json::from_str(json).expect("inspect response should deserialize")
     }
 
@@ -713,6 +823,31 @@ mod container_inspection_tests {
     }
 
     #[test]
+    fn preserves_unrecognized_status_and_maps_other_fields() {
+        let details = map_container_details(
+            response(
+                r#"{"Id":"container-id","Name":"/worker","Image":"sha256:digest","Created":"created","State":{"Status":"checkpointing","ExitCode":7,"StartedAt":"started","FinishedAt":"finished"},"RestartCount":2,"Mounts":[],"Config":{"Image":"registry/worker:latest","Env":["SECRET=value"]}}"#,
+            ),
+            ENDPOINT,
+        )
+        .expect("id is present");
+
+        assert_eq!(details.id, "container-id");
+        assert_eq!(details.name.as_deref(), Some("worker"));
+        assert_eq!(
+            details.state,
+            Some(ContainerState::Unknown("checkpointing".to_owned()))
+        );
+        assert_eq!(details.image.as_deref(), Some("registry/worker:latest"));
+        assert_eq!(details.created.as_deref(), Some("created"));
+        assert_eq!(details.restart_count, Some(2));
+        assert_eq!(details.exit_code, Some(7));
+        assert_eq!(details.started_at.as_deref(), Some("started"));
+        assert_eq!(details.finished_at.as_deref(), Some("finished"));
+        assert_eq!(details.mounts, Some(Vec::new()));
+    }
+
+    #[test]
     fn rejects_missing_identifier_and_normalizes_empty_names() {
         let error = map_container_details(response(r#"{"Name":"/ignored"}"#), ENDPOINT)
             .expect_err("inspection ID is required");
@@ -727,6 +862,60 @@ mod container_inspection_tests {
             map_container_details(response(r#"{"Id":"container-id","Name":"///"}"#), ENDPOINT)
                 .expect("id is present");
         assert_eq!(details.name, None);
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn request_inspect_accepts_chunked_http_and_preserves_unknown_state() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::UnixListener,
+        };
+
+        let directory = std::env::temp_dir().join(format!(
+            "ferrum-inspect-chunked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).expect("unique temporary directory should be created");
+        let socket_path = directory.join("engine.sock");
+        let listener = UnixListener::bind(&socket_path).expect("Unix socket should bind");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let mut request = [0_u8; 2048];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("request should be read");
+            let body = br#"{"Id":"container-id","State":{"Status":"checkpointing"}}"#;
+            let chunks = format!(
+                "{:X}\r\n{}\r\n0\r\n\r\n",
+                body.len(),
+                std::str::from_utf8(body).expect("fixture JSON is UTF-8")
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{chunks}"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("chunked response should be written");
+        });
+
+        let result = request_inspect(&socket_path, "1.45", "container-id").await;
+        server.await.expect("fixture server should finish");
+        std::fs::remove_file(&socket_path).expect("socket should be removed");
+        std::fs::remove_dir(&directory).expect("temporary directory should be removed");
+        let body = result.expect("chunked inspect response should decode");
+        let response: InspectResponse = serde_json::from_slice(&body).expect("body should be JSON");
+        let details = map_container_details(response, ENDPOINT).expect("ID is present");
+        assert_eq!(
+            details.state,
+            Some(ContainerState::Unknown("checkpointing".to_owned()))
+        );
     }
 }
 

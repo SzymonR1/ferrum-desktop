@@ -27,6 +27,10 @@ pending request. The view can show the container ID, name, image, creation time,
 state, restart and exit information, start/finish times, and mounts when the
 engine reports them.
 
+When an engine reports a state Ferrum does not recognize, the reported text is
+shown as that container's state rather than treating inspection as failed. An
+empty or missing state remains **Not reported**.
+
 A field omitted by the engine is shown as **Not reported**. Mount information
 that is unavailable is distinct from a reported empty mount list. Ferrum does
 not display environment variables, labels, or command arguments in this view.
