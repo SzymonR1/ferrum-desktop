@@ -1879,6 +1879,8 @@ mod log_retry_budget_tests {
 #[cfg(test)]
 mod event_reconciliation_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use ferrum_core::ContainerLogSource;
 
     fn app_with_open_inspection() -> (FerrumApp, mpsc::Sender<EngineEvent>) {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2090,6 +2092,44 @@ mod event_reconciliation_tests {
             inspection.action_error.as_deref(),
             Some(expected_error.as_str())
         );
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reconnect_resets_the_tail_and_preserves_search_filters() {
+        let (mut app, _) = app_with_open_inspection();
+        app.log_search = "fresh".to_owned();
+        app.log_buffer.append(ContainerLogLine {
+            source: ContainerLogSource::Stdout,
+            text: "old tail".to_owned(),
+        });
+        app.log_buffer.set_filters(&app.log_search, true, true);
+        assert!(app.log_buffer.visible_indices().is_empty());
+
+        let generation = app.log_generation;
+        assert!(
+            app.log_sender
+                .try_send(LogEvent::Reset { generation })
+                .is_ok()
+        );
+        app.receive_events(egui::Context::default());
+
+        assert!(app.log_buffer.entries().is_empty());
+        assert!(app.log_reconnected);
+        assert_eq!(app.log_search, "fresh");
+
+        assert!(
+            app.log_sender
+                .try_send(LogEvent::Line {
+                    generation,
+                    line: ContainerLogLine {
+                        source: ContainerLogSource::Stdout,
+                        text: "fresh output".to_owned(),
+                    },
+                })
+                .is_ok()
+        );
+        app.receive_events(egui::Context::default());
+        assert_eq!(app.log_buffer.visible_indices(), vec![0]);
+        assert_eq!(app.log_buffer.entries()[0].text, "fresh output");
     }
 
     fn assert_reinspection_is_pending(app: &FerrumApp) {
