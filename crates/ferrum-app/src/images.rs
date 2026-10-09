@@ -39,6 +39,12 @@ pub(super) struct ImageInspectionRequest {
     pub(super) inspection_generation: u64,
     pub(super) id: String,
 }
+pub(super) struct ImageTagRequest {
+    pub(super) generation: u64,
+    pub(super) image_id: String,
+    pub(super) repository: String,
+    pub(super) tag: String,
+}
 
 #[derive(Default)]
 pub(super) struct ImagesView {
@@ -64,8 +70,18 @@ pub(super) struct ImagesView {
     pull_error: Option<String>,
     pull_requested: bool,
     cancel_requested: bool,
+    tag_repository: String,
+    tag_name: String,
+    tag_generation: u64,
+    tag_confirmation_open: bool,
+    tag_confirmation_image_id: Option<String>,
+    tag_confirmed: bool,
+    tag_requested: bool,
+    tag_loading: bool,
+    tag_complete: bool,
+    tag_result_target: Option<String>,
+    tag_error: Option<String>,
 }
-
 impl ImagesView {
     pub(super) fn is_loading(&self) -> bool {
         self.loading
@@ -73,6 +89,10 @@ impl ImagesView {
     pub(super) fn has_loaded(&self) -> bool {
         self.loaded
     }
+    pub(super) fn is_tagging(&self) -> bool {
+        self.tag_loading
+    }
+
     pub(super) fn is_pulling(&self) -> bool {
         self.pull_loading
     }
@@ -102,6 +122,15 @@ impl ImagesView {
     pub(super) fn invalidate(&mut self) {
         self.reset_inventory();
         self.cancel_pull();
+        self.tag_generation = self.tag_generation.wrapping_add(1);
+        self.tag_confirmation_open = false;
+        self.tag_confirmation_image_id = None;
+        self.tag_confirmed = false;
+        self.tag_requested = false;
+        self.tag_loading = false;
+        self.tag_complete = false;
+        self.tag_result_target = None;
+        self.tag_error = None;
     }
 
     fn reset_inventory(&mut self) {
@@ -113,6 +142,12 @@ impl ImagesView {
         self.images.clear();
         self.visible.clear();
         self.clear_selection();
+        self.tag_confirmation_open = false;
+        if !self.tag_loading {
+            self.tag_confirmation_image_id = None;
+            self.tag_confirmed = false;
+            self.tag_requested = false;
+        }
     }
 
     pub(super) fn pull_reference_valid(&self) -> bool {
@@ -122,6 +157,100 @@ impl ImagesView {
             && !reference
                 .bytes()
                 .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    }
+
+    pub(super) fn tag_target_valid(&self) -> bool {
+        let repository = self.tag_repository.as_str();
+        let tag = self.tag_name.as_str();
+        let Some(target_length) = repository
+            .len()
+            .checked_add(1)
+            .and_then(|length| length.checked_add(tag.len()))
+        else {
+            return false;
+        };
+        !repository.is_empty()
+            && !tag.is_empty()
+            && target_length <= 512
+            && !repository
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+            && valid_docker_tag(tag)
+    }
+
+    fn tag_target(&self) -> String {
+        format!("{}:{}", self.tag_repository, self.tag_name)
+    }
+
+    pub(super) fn begin_tag_confirmation(&mut self) {
+        if self.tag_target_valid()
+            && !self.tag_loading
+            && let Some(image_id) = &self.selected_id
+        {
+            self.tag_confirmation_image_id = Some(image_id.clone());
+            self.tag_confirmation_open = true;
+            self.tag_complete = false;
+            self.tag_result_target = None;
+            self.tag_error = None;
+        }
+    }
+
+    pub(super) fn cancel_tag_confirmation(&mut self) {
+        self.tag_confirmation_open = false;
+        self.tag_confirmation_image_id = None;
+        self.tag_confirmed = false;
+        self.tag_requested = false;
+    }
+
+    pub(super) fn confirm_tag(&mut self) {
+        if self.tag_confirmation_open
+            && self.tag_confirmation_image_id.is_some()
+            && self.tag_target_valid()
+            && !self.tag_loading
+        {
+            self.tag_confirmation_open = false;
+            self.tag_confirmed = true;
+            self.tag_requested = true;
+        }
+    }
+
+    pub(super) fn take_tag_requested(&mut self) -> bool {
+        std::mem::take(&mut self.tag_requested)
+    }
+
+    pub(super) fn begin_tag(&mut self) -> Option<ImageTagRequest> {
+        if !std::mem::take(&mut self.tag_confirmed) || self.tag_loading || !self.tag_target_valid()
+        {
+            return None;
+        }
+        let image_id = self.tag_confirmation_image_id.take()?;
+        self.tag_generation = self.tag_generation.wrapping_add(1);
+        self.tag_loading = true;
+        self.tag_complete = false;
+        self.tag_error = None;
+        self.tag_result_target = Some(self.tag_target());
+        Some(ImageTagRequest {
+            generation: self.tag_generation,
+            image_id,
+            repository: self.tag_repository.clone(),
+            tag: self.tag_name.clone(),
+        })
+    }
+
+    pub(super) fn finish_tag<E: Display>(
+        &mut self,
+        generation: u64,
+        result: Result<(), E>,
+    ) -> bool {
+        if generation != self.tag_generation || !self.tag_loading {
+            return false;
+        }
+        self.tag_loading = false;
+        match result {
+            Ok(()) => self.tag_complete = true,
+            Err(error) => self.tag_error = Some(error.to_string()),
+        }
+        true
     }
 
     pub(super) fn begin_pull(&mut self) -> Option<(u64, String)> {
@@ -239,6 +368,8 @@ impl ImagesView {
         connected: bool,
         connection_message: &str,
         pull_allowed: bool,
+        tag_allowed: bool,
+        tag_request_busy: bool,
     ) -> Option<ImageInspectionRequest> {
         ui.group(|ui| {
             ui.heading("Pull public image");
@@ -287,6 +418,7 @@ impl ImagesView {
         if !connected {
             ui.heading("Image list unavailable");
             ui.label(connection_message);
+            self.draw_tag_controls(ui, false, tag_allowed, tag_request_busy);
             return None;
         }
 
@@ -326,6 +458,7 @@ impl ImagesView {
 
         let request = selected_id.map(|id| self.select_image(id));
         self.draw_details(ui);
+        self.draw_tag_controls(ui, connected, tag_allowed, tag_request_busy);
         request
     }
 
@@ -454,6 +587,107 @@ impl ImagesView {
                 .then_some(index)
             }));
     }
+
+    fn draw_tag_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        connected: bool,
+        tag_allowed: bool,
+        tag_request_busy: bool,
+    ) {
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.heading("Tag selected image");
+            if self.selected_id.is_none() {
+                ui.label("Select an image before tagging it.");
+            }
+            if !tag_allowed && connected && !tag_request_busy {
+                ui.label("Image tagging is available only through the local Docker Unix socket on Linux.");
+            }
+            if tag_request_busy && !self.tag_loading {
+                ui.label("A previous image tag request is still in progress; wait for its result before starting another.");
+            }
+            ui.add_enabled_ui(!self.tag_loading && !self.tag_confirmation_open, |ui| {
+                ui.horizontal(|ui| {
+                    let label = ui.label("Repository");
+                    ui.text_edit_singleline(&mut self.tag_repository)
+                        .labelled_by(label.id);
+                });
+                ui.horizontal(|ui| {
+                    let label = ui.label("Tag");
+                    ui.text_edit_singleline(&mut self.tag_name)
+                        .labelled_by(label.id);
+                });
+            });
+            let target_valid = self.tag_target_valid();
+            if !target_valid {
+                ui.label("Enter a repository and a valid Docker tag; the combined target is limited to 512 bytes.");
+            }
+            if ui
+                .add_enabled(
+                    connected
+                        && tag_allowed
+                        && !tag_request_busy
+                        && self.selected_id.is_some()
+                        && target_valid
+                        && !self.tag_loading
+                        && !self.tag_confirmation_open,
+                    egui::Button::new("Tag image"),
+                )
+                .clicked()
+            {
+                self.begin_tag_confirmation();
+            }
+            if self.tag_confirmation_open
+                && let Some(image_id) = self.tag_confirmation_image_id.clone()
+            {
+                let target = self.tag_target();
+                ui.group(|ui| {
+                    ui.heading("Confirm image tag");
+                    ui.label(format!(
+                        "Tag image {image_id} as {target}? Docker may reassign an existing repository:tag; the image data remains. Confirm to send this request to the connected local Docker engine."
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("Confirm tag").clicked() {
+                            self.confirm_tag();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.cancel_tag_confirmation();
+                        }
+                    });
+                });
+            }
+            if self.tag_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    if let Some(target) = self.tag_result_target.as_deref() {
+                        ui.label(format!("Tagging image as {target}…"));
+                    }
+                });
+            } else if self.tag_complete {
+                if let Some(target) = &self.tag_result_target {
+                    ui.label(format!(
+                        "Image tagged as {target}. Docker may have reassigned an existing repository:tag; the image data remains."
+                    ));
+                }
+            } else if let Some(error) = &self.tag_error {
+                ui.label("Image tag request failed.");
+                ui.label(error);
+            }
+        });
+    }
+}
+
+fn valid_docker_tag(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    let Some((&first, rest)) = bytes.split_first() else {
+        return false;
+    };
+    bytes.len() <= 128
+        && (first.is_ascii_alphanumeric() || first == b'_')
+        && rest
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
 fn image_cell(ui: &mut egui::Ui, text: &str, width: f32) {
@@ -499,7 +733,7 @@ mod tests {
     fn harness_for(view: ImagesView) -> Harness<'static, ImagesUi> {
         Harness::new_ui_state(
             |ui, state: &mut ImagesUi| {
-                if let Some(request) = state.view.show(ui, true, "", true) {
+                if let Some(request) = state.view.show(ui, true, "", true, true, false) {
                     state.inspection = Some(request);
                 }
             },
@@ -536,6 +770,209 @@ mod tests {
         let generation = view.begin_load();
         assert!(view.complete_load(generation, Ok::<_, &str>(images)));
         view
+    }
+    fn taggable_view() -> ImagesView {
+        let mut view = loaded_view(vec![image("sha256:image", "existing:tag", 1024)]);
+        view.selected_id = Some("sha256:image".to_owned());
+        view.tag_repository = "example/image".to_owned();
+        view.tag_name = "release-1".to_owned();
+        view
+    }
+
+    #[test]
+    fn tag_target_validation_matches_bounded_docker_tag_rules() {
+        let mut view = ImagesView::default();
+        assert!(!view.tag_target_valid());
+        view.tag_repository = "example/image".to_owned();
+        view.tag_name = "release_1.2-a".to_owned();
+        assert!(view.tag_target_valid());
+        view.tag_name = "bad tag".to_owned();
+        assert!(!view.tag_target_valid());
+        view.tag_name = "-invalid".to_owned();
+        assert!(!view.tag_target_valid());
+        view.tag_name = "x".repeat(129);
+        assert!(!view.tag_target_valid());
+        view.tag_name = "v1".to_owned();
+        view.tag_repository = "example\nimage".to_owned();
+        assert!(!view.tag_target_valid());
+        view.tag_repository = "r".repeat(509);
+        assert!(view.tag_target_valid());
+        view.tag_repository.push('r');
+        assert!(!view.tag_target_valid());
+    }
+
+    #[test]
+    fn accessible_tag_inputs_disable_invalid_target() {
+        let mut view = taggable_view();
+        view.tag_name = "invalid tag".to_owned();
+        let mut harness = harness_for(view);
+        harness.run();
+        let _repository = harness.get_by_role_and_label(Role::TextInput, "Repository");
+        let _tag = harness.get_by_role_and_label(Role::TextInput, "Tag");
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, "Tag image")
+                .accesskit_node()
+                .is_disabled()
+        );
+    }
+    #[test]
+    fn accessible_tag_inputs_accept_a_valid_repository_and_tag() {
+        let mut view = taggable_view();
+        view.tag_repository.clear();
+        view.tag_name.clear();
+        let mut harness = harness_for(view);
+        harness.run();
+        let repository = harness.get_by_role_and_label(Role::TextInput, "Repository");
+        repository.focus();
+        harness.run();
+        harness.event(egui::Event::Text("example/service".to_owned()));
+        harness.run();
+        let tag = harness.get_by_role_and_label(Role::TextInput, "Tag");
+        tag.focus();
+        harness.run();
+        harness.event(egui::Event::Text("release_1".to_owned()));
+        harness.run();
+        assert!(harness.state().view.tag_target_valid());
+        assert!(
+            !harness
+                .get_by_role_and_label(Role::Button, "Tag image")
+                .accesskit_node()
+                .is_disabled()
+        );
+    }
+
+    #[test]
+    fn outstanding_tag_request_disables_a_second_request() {
+        let mut harness = Harness::new_ui_state(
+            |ui, view: &mut ImagesView| {
+                view.show(ui, true, "", true, true, true);
+            },
+            taggable_view(),
+        );
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, "Tag image")
+                .accesskit_node()
+                .is_disabled()
+        );
+        let _notice = harness.get_by_role_and_label(
+            Role::Label,
+            "A previous image tag request is still in progress; wait for its result before starting another.",
+        );
+    }
+
+    #[test]
+    fn tagging_requires_confirmation_and_cancel_sends_no_request() {
+        let mut harness = harness_for(taggable_view());
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Tag image")
+            .click_accesskit();
+        harness.run();
+        let _confirmation = harness.get_by_role_and_label(Role::Label, "Confirm image tag");
+        let _overwrite_warning = harness.get_by_role_and_label(
+            Role::Label,
+            "Tag image sha256:image as example/image:release-1? Docker may reassign an existing repository:tag; the image data remains. Confirm to send this request to the connected local Docker engine.",
+        );
+
+        assert!(!harness.state().view.tag_requested);
+        harness
+            .get_by_role_and_label(Role::Button, "Cancel")
+            .click_accesskit();
+        harness.run();
+        assert!(!harness.state_mut().view.take_tag_requested());
+        assert!(!harness.state().view.tag_loading);
+    }
+
+    #[test]
+    fn confirmed_tag_shows_progress_and_success_result() {
+        let mut harness = harness_for(taggable_view());
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Tag image")
+            .click_accesskit();
+        harness.run();
+        harness.state_mut().view.selected_id = Some("sha256:other".to_owned());
+
+        harness
+            .get_by_role_and_label(Role::Button, "Confirm tag")
+            .click_accesskit();
+        harness.run();
+        assert!(harness.state_mut().view.take_tag_requested());
+        let request = harness.state_mut().view.begin_tag().unwrap();
+        assert_eq!(request.image_id, "sha256:image");
+        assert_eq!(request.repository, "example/image");
+        assert_eq!(request.tag, "release-1");
+        harness.step();
+        let _progress =
+            harness.get_by_role_and_label(Role::Label, "Tagging image as example/image:release-1…");
+        assert!(
+            harness
+                .state_mut()
+                .view
+                .finish_tag(request.generation, Ok::<_, &str>(()))
+        );
+        harness.run();
+        let _success = harness.get_by_role_and_label(
+            Role::Label,
+            "Image tagged as example/image:release-1. Docker may have reassigned an existing repository:tag; the image data remains.",
+        );
+
+        harness
+            .get_by_role_and_label(Role::Button, "Tag image")
+            .click_accesskit();
+        harness.run();
+        assert!(!harness.state().view.tag_requested);
+        harness
+            .get_by_role_and_label(Role::Button, "Confirm tag")
+            .click_accesskit();
+        harness.run();
+        assert!(harness.state_mut().view.take_tag_requested());
+        let repeated = harness.state_mut().view.begin_tag().unwrap();
+        assert_eq!(repeated.image_id, "sha256:other");
+        assert!(
+            harness
+                .state_mut()
+                .view
+                .finish_tag(repeated.generation, Ok::<_, &str>(()))
+        );
+        harness.state_mut().view.begin_load();
+        harness.step();
+        let _success_after_refresh = harness.get_by_role_and_label(
+            Role::Label,
+            "Image tagged as example/image:release-1. Docker may have reassigned an existing repository:tag; the image data remains.",
+        );
+    }
+
+    #[test]
+    fn tag_failure_is_safe_and_completion_after_invalidation_is_ignored() {
+        let mut view = taggable_view();
+        view.begin_tag_confirmation();
+        view.confirm_tag();
+        assert!(view.take_tag_requested());
+        let request = view.begin_tag().unwrap();
+        assert!(view.finish_tag(
+            request.generation,
+            Err::<(), _>("ImageTagRejected: endpoint returned HTTP 409")
+        ));
+        let mut harness = harness_for(view);
+        harness.run();
+        let _failure = harness.get_by_role_and_label(Role::Label, "Image tag request failed.");
+        let _safe_error = harness
+            .get_by_role_and_label(Role::Label, "ImageTagRejected: endpoint returned HTTP 409");
+
+        let mut view = taggable_view();
+        view.begin_tag_confirmation();
+        view.confirm_tag();
+        assert!(view.take_tag_requested());
+        let stale_request = view.begin_tag().unwrap();
+        view.invalidate();
+        assert!(!view.finish_tag(stale_request.generation, Ok::<_, &str>(())));
+        assert!(!view.tag_loading);
+        assert!(!view.tag_complete);
+        assert!(view.tag_error.is_none());
     }
 
     #[test]
@@ -782,10 +1219,11 @@ mod tests {
     fn disconnected_view_disables_pull_without_engine_access() {
         let mut harness = Harness::new_ui_state(
             |ui, view: &mut ImagesView| {
-                view.show(ui, false, "offline", false);
+                view.show(ui, false, "offline", false, false, false);
             },
             ImagesView::default(),
         );
+
         harness.run();
         assert!(
             harness
@@ -829,10 +1267,11 @@ mod tests {
         view.pull_reference = "x".repeat(513);
         let mut invalid_harness = Harness::new_ui_state(
             |ui, view: &mut ImagesView| {
-                view.show(ui, true, "", true);
+                view.show(ui, true, "", true, true, false);
             },
             view,
         );
+
         invalid_harness.run();
         assert!(
             invalid_harness
@@ -846,10 +1285,11 @@ mod tests {
         };
         let mut boundary_harness = Harness::new_ui_state(
             |ui, view: &mut ImagesView| {
-                view.show(ui, true, "", true);
+                view.show(ui, true, "", true, true, false);
             },
             boundary_view,
         );
+
         boundary_harness.run();
         assert!(
             !boundary_harness
