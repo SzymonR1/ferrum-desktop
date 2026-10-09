@@ -701,7 +701,10 @@ struct FerrumApp {
     images: images::ImagesView,
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
+    // Hold the reader until the terminal response event releases the mutation gate.
     image_pull_task: Option<JoinHandle<()>>,
+    #[cfg(target_os = "linux")]
+    image_pull_progress_reporting: Option<Arc<AtomicBool>>,
     // Keep a submitted tag POST alive across page invalidation; aborting it
     // would not undo a mutation the engine may already have accepted.
     image_tag_task: Option<JoinHandle<()>>,
@@ -877,6 +880,8 @@ impl FerrumApp {
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
+            #[cfg(target_os = "linux")]
+            image_pull_progress_reporting: None,
             image_tag_task: None,
             image_remove_task: None,
             loading: false,
@@ -1021,24 +1026,29 @@ impl FerrumApp {
             .as_ref()
             .is_some_and(|inspection| inspection.action_busy)
     }
-    fn cancel_image_tasks(&mut self) {
+    fn cancel_image_read_tasks(&mut self) {
         if let Some(task) = self.image_list_task.take() {
             task.abort();
         }
         if let Some(task) = self.image_inspection_task.take() {
             task.abort();
         }
-        self.cancel_image_pull();
     }
-    fn cancel_image_pull(&mut self) {
-        if let Some(task) = self.image_pull_task.take() {
-            task.abort();
-            self.images.stop_pull_monitoring();
+
+    fn hide_image_pull_progress(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(reporting) = &self.image_pull_progress_reporting {
+            reporting.store(false, Ordering::Release);
         }
+        self.images.hide_pull_progress();
     }
 
     fn invalidate_images(&mut self) {
-        self.cancel_image_tasks();
+        self.cancel_image_read_tasks();
+        #[cfg(target_os = "linux")]
+        if let Some(reporting) = &self.image_pull_progress_reporting {
+            reporting.store(false, Ordering::Release);
+        }
         self.images.invalidate();
     }
 
@@ -1050,7 +1060,7 @@ impl FerrumApp {
             self.connect(context);
             return;
         };
-        self.cancel_image_tasks();
+        self.cancel_image_read_tasks();
         let generation = self.images.begin_load();
         let sender = self.sender.clone();
         self.image_list_task = Some(self.runtime.spawn(async move {
@@ -1085,21 +1095,27 @@ impl FerrumApp {
             return;
         };
         let sender = self.sender.clone();
+        let progress_reporting = Arc::new(AtomicBool::new(true));
+        self.image_pull_progress_reporting = Some(Arc::clone(&progress_reporting));
         self.image_pull_task = Some(self.runtime.spawn(async move {
             let result = async {
                 let mut stream = engine.open_image_pull(&reference).await?;
+                // Progress reporting may stop, but the reader must drain through the terminal response.
                 while let Some(progress) = stream.next_progress().await? {
-                    if sender
-                        .send(EngineEvent::ImagePullProgress {
-                            generation,
-                            progress,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return Ok(());
+                    if progress_reporting.load(Ordering::Acquire) {
+                        if sender
+                            .send(EngineEvent::ImagePullProgress {
+                                generation,
+                                progress,
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            context.request_repaint();
+                        } else {
+                            progress_reporting.store(false, Ordering::Release);
+                        }
                     }
-                    context.request_repaint();
                 }
                 Ok::<(), EngineError>(())
             }
@@ -1425,18 +1441,22 @@ impl FerrumApp {
                     generation,
                     progress,
                 } => {
-                    self.images.update_pull(generation, progress);
+                    if self.images.update_pull(generation, progress) {
+                        context.request_repaint();
+                    }
                 }
                 EngineEvent::ImagePullFinished { generation, result } => {
                     let succeeded = result.is_ok();
-                    if self
+                    let applied = self
                         .images
-                        .finish_pull(generation, result.map_err(|error| error.to_string()))
+                        .finish_pull(generation, result.map_err(|error| error.to_string()));
+                    self.image_pull_task = None;
+                    #[cfg(target_os = "linux")]
                     {
-                        self.image_pull_task = None;
-                        if succeeded {
-                            self.load_images(context.clone());
-                        }
+                        self.image_pull_progress_reporting = None;
+                    }
+                    if applied && succeeded && self.page == images::AppPage::Images {
+                        self.load_images(context.clone());
                     }
                 }
                 EngineEvent::ImageTagged { generation, result } => {
@@ -1965,8 +1985,8 @@ impl FerrumApp {
             #[cfg(target_os = "linux")]
             self.start_image_pull(ui.ctx().clone());
         }
-        if self.images.take_cancel_requested() {
-            self.cancel_image_pull();
+        if self.images.take_hide_progress_requested() {
+            self.hide_image_pull_progress();
         }
         if self.images.take_tag_requested() {
             #[cfg(target_os = "linux")]
@@ -2783,7 +2803,7 @@ impl Drop for FerrumApp {
         self.cancel_log_stream();
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
-        self.cancel_image_tasks();
+        self.cancel_image_read_tasks();
         if let Some(task) = self.inspection_task.take() {
             task.abort();
         }
@@ -3200,6 +3220,8 @@ mod log_retry_budget_tests {
 mod event_reconciliation_tests {
     use super::*;
     #[cfg(target_os = "linux")]
+    use egui_kittest::kittest::NodeT;
+    #[cfg(target_os = "linux")]
     use ferrum_core::ContainerLogSource;
 
     fn app_with_open_inspection() -> (FerrumApp, mpsc::Sender<EngineEvent>) {
@@ -3253,6 +3275,8 @@ mod event_reconciliation_tests {
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
+            #[cfg(target_os = "linux")]
+            image_pull_progress_reporting: None,
             image_tag_task: None,
             image_remove_task: None,
             loading: false,
@@ -4152,18 +4176,43 @@ mod event_reconciliation_tests {
         let _last_inventory = refresh_harness.get_by_role_and_label(Role::Button, "example");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn accessible_stop_monitoring_aborts_only_the_local_progress_task() {
+    fn accessible_hide_progress_keeps_pull_reader_and_gate_until_terminal_event() {
         use egui::accesskit::Role;
         use egui_kittest::{Harness, kittest::Queryable};
 
-        let (mut app, _) = app_with_open_inspection();
+        let (mut app, sender) = app_with_open_inspection();
         app.page = images::AppPage::Images;
         app.images.set_pull_reference("alpine:latest".to_owned());
-        app.images.begin_pull().unwrap();
-        let task = app.runtime.spawn(std::future::pending());
+        let (generation, _) = app.images.begin_pull().unwrap();
+        let (task_finish, task_wait) = tokio::sync::oneshot::channel();
+        let (task_started, task_started_wait) = tokio::sync::oneshot::channel();
+        let task = app.runtime.spawn(async move {
+            let _ = task_started.send(());
+            let _ = task_wait.await;
+        });
+        app.runtime
+            .block_on(task_started_wait)
+            .expect("fake pull reader should start");
         let abort = task.abort_handle();
         app.image_pull_task = Some(task);
+        let progress_reporting = Arc::new(AtomicBool::new(true));
+        app.image_pull_progress_reporting = Some(Arc::clone(&progress_reporting));
+        assert!(
+            sender
+                .try_send(EngineEvent::ImagePullProgress {
+                    generation,
+                    progress: ImagePullProgress {
+                        status: "Downloading".to_owned(),
+                        current_bytes: Some(10),
+                        total_bytes: Some(100),
+                    },
+                })
+                .is_ok()
+        );
+        app.receive_events(egui::Context::default());
+
         let mut harness = Harness::new_ui_state(
             |ui, app: &mut FerrumApp| {
                 app.draw_images(ui);
@@ -4172,19 +4221,171 @@ mod event_reconciliation_tests {
         );
         harness.step();
         harness
-            .get_by_role_and_label(Role::Button, "Stop monitoring")
+            .get_by_role_and_label(Role::Button, "Hide progress")
             .click_accesskit();
         harness.run();
+        harness.state().runtime.block_on(tokio::task::yield_now());
         assert!(!harness.state().images.is_pulling());
-        assert!(harness.state().images.is_monitoring_stopped());
+        assert!(harness.state().images.is_pull_progress_hidden());
         assert!(harness.state().images.pull_progress().is_none());
-        assert!(harness.state().image_pull_task.is_none());
-        let _stopped_notice = harness.get_by_role_and_label(
+        assert!(harness.state().images.has_mutation_in_flight());
+        assert!(harness.state().image_mutation_busy());
+        assert!(harness.state().image_pull_task.is_some());
+        assert!(!progress_reporting.load(Ordering::Acquire));
+        assert!(!abort.is_finished());
+        let _hidden_notice = harness.get_by_role_and_label(
             Role::Label,
-            "Monitoring stopped. The image transfer may continue in the engine.",
+            "Progress hidden. The Docker image transfer may continue; other image operations remain disabled until Ferrum finishes reading the pull response.",
         );
+        let _busy_notice = harness.get_by_role_and_label(
+            Role::Label,
+            "An image operation is in progress; wait for it to finish before starting another pull, tag, or removal.",
+        );
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, "Pull image")
+                .accesskit_node()
+                .is_disabled()
+        );
+
+        let context = egui::Context::default();
+        harness.state_mut().start_image_pull(context.clone());
+        harness.state_mut().start_image_tag(context.clone());
+        harness.state_mut().start_image_remove(context);
+        assert!(harness.state().image_pull_task.is_some());
+        assert!(harness.state().image_tag_task.is_none());
+        assert!(harness.state().image_remove_task.is_none());
+        assert!(harness.state().images.has_mutation_in_flight());
+
+        assert!(task_finish.send(()).is_ok());
         harness.state().runtime.block_on(tokio::task::yield_now());
         assert!(abort.is_finished());
+        assert!(harness.state().image_mutation_busy());
+
+        assert!(
+            sender
+                .try_send(EngineEvent::ImagePullProgress {
+                    generation,
+                    progress: ImagePullProgress {
+                        status: "late progress".to_owned(),
+                        current_bytes: Some(50),
+                        total_bytes: Some(100),
+                    },
+                })
+                .is_ok()
+        );
+        harness.state_mut().receive_events(egui::Context::default());
+        assert!(harness.state().images.pull_progress().is_none());
+
+        harness.state_mut().loading = true;
+        assert!(
+            sender
+                .try_send(EngineEvent::ImagePullFinished {
+                    generation,
+                    result: Ok(()),
+                })
+                .is_ok()
+        );
+        harness.state_mut().receive_events(egui::Context::default());
+        assert!(harness.state().image_pull_task.is_none());
+        assert!(harness.state().image_pull_progress_reporting.is_none());
+        assert!(!harness.state().images.has_mutation_in_flight());
+        assert!(!harness.state().image_mutation_busy());
+        assert!(harness.state().images.is_pull_complete());
+        harness.state_mut().loading = false;
+        harness.run();
+        let _complete = harness.get_by_role_and_label(Role::Label, "Image pull complete.");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn page_invalidation_makes_late_pull_events_stale_but_releases_the_task() {
+        let (mut app, sender) = app_with_open_inspection();
+        app.page = images::AppPage::Images;
+        app.images.set_pull_reference("alpine:latest".to_owned());
+        let (generation, _) = app.images.begin_pull().unwrap();
+        app.images.update_pull(
+            generation,
+            ImagePullProgress {
+                status: "old context".to_owned(),
+                current_bytes: Some(10),
+                total_bytes: Some(100),
+            },
+        );
+
+        let (task_finish, task_wait) = tokio::sync::oneshot::channel();
+        let (task_started, task_started_wait) = tokio::sync::oneshot::channel();
+        let pull_task = app.runtime.spawn(async move {
+            let _ = task_started.send(());
+            let _ = task_wait.await;
+        });
+        app.runtime
+            .block_on(task_started_wait)
+            .expect("fake pull reader should start");
+        let pull_abort = pull_task.abort_handle();
+        app.image_pull_task = Some(pull_task);
+        let progress_reporting = Arc::new(AtomicBool::new(true));
+        app.image_pull_progress_reporting = Some(Arc::clone(&progress_reporting));
+
+        let list_task = app.runtime.spawn(std::future::pending());
+        let list_abort = list_task.abort_handle();
+        app.image_list_task = Some(list_task);
+        let inspection_task = app.runtime.spawn(std::future::pending());
+        let inspection_abort = inspection_task.abort_handle();
+        app.image_inspection_task = Some(inspection_task);
+
+        app.set_page(images::AppPage::Containers, egui::Context::default());
+        app.runtime.block_on(tokio::task::yield_now());
+        assert!(list_abort.is_finished());
+        assert!(inspection_abort.is_finished());
+        assert!(!pull_abort.is_finished());
+        assert!(!progress_reporting.load(Ordering::Acquire));
+        assert!(app.image_pull_task.is_some());
+        assert!(app.image_mutation_busy());
+        assert!(!app.images.is_pulling());
+        assert!(app.images.pull_progress().is_none());
+        let context = egui::Context::default();
+        app.start_image_pull(context.clone());
+        app.start_image_tag(context.clone());
+        app.start_image_remove(context);
+        assert!(app.image_pull_task.is_some());
+        assert!(app.image_tag_task.is_none());
+        assert!(app.image_remove_task.is_none());
+        assert!(app.image_mutation_busy());
+
+        assert!(task_finish.send(()).is_ok());
+        app.runtime.block_on(tokio::task::yield_now());
+        assert!(pull_abort.is_finished());
+        assert!(app.image_mutation_busy());
+        assert!(
+            sender
+                .try_send(EngineEvent::ImagePullProgress {
+                    generation,
+                    progress: ImagePullProgress {
+                        status: "stale progress".to_owned(),
+                        current_bytes: Some(90),
+                        total_bytes: Some(100),
+                    },
+                })
+                .is_ok()
+        );
+        assert!(
+            sender
+                .try_send(EngineEvent::ImagePullFinished {
+                    generation,
+                    result: Err(EngineError::NoLocalSocket),
+                })
+                .is_ok()
+        );
+        app.receive_events(egui::Context::default());
+
+        assert!(app.image_pull_task.is_none());
+        assert!(app.image_pull_progress_reporting.is_none());
+        assert!(!app.image_mutation_busy());
+        assert!(!app.images.has_mutation_in_flight());
+        assert!(app.images.pull_progress().is_none());
+        assert!(app.images.pull_error().is_none());
+        assert!(!app.images.is_pull_complete());
     }
     fn assert_reinspection_is_pending(app: &FerrumApp) {
         let inspection = app.inspection.as_ref().expect("inspection stays open");

@@ -35,9 +35,11 @@ known repository tags and warns that removing the final reference can delete
 image data. Removal does not force the engine: it may reject images used by
 containers or with other tags. The request sets `noprune=true` to preserve
 untagged parent images, omits `force`, and sends no registry credentials or
-authentication. Only one image mutation (pull, tag, or remove) is in flight at a
-time. **Stop monitoring** aborts only Ferrum's client-side pull progress stream;
-it does not cancel or claim to stop a daemon-side image transfer. A removal
+authentication. Ferrum holds one image-mutation gate for pull, tag, or removal.
+**Hide progress** suppresses pull updates but keeps draining the bounded Engine
+response, so the gate remains closed until the pull reaches a terminal response.
+Leaving Images or switching context hides stale updates without aborting the
+reader; closing Ferrum does not guarantee that the daemon stops its pull. A
 timeout or request error does not prove that engine state stayed unchanged.
 Invalidating the page ignores stale UI results but does not abort or claim to
 undo a submitted removal; successful removal refreshes inventory only when

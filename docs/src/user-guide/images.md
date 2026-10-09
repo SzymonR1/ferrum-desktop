@@ -18,9 +18,11 @@ loaded inventory; use **Refresh** to request a new image list.
 
 The pull form accepts an anonymous public image reference only. Ferrum does not
 read credentials or send registry authentication. While a pull is active,
-**Stop monitoring** stops Ferrum's client-side progress stream; the image
-transfer may continue in the engine. A completion event already received by
-Ferrum may still update the page and trigger an inventory refresh.
+**Hide progress** suppresses progress updates in the UI only: Ferrum continues
+draining the Engine response and keeps other image mutations disabled until the
+terminal response. Leaving Images or changing context hides stale pull results
+without aborting the reader; closing Ferrum does not guarantee the daemon-side
+transfer stops.
 
 ## Tagging a local image
 

@@ -21,9 +21,11 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   displayed status is capped at 256 bytes; control characters and selected
   invisible formatting characters (bidi marks, zero-width marks/joiners, and
   soft hyphens) are replaced before rendering. Only status and optional byte
-  counts are exposed. Daemon error details are discarded, never logged or
-  displayed. Closing Ferrum's client stream does not guarantee that the daemon
-  stops its pull.
+  counts are exposed. Daemon error details are discarded, never logged or displayed.
+  At Hide progress, Ferrum stops forwarding UI progress but continues draining
+  the response until a terminal event, keeping the image-mutation gate closed.
+  Page/context invalidation hides stale progress without aborting the reader.
+  Closing Ferrum still does not guarantee that daemon-side pull work stops.
 - Send image-tag requests only to the selected local Docker Unix-socket engine
   using the negotiated API version and the bounded 8-second request timeout.
   Validate the image ID and bound the combined `repository:tag` target to 512

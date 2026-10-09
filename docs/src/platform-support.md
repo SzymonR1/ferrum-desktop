@@ -41,8 +41,10 @@ flight at a time. A timeout or request error does not prove removal had no
 effect; stale UI results are ignored without aborting or claiming to undo a
 submitted request. Inventory refresh after success occurs only when Images is
 current. No live pull, tag, or removal operation is claimed, and tests do not
-mutate images. **Stop monitoring** aborts Ferrum's client-side pull progress
-stream only; it does not cancel or claim to stop daemon-side work.
+mutate images. **Hide progress** suppresses pull updates but keeps Ferrum draining
+the response and the image-mutation gate closed until a terminal event.
+Page/context invalidation hides stale updates without aborting the reader;
+closing Ferrum does not guarantee that daemon-side pull work stops.
 Private-registry authentication, Podman/rootless behavior, and remote endpoints
 remain unsupported or unvalidated. Issues
 [#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) and

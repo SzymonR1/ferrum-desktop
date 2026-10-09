@@ -105,7 +105,9 @@ coverage checks the accessible confirmation with a snapshot of the selected
 image ID and known tags, final-reference warning, non-force/in-use and
 multi-tag warnings, `noprune=true` parent preservation, Cancel-without-request,
 successful request state, safe errors, stale invalidation, and one-mutation-at-
-a-time gating across pull/tag/remove. These tests use fixed image data and
+a-time gating across pull/tag/remove. Hidden-progress coverage verifies the
+reader and gate stay active until a terminal event; invalidation hides late
+events without releasing the gate early. These tests use fixed image data and
 local state/events only; they never contact an engine or delete an image.
 
 Pull presentation tests use fixed progress values. Tag and removal tests
