@@ -35,9 +35,10 @@ It does not add settings support on other platforms or complete security issue
   symlink target if the directory entry changes concurrently.
 - Apply `0700` only to the final app settings directory. Keep settings files
   and save-time temporary files at `0600`. Create temporary files with
-  `openat`, replace the settings file with `renameat`, and clean up failed
-  temporary files with `unlinkat`. Keep every post-initialization filesystem
-  operation relative to the retained descriptor.
+  `openat`, then reset their mode through the opened descriptor so a
+  restrictive umask cannot remove owner permissions. Replace settings with
+  `renameat` and clean up failed temporary files with `unlinkat`. Keep every
+  post-initialization filesystem operation relative to the retained descriptor.
 - Preserve the existing schema migration, default values, and rejection of
   unknown fields. Do not persist credentials, secrets, endpoints, or remote
   contexts.
@@ -82,9 +83,11 @@ protects settings without changing permissions on its parent directories.
 - The chosen XDG/HOME location remains user-trusted and may be outside `HOME`.
   This decision is Linux-only and makes no Windows, macOS, Podman, rootless, or
   remote-engine support claim.
-- Temporary-directory regression tests should cover initialization with an
-  existing symlink alias, parent-path replacement, missing-directory loads,
-  save-time directory creation, final-component symlink rejection, and
-  permission changes limited to the final app directory and settings files.
+- Temporary-directory regressions cover initialization with a symlink alias,
+  parent-path replacement, missing-directory loads, safe save-time creation,
+  final-component symlinks, and permissions limited to the final app directory
+  and settings files.
+- Temporary-file permissions are explicitly reset through the open descriptor,
+  so restrictive umasks cannot remove owner read/write access.
 - Issues #19 and #10 remain open. This ADR records the path decision and does
   not claim full issue acceptance or a release.

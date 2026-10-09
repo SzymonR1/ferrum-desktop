@@ -400,6 +400,13 @@ fn create_temp(directory: &File) -> Result<(CString, File), SettingsError> {
         if descriptor >= 0 {
             // SAFETY: a successful `openat` call returned a newly owned descriptor.
             let file = unsafe { File::from_raw_fd(descriptor) };
+            if file
+                .set_permissions(fs::Permissions::from_mode(0o600))
+                .is_err()
+            {
+                let _ = unlink_temp_at(directory, &name);
+                return Err(SettingsError::Write);
+            }
             return Ok((name, file));
         }
         if std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists {
@@ -932,6 +939,39 @@ mod tests {
         );
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         let _ = fs::remove_dir_all(dir);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn saved_settings_file_keeps_owner_permissions_under_restrictive_umask() {
+        const CHILD: &str = "FERRUM_SETTINGS_UMASK_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let (dir, store) = store();
+            fs::create_dir_all(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            // SAFETY: this isolated child process runs only this exact test.
+            unsafe {
+                libc::umask(0o200 as libc::mode_t);
+            }
+            store.save(&Settings::default()).unwrap();
+            let mode = fs::metadata(dir.join("settings.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            let _ = fs::remove_dir_all(dir);
+            assert_eq!(mode, 0o600);
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "settings::tests::saved_settings_file_keeps_owner_permissions_under_restrictive_umask",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "child settings permission test failed");
     }
 
     #[cfg(unix)]

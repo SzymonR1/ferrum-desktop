@@ -30,9 +30,10 @@ follows a destination symlink. Opened settings files are verified to be regular
 files before permissions are changed.
 Only the final `ferrum` directory receives owner-only (`0700`) permissions.
 Settings files and save-time temporary files use owner-only (`0600`) permissions.
-Save creates the temporary file with `openat`, atomically replaces the settings
-file with `renameat`, and removes a failed temporary file with `unlinkat`.
-All filesystem operations after initialization use the retained descriptor.
+Save creates its temporary file with `openat`, then resets its mode through the
+opened descriptor so a restrictive umask cannot weaken owner access. It
+atomically replaces the settings-file entry with `renameat` and removes a
+failed temporary file with `unlinkat`.
 Replacing the selected absolute parent path after initialization cannot
 redirect settings access away from the pinned directory.
 

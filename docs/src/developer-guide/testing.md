@@ -31,9 +31,9 @@ changing or writing through their targets. Loads reject symlinked or non-regular
 settings files. Saves reject a pre-existing symlink or non-regular entry before
 writing; if the destination changes concurrently into a symlink, `renameat`
 replaces the link entry without following its target. Verify only the final app
-settings directory changes to `0700`, settings and temporary files use `0600`,
-and parent-directory modes remain unchanged. Keep migration, default, corrupt
-file, and unknown-secret-field checks.
+settings directory changes to `0700`, settings and temporary files stay `0600`
+under a restrictive umask, and parent-directory modes remain unchanged. Keep
+the migration, default, corrupt-file, and unknown-secret-field checks.
 The default suite must use temporary
 paths and must not change the user's real XDG or HOME settings tree.
 
