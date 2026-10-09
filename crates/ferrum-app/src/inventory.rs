@@ -24,8 +24,11 @@ pub(super) struct InventoryView {
 impl InventoryView {
     pub(super) fn show_controls(&mut self, ui: &mut egui::Ui, inventory: &[ContainerSummary]) {
         ui.horizontal(|ui| {
-            ui.label("Search");
-            if ui.text_edit_singleline(&mut self.query).changed() {
+            let search_label = ui.label("Search");
+            let search = ui
+                .text_edit_singleline(&mut self.query)
+                .labelled_by(search_label.id);
+            if search.changed() {
                 self.rebuild(inventory);
             }
             let mut sort = self.sort;
@@ -145,6 +148,23 @@ mod tests {
             .iter()
             .map(|index| rows[*index].id.as_str())
             .collect()
+    }
+
+    fn synthetic_rows(count: usize) -> Vec<ContainerSummary> {
+        let mut rows = Vec::with_capacity(count);
+        for index in 0..count {
+            let id = format!("id-{index:04}");
+            let name = format!("container-{index:04}");
+            let image = format!("image-{:02}", index % 8);
+            rows.push(item(
+                &id,
+                &name,
+                Some(&image),
+                Some(ContainerState::Running),
+                Some("Up"),
+            ));
+        }
+        rows
     }
 
     #[test]
@@ -267,5 +287,63 @@ mod tests {
         assert_eq!(ids(&view, &rows), vec!["p", "r", "u"]);
         view.set_sort(SortField::Status, true, &rows);
         assert_eq!(ids(&view, &rows), vec!["r", "p", "u"]);
+    }
+
+    #[test]
+    fn searches_and_sorts_one_thousand_container_records() {
+        let rows = synthetic_rows(1_000);
+        let mut view = InventoryView::default();
+        view.inventory_changed(&rows);
+
+        let ordered = ids(&view, &rows);
+        assert_eq!(ordered.len(), 1_000);
+        assert_eq!(ordered.first(), Some(&"id-0000"));
+        assert_eq!(ordered.last(), Some(&"id-0999"));
+
+        view.query = "container-0999".to_owned();
+        view.inventory_changed(&rows);
+        assert_eq!(ids(&view, &rows), vec!["id-0999"]);
+
+        view.query = "IMAGE-07".to_owned();
+        view.inventory_changed(&rows);
+        let image_matches = ids(&view, &rows);
+        assert_eq!(image_matches.len(), 125);
+        assert_eq!(image_matches.first(), Some(&"id-0007"));
+        assert_eq!(image_matches.last(), Some(&"id-0999"));
+    }
+
+    #[test]
+    #[ignore = "manual release-mode inventory timing sample; no timing threshold"]
+    fn measures_filter_and_sort_for_one_thousand_container_records() {
+        use std::time::Instant;
+
+        const WARMUP_ITERATIONS: usize = 20;
+        const MEASURED_ITERATIONS: usize = 200;
+        let rows = synthetic_rows(1_000);
+        let mut view = InventoryView::default();
+
+        for _ in 0..WARMUP_ITERATIONS {
+            view.query = "container-09".to_owned();
+            view.inventory_changed(&rows);
+        }
+        let mut durations = Vec::with_capacity(MEASURED_ITERATIONS);
+        for iteration in 0..MEASURED_ITERATIONS {
+            view.query = if iteration % 2 == 0 {
+                "container-09".to_owned()
+            } else {
+                String::new()
+            };
+            let started = Instant::now();
+            view.inventory_changed(&rows);
+            durations.push(started.elapsed());
+        }
+        durations.sort_unstable();
+        let median = durations[MEASURED_ITERATIONS / 2];
+        let p95 = durations[MEASURED_ITERATIONS * 95 / 100];
+        eprintln!(
+            "inventory filter+sort: 1,000 synthetic rows, {MEASURED_ITERATIONS} rebuilds, median={}us p95={}us",
+            median.as_micros(),
+            p95.as_micros()
+        );
     }
 }

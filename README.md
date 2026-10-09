@@ -72,6 +72,7 @@ An ignored lifecycle integration test is mutating; see the testing guide for its
 - [Platform support](docs/src/platform-support.md)
 - [Architecture decisions](docs/decisions/)
 - [Embedded terminal guide](docs/src/user-guide/terminal.md)
+- [Performance and accessibility evidence](docs/src/performance.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 
 No release artifacts or installers have been published.
