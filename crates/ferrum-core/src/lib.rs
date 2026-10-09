@@ -162,6 +162,35 @@ pub struct ImageSummary {
     /// Image size in bytes, when reported by the engine.
     pub size_bytes: Option<u64>,
 }
+/// Engine-independent information about one local volume.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeSummary {
+    /// Volume name.
+    pub name: String,
+    /// Storage driver, when reported by the engine.
+    pub driver: Option<String>,
+    /// Driver scope, when reported by the engine.
+    pub scope: Option<String>,
+}
+
+/// Read-only details reported for one local volume.
+///
+/// Optional values remain absent when the engine does not report them. The
+/// mountpoint is untrusted path text reported by the host engine; callers must
+/// not treat it as a safe path to access.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeDetails {
+    /// Volume name.
+    pub name: String,
+    /// Storage driver, when reported by the engine.
+    pub driver: Option<String>,
+    /// Driver scope, when reported by the engine.
+    pub scope: Option<String>,
+    /// Creation timestamp, when reported by the engine.
+    pub created_at: Option<String>,
+    /// Untrusted host mountpoint path text, when reported by the engine.
+    pub mountpoint: Option<String>,
+}
 
 /// Read-only details reported for one image by a Docker-compatible engine.
 ///

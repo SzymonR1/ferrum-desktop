@@ -35,6 +35,17 @@ FERRUM_TEST_IMAGE=busybox:1.37.0 cargo test -p ferrum-engine --test live_engine 
 The pull is an optional manual prerequisite, not part of the test. A smoke run
 against an image already present needs only the second command.
 
+The ignored read-only volume list/inspect test requires `FERRUM_TEST_VOLUME`
+to name a volume already present on the selected local Docker context:
+
+```sh
+FERRUM_TEST_VOLUME=my-existing-volume cargo test -p ferrum-engine --test live_engine local_engine_lists_and_inspects_existing_volume_read_only -- --exact --ignored
+```
+
+It only lists volumes and inspects that name. It does not create, remove,
+modify, or clean up any resource. Headless Volumes UI tests and fake-socket
+protocol tests need no live engine and perform no mutations.
+
 The lifecycle and logs tests below are separate opt-in ignored tests and mutate
 the engine by creating one disposable container.
 

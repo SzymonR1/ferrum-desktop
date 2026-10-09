@@ -15,6 +15,7 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 - Keep Docker CLI context selection session-only; do not log or display raw context endpoints.
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
 - Use a private bounded request path for version, inventory, inspect, and lifecycle operations. Version/inventory/inspection and event-subscription setup use an 8-second timeout; lifecycle requests use a bounded 30-second timeout for graceful Stop/Restart. Timed-out actions may still be changing state, so errors advise refresh before retry. Remove requires confirmation and sends neither force nor volume-removal parameters. Never log or expose raw response bodies.
+- Restrict volume listing/inspection to the selected local Docker Unix socket on Linux, using the bounded read-only API path. Retain/display only volume name, driver, scope, creation time, and mountpoint as plain text; never expose labels/options/status or raw bodies. List/inspect do not provide `UsageData`, so do not imply size or reference counts. The UI offers no volume mutation, network operation, or filesystem browsing; Podman/rootless and remote endpoints remain unsupported.
 - Anonymous image pulls are restricted to the selected local Unix-socket Docker
   engine and send no `X-Registry-Auth` header or stored credentials. Progress
   responses are bounded to 1 MiB per HTTP frame and 64 KiB per JSON record;

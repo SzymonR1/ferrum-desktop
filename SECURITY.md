@@ -14,3 +14,9 @@ an active pull reader: Ferrum drains the response and keeps the mutation gate
 closed until a terminal event. Closing Ferrum does not guarantee that the
 daemon-side pull stops.
 
+The Volumes page is read-only and limited to listing and inspecting volumes on
+the selected local Docker Unix socket on Linux. It displays only name, driver,
+scope, creation time, and a plain-text mountpoint; it does not expose labels,
+options, status, or usage estimates. No volume mutation, network operations,
+Podman/rootless, or remote endpoint support is provided. Issue #17 remains open.
+
