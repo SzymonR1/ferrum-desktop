@@ -3270,6 +3270,7 @@ mod volume_api_tests {
             server.await.expect("server");
             assert!(matches!(error, EngineError::VolumeUsageUnavailable { .. }));
             assert!(!error.to_string().contains("private"));
+            assert!(!format!("{error:?}").contains("private"));
             cleanup(&socket, &directory);
         }
 
