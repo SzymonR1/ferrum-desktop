@@ -139,6 +139,40 @@ pub struct ContainerSummary {
     pub status: Option<String>,
 }
 
+/// Engine-independent image information shown in Ferrum's image list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageSummary {
+    /// Full engine identifier for the image.
+    pub id: String,
+    /// Repository tags reported for the image.
+    pub repo_tags: Vec<String>,
+    /// Creation time as Unix seconds, when reported by the engine.
+    pub created_unix_seconds: Option<i64>,
+    /// Image size in bytes, when reported by the engine.
+    pub size_bytes: Option<u64>,
+}
+
+/// Read-only details reported for one image by a Docker-compatible engine.
+///
+/// Optional values remain absent when the engine does not report them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageDetails {
+    /// Full engine identifier.
+    pub id: String,
+    /// Repository tags reported for the image.
+    pub repo_tags: Vec<String>,
+    /// Creation timestamp, when reported by the engine.
+    pub created: Option<String>,
+    /// Image size in bytes, when reported by the engine.
+    pub size_bytes: Option<u64>,
+    /// CPU architecture, when reported by the engine.
+    pub architecture: Option<String>,
+    /// Operating system, when reported by the engine.
+    pub os: Option<String>,
+    /// Image author, when reported by the engine.
+    pub author: Option<String>,
+}
+
 /// Read-only details reported for one container by a Docker-compatible engine.
 ///
 /// Optional values remain absent when the engine does not report them.

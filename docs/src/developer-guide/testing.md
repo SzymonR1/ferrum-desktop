@@ -15,6 +15,20 @@ The default suite does not require a host engine. Ignored live-engine tests for
 version, inventory, and Docker CLI contexts are read-only. The general
 local-engine inventory test may inspect an existing container; these tests do
 not mutate resources.
+
+The opt-in image list/inspect test is read-only and requires
+`FERRUM_TEST_IMAGE` to name an image already present on the current local Docker
+context. The image does not need a shell; the test never pulls or mutates image
+resources. For example, after manually installing `busybox:1.37.0` if needed:
+
+```sh
+docker pull busybox:1.37.0
+FERRUM_TEST_IMAGE=busybox:1.37.0 cargo test -p ferrum-engine --test live_engine local_engine_lists_and_inspects_preinstalled_image_read_only -- --exact --ignored
+```
+
+The pull is an optional manual prerequisite, not part of the test. A smoke run
+against an image already present needs only the second command.
+
 The lifecycle and logs tests below are separate opt-in ignored tests and mutate
 the engine by creating one disposable container.
 
@@ -61,6 +75,23 @@ named pipes and macOS remain deferred to issue #21/M8.
 
 The workspace includes headless AccessKit tests for labels, focus, keyboard
 activation, large-inventory virtualization, and stream error/reconnect states.
+
+The Images page has headless `egui_kittest` coverage for navigation, searchable
+and virtualized rows, image selection and details, loading/error/empty states,
+keyboard interaction, and stale-result rejection. Run only these UI tests with:
+
+```sh
+cargo test -p ferrum-app images::tests
+```
+
+These tests use fixed image data and do not call an engine. The separate
+opt-in ignored `local_engine_lists_and_inspects_preinstalled_image_read_only`
+test exercises image list and inspect requests against the local Docker Unix
+socket. On 2026-10-09, it listed and inspected the preinstalled
+`hello-world:latest` image and confirmed its ID appeared in the inventory
+without pulling or modifying images. The native Images page was not clicked or
+visually captured because the desktop provider cannot enumerate Ferrum or take
+screenshots.
 Manual release-mode performance samples are opt-in and have no timing
 thresholds. See the [performance and accessibility evidence](../performance.md)
 for the host, dataset, methodology, results, and known validation limits.

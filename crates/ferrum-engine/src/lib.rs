@@ -39,7 +39,7 @@ use contexts::{
 
 use ferrum_core::{
     ContainerAction, ContainerChange, ContainerDetails, ContainerMount, ContainerState,
-    ContainerSummary,
+    ContainerSummary, ImageDetails, ImageSummary,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -82,6 +82,29 @@ struct ContainerListItem {
     image: Option<String>,
     state: Option<String>,
     status: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ImageListItem {
+    id: Option<String>,
+    repo_tags: Option<Vec<String>>,
+    created: Option<i64>,
+    size: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ImageInspectResponse {
+    id: Option<String>,
+    repo_tags: Option<Vec<String>>,
+    created: Option<String>,
+    size: Option<u64>,
+    architecture: Option<String>,
+    os: Option<String>,
+    author: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -233,6 +256,38 @@ pub enum EngineError {
     /// An inspection response omitted its required container identifier.
     #[error("The engine at the {endpoint_label} returned container details without an identifier.")]
     MissingInspectedContainerId {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The engine could not return a valid, bounded image inventory.
+    #[cfg(target_os = "linux")]
+    #[error("The engine at the {endpoint_label} could not return safe image information.")]
+    ImageInventoryUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// An image summary omitted its required engine identifier.
+    #[cfg(target_os = "linux")]
+    #[error("The engine at the {endpoint_label} returned an image without an identifier.")]
+    MissingImageId {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// Image inspection failed or returned an invalid, oversized response.
+    #[cfg(target_os = "linux")]
+    #[error("The engine at the {endpoint_label} could not return safe image details.")]
+    ImageInspectionUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The image identifier supplied to an inspection request is invalid.
+    #[cfg(target_os = "linux")]
+    #[error("The image identifier for the inspection request is invalid.")]
+    InvalidImageId,
+    /// An image inspection response omitted its required engine identifier.
+    #[cfg(target_os = "linux")]
+    #[error("The engine at the {endpoint_label} returned image details without an identifier.")]
+    MissingInspectedImageId {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
     },
@@ -636,6 +691,72 @@ impl EngineClient {
             Err(EngineError::UnsupportedPlatform)
         }
     }
+    /// Returns all images, including images unused by containers.
+    ///
+    /// Only the image identifier, repository tags, creation time, and size are
+    /// retained from the engine response.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe typed error if the inventory request fails, the response
+    /// is invalid or oversized, or an image omits its identifier.
+    pub async fn list_images(&self) -> Result<Vec<ImageSummary>, EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            let endpoint_label = self.info.endpoint_label;
+            let path = format!("/v{}/images/json?all=true", self.api_version);
+            let images: Vec<ImageListItem> = request_json(
+                &self.socket_path,
+                &path,
+                MAX_LIST_RESPONSE_BYTES,
+                REQUEST_TIMEOUT,
+            )
+            .await
+            .map_err(|_| EngineError::ImageInventoryUnavailable { endpoint_label })?;
+            images
+                .into_iter()
+                .map(|image| map_image_summary(image, endpoint_label))
+                .collect()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
+
+    /// Returns read-only details for an image identified by its engine ID.
+    ///
+    /// The engine response is reduced to the documented image fields; labels,
+    /// configuration, and environment data are not exposed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe typed error if the identifier is invalid, inspection
+    /// fails, the response is invalid or oversized, or the response omits the
+    /// image identifier.
+    pub async fn inspect_image(&self, id: &str) -> Result<ImageDetails, EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            let endpoint_label = self.info.endpoint_label;
+            let path = image_inspect_request_path(&self.api_version, id)
+                .map_err(|_| EngineError::InvalidImageId)?;
+            let response: ImageInspectResponse = request_json(
+                &self.socket_path,
+                &path,
+                MAX_INSPECT_RESPONSE_BYTES,
+                REQUEST_TIMEOUT,
+            )
+            .await
+            .map_err(|_| EngineError::ImageInspectionUnavailable { endpoint_label })?;
+            map_image_details(response, endpoint_label)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = id;
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
+
     /// Returns read-only details for a container identified by its engine ID.
     ///
     /// The engine response is reduced to the documented domain fields; secret-
@@ -1090,14 +1211,32 @@ fn container_request_path(
     id: &str,
     suffix: &str,
 ) -> Result<String, RequestJsonError> {
+    resource_request_path(api_version, "containers", id, suffix)
+}
+
+#[cfg(target_os = "linux")]
+fn image_inspect_request_path(api_version: &str, id: &str) -> Result<String, RequestJsonError> {
+    resource_request_path(api_version, "images", id, "/json")
+}
+
+#[cfg(target_os = "linux")]
+fn resource_request_path(
+    api_version: &str,
+    resource: &str,
+    id: &str,
+    suffix: &str,
+) -> Result<String, RequestJsonError> {
     if id.is_empty() || id.len() > 4096 {
         return Err(RequestJsonError::RequestBuild);
     }
-    let mut path =
-        String::with_capacity(api_version.len() + id.len().saturating_mul(3) + 24 + suffix.len());
+    let mut path = String::with_capacity(
+        api_version.len() + resource.len() + id.len().saturating_mul(3) + suffix.len() + 4,
+    );
     path.push_str("/v");
     path.push_str(api_version);
-    path.push_str("/containers/");
+    path.push('/');
+    path.push_str(resource);
+    path.push('/');
     for byte in id.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             path.push(char::from(byte));
@@ -1128,6 +1267,43 @@ fn negotiate_api_version(client: &str, server: &str) -> Option<String> {
         client.to_owned()
     } else {
         server.to_owned()
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn map_image_summary(
+    image: ImageListItem,
+    endpoint_label: &'static str,
+) -> Result<ImageSummary, EngineError> {
+    let id = image
+        .id
+        .filter(|id| !id.is_empty())
+        .ok_or(EngineError::MissingImageId { endpoint_label })?;
+    Ok(ImageSummary {
+        id,
+        repo_tags: image.repo_tags.unwrap_or_default(),
+        created_unix_seconds: image.created,
+        size_bytes: image.size,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn map_image_details(
+    response: ImageInspectResponse,
+    endpoint_label: &'static str,
+) -> Result<ImageDetails, EngineError> {
+    let id = response
+        .id
+        .filter(|id| !id.is_empty())
+        .ok_or(EngineError::MissingInspectedImageId { endpoint_label })?;
+    Ok(ImageDetails {
+        id,
+        repo_tags: response.repo_tags.unwrap_or_default(),
+        created: response.created,
+        size_bytes: response.size,
+        architecture: response.architecture,
+        os: response.os,
+        author: response.author,
     })
 }
 
@@ -1593,6 +1769,261 @@ mod container_inspection_tests {
             details.state,
             Some(ContainerState::Unknown("checkpointing".to_owned()))
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod image_api_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{UnixListener, UnixStream},
+    };
+
+    static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_directory() -> std::path::PathBuf {
+        let sequence = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "ferrum-images-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("temporary directory should be created");
+        directory
+    }
+
+    fn client(socket_path: std::path::PathBuf) -> EngineClient {
+        EngineClient {
+            info: EngineInfo {
+                version: "fixture".to_owned(),
+                api_version: "1.45".to_owned(),
+                endpoint_label: "test endpoint",
+            },
+            api_version: "1.45".to_owned(),
+            selected_context: None,
+            socket_path,
+        }
+    }
+
+    fn http_response(status: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    async fn fixture(
+        response: Vec<u8>,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        tokio::task::JoinHandle<String>,
+    ) {
+        let directory = temporary_directory();
+        let socket_path = directory.join("engine.sock");
+        let listener = UnixListener::bind(&socket_path).expect("Unix socket should bind");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let request = read_request(&mut stream).await;
+            // An oversized-body request may close the socket as soon as the
+            // response limit is reached.
+            let _ = stream.write_all(&response).await;
+            request
+        });
+        (socket_path, directory, server)
+    }
+
+    async fn read_request(stream: &mut UnixStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream
+                .read(&mut buffer)
+                .await
+                .expect("request should be readable");
+            assert_ne!(count, 0, "client should send HTTP headers");
+            request.extend_from_slice(&buffer[..count]);
+        }
+        String::from_utf8(request).expect("HTTP request should be UTF-8")
+    }
+
+    fn cleanup(socket_path: &std::path::Path, directory: &std::path::Path) {
+        std::fs::remove_file(socket_path).expect("socket should be removed");
+        std::fs::remove_dir(directory).expect("directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn lists_images_from_versioned_endpoint_and_maps_allowlisted_fields() {
+        let body = br#"[{"Id":"sha256:image-id","RepoTags":["registry.example/app:stable"],"Created":1720000000,"Size":9876,"Labels":{"credential":"private-label"},"Containers":4},{"Id":"sha256:untagged","RepoTags":null,"Created":1720000001}]"#;
+        let (socket, directory, server) = fixture(http_response("200 OK", body)).await;
+
+        let images = client(socket.clone())
+            .list_images()
+            .await
+            .expect("image inventory should be returned");
+        let request = server.await.expect("fixture server should finish");
+        assert!(
+            request.starts_with("GET /v1.45/images/json?all=true HTTP/1.1\r\n"),
+            "unexpected image list request: {request}"
+        );
+        assert_eq!(
+            images,
+            vec![
+                ferrum_core::ImageSummary {
+                    id: "sha256:image-id".to_owned(),
+                    repo_tags: vec!["registry.example/app:stable".to_owned()],
+                    created_unix_seconds: Some(1_720_000_000),
+                    size_bytes: Some(9_876),
+                },
+                ferrum_core::ImageSummary {
+                    id: "sha256:untagged".to_owned(),
+                    repo_tags: Vec::new(),
+                    created_unix_seconds: Some(1_720_000_001),
+                    size_bytes: None,
+                },
+            ]
+        );
+        let debug = format!("{images:?}");
+        assert!(!debug.contains("private-label"));
+        assert!(!debug.contains("credential"));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn inspects_encoded_image_id_and_maps_only_allowlisted_fields() {
+        let body = br#"{"Id":"sha256:image-id","RepoTags":["registry.example/app:stable"],"Created":"2024-07-03T12:00:00Z","Size":9876,"Architecture":"amd64","Os":"linux","Author":"maintainer","Config":{"Env":["TOKEN=private-env"],"Labels":{"credential":"private-label"}},"ContainerConfig":{"Env":["OTHER=secret"]},"RootFS":{"Layers":["private-layer"]}}"#;
+        let (socket, directory, server) = fixture(http_response("200 OK", body)).await;
+
+        let details = client(socket.clone())
+            .inspect_image("a/b c")
+            .await
+            .expect("image details should be returned");
+        let request = server.await.expect("fixture server should finish");
+        assert!(
+            request.starts_with("GET /v1.45/images/a%2Fb%20c/json HTTP/1.1\r\n"),
+            "unexpected image inspection request: {request}"
+        );
+        assert_eq!(
+            details,
+            ferrum_core::ImageDetails {
+                id: "sha256:image-id".to_owned(),
+                repo_tags: vec!["registry.example/app:stable".to_owned()],
+                created: Some("2024-07-03T12:00:00Z".to_owned()),
+                size_bytes: Some(9_876),
+                architecture: Some("amd64".to_owned()),
+                os: Some("linux".to_owned()),
+                author: Some("maintainer".to_owned()),
+            }
+        );
+        let debug = format!("{details:?}");
+        assert!(!debug.contains("private-env"));
+        assert!(!debug.contains("private-label"));
+        assert!(!debug.contains("OTHER=secret"));
+        assert!(!debug.contains("private-layer"));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_input_and_responses_missing_image_ids() {
+        let missing_socket = std::env::temp_dir().join("ferrum-image-id-must-not-connect.sock");
+        let engine = client(missing_socket);
+        assert!(matches!(
+            engine.inspect_image("").await,
+            Err(EngineError::InvalidImageId)
+        ));
+
+        let (socket, directory, server) = fixture(http_response(
+            "200 OK",
+            br#"[{"RepoTags":["ignored:tag"]}]"#,
+        ))
+        .await;
+        let error = client(socket.clone())
+            .list_images()
+            .await
+            .expect_err("list items require an image ID");
+        let request = server.await.expect("fixture server should finish");
+        assert!(request.starts_with("GET /v1.45/images/json?all=true HTTP/1.1\r\n"));
+        assert!(matches!(
+            error,
+            EngineError::MissingImageId {
+                endpoint_label: "test endpoint"
+            }
+        ));
+        cleanup(&socket, &directory);
+
+        let (socket, directory, server) =
+            fixture(http_response("200 OK", br#"{"RepoTags":[]}"#)).await;
+        let error = client(socket.clone())
+            .inspect_image("image-id")
+            .await
+            .expect_err("inspection response requires an image ID");
+        let request = server.await.expect("fixture server should finish");
+        assert!(request.starts_with("GET /v1.45/images/image-id/json HTTP/1.1\r\n"));
+        assert!(matches!(
+            error,
+            EngineError::MissingInspectedImageId {
+                endpoint_label: "test endpoint"
+            }
+        ));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn maps_malformed_http_and_oversized_responses_to_safe_errors() {
+        let (socket, directory, server) = fixture(http_response("200 OK", b"{malformed")).await;
+        let error = client(socket.clone())
+            .list_images()
+            .await
+            .expect_err("malformed JSON should fail safely");
+        let _ = server.await.expect("fixture server should finish");
+        assert!(matches!(
+            error,
+            EngineError::ImageInventoryUnavailable {
+                endpoint_label: "test endpoint"
+            }
+        ));
+        cleanup(&socket, &directory);
+
+        let private_body = b"private daemon response body";
+        let (socket, directory, server) =
+            fixture(http_response("500 Internal Server Error", private_body)).await;
+        let error = client(socket.clone())
+            .inspect_image("image-id")
+            .await
+            .expect_err("HTTP errors should not be treated as image details");
+        let _ = server.await.expect("fixture server should finish");
+        assert!(matches!(
+            error,
+            EngineError::ImageInspectionUnavailable {
+                endpoint_label: "test endpoint"
+            }
+        ));
+        assert!(!format!("{error:?}").contains("private daemon"));
+        assert!(!error.to_string().contains("private daemon"));
+        cleanup(&socket, &directory);
+
+        let oversized = vec![b' '; MAX_INSPECT_RESPONSE_BYTES + 1];
+        let (socket, directory, server) = fixture(http_response("200 OK", &oversized)).await;
+        let error = client(socket.clone())
+            .inspect_image("image-id")
+            .await
+            .expect_err("oversized inspection JSON should be rejected");
+        let _ = server.await.expect("fixture server should finish");
+        assert!(matches!(
+            error,
+            EngineError::ImageInspectionUnavailable {
+                endpoint_label: "test endpoint"
+            }
+        ));
+        cleanup(&socket, &directory);
     }
 }
 

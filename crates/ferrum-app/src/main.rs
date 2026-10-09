@@ -25,6 +25,7 @@ fn available_container_actions(state: Option<&ContainerState>) -> &'static [Cont
 fn action_requires_confirmation(action: ContainerAction) -> bool {
     action.is_destructive()
 }
+mod images;
 mod inventory;
 mod logs;
 mod retry;
@@ -43,7 +44,9 @@ use crate::inventory::InventoryView;
 use eframe::egui::{self, Color32, RichText};
 #[cfg(target_os = "linux")]
 use ferrum_core::ContainerLogLine;
-use ferrum_core::{ContainerAction, ContainerDetails, ContainerState, ContainerSummary};
+use ferrum_core::{
+    ContainerAction, ContainerDetails, ContainerState, ContainerSummary, ImageDetails, ImageSummary,
+};
 #[cfg(target_os = "linux")]
 use ferrum_engine::ContainerLogsOptions;
 #[cfg(target_os = "linux")]
@@ -109,6 +112,16 @@ enum EngineEvent {
     Inspected {
         generation: u64,
         result: Result<ContainerDetails, EngineError>,
+    },
+    ImagesListed {
+        generation: u64,
+        result: Result<Vec<ImageSummary>, EngineError>,
+    },
+    ImageInspected {
+        generation: u64,
+        inspection_generation: u64,
+        id: String,
+        result: Result<ImageDetails, EngineError>,
     },
     ActionFinished {
         generation: u64,
@@ -665,6 +678,10 @@ struct FerrumApp {
     engine_info: Option<EngineInfo>,
     containers: Vec<ContainerSummary>,
     inventory_view: InventoryView,
+    page: images::AppPage,
+    images: images::ImagesView,
+    image_list_task: Option<JoinHandle<()>>,
+    image_inspection_task: Option<JoinHandle<()>>,
     loading: bool,
     refresh_error: Option<String>,
     contexts: Vec<DockerContext>,
@@ -828,6 +845,10 @@ impl FerrumApp {
             engine_info: None,
             containers: Vec::new(),
             inventory_view: InventoryView::default(),
+            page: images::AppPage::default(),
+            images: images::ImagesView::default(),
+            image_list_task: None,
+            image_inspection_task: None,
             loading: false,
             refresh_error: None,
             contexts: Vec::new(),
@@ -969,6 +990,82 @@ impl FerrumApp {
             .as_ref()
             .is_some_and(|inspection| inspection.action_busy)
     }
+    fn cancel_image_tasks(&mut self) {
+        if let Some(task) = self.image_list_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.image_inspection_task.take() {
+            task.abort();
+        }
+    }
+
+    fn invalidate_images(&mut self) {
+        self.cancel_image_tasks();
+        self.images.invalidate();
+    }
+
+    fn load_images(&mut self, context: egui::Context) {
+        if self.loading {
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            self.connect(context);
+            return;
+        };
+        self.cancel_image_tasks();
+        let generation = self.images.begin_load();
+        let sender = self.sender.clone();
+        self.image_list_task = Some(self.runtime.spawn(async move {
+            let result = engine.list_images().await;
+            if sender
+                .send(EngineEvent::ImagesListed { generation, result })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
+
+    fn inspect_image(&mut self, request: images::ImageInspectionRequest, context: egui::Context) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        if let Some(task) = self.image_inspection_task.take() {
+            task.abort();
+        }
+        let sender = self.sender.clone();
+        self.image_inspection_task = Some(self.runtime.spawn(async move {
+            let result = engine.inspect_image(&request.id).await;
+            if sender
+                .send(EngineEvent::ImageInspected {
+                    generation: request.list_generation,
+                    inspection_generation: request.inspection_generation,
+                    id: request.id,
+                    result,
+                })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
+
+    fn set_page(&mut self, page: images::AppPage, context: egui::Context) {
+        if self.page == page {
+            return;
+        }
+        let previous = self.page;
+        self.page = page;
+        if previous == images::AppPage::Images {
+            self.invalidate_images();
+        }
+        if page == images::AppPage::Images && !self.loading && self.engine.is_some() {
+            self.load_images(context);
+        }
+    }
+
     fn connect(&mut self, context: egui::Context) {
         if self.loading {
             return;
@@ -976,6 +1073,7 @@ impl FerrumApp {
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
 
+        self.invalidate_images();
         self.loading = true;
         self.connection = ConnectionState::Connecting;
         self.refresh_error = None;
@@ -1012,6 +1110,7 @@ impl FerrumApp {
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
         self.cancel_inspection();
+        self.invalidate_images();
         self.loading = true;
         self.context_error = None;
         let sender = self.sender.clone();
@@ -1041,6 +1140,10 @@ impl FerrumApp {
             return;
         }
 
+        if self.page == images::AppPage::Images {
+            self.load_images(context);
+            return;
+        }
         let Some(engine) = self.engine.clone() else {
             self.connect(context);
             return;
@@ -1117,6 +1220,7 @@ impl FerrumApp {
                         Err(error) => {
                             #[cfg(target_os = "linux")]
                             self.cancel_terminal_session();
+                            self.invalidate_images();
                             self.engine = None;
                             self.engine_info = None;
                             self.containers.clear();
@@ -1132,7 +1236,32 @@ impl FerrumApp {
                         Ok((engine, info, containers)) => {
                             self.apply_connection_success(engine, info, containers, context.clone())
                         }
-                        Err(error) => self.context_error = Some(error.to_string()),
+                        Err(error) => {
+                            self.context_error = Some(error.to_string());
+                            if self.page == images::AppPage::Images {
+                                self.load_images(context.clone());
+                            }
+                        }
+                    }
+                }
+                EngineEvent::ImagesListed { generation, result } => {
+                    if self.images.complete_load(generation, result) {
+                        self.image_list_task = None;
+                    }
+                }
+                EngineEvent::ImageInspected {
+                    generation,
+                    inspection_generation,
+                    id,
+                    result,
+                } => {
+                    if self.images.complete_inspection(
+                        generation,
+                        inspection_generation,
+                        &id,
+                        result,
+                    ) {
+                        self.image_inspection_task = None;
                     }
                 }
                 EngineEvent::Refreshed(result) => {
@@ -1321,6 +1450,7 @@ impl FerrumApp {
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
         self.cancel_inspection();
+        self.invalidate_images();
         if let Some(task) = self.action_task.take() {
             task.abort();
         }
@@ -1332,7 +1462,10 @@ impl FerrumApp {
         self.connection = ConnectionState::Connected;
         self.refresh_error = None;
         self.context_error = None;
-        self.start_event_stream(engine, context);
+        self.start_event_stream(engine, context.clone());
+        if self.page == images::AppPage::Images {
+            self.load_images(context.clone());
+        }
     }
 
     fn stop_event_stream(&mut self) {
@@ -1551,7 +1684,8 @@ impl FerrumApp {
         #[cfg(not(target_os = "linux"))]
         let _ = (engine, context);
     }
-    fn draw_sidebar(&self, ui: &mut egui::Ui) {
+    fn draw_sidebar(&self, ui: &mut egui::Ui) -> Option<images::AppPage> {
+        let mut page_requested = None;
         egui::Panel::left("navigation")
             .resizable(false)
             .exact_size(218.0)
@@ -1564,11 +1698,7 @@ impl FerrumApp {
                 ui.add_space(8.0);
                 ui.label(RichText::new("Container workbench").small().weak());
                 ui.add_space(24.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    ui.colored_label(Color32::from_rgb(231, 139, 90), "▏");
-                    ui.label(RichText::new("Containers").strong());
-                });
+                page_requested = images::show_navigation(ui, self.page);
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.separator();
                     match &self.connection {
@@ -1585,6 +1715,43 @@ impl FerrumApp {
                     ui.add_space(10.0);
                 });
             });
+        page_requested
+    }
+
+    fn draw_images(&mut self, ui: &mut egui::Ui) -> Option<images::ImageInspectionRequest> {
+        if let Some(error) = &self.context_error {
+            ui.colored_label(Color32::from_rgb(224, 174, 109), "Context switch failed");
+            ui.label("The previous engine connection remains active.");
+            ui.label(error);
+            ui.add_space(10.0);
+        }
+        if self.loading && !self.images.is_loading() {
+            ui.spinner();
+            ui.heading("Waiting for the engine context");
+            ui.label("Images will load when the connection change finishes.");
+            return None;
+        }
+        if !self.loading
+            && matches!(&self.connection, ConnectionState::Connected)
+            && self.engine.is_some()
+            && !self.images.is_loading()
+            && !self.images.has_loaded()
+        {
+            self.load_images(ui.ctx().clone());
+        }
+
+        let (connected, message) = match &self.connection {
+            ConnectionState::Connecting => (
+                false,
+                "Connecting to a local engine; images will appear when it responds.",
+            ),
+            ConnectionState::Disconnected(message) => (false, message.as_str()),
+            ConnectionState::Connected if self.engine.is_none() => {
+                (false, "The engine connection is unavailable.")
+            }
+            ConnectionState::Connected => (true, ""),
+        };
+        self.images.show(ui, connected, message)
     }
 
     fn draw_header(
@@ -1594,11 +1761,13 @@ impl FerrumApp {
         settings_requested: &mut bool,
         context_requested: &mut Option<Option<String>>,
     ) {
+        let page_loading =
+            self.loading || (self.page == images::AppPage::Images && self.images.is_loading());
         egui::Panel::top("header")
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 14)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Containers");
+                    ui.heading(self.page.title());
                     ui.add_space(12.0);
                     match &self.connection {
                         ConnectionState::Connecting => {
@@ -1611,7 +1780,7 @@ impl FerrumApp {
                             ui.colored_label(Color32::from_rgb(227, 113, 102), "Disconnected");
                         }
                     }
-                    ui.add_enabled_ui(!self.loading && !self.action_busy(), |ui| {
+                    ui.add_enabled_ui(!page_loading && !self.action_busy(), |ui| {
                         let selected_name = match self.selected_context.as_deref() {
                             Some(name) => self
                                 .contexts
@@ -1673,7 +1842,7 @@ impl FerrumApp {
                         if ui.button("Settings").clicked() {
                             *settings_requested = true;
                         }
-                        let button_text = if self.loading {
+                        let button_text = if page_loading {
                             "Loading"
                         } else if self.engine.is_some() {
                             "Refresh"
@@ -1682,7 +1851,7 @@ impl FerrumApp {
                         };
                         if ui
                             .add_enabled(
-                                !self.loading && !self.action_busy(),
+                                !page_loading && !self.action_busy(),
                                 egui::Button::new(button_text),
                             )
                             .clicked()
@@ -2381,6 +2550,7 @@ impl Drop for FerrumApp {
         self.cancel_log_stream();
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
+        self.cancel_image_tasks();
         if let Some(task) = self.inspection_task.take() {
             task.abort();
         }
@@ -2407,7 +2577,10 @@ impl eframe::App for FerrumApp {
             self.event_refresh_pending = false;
             self.refresh(context.clone());
         }
-        self.draw_sidebar(ui);
+        let page_requested = self.draw_sidebar(ui);
+        if let Some(page) = page_requested {
+            self.set_page(page, context.clone());
+        }
         let mut refresh_requested = false;
         let mut settings_requested = false;
 
@@ -2428,14 +2601,21 @@ impl eframe::App for FerrumApp {
             self.settings_open = true;
         }
         let mut inspect_index = None;
+        let mut image_inspection = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 18)))
-            .show(ui, |ui| inspect_index = self.draw_inventory(ui));
+            .show(ui, |ui| match self.page {
+                images::AppPage::Containers => inspect_index = self.draw_inventory(ui),
+                images::AppPage::Images => image_inspection = self.draw_images(ui),
+            });
         if let Some(index) = inspect_index {
             let container = &self.containers[index];
             let id = container.id.clone();
             let name = container.name.clone();
             self.inspect_container(&id, &name, context.clone());
+        }
+        if let Some(request) = image_inspection {
+            self.inspect_image(request, context.clone());
         }
         self.draw_inspection(context.clone());
         self.draw_settings(context.clone());
@@ -2444,7 +2624,10 @@ impl eframe::App for FerrumApp {
             self.refresh(context.clone());
         }
 
-        if self.loading || self.action_busy() {
+        if self.loading
+            || self.action_busy()
+            || (self.page == images::AppPage::Images && self.images.is_loading())
+        {
             context.request_repaint_after(Duration::from_millis(250));
         }
     }
@@ -2827,6 +3010,10 @@ mod event_reconciliation_tests {
                 status: Some("Up".to_owned()),
             }],
             inventory_view: InventoryView::default(),
+            page: images::AppPage::default(),
+            images: images::ImagesView::default(),
+            image_list_task: None,
+            image_inspection_task: None,
             loading: false,
             refresh_error: None,
             contexts: Vec::new(),
