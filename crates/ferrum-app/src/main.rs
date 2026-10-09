@@ -171,6 +171,17 @@ enum EngineEvent {
         generation: u64,
     },
 }
+#[derive(Debug, PartialEq, Eq)]
+enum PendingVolumeRead {
+    List {
+        generation: u64,
+    },
+    Inspect {
+        generation: u64,
+        inspection_generation: u64,
+        name: String,
+    },
+}
 
 struct Inspection {
     generation: u64,
@@ -713,6 +724,7 @@ struct FerrumApp {
     images: images::ImagesView,
     volumes: volumes::VolumesView,
     volume_list_task: Option<JoinHandle<()>>,
+    pending_volume_read: Option<PendingVolumeRead>,
     volume_inspection_task: Option<JoinHandle<()>>,
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
@@ -894,6 +906,7 @@ impl FerrumApp {
             images: images::ImagesView::default(),
             volumes: volumes::VolumesView::default(),
             volume_list_task: None,
+            pending_volume_read: None,
             volume_inspection_task: None,
             image_list_task: None,
             image_inspection_task: None,
@@ -1061,19 +1074,8 @@ impl FerrumApp {
         self.images.hide_pull_progress();
     }
 
-    fn cancel_volume_inspection_task(&mut self) {
-        if let Some(task) = self.volume_inspection_task.take() {
-            task.abort();
-        }
-    }
-    fn cancel_volume_read_tasks(&mut self) {
-        if let Some(task) = self.volume_list_task.take() {
-            task.abort();
-        }
-        self.cancel_volume_inspection_task();
-    }
     fn invalidate_volumes(&mut self) {
-        self.cancel_volume_read_tasks();
+        self.pending_volume_read = None;
         self.volumes.invalidate();
     }
     fn load_volumes(&mut self, context: egui::Context) {
@@ -1083,22 +1085,9 @@ impl FerrumApp {
         {
             return;
         }
-        let Some(engine) = self.engine.clone() else {
-            return;
-        };
-        self.cancel_volume_read_tasks();
         let generation = self.volumes.begin_list();
-        let sender = self.sender.clone();
-        self.volume_list_task = Some(self.runtime.spawn(async move {
-            let result = engine.list_volumes().await;
-            if sender
-                .send(EngineEvent::VolumesListed { generation, result })
-                .await
-                .is_ok()
-            {
-                context.request_repaint();
-            }
-        }));
+        self.pending_volume_read = Some(PendingVolumeRead::List { generation });
+        self.start_pending_volume_read(context);
     }
     fn inspect_volume(&mut self, name: String, context: egui::Context) {
         if !cfg!(target_os = "linux")
@@ -1107,27 +1096,69 @@ impl FerrumApp {
         {
             return;
         }
+        let (generation, inspection_generation, name) = self.volumes.begin_inspection(name);
+        self.pending_volume_read = Some(PendingVolumeRead::Inspect {
+            generation,
+            inspection_generation,
+            name,
+        });
+        self.start_pending_volume_read(context);
+    }
+    fn start_pending_volume_read(&mut self, context: egui::Context) {
+        if self.volume_list_task.is_some() || self.volume_inspection_task.is_some() {
+            return;
+        }
+        let Some(operation) = self.pending_volume_read.take() else {
+            return;
+        };
+        if self.page != images::AppPage::Volumes
+            || self.loading
+            || !matches!(&self.connection, ConnectionState::Connected)
+        {
+            return;
+        }
         let Some(engine) = self.engine.clone() else {
             return;
         };
-        self.cancel_volume_inspection_task();
-        let (generation, inspection_generation, name) = self.volumes.begin_inspection(name);
         let sender = self.sender.clone();
-        self.volume_inspection_task = Some(self.runtime.spawn(async move {
-            let result = engine.inspect_volume(&name).await;
-            if sender
-                .send(EngineEvent::VolumeInspected {
-                    generation,
-                    inspection_generation,
-                    name,
-                    result,
-                })
-                .await
-                .is_ok()
-            {
-                context.request_repaint();
+        match operation {
+            PendingVolumeRead::List { generation } if generation == self.volumes.generation => {
+                self.volume_list_task = Some(self.runtime.spawn(async move {
+                    let result = engine.list_volumes().await;
+                    if sender
+                        .send(EngineEvent::VolumesListed { generation, result })
+                        .await
+                        .is_ok()
+                    {
+                        context.request_repaint();
+                    }
+                }));
             }
-        }));
+            PendingVolumeRead::Inspect {
+                generation,
+                inspection_generation,
+                name,
+            } if generation == self.volumes.generation
+                && inspection_generation == self.volumes.inspection_generation =>
+            {
+                self.volume_inspection_task = Some(self.runtime.spawn(async move {
+                    let result = engine.inspect_volume(&name).await;
+                    if sender
+                        .send(EngineEvent::VolumeInspected {
+                            generation,
+                            inspection_generation,
+                            name,
+                            result,
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        context.request_repaint();
+                    }
+                }));
+            }
+            _ => {}
+        }
     }
     fn invalidate_images(&mut self) {
         self.cancel_image_read_tasks();
@@ -1536,9 +1567,8 @@ impl FerrumApp {
                 EngineEvent::VolumesListed { generation, result } => {
                     self.volumes
                         .finish_list(generation, result.map_err(|error| error.to_string()));
-                    if generation == self.volumes.generation {
-                        self.volume_list_task = None;
-                    }
+                    self.volume_list_task = None;
+                    self.start_pending_volume_read(context.clone());
                 }
                 EngineEvent::VolumeInspected {
                     generation,
@@ -1552,11 +1582,8 @@ impl FerrumApp {
                         &name,
                         result.map_err(|error| error.to_string()),
                     );
-                    if generation == self.volumes.generation
-                        && inspection_generation == self.volumes.inspection_generation
-                    {
-                        self.volume_inspection_task = None;
-                    }
+                    self.volume_inspection_task = None;
+                    self.start_pending_volume_read(context.clone());
                 }
                 EngineEvent::ImagesListed { generation, result } => {
                     if self.images.complete_load(generation, result) {
@@ -2970,7 +2997,13 @@ impl Drop for FerrumApp {
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
         self.cancel_image_read_tasks();
-        self.invalidate_volumes();
+        self.pending_volume_read = None;
+        if let Some(task) = self.volume_list_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.volume_inspection_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.inspection_task.take() {
             task.abort();
         }
@@ -3447,6 +3480,7 @@ mod event_reconciliation_tests {
             volumes: volumes::VolumesView::default(),
             volume_list_task: None,
             volume_inspection_task: None,
+            pending_volume_read: None,
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
@@ -4576,26 +4610,56 @@ mod event_reconciliation_tests {
     }
 
     #[test]
-    fn cancelling_volume_inspection_aborts_previous_reader() {
-        let (mut app, _) = app_with_open_inspection();
+    fn volume_reads_keep_one_active_task_and_only_latest_pending_read_survives() {
+        let (mut app, sender) = app_with_open_inspection();
+        app.page = images::AppPage::Volumes;
+        let active_generation = app.volumes.begin_list();
         let (release_sender, release_receiver) = tokio::sync::oneshot::channel::<()>();
         let (started_sender, started_receiver) = tokio::sync::oneshot::channel::<()>();
+        let task_sender = sender.clone();
         let task = app.runtime.spawn(async move {
             let _ = started_sender.send(());
-            let _ = release_receiver.await;
+            if release_receiver.await.is_ok() {
+                let _ = task_sender
+                    .send(EngineEvent::VolumesListed {
+                        generation: active_generation,
+                        result: Ok(Vec::new()),
+                    })
+                    .await;
+            }
         });
         app.runtime
             .block_on(started_receiver)
-            .expect("fake volume inspection task should start");
+            .expect("fake volume list task should start");
         let abort = task.abort_handle();
-        app.volume_inspection_task = Some(task);
+        app.volume_list_task = Some(task);
 
-        app.cancel_volume_inspection_task();
+        app.load_volumes(egui::Context::default());
+        let list_generation = app.volumes.generation;
+        assert!(matches!(
+            &app.pending_volume_read,
+            Some(PendingVolumeRead::List { generation }) if *generation == list_generation
+        ));
+        assert!(app.volume_list_task.is_some());
+
+        app.inspect_volume("older".to_owned(), egui::Context::default());
+        app.inspect_volume("latest".to_owned(), egui::Context::default());
+        assert!(matches!(
+            &app.pending_volume_read,
+            Some(PendingVolumeRead::Inspect { name, .. }) if name == "latest"
+        ));
+        assert!(app.volume_list_task.is_some());
+
+        app.set_page(images::AppPage::Images, egui::Context::default());
+        assert!(app.pending_volume_read.is_none());
+        assert!(app.volume_list_task.is_some());
+        assert!(!abort.is_finished(), "invalidation must retain active read");
+
+        assert!(release_sender.send(()).is_ok());
         app.runtime.block_on(tokio::task::yield_now());
-
-        assert!(abort.is_finished());
-        assert!(app.volume_inspection_task.is_none());
-        drop(release_sender);
+        app.receive_events(egui::Context::default());
+        assert!(app.volume_list_task.is_none());
+        assert!(!app.volumes.loaded, "stale page result must not render");
     }
 
     fn assert_reinspection_is_pending(app: &FerrumApp) {
