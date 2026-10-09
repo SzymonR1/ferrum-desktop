@@ -186,19 +186,13 @@ impl VolumesView {
         if let Some(details) = &self.details {
             ui.separator();
             ui.heading(&details.name);
-            value(ui, "Driver", details.driver.as_deref());
-            value(ui, "Scope", details.scope.as_deref());
-            value(ui, "Created", details.created_at.as_deref());
-            value(ui, "Host mountpoint", details.mountpoint.as_deref());
+            crate::detail_row(ui, "Driver", details.driver.as_deref());
+            crate::detail_row(ui, "Scope", details.scope.as_deref());
+            crate::detail_row(ui, "Created", details.created_at.as_deref());
+            crate::detail_row(ui, "Host mountpoint", details.mountpoint.as_deref());
         }
         selected
     }
-}
-fn value(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
-    ui.horizontal(|ui| {
-        ui.strong(label);
-        ui.label(value.unwrap_or("Not reported"));
-    });
 }
 
 #[cfg(test)]
