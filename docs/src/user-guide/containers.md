@@ -8,6 +8,14 @@ state-gated lifecycle actions (Start, Stop, Restart, Pause, Unpause, Remove)
 only when the container is in a known state where that action is safe. Remove
 requires explicit confirmation. Engine response bodies are not exposed.
 
+Lifecycle request results emit a structured local tracing event containing the
+action, outcome (`success` or `request_error`), and a full container ID only
+when it is validated as 64 hexadecimal characters. A request error does not
+prove that the engine state remained unchanged. Container names, endpoint
+values, raw errors, and daemon response bodies are excluded. Events go to the
+configured process logger; they are not a persistent or tamper-proof audit
+store and do not record actions performed outside Ferrum.
+
 External changes are synchronized from Docker container events. An inventory
 snapshot is fetched on initial subscription and after reconnect; any open
 inspection is reloaded so state-gated actions do not remain stale. If bounded
