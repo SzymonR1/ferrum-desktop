@@ -56,3 +56,11 @@ view cancels its stream.
 The engine integration targets Linux local Unix sockets. Podman/rootless
 behavior remains unvalidated, remote transports remain unsupported, and Windows
 named pipes and macOS remain deferred to issue #21/M8.
+
+## Accessibility and performance samples
+
+The workspace includes headless AccessKit tests for labels, focus, keyboard
+activation, large-inventory virtualization, and stream error/reconnect states.
+Manual release-mode performance samples are opt-in and have no timing
+thresholds. See the [performance and accessibility evidence](../performance.md)
+for the host, dataset, methodology, results, and known validation limits.

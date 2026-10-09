@@ -25,3 +25,7 @@
 # Platform support
 
 - [Support matrix](platform-support.md)
+
+# Performance and accessibility
+
+- [Performance and accessibility evidence](performance.md)

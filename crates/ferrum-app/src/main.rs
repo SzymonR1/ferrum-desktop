@@ -2704,6 +2704,45 @@ mod log_buffer_tests {
         buffer.append(line(ContainerLogSource::Stdout, "reconnected 9999"));
         assert_eq!(buffer.visible_indices(), vec![0]);
     }
+
+    #[test]
+    #[ignore = "manual release-mode log-buffer timing sample; no timing threshold"]
+    fn measures_bounded_log_buffer_append_throughput() {
+        use std::time::Instant;
+
+        const LINE_COUNT: usize = 100_000;
+        const MEASURED_RUNS: usize = 7;
+        let text = "x".repeat(512);
+        let mut durations = Vec::with_capacity(MEASURED_RUNS);
+        let mut retained = None;
+
+        for run in 0..=MEASURED_RUNS {
+            let mut buffer = logs::LogBuffer::new();
+            let started = Instant::now();
+            for _ in 0..LINE_COUNT {
+                buffer.append(line(ContainerLogSource::Stdout, &text));
+            }
+            let elapsed = started.elapsed();
+            assert_eq!(buffer.entries().len(), 10_000);
+            assert_eq!(buffer.dropped_lines(), 90_000);
+            assert!(buffer.retained_bytes() <= 8 * 1024 * 1024);
+            if run > 0 {
+                durations.push(elapsed);
+            }
+            retained = Some(buffer.retained_bytes());
+        }
+
+        durations.sort_unstable();
+        let median = durations[MEASURED_RUNS / 2];
+        let maximum = durations[MEASURED_RUNS - 1];
+        let median_lines_per_second = LINE_COUNT as f64 / median.as_secs_f64();
+        eprintln!(
+            "log-buffer append: {MEASURED_RUNS} runs of {LINE_COUNT} synthetic 512-byte lines; retained={} bytes, median={}us max={}us throughput={median_lines_per_second:.0} lines/s",
+            retained.expect("at least one measurement"),
+            median.as_micros(),
+            maximum.as_micros()
+        );
+    }
 }
 #[cfg(all(test, target_os = "linux"))]
 mod log_retry_budget_tests {
@@ -3496,6 +3535,170 @@ mod event_reconciliation_tests {
         );
         harness.run();
         let _notice = harness.get_by_role_and_label(Role::Label, message.as_str());
+    }
+
+    #[test]
+    fn large_inventory_is_virtualized_and_accessible_to_keyboard_users() {
+        use egui::accesskit::Role;
+        use egui_kittest::{
+            Harness,
+            kittest::{NodeT, Queryable},
+        };
+
+        struct InventoryUi {
+            app: FerrumApp,
+            selected: Option<usize>,
+        }
+
+        let (mut app, _) = app_with_open_inspection();
+        app.containers = (0..1_000)
+            .map(|index| ContainerSummary {
+                id: format!("id-{index:04}"),
+                name: format!("container-{index:04}"),
+                image: Some(format!("image-{index:04}")),
+                state: Some(ContainerState::Running),
+                status: Some("Up".to_owned()),
+            })
+            .collect();
+        app.inventory_view.inventory_changed(&app.containers);
+
+        let mut harness = Harness::new_ui_state(
+            |ui, state: &mut InventoryUi| {
+                if let Some(index) = state.app.draw_inventory(ui) {
+                    state.selected = Some(index);
+                }
+            },
+            InventoryUi {
+                app,
+                selected: None,
+            },
+        );
+        harness.run();
+        assert_eq!(harness.state().app.inventory_view.visible().len(), 1_000);
+        assert!(
+            harness.get_all_by_role(Role::Button).count() < 100,
+            "the accessible tree should contain only the visible container rows"
+        );
+
+        let first = harness.get_by_role_and_label(Role::Button, "container-0000");
+        first.click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().selected, Some(0));
+        harness.state_mut().selected = None;
+        let search = harness.get_by_role_and_label(Role::TextInput, "Search");
+        search.focus();
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(Role::TextInput, "Search")
+                .is_focused()
+        );
+
+        let mut row_focused = false;
+        for _ in 0..8 {
+            harness.key_down(egui::Key::Tab);
+            harness.run();
+            harness.key_up(egui::Key::Tab);
+            harness.run();
+            if harness
+                .get_by_role_and_label(Role::Button, "container-0000")
+                .is_focused()
+            {
+                row_focused = true;
+                break;
+            }
+        }
+        assert!(row_focused, "Tab navigation should reach the first row");
+        harness.key_down(egui::Key::Space);
+        harness.run();
+        assert_eq!(harness.state().selected, Some(0));
+
+        let search = harness.get_by_role_and_label(Role::TextInput, "Search");
+        search.focus();
+        harness.run();
+        let search = harness.get_by_role_and_label(Role::TextInput, "Search");
+        search.type_text("container-0999");
+        harness.run();
+        assert_eq!(harness.state().app.inventory_view.visible().len(), 1);
+        let last = harness.get_by_role_and_label(Role::Button, "container-0999");
+        assert!(!last.accesskit_node().is_disabled());
+    }
+
+    #[test]
+    fn inventory_connection_and_refresh_states_are_accessible() {
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let (mut connecting, sender) = app_with_open_inspection();
+        connecting.connection = ConnectionState::Connecting;
+        connecting.loading = true;
+        let mut loading_harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| {
+                let _ = app.draw_inventory(ui);
+            },
+            connecting,
+        );
+        loading_harness.step();
+        let _connecting = loading_harness
+            .get_by_role_and_label(Role::Label, "Connecting to a local container engine");
+        let _loading = loading_harness.get_by_role_and_label(
+            Role::Label,
+            "The container inventory will appear when the engine responds.",
+        );
+
+        let connection_error = EngineError::NoLocalSocket;
+        let connection_diagnostic = connection_error.to_string();
+        assert!(
+            sender
+                .try_send(EngineEvent::Connected(Err(connection_error)))
+                .is_ok()
+        );
+        loading_harness
+            .state_mut()
+            .receive_events(egui::Context::default());
+        loading_harness.run();
+        assert!(!loading_harness.state().loading);
+        assert!(loading_harness.state().containers.is_empty());
+        let _unavailable =
+            loading_harness.get_by_role_and_label(Role::Label, "Connection unavailable");
+        let _diagnostic =
+            loading_harness.get_by_role_and_label(Role::Label, connection_diagnostic.as_str());
+
+        let (mut refresh_failed, refresh_sender) = app_with_open_inspection();
+        refresh_failed.loading = true;
+        refresh_failed
+            .inventory_view
+            .inventory_changed(&refresh_failed.containers);
+        let last_inventory = refresh_failed.containers.clone();
+        let refresh_error = EngineError::InventoryRequest {
+            endpoint_label: "selected local socket",
+        };
+        let refresh_diagnostic = refresh_error.to_string();
+        assert!(
+            refresh_sender
+                .try_send(EngineEvent::Refreshed(Err(refresh_error)))
+                .is_ok()
+        );
+        refresh_failed.receive_events(egui::Context::default());
+        assert!(!refresh_failed.loading);
+        assert_eq!(refresh_failed.containers, last_inventory);
+        assert_eq!(
+            refresh_failed.refresh_error.as_deref(),
+            Some(refresh_diagnostic.as_str())
+        );
+        let mut refresh_harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| {
+                let _ = app.draw_inventory(ui);
+            },
+            refresh_failed,
+        );
+        refresh_harness.run();
+        let _failure = refresh_harness.get_by_role_and_label(Role::Label, "Refresh failed");
+        let _diagnostic =
+            refresh_harness.get_by_role_and_label(Role::Label, refresh_diagnostic.as_str());
+        let _preserved = refresh_harness
+            .get_by_role_and_label(Role::Label, "Showing the last successful inventory.");
+        let _last_inventory = refresh_harness.get_by_role_and_label(Role::Button, "example");
     }
 
     fn assert_reinspection_is_pending(app: &FerrumApp) {
