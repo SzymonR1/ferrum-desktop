@@ -7,21 +7,38 @@ The only preference is `auto_connect_on_startup`, which defaults to `true`. When
 Missing files use defaults. Versionless legacy settings are migrated in memory
 while preserving recognized values. Invalid, oversized, or future-version files
 fall back to defaults and produce a safe warning; Ferrum does not overwrite the
-file until the user explicitly saves. The final settings-path component is
-opened without following symlinks, and Ferrum verifies the opened descriptor is
-a regular file before changing its permissions. Non-regular settings files are
-rejected. Parent path components follow the selected XDG/HOME location.
+file until the user explicitly saves.
 
-The final settings directory is opened without following a symlink before
-Ferrum applies owner-only (`0700`) permissions; a symlinked final directory is
-rejected. Existing settings files are restricted to owner-only (`0600`) when
-loaded. Save creates the private temporary file with `openat`, atomically
-replaces the target with `renameat`, and removes failed temporary files with
-`unlinkat`, all relative to the opened directory descriptor. Replacing the
-final directory path after it is opened cannot redirect these save operations.
+## Linux settings path
 
-No-follow applies to the final settings-file and settings-directory components.
-Configured XDG/HOME parent components are resolved before opening the directory
-and are not descriptor-contained.
+The accepted Linux settings-path contract works as follows.
+
+At initialization, `SettingsStore` chooses the absolute `XDG_CONFIG_HOME` path
+when available, or falls back to the absolute `HOME` path. It pins a file
+descriptor for the longest existing directory before the final `ferrum`
+settings directory. Symlink aliases already present in the user-selected
+XDG/HOME path at initialization are honored.
+
+Ferrum traverses the remaining directory components relative to that descriptor
+with `openat` and `O_NOFOLLOW`. It creates missing components with `mkdirat`
+only when saving. A load never creates directories, and a missing directory or
+settings file leaves the defaults in use. The final `ferrum` directory rejects
+symlinks on load and save. Loads reject symlinked `settings.toml` entries
+before reading or changing their permissions. A save never follows or modifies
+the target of a symlink at the settings-file entry. Opened settings files are
+verified to be regular files before permissions are changed.
+
+Only the final `ferrum` directory receives owner-only (`0700`) permissions.
+Settings files and save-time temporary files use owner-only (`0600`) permissions.
+Save creates the temporary file with `openat`, atomically replaces the settings
+file with `renameat`, and removes a failed temporary file with `unlinkat`.
+All filesystem operations after initialization use the retained descriptor.
+Replacing the selected absolute parent path after initialization cannot
+redirect settings access away from the pinned directory.
+
+The configured XDG/HOME location remains user-trusted. Ferrum honors its
+existing symlink aliases and does not confine it to `HOME`. All suffix
+components are opened relative to the pinned descriptor; saves replace the
+settings-file entry without following a symlink target.
 
 Ferrum does not persist credentials, secrets, endpoints, or remote contexts. Credentials and remote connection contexts are not supported by this Linux-only settings slice.

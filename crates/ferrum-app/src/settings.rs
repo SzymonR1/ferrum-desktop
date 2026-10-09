@@ -1,16 +1,13 @@
 use std::{
     env,
-    ffi::{CStr, CString},
-    fs::{self, File, OpenOptions},
+    ffi::{CStr, CString, OsStr, OsString},
+    fs::{self, File},
     io::{Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::{
-            ffi::OsStrExt,
-            fs::{OpenOptionsExt, PermissionsExt},
-        },
+        unix::{ffi::OsStrExt, fs::PermissionsExt},
     },
-    path::PathBuf,
+    path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -45,28 +42,43 @@ fn default_auto_connect() -> bool {
     true
 }
 
-#[derive(Debug)]
 pub(super) struct SettingsStore {
-    path: Option<PathBuf>,
+    location: Option<Result<SettingsLocation, PathResolutionError>>,
 }
 
 impl SettingsStore {
     pub(super) fn new() -> Self {
         Self {
-            path: config_path(),
+            location: config_path().map(|path| SettingsLocation::resolve(&path)),
         }
     }
 
     #[cfg(test)]
     fn at(path: PathBuf) -> Self {
-        Self { path: Some(path) }
+        Self {
+            location: Some(SettingsLocation::resolve(&path)),
+        }
     }
 
     pub(super) fn load(&self) -> (Settings, Option<SettingsError>) {
-        let Some(path) = self.path.as_ref() else {
+        let Some(location) = self.location.as_ref() else {
             return (Settings::default(), Some(SettingsError::Unavailable));
         };
-        let file = match open_settings_file(path) {
+        let location = match location {
+            Ok(location) => location,
+            Err(error) => return (Settings::default(), Some(error.load_error())),
+        };
+        let directory = match open_settings_directory(location, false) {
+            Ok(Some(directory)) => directory,
+            Ok(None) => return (Settings::default(), None),
+            Err(DirectoryError::Invalid) => {
+                return (Settings::default(), Some(SettingsError::Invalid));
+            }
+            Err(DirectoryError::Io) => {
+                return (Settings::default(), Some(SettingsError::Read));
+            }
+        };
+        let file = match open_settings_file(&directory, &location.file_name) {
             Ok(Some(file)) => file,
             Ok(None) => return (Settings::default(), None),
             Err(error) => return (Settings::default(), Some(error)),
@@ -104,11 +116,18 @@ impl SettingsStore {
         settings: &Settings,
         replace: impl FnOnce(&File, &CStr, &CStr) -> std::io::Result<()>,
     ) -> Result<(), SettingsError> {
-        let path = self.path.as_ref().ok_or(SettingsError::Unavailable)?;
-        let file_name = settings_file_name(path)?;
-        let parent = path.parent().ok_or(SettingsError::Unavailable)?;
-        fs::create_dir_all(parent).map_err(|_| SettingsError::Write)?;
-        let directory = open_private_settings_directory(parent)?;
+        let location = self
+            .location
+            .as_ref()
+            .ok_or(SettingsError::Unavailable)?
+            .as_ref()
+            .map_err(|error| error.save_error())?;
+        let directory = open_settings_directory(location, true)
+            .map_err(|_| SettingsError::Write)?
+            .ok_or(SettingsError::Write)?;
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(|_| SettingsError::Write)?;
         let mut persisted = settings.clone();
         persisted.schema_version = SCHEMA_VERSION;
         let serialized = toml::to_string_pretty(&persisted).map_err(|_| SettingsError::Write)?;
@@ -119,7 +138,8 @@ impl SettingsStore {
             file.flush().map_err(|_| SettingsError::Write)?;
             file.sync_all().map_err(|_| SettingsError::Write)?;
             drop(file);
-            replace(&directory, &temp_name, &file_name).map_err(|_| SettingsError::Write)?;
+            replace(&directory, &temp_name, &location.file_name)
+                .map_err(|_| SettingsError::Write)?;
             let directory_sync = directory.sync_all();
             if directory_sync.is_err() {
                 tracing::warn!(
@@ -135,19 +155,195 @@ impl SettingsStore {
         result
     }
 }
-fn open_settings_file(path: &std::path::Path) -> Result<Option<File>, SettingsError> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+
+struct SettingsLocation {
+    anchor: File,
+    directories: Vec<OsString>,
+    file_name: CString,
+}
+
+impl SettingsLocation {
+    fn resolve(path: &Path) -> Result<Self, PathResolutionError> {
+        if !path.is_absolute() {
+            return Err(PathResolutionError::Unavailable);
+        }
+        let file_name = CString::new(
+            path.file_name()
+                .ok_or(PathResolutionError::Unavailable)?
+                .as_bytes(),
+        )
+        .map_err(|_| PathResolutionError::Unavailable)?;
+        let settings_directory = path.parent().ok_or(PathResolutionError::Unavailable)?;
+        let final_directory = settings_directory
+            .file_name()
+            .ok_or(PathResolutionError::Unavailable)?
+            .to_os_string();
+        let ancestor_path = settings_directory
+            .parent()
+            .ok_or(PathResolutionError::Unavailable)?;
+
+        let mut anchor = File::open("/").map_err(|_| PathResolutionError::Io)?;
+        let mut directories = Vec::new();
+        let mut missing_component_seen = false;
+        for component in ancestor_path.components() {
+            match component {
+                Component::RootDir | Component::CurDir => {}
+                Component::Prefix(_) => return Err(PathResolutionError::Unavailable),
+                Component::ParentDir => {
+                    if missing_component_seen {
+                        return Err(PathResolutionError::Unavailable);
+                    }
+                    anchor = open_directory_at(&anchor, OsStr::new(".."), false)
+                        .map_err(|_| PathResolutionError::Io)?;
+                }
+                Component::Normal(name) if missing_component_seen => {
+                    directories.push(name.to_os_string());
+                }
+                Component::Normal(name) => match open_directory_at(&anchor, name, false) {
+                    Ok(directory) => anchor = directory,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        directories.push(name.to_os_string());
+                        missing_component_seen = true;
+                    }
+                    Err(_) => return Err(PathResolutionError::Io),
+                },
+            }
+        }
+        directories.push(final_directory);
+
+        Ok(Self {
+            anchor,
+            directories,
+            file_name,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PathResolutionError {
+    Unavailable,
+    Io,
+}
+
+impl PathResolutionError {
+    fn load_error(self) -> SettingsError {
+        match self {
+            Self::Unavailable => SettingsError::Unavailable,
+            Self::Io => SettingsError::Read,
+        }
+    }
+
+    fn save_error(self) -> SettingsError {
+        match self {
+            Self::Unavailable => SettingsError::Unavailable,
+            Self::Io => SettingsError::Write,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DirectoryError {
+    Invalid,
+    Io,
+}
+
+fn open_settings_directory(
+    location: &SettingsLocation,
+    create_missing: bool,
+) -> Result<Option<File>, DirectoryError> {
+    let mut directory = location
+        .anchor
+        .try_clone()
+        .map_err(|_| DirectoryError::Io)?;
+    for (index, component) in location.directories.iter().enumerate() {
+        let directory_mode = if index + 1 == location.directories.len() {
+            0o700
+        } else {
+            0o777
+        };
+        let child = match open_directory_at(&directory, component, true) {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
+                create_directory_at(&directory, component, directory_mode)?;
+                open_directory_at(&directory, component, true).map_err(classify_directory_error)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(classify_directory_error(error)),
+        };
+        directory = child;
+    }
+    Ok(Some(directory))
+}
+
+fn open_directory_at(parent: &File, name: &OsStr, nofollow: bool) -> std::io::Result<File> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+    let mut flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    if nofollow {
+        flags |= libc::O_NOFOLLOW;
+    }
+    // SAFETY: `parent` is an open directory and `name` is one NUL-terminated
+    // path component interpreted relative to that descriptor.
+    let descriptor = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful `openat` returned a newly owned descriptor.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn create_directory_at(
+    parent: &File,
+    name: &OsStr,
+    mode: libc::mode_t,
+) -> Result<(), DirectoryError> {
+    let name = CString::new(name.as_bytes()).map_err(|_| DirectoryError::Invalid)?;
+    // SAFETY: `parent` is an open directory and `name` is one NUL-terminated
+    // path component interpreted relative to that descriptor.
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        Ok(())
+    } else {
+        Err(classify_directory_error(error))
+    }
+}
+
+fn classify_directory_error(error: std::io::Error) -> DirectoryError {
+    if error.raw_os_error() == Some(libc::ELOOP)
+        || error.kind() == std::io::ErrorKind::NotADirectory
+    {
+        DirectoryError::Invalid
+    } else {
+        DirectoryError::Io
+    }
+}
+
+fn open_settings_file(directory: &File, name: &CStr) -> Result<Option<File>, SettingsError> {
+    // SAFETY: `directory` is an open directory and `name` is a single
+    // NUL-terminated filename interpreted relative to that descriptor.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        if error.raw_os_error() == Some(libc::ELOOP) {
             return Err(SettingsError::Invalid);
         }
-        Err(_) => return Err(SettingsError::Read),
-    };
+        return Err(SettingsError::Read);
+    }
+    // SAFETY: successful `openat` returned a newly owned descriptor.
+    let file = unsafe { File::from_raw_fd(descriptor) };
     let metadata = file.metadata().map_err(|_| SettingsError::Read)?;
     if !metadata.file_type().is_file() {
         return Err(SettingsError::Invalid);
@@ -155,29 +351,6 @@ fn open_settings_file(path: &std::path::Path) -> Result<Option<File>, SettingsEr
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|_| SettingsError::Read)?;
     Ok(Some(file))
-}
-fn open_private_settings_directory(parent: &std::path::Path) -> Result<File, SettingsError> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let directory = options.open(parent).map_err(|_| SettingsError::Write)?;
-    if !directory
-        .metadata()
-        .map_err(|_| SettingsError::Write)?
-        .is_dir()
-    {
-        return Err(SettingsError::Write);
-    }
-    directory
-        .set_permissions(fs::Permissions::from_mode(0o700))
-        .map_err(|_| SettingsError::Write)?;
-    Ok(directory)
-}
-
-fn settings_file_name(path: &std::path::Path) -> Result<CString, SettingsError> {
-    let name = path.file_name().ok_or(SettingsError::Unavailable)?;
-    CString::new(name.as_bytes()).map_err(|_| SettingsError::Unavailable)
 }
 
 fn create_temp(directory: &File) -> Result<(CString, File), SettingsError> {
@@ -318,8 +491,9 @@ mod tests {
 
     #[test]
     fn missing_file_uses_defaults() {
-        let (_dir, store) = store();
+        let (dir, store) = store();
         assert_eq!(store.load(), (Settings::default(), None));
+        assert!(!dir.exists(), "load must not create missing directories");
     }
 
     #[test]
@@ -402,8 +576,10 @@ mod tests {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
         std::os::unix::fs::symlink(&target, &path).unwrap();
 
+        let directory_fd = File::open(&dir).unwrap();
+        let settings_name = CString::new("settings.toml").unwrap();
         assert!(matches!(
-            open_settings_file(&path),
+            open_settings_file(&directory_fd, &settings_name),
             Err(SettingsError::Invalid)
         ));
         assert_eq!(
@@ -414,10 +590,203 @@ mod tests {
         fs::remove_file(&path).unwrap();
         fs::create_dir(&directory).unwrap();
         assert!(matches!(
-            open_settings_file(&directory),
+            open_settings_file(&directory_fd, &CString::new("settings-directory").unwrap()),
             Err(SettingsError::Invalid)
         ));
         let _ = fs::remove_dir_all(dir);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn loading_rejects_a_symlinked_settings_directory_without_changing_target_permissions() {
+        let (dir, _) = store();
+        let target_directory = dir.join("target");
+        let settings_directory = dir.join("ferrum");
+        let target_settings = target_directory.join("settings.toml");
+        fs::create_dir_all(&target_directory).unwrap();
+        fs::write(&target_settings, "auto_connect_on_startup = false\n").unwrap();
+        fs::set_permissions(&target_settings, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target_directory, &settings_directory).unwrap();
+        let store = SettingsStore::at(settings_directory.join("settings.toml"));
+
+        let result = store.load();
+        let target_mode = fs::metadata(&target_settings).unwrap().permissions().mode() & 0o777;
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(result, (Settings::default(), Some(SettingsError::Invalid)));
+        assert_eq!(target_mode, 0o644);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn saving_replaces_a_settings_file_symlink_without_following_its_target() {
+        let (dir, store) = store();
+        let path = dir.join("settings.toml");
+        let target = dir.join("other-settings.toml");
+        fs::create_dir_all(&dir).unwrap();
+        let original = b"auto_connect_on_startup = true\n";
+        fs::write(&target, original).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let settings = Settings {
+            auto_connect_on_startup: false,
+            ..Settings::default()
+        };
+
+        let result = store.save(&settings);
+        let target_after = fs::read(&target).unwrap();
+        let target_mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        let saved_metadata = fs::symlink_metadata(&path).unwrap();
+        let saved_contents = fs::read(&path).unwrap();
+        let saved_mode = saved_metadata.permissions().mode() & 0o777;
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(target_after, original);
+        assert_eq!(target_mode, 0o644);
+        assert!(saved_metadata.file_type().is_file());
+        assert_eq!(
+            saved_contents,
+            toml::to_string_pretty(&settings).unwrap().as_bytes()
+        );
+        assert_eq!(saved_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_symlink_root_is_resolved_and_pinned_at_initialization() {
+        let (root, _) = store();
+        fs::create_dir_all(&root).unwrap();
+        let real_root = root.join("real-config");
+        let decoy_root = root.join("decoy-config");
+        let configured_root = root.join("xdg-config");
+        fs::create_dir(&real_root).unwrap();
+        fs::create_dir(&decoy_root).unwrap();
+        std::os::unix::fs::symlink(&real_root, &configured_root).unwrap();
+        let store = SettingsStore::at(configured_root.join("ferrum/settings.toml"));
+        let expected = Settings {
+            auto_connect_on_startup: false,
+            ..Settings::default()
+        };
+
+        fs::remove_file(&configured_root).unwrap();
+        std::os::unix::fs::symlink(&decoy_root, &configured_root).unwrap();
+        store.save(&expected).unwrap();
+
+        assert_eq!(store.load(), (expected, None));
+        assert!(real_root.join("ferrum/settings.toml").exists());
+        assert!(!decoy_root.join("ferrum/settings.toml").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn save_rejects_a_symlink_added_to_a_missing_suffix_after_resolution() {
+        let (root, _) = store();
+        let configured_root = root.join("config");
+        let decoy_root = root.join("decoy");
+        let decoy_settings_directory = decoy_root.join("ferrum");
+        let decoy_settings = decoy_settings_directory.join("settings.toml");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&decoy_settings_directory).unwrap();
+        fs::set_permissions(&decoy_settings_directory, fs::Permissions::from_mode(0o755)).unwrap();
+        let decoy_contents = b"preserve the replacement target";
+        fs::write(&decoy_settings, decoy_contents).unwrap();
+        fs::set_permissions(&decoy_settings, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let store = SettingsStore::at(configured_root.join("ferrum/settings.toml"));
+        std::os::unix::fs::symlink(&decoy_root, &configured_root).unwrap();
+        let result = store.save(&Settings {
+            auto_connect_on_startup: false,
+            ..Settings::default()
+        });
+        let decoy_mode = fs::metadata(&decoy_settings_directory)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let decoy_after = fs::read(&decoy_settings).unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(result, Err(SettingsError::Write));
+        assert_eq!(decoy_mode, 0o755);
+        assert_eq!(decoy_after, decoy_contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_an_anchored_parent_path_does_not_redirect_load_or_save() {
+        let (anchor_path, _) = store();
+        let anchor_name = anchor_path.file_name().unwrap().to_string_lossy();
+        let moved_anchor = anchor_path.with_file_name(format!("{anchor_name}-moved"));
+        let decoy_anchor = anchor_path.with_file_name(format!("{anchor_name}-decoy"));
+        let settings_directory = anchor_path.join("ferrum");
+        let settings_path = settings_directory.join("settings.toml");
+        fs::create_dir_all(&settings_directory).unwrap();
+        fs::create_dir_all(decoy_anchor.join("ferrum")).unwrap();
+        fs::write(&settings_path, "auto_connect_on_startup = true\n").unwrap();
+        let decoy_settings = decoy_anchor.join("ferrum/settings.toml");
+        let decoy_contents = b"leave this settings file alone";
+        fs::write(&decoy_settings, decoy_contents).unwrap();
+        let store = SettingsStore::at(settings_path);
+        let replacement = Settings {
+            auto_connect_on_startup: false,
+            ..Settings::default()
+        };
+
+        fs::rename(&anchor_path, &moved_anchor).unwrap();
+        std::os::unix::fs::symlink(&decoy_anchor, &anchor_path).unwrap();
+        assert_eq!(
+            store.load(),
+            (
+                Settings {
+                    auto_connect_on_startup: true,
+                    ..Settings::default()
+                },
+                None
+            )
+        );
+        store.save(&replacement).unwrap();
+
+        assert_eq!(
+            SettingsStore::at(moved_anchor.join("ferrum/settings.toml")).load(),
+            (replacement, None)
+        );
+        assert_eq!(fs::read(decoy_settings).unwrap().as_slice(), decoy_contents);
+        fs::remove_file(&anchor_path).unwrap();
+        let _ = fs::remove_dir_all(moved_anchor);
+        let _ = fs::remove_dir_all(decoy_anchor);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolved_parent_components_are_rejected_without_creating_directories() {
+        let (root, _) = store();
+        let path = root.join("missing/../ferrum/settings.toml");
+        let store = SettingsStore::at(path);
+
+        assert_eq!(
+            store.load(),
+            (Settings::default(), Some(SettingsError::Unavailable))
+        );
+        assert_eq!(
+            store.save(&Settings::default()),
+            Err(SettingsError::Unavailable)
+        );
+        assert!(!root.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn settings_location_rejects_dot_components_at_the_file_and_directory_leaves() {
+        let (root, _) = store();
+        fs::create_dir_all(&root).unwrap();
+        let paths = [root.join("../settings.toml"), root.join("ferrum/..")];
+
+        let results = paths.map(|path| SettingsLocation::resolve(&path));
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, Err(PathResolutionError::Unavailable)))
+        );
     }
 
     #[test]
@@ -483,6 +852,41 @@ mod tests {
         );
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_only_restricts_permissions_on_the_final_settings_directory() {
+        let (config_root, _) = store();
+        let settings_directory = config_root.join("ferrum");
+        fs::create_dir_all(&settings_directory).unwrap();
+        fs::set_permissions(&config_root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&settings_directory, fs::Permissions::from_mode(0o755)).unwrap();
+        let store = SettingsStore::at(settings_directory.join("settings.toml"));
+
+        store.save(&Settings::default()).unwrap();
+
+        assert_eq!(
+            fs::metadata(&config_root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(&settings_directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(settings_directory.join("settings.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(config_root);
     }
 
     #[test]
@@ -560,7 +964,9 @@ mod tests {
         let decoy_directory = settings_directory.with_file_name(format!("{directory_name}-decoy"));
         fs::create_dir_all(&settings_directory).unwrap();
         fs::create_dir_all(&decoy_directory).unwrap();
-        let directory = open_private_settings_directory(&settings_directory).unwrap();
+        let location =
+            SettingsLocation::resolve(&settings_directory.join("settings.toml")).unwrap();
+        let directory = open_settings_directory(&location, true).unwrap().unwrap();
 
         fs::rename(&settings_directory, &moved_directory).unwrap();
         std::os::unix::fs::symlink(&decoy_directory, &settings_directory).unwrap();

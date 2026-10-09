@@ -17,10 +17,23 @@ local-engine inventory test may inspect an existing container; these tests do
 not mutate resources.
 Settings tests cover missing/corrupt settings, file symlink rejection without
 changing target permissions, non-regular file rejection, and refusal to chmod
-or write through a symlinked settings directory. A deterministic path-replacement
-test verifies temp creation, replacement, and failure cleanup stay on the
-opened directory descriptor while a symlink target remains untouched. These
-tests run in the default suite and use only temporary paths.
+or write through a symlinked settings directory. Temporary-directory path
+regressions should also verify the anchored-path contract. Create a store, then
+replace the selected parent path and confirm that loads and saves cannot reach
+the replacement target. Include an XDG/HOME symlink alias that exists when the
+store is initialized and confirm that Ferrum honors that selected location.
+
+Use temporary directory trees to check that loads with missing directories use
+defaults without creating directories, while saves create remaining components
+relative to the retained descriptor. Insert symlinks in the remaining directory
+components and at the final app directory; load and save must reject them
+without changing or writing through their targets. Loads reject symlinked
+settings files. Saves atomically replace the settings-file directory entry
+without following or modifying a symlink target. Verify that only the final app
+settings directory changes to `0700`, settings and temporary files use `0600`,
+and parent-directory modes remain unchanged. Keep migration, default, corrupt
+file, and unknown-secret-field checks. The default suite must use temporary
+paths and must not change the user's real XDG or HOME settings tree.
 
 The opt-in image list/inspect test is read-only and requires
 `FERRUM_TEST_IMAGE` to name an image already present on the current local Docker

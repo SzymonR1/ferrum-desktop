@@ -66,17 +66,26 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 - Keep the experimental embedded terminal restricted to the selected local Docker-compatible Unix socket on Linux and the negotiated API version. Terminal output is untrusted; ignore OSC 52 clipboard and title requests, expose clipboard actions only to explicit user controls, and never put terminal bytes or daemon bodies in logs or errors. Closing the exec session closes its connection only; it does not stop or remove the container.
 - Persist only the schema version and startup auto-connect boolean; reject unknown fields, bound input size, and keep config files/private temporary files owner-only.
 - Do not include configuration paths or contents in settings errors or logs. Corrupt settings fall back to defaults and are not overwritten until explicit user save.
-- Open settings files with Unix `O_NOFOLLOW` and `O_NONBLOCK` flags, verify the
-  opened descriptor is a regular file before changing permissions, and reject
-  final-component symlinks or non-regular files. Parent path components still
-  follow the configured XDG/HOME path.
-- When saving, open the final settings directory without following a symlink
-  and apply `0700` through that descriptor. Create the private temporary file
-  with `openat`, atomically replace the settings file with `renameat`, and
-  clean up failed temporary files with `unlinkat`, all relative to the same
-  opened directory descriptor. Replacing the final directory path after open
-  cannot redirect those operations. Parent components remain resolved through
-  the configured XDG/HOME path and are not descriptor-contained.
+- The agreed Linux settings-path contract uses an absolute
+  `XDG_CONFIG_HOME` path or falls back to absolute `HOME`. At initialization,
+  `SettingsStore` pins a descriptor for the longest existing directory before
+  the final app settings directory. Existing symlink aliases in the
+  user-selected XDG/HOME path are honored at that time. The configured
+  location remains user-trusted and is not confined to `HOME`.
+- Traverse every remaining settings-directory component relative to the
+  retained descriptor with `openat` and `O_NOFOLLOW`. Save may create missing
+  components with `mkdirat`; load never creates directories. Reject symlinks
+  at the final app settings directory on both load and save, and reject
+  symlinked `settings.toml` entries during load. On save, `renameat` atomically
+  replaces the settings-file directory entry and never follows its symlink
+  target. Verify settings files are regular files before changing permissions.
+- Apply `0700` only to the final app settings directory. Keep settings and
+  temporary files at `0600`. Create save-time temporary files with `openat`,
+  replace settings with `renameat`, and remove failed temporary files with
+  `unlinkat`, all relative to the retained descriptor. Every filesystem
+  operation after initialization uses that descriptor. Replacing the selected
+  absolute parent path after initialization cannot redirect access away from
+  it. This path contract applies only to Linux.
 
 ## Deferred attack surfaces
 
@@ -101,4 +110,3 @@ Separate opt-in ignored lifecycle, logs, and terminal tests mutate engine state
 using one uniquely named disposable container and only its validated full ID as
 cleanup authority. Logs and terminal tests require locally installed images and
 never pull, tag, or delete images. See [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
-
