@@ -15,14 +15,14 @@ containers and did not mutate engine resources.
 
 | Workload | Dataset and method | Observed result |
 |---|---|---|
-| Release process startup to inventory | Two release-mode Ferrum processes launched on X11; elapsed monotonic time from immediately before spawn to the `Loaded local container inventory` log. The filesystem cache was warm; these are not cold-start measurements. | 108 ms and 114 ms; 14 containers per run |
-| Connected-process memory | `/proc/<pid>/status` RSS sampled after inventory load and after a 30-second idle interval in each run. | Run 1: 107.5 MiB at load, 110.3 MiB after 30 seconds; Run 2: 107.5 MiB at load, 110.4 MiB after 30 seconds |
-| Connected-process CPU | `/proc/<pid>/stat` user/system tick deltas over the same 30-second intervals; `getconf CLK_TCK` reported 100 ticks/second. | Run 1: 0.15 s; Run 2: 0.14 s of process CPU time |
+| Release process startup to inventory | Three release-mode Ferrum processes launched on X11; elapsed monotonic time from immediately before spawn to the `Loaded local container inventory` log. The filesystem cache was warm; these are not cold-start measurements. | 108 ms, 114 ms, and 140 ms; 14 containers per run |
+| Connected-process memory | `/proc/<pid>/status` RSS sampled after inventory load and after a 30-second idle interval in each run. | Run 1: 107.5 MiB at load, 110.3 MiB after 30 seconds; Run 2: 107.5 MiB at load, 110.4 MiB after 30 seconds; Run 3: 107.6 MiB at load, 110.5 MiB after 30 seconds |
+| Connected-process CPU | `/proc/<pid>/stat` user/system tick deltas over the same 30-second intervals; `getconf CLK_TCK` reported 100 ticks/second. | Run 1: 0.15 s; Run 2: 0.14 s; Run 3: 0.18 s of process CPU time |
 | Inventory filter and sort | Release-mode `InventoryView` benchmark; 1,000 synthetic summaries, 20 warmups and 200 rebuilds alternating an empty query with `container-09`. Each row has an ID, name, one of eight image names, Running state, and `Up` status. | 253 μs median; 408 μs p95 per rebuild |
 | Log-buffer append | Release-mode `LogBuffer` benchmark; 100,000 synthetic 512-byte stdout lines per run, one warmup and seven measured runs. The buffer retains at most 10,000 lines or 8 MiB. | 1,967 μs median; 3,002 μs maximum; 5,120,000 retained bytes |
 
-The connected-process RSS sample exceeds the initial 100 MiB GUI-only target and
-is not a measurement of GUI-only memory. No claim is made that the target is met.
+The connected-process samples are above 100 MiB but are not GUI-only
+measurements; they cannot establish whether the initial GUI-only target is met.
 
 ## Resilience and bounded data
 

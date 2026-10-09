@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use std::{
+    collections::VecDeque,
     fs,
     io::{self, BufRead, BufReader},
     process::{Child, Command, Stdio},
@@ -8,6 +9,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+const RECENT_LOG_LIMIT: usize = 8;
 
 struct ConfigHome(std::path::PathBuf);
 
@@ -40,7 +43,12 @@ impl Drop for AppProcess {
     }
 }
 
-fn process_sample(pid: u32) -> io::Result<(u64, u64)> {
+struct ProcessSample {
+    rss_kib: u64,
+    cpu_ticks: u64,
+}
+
+fn process_sample(pid: u32) -> io::Result<ProcessSample> {
     let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
     let rss_kib = status
         .lines()
@@ -65,7 +73,10 @@ fn process_sample(pid: u32) -> io::Result<(u64, u64)> {
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| io::Error::other("system CPU ticks missing from proc stat"))?;
 
-    Ok((rss_kib, user_ticks + system_ticks))
+    Ok(ProcessSample {
+        rss_kib,
+        cpu_ticks: user_ticks + system_ticks,
+    })
 }
 
 fn forward_log_lines<R>(reader: R, sender: mpsc::SyncSender<String>) -> thread::JoinHandle<()>
@@ -99,6 +110,13 @@ where
     })
 }
 
+fn remember_recent_log(recent_logs: &mut VecDeque<String>, line: String) {
+    if recent_logs.len() == RECENT_LOG_LIMIT {
+        let _ = recent_logs.pop_front();
+    }
+    recent_logs.push_back(line);
+}
+
 #[test]
 #[ignore = "manual release-mode sample; requires X11, a local engine, and startup auto-connect"]
 fn measures_release_launch_inventory_memory_and_idle_cpu() {
@@ -124,7 +142,7 @@ fn measures_release_launch_inventory_memory_and_idle_cpu() {
     let stderr_reader = forward_log_lines(stderr, line_sender);
 
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut recent_logs = Vec::new();
+    let mut recent_logs = VecDeque::with_capacity(RECENT_LOG_LIMIT);
     let inventory_line = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(
@@ -137,10 +155,7 @@ fn measures_release_launch_inventory_memory_and_idle_cpu() {
                 panic!("Ferrum did not report an inventory ({error}); recent logs: {recent_logs:?}")
             }
         };
-        if recent_logs.len() == 8 {
-            recent_logs.remove(0);
-        }
-        recent_logs.push(line.clone());
+        remember_recent_log(&mut recent_logs, line.clone());
         if line.contains("Loaded local container inventory") {
             break line;
         }
@@ -152,7 +167,7 @@ fn measures_release_launch_inventory_memory_and_idle_cpu() {
         .and_then(|value| value.split_whitespace().next())
         .and_then(|value| value.parse::<usize>().ok())
         .expect("inventory log reports its container count");
-    let (rss_at_inventory_kib, cpu_at_inventory_ticks) =
+    let sample_at_inventory =
         process_sample(pid).expect("sample the Ferrum process after inventory load");
 
     let idle_sample = Duration::from_secs(30);
@@ -163,17 +178,12 @@ fn measures_release_launch_inventory_memory_and_idle_cpu() {
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_millis(100)),
         ) {
-            Ok(line) => {
-                if recent_logs.len() == 8 {
-                    recent_logs.remove(0);
-                }
-                recent_logs.push(line);
-            }
+            Ok(line) => remember_recent_log(&mut recent_logs, line),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    let (rss_after_idle_kib, cpu_after_idle_ticks) =
+    let sample_after_idle =
         process_sample(pid).expect("sample the Ferrum process after the idle interval");
     let clock_ticks_per_second = Command::new("getconf")
         .arg("CLK_TCK")
@@ -191,9 +201,10 @@ fn measures_release_launch_inventory_memory_and_idle_cpu() {
         "release UI sample: inventory_ready_ms={}, containers={}, rss_at_inventory_mib={:.1}, rss_after_30s_mib={:.1}, cpu_seconds_over_30s={:.4}",
         inventory_ready.duration_since(launch_started).as_millis(),
         container_count,
-        rss_at_inventory_kib as f64 / 1024.0,
-        rss_after_idle_kib as f64 / 1024.0,
-        (cpu_after_idle_ticks - cpu_at_inventory_ticks) as f64 / clock_ticks_per_second as f64
+        sample_at_inventory.rss_kib as f64 / 1024.0,
+        sample_after_idle.rss_kib as f64 / 1024.0,
+        (sample_after_idle.cpu_ticks - sample_at_inventory.cpu_ticks) as f64
+            / clock_ticks_per_second as f64
     );
 
     let _ = child.0.kill();

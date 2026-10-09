@@ -3629,7 +3629,7 @@ mod event_reconciliation_tests {
         use egui::accesskit::Role;
         use egui_kittest::{Harness, kittest::Queryable};
 
-        let (mut connecting, _) = app_with_open_inspection();
+        let (mut connecting, sender) = app_with_open_inspection();
         connecting.connection = ConnectionState::Connecting;
         connecting.loading = true;
         let mut loading_harness = Harness::new_ui_state(
@@ -3646,30 +3646,46 @@ mod event_reconciliation_tests {
             "The container inventory will appear when the engine responds.",
         );
 
-        let (mut disconnected, _) = app_with_open_inspection();
-        disconnected.connection =
-            ConnectionState::Disconnected("selected local socket unavailable".to_owned());
-        disconnected.containers.clear();
-        disconnected
-            .inventory_view
-            .inventory_changed(&disconnected.containers);
-        let mut disconnected_harness = Harness::new_ui_state(
-            |ui, app: &mut FerrumApp| {
-                let _ = app.draw_inventory(ui);
-            },
-            disconnected,
+        let connection_error = EngineError::NoLocalSocket;
+        let connection_diagnostic = connection_error.to_string();
+        assert!(
+            sender
+                .try_send(EngineEvent::Connected(Err(connection_error)))
+                .is_ok()
         );
-        disconnected_harness.run();
+        loading_harness
+            .state_mut()
+            .receive_events(egui::Context::default());
+        loading_harness.run();
+        assert!(!loading_harness.state().loading);
+        assert!(loading_harness.state().containers.is_empty());
         let _unavailable =
-            disconnected_harness.get_by_role_and_label(Role::Label, "Connection unavailable");
-        let _diagnostic = disconnected_harness
-            .get_by_role_and_label(Role::Label, "selected local socket unavailable");
+            loading_harness.get_by_role_and_label(Role::Label, "Connection unavailable");
+        let _diagnostic =
+            loading_harness.get_by_role_and_label(Role::Label, connection_diagnostic.as_str());
 
-        let (mut refresh_failed, _) = app_with_open_inspection();
-        refresh_failed.refresh_error = Some("scripted refresh interruption".to_owned());
+        let (mut refresh_failed, refresh_sender) = app_with_open_inspection();
+        refresh_failed.loading = true;
         refresh_failed
             .inventory_view
             .inventory_changed(&refresh_failed.containers);
+        let last_inventory = refresh_failed.containers.clone();
+        let refresh_error = EngineError::InventoryRequest {
+            endpoint_label: "selected local socket",
+        };
+        let refresh_diagnostic = refresh_error.to_string();
+        assert!(
+            refresh_sender
+                .try_send(EngineEvent::Refreshed(Err(refresh_error)))
+                .is_ok()
+        );
+        refresh_failed.receive_events(egui::Context::default());
+        assert!(!refresh_failed.loading);
+        assert_eq!(refresh_failed.containers, last_inventory);
+        assert_eq!(
+            refresh_failed.refresh_error.as_deref(),
+            Some(refresh_diagnostic.as_str())
+        );
         let mut refresh_harness = Harness::new_ui_state(
             |ui, app: &mut FerrumApp| {
                 let _ = app.draw_inventory(ui);
@@ -3678,6 +3694,8 @@ mod event_reconciliation_tests {
         );
         refresh_harness.run();
         let _failure = refresh_harness.get_by_role_and_label(Role::Label, "Refresh failed");
+        let _diagnostic =
+            refresh_harness.get_by_role_and_label(Role::Label, refresh_diagnostic.as_str());
         let _preserved = refresh_harness
             .get_by_role_and_label(Role::Label, "Showing the last successful inventory.");
         let _last_inventory = refresh_harness.get_by_role_and_label(Role::Button, "example");
