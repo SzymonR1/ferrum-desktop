@@ -20,15 +20,16 @@ cargo run -p ferrum-app
 
 `packaging/linux/com.ferrum.desktop` is launcher metadata only; it assumes `ferrum` is on `PATH` and is not installed by the build commands.
 
-The Linux adapter preserves `DOCKER_HOST` local-Unix behavior and automatic
-socket discovery. Docker CLI contexts are also listed for session-only selection;
-`DOCKER_CONTEXT` takes precedence over `DOCKER_HOST`, followed by a non-default
-current local context and then automatic local socket discovery. Only context
-endpoints using local Unix sockets are supported. Remote TCP/HTTP/TLS/SSH
-contexts are rejected. Windows named pipes and macOS support remain deferred to
-[issue #21](https://github.com/SzymonR1/ferrum-desktop/issues/21) and M8.
+The Linux adapter preserves direct `DOCKER_HOST` local-Unix behavior and automatic
+socket discovery. Docker CLI contexts are listed for session-only selection;
+`DOCKER_CONTEXT` takes precedence over `DOCKER_HOST`, followed by the non-default
+current local context and then automatic local socket discovery. Only local
+Unix-socket context endpoints are supported. Direct remote `DOCKER_HOST` values and
+remote TCP/HTTP/HTTPS/SSH contexts return typed unsupported errors without local
+fallback. Windows named pipes and macOS support remain deferred to
+[issue #21](https://github.com/SzymonR1/ferrum-desktop/issues/21).
 Context-selection work is a slice of [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10),
-which remains open for Podman/rootless validation and remote TLS/SSH policy.
+which remains open for Podman/rootless validation and a real endpoint matrix.
 
 Context listing and switching require the Docker CLI. Ferrum's direct local
 socket connection and automatic discovery do not require the CLI.

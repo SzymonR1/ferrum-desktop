@@ -426,94 +426,94 @@ impl EngineClient {
                 .map(|value| value.into_string())
                 .transpose()
                 .map_err(|_| EngineError::InvalidEndpointEncoding)?;
-            let contexts = if docker_context
-                .as_deref()
-                .is_some_and(|name| !name.is_empty())
-            {
-                Some(
-                    discover_contexts()
-                        .await
-                        .map_err(|_| EngineError::ContextCatalogUnavailable)?,
-                )
-            } else if docker_host.as_deref().is_none_or(str::is_empty) {
-                match discover_contexts().await {
-                    Ok(contexts) => Some(contexts),
-                    Err(ContextCommandError::CliUnavailable) => None,
-                    Err(_) => return Err(EngineError::ContextCatalogUnavailable),
-                }
-            } else {
-                None
-            };
-            let current = if docker_context
-                .as_deref()
-                .is_some_and(|name| !name.is_empty())
-                || docker_host.as_deref().is_some_and(|host| !host.is_empty())
-            {
-                None
-            } else if let Some(contexts) = contexts.as_deref() {
-                Some(
-                    current_cli_context(contexts)
-                        .map_err(|_| EngineError::ContextCatalogUnavailable)?,
-                )
-            } else {
-                None
-            };
-            match resolve_startup_source(docker_context.as_deref(), docker_host.as_deref(), current)
-            {
-                StartupSource::ExplicitContext => {
-                    return Self::connect_catalog_context(
-                        contexts
-                            .as_deref()
-                            .ok_or(EngineError::ContextCatalogUnavailable)?,
-                        docker_context.as_deref().unwrap_or_default(),
-                    )
-                    .await;
-                }
-                StartupSource::CurrentContext => {
-                    if let Some(current) = current {
-                        return Self::connect_context_record(current).await;
-                    }
-                }
-                StartupSource::DockerHost => {
-                    let host = docker_host.as_deref().unwrap_or_default();
-                    if is_remote_endpoint(host) {
-                        return Err(EngineError::UnsupportedRemoteTransport);
-                    }
-                    let endpoint_label = configured_endpoint_label(host);
-                    let path = host
-                        .strip_prefix("unix://")
-                        .filter(|path| !path.is_empty())
-                        .map(PathBuf::from)
-                        .ok_or(EngineError::UnsupportedRemoteTransport)?;
-                    return Self::connect_unix_socket(&path, endpoint_label).await;
-                }
-                StartupSource::DefaultDiscovery => {}
-            }
-
-            let mut last_error = None;
-            let mut found_socket = false;
-
-            for (endpoint_label, path) in local_socket_candidates() {
-                if !path.exists() {
-                    continue;
-                }
-
-                found_socket = true;
-                match Self::connect_unix_socket(&path, endpoint_label).await {
-                    Ok(client) => return Ok(client),
-                    Err(error) => last_error = Some(error),
-                }
-            }
-
-            if let Some(error) = last_error {
-                return Err(error);
-            }
-            if !found_socket {
-                return Err(EngineError::NoLocalSocket);
-            }
-
-            Err(EngineError::NoLocalSocket)
+            Self::connect_with_startup_environment(docker_context, docker_host).await
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn connect_with_startup_environment(
+        docker_context: Option<String>,
+        docker_host: Option<String>,
+    ) -> Result<Self, EngineError> {
+        let contexts = if docker_context
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
+        {
+            Some(
+                discover_contexts()
+                    .await
+                    .map_err(|_| EngineError::ContextCatalogUnavailable)?,
+            )
+        } else if docker_host.as_deref().is_none_or(str::is_empty) {
+            match discover_contexts().await {
+                Ok(contexts) => Some(contexts),
+                Err(ContextCommandError::CliUnavailable) => None,
+                Err(_) => return Err(EngineError::ContextCatalogUnavailable),
+            }
+        } else {
+            None
+        };
+        let current = if docker_context
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
+            || docker_host.as_deref().is_some_and(|host| !host.is_empty())
+        {
+            None
+        } else if let Some(contexts) = contexts.as_deref() {
+            Some(
+                current_cli_context(contexts)
+                    .map_err(|_| EngineError::ContextCatalogUnavailable)?,
+            )
+        } else {
+            None
+        };
+        match resolve_startup_source(docker_context.as_deref(), docker_host.as_deref(), current) {
+            StartupSource::ExplicitContext => {
+                return Self::connect_catalog_context(
+                    contexts
+                        .as_deref()
+                        .ok_or(EngineError::ContextCatalogUnavailable)?,
+                    docker_context.as_deref().unwrap_or_default(),
+                )
+                .await;
+            }
+            StartupSource::CurrentContext => {
+                if let Some(current) = current {
+                    return Self::connect_context_record(current).await;
+                }
+            }
+            StartupSource::DockerHost => {
+                let host = docker_host.as_deref().unwrap_or_default();
+                let path = local_socket_path_from_docker_host(host)?;
+                let endpoint_label = configured_endpoint_label(host);
+                return Self::connect_unix_socket(&path, endpoint_label).await;
+            }
+            StartupSource::DefaultDiscovery => {}
+        }
+
+        let mut last_error = None;
+        let mut found_socket = false;
+
+        for (endpoint_label, path) in local_socket_candidates() {
+            if !path.exists() {
+                continue;
+            }
+
+            found_socket = true;
+            match Self::connect_unix_socket(&path, endpoint_label).await {
+                Ok(client) => return Ok(client),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        if let Some(error) = last_error {
+            return Err(error);
+        }
+        if !found_socket {
+            return Err(EngineError::NoLocalSocket);
+        }
+
+        Err(EngineError::NoLocalSocket)
     }
 
     /// Lists Docker CLI contexts without exposing their endpoint data.
@@ -1016,6 +1016,16 @@ fn configured_endpoint_label(host: &str) -> &'static str {
     } else {
         "configured endpoint"
     }
+}
+#[cfg(target_os = "linux")]
+fn local_socket_path_from_docker_host(host: &str) -> Result<PathBuf, EngineError> {
+    if is_remote_endpoint(host) {
+        return Err(EngineError::UnsupportedRemoteTransport);
+    }
+    host.strip_prefix("unix://")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or(EngineError::UnsupportedRemoteTransport)
 }
 
 #[cfg(target_os = "linux")]
@@ -2500,5 +2510,48 @@ mod context_selection_tests {
             EngineClient::connect_context_record(&catalog[0]).await,
             Err(EngineError::UnsupportedContextTransport)
         ));
+    }
+    #[test]
+    fn rejects_direct_remote_docker_host_schemes_with_safe_typed_error() {
+        for host in [
+            "tcp://engine.example:2376",
+            "http://engine.example:2375",
+            "https://engine.example:2376",
+            "ssh://user@engine.example",
+            "HTTPS://engine.example:2376",
+        ] {
+            let error = local_socket_path_from_docker_host(host)
+                .expect_err("explicit remote Docker endpoints must fail closed");
+            assert!(matches!(error, EngineError::UnsupportedRemoteTransport));
+            assert!(
+                !error.to_string().contains("engine.example"),
+                "configured endpoint details must not appear in user-facing errors"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_direct_hosts_are_rejected_before_default_discovery() {
+        for host in [
+            "tcp://127.0.0.1:0",
+            "http://127.0.0.1:0",
+            "https://127.0.0.1:0",
+            "ssh://127.0.0.1:0",
+        ] {
+            let result =
+                EngineClient::connect_with_startup_environment(None, Some(host.to_owned())).await;
+            assert!(
+                matches!(result, Err(EngineError::UnsupportedRemoteTransport)),
+                "explicit remote host {host} must be rejected before local discovery"
+            );
+        }
+    }
+    #[test]
+    fn accepts_local_unix_docker_host_socket() {
+        assert_eq!(
+            local_socket_path_from_docker_host("unix:///tmp/docker.sock")
+                .expect("a local Unix socket is supported"),
+            PathBuf::from("/tmp/docker.sock")
+        );
     }
 }

@@ -79,10 +79,10 @@ context switch preserves the working connection and inventory.
 
 The adapter is Linux-only. It preserves local `DOCKER_HOST` behavior and default
 XDG/system socket discovery, and supports Docker CLI contexts backed by local
-Unix sockets. Precedence is explicit `DOCKER_CONTEXT`, then `DOCKER_HOST`, then
-the CLI current non-default context, then automatic discovery. Remote TCP/HTTP/
-TLS/SSH contexts are unsupported and never downgraded. Podman/rootless behavior
-remains unvalidated.
+Unix sockets. Precedence is explicit `DOCKER_CONTEXT`, then `DOCKER_HOST`, then the
+CLI current non-default context, then automatic discovery. Direct remote
+`DOCKER_HOST` values and remote TCP/HTTP/HTTPS/SSH contexts are rejected without
+local fallback. Podman/rootless behavior remains unvalidated.
 
 The Linux local-context slice contributes to [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10)
 and does not close it. Windows named pipes and macOS are deferred to issue
