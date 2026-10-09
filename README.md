@@ -20,6 +20,12 @@ event updates use bounded delivery and report when synchronization is
 unavailable, while manual refresh remains available. Logs are plain text,
 bounded in memory, and stream only from the selected local Unix socket.
 
+Lifecycle request outcomes also emit minimal structured local trace events with
+the action and a validated full container ID when available. `request_error`
+means Ferrum did not receive success confirmation; the engine state may still
+be changing. Raw errors, endpoints, names, and daemon response bodies are
+excluded. These events are not a persistent or tamper-proof audit store.
+
 The **Images** page provides read-only image listing and inspection through a
 local Docker Unix socket on Linux. Pull, tag, remove, build, push, and registry
 authentication are not offered; Podman/rootless and remote image endpoints

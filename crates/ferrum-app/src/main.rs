@@ -25,6 +25,7 @@ fn available_container_actions(state: Option<&ContainerState>) -> &'static [Cont
 fn action_requires_confirmation(action: ContainerAction) -> bool {
     action.is_destructive()
 }
+mod audit;
 mod images;
 mod inventory;
 mod logs;
@@ -1599,6 +1600,7 @@ impl FerrumApp {
         let sender = self.sender.clone();
         self.action_task = Some(self.runtime.spawn(async move {
             let result = engine.perform_container_action(&id, action).await;
+            audit::record_container_action_result(&id, action, result.is_ok());
             if sender
                 .send(EngineEvent::ActionFinished {
                     generation,
