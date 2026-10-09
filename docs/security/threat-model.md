@@ -76,17 +76,39 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   retained descriptor with `openat` and `O_NOFOLLOW`. Save may create missing
   components with `mkdirat`; load never creates directories. Reject symlinks at
   the final app settings directory on load and save, and reject symlinked or
-  non-regular `settings.toml` entries on both load and save. Before saving,
-  inspect the directory entry with `fstatat(AT_SYMLINK_NOFOLLOW)`;
-  `renameat` never follows a symlink target if the entry changes concurrently.
-  Verify opened settings files are regular files before changing permissions.
-- Apply `0700` only to the final app settings directory. Keep settings and
-  temporary files at `0600`. Create save-time temporary files with `openat`,
-  replace settings with `renameat`, and remove failed temporary files with
-  `unlinkat`, all relative to the retained descriptor. Every filesystem
-  operation after initialization uses that descriptor. Replacing the selected
-  absolute parent path after initialization cannot redirect access away from
-  it. This path contract applies only to Linux.
+  non-regular `settings.toml` entries on both paths. Before opening
+  `settings.toml`, load sets the already-open final `ferrum` directory to
+  exactly `0700`; it rejects non-regular files and files with `nlink != 1`
+  before changing file permissions or reading contents. A single-link regular
+  file is set to `0600` before it is read. Before saving, inspect the directory
+  entry with `fstatat(AT_SYMLINK_NOFOLLOW)`; `renameat` never follows a
+  symlink target if the entry changes concurrently.
+  The link-count check and following mode change are not atomic. The final
+  directory's `0700` mode limits access by different unprivileged UIDs, but
+  same-UID processes and privileged actors remain inside the local filesystem
+  trust boundary.
+- Save requests `0700` for each missing remaining settings-path component and,
+  only when `mkdirat` creates it, sets its mode to exactly `0700` through the
+  opened directory descriptor. Existing ancestors are not normalized; the
+  final app `ferrum` directory remains subject to the separate `0700`-on-save
+  rule. Settings files and save-time temporary files use `0600`. Temporary
+  files are created with `openat`, replaced with `renameat`, and removed with
+  `unlinkat` on failed saves, all relative to the retained descriptor. A umask
+  that removes owner-read needed to open a new directory makes save fail before
+  temporary-file creation or settings writes; the new directory may remain.
+- `mkdirat` and the following `openat` are separate operations. An actor with
+  write/search access to the parent may replace a just-created name with a real
+  directory before it is opened, subject to sticky-directory rules.
+  `O_NOFOLLOW` rejects symlink replacements, not real-directory replacements.
+  If a replacement cannot be opened, save fails. If it can be opened,
+  normalization applies to that opened inode; a process without ownership or
+  `CAP_FOWNER` fails with `EPERM` when normalizing a foreign-owned replacement,
+  before settings writes. The replacement owner or a process with `CAP_FOWNER`
+  can change its mode. No interprocess lock closes this race.
+- Every filesystem operation after initialization uses the retained directory
+  descriptor. Replacing the selected absolute parent path after initialization
+  cannot redirect access away from it. This settings-path contract applies
+  only to Linux.
 
 ## Deferred attack surfaces
 

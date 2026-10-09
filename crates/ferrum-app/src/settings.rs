@@ -6,7 +6,10 @@ use std::{
     mem::MaybeUninit,
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::{ffi::OsStrExt, fs::PermissionsExt},
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, PermissionsExt},
+        },
     },
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -79,6 +82,12 @@ impl SettingsStore {
                 return (Settings::default(), Some(SettingsError::Read));
             }
         };
+        if directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .is_err()
+        {
+            return (Settings::default(), Some(SettingsError::Read));
+        }
         let file = match open_settings_file(&directory, &location.file_name) {
             Ok(Some(file)) => file,
             Ok(None) => return (Settings::default(), None),
@@ -257,17 +266,20 @@ fn open_settings_directory(
         .anchor
         .try_clone()
         .map_err(|_| DirectoryError::Io)?;
-    for (index, component) in location.directories.iter().enumerate() {
-        let directory_mode = if index + 1 == location.directories.len() {
-            0o700
-        } else {
-            0o777
-        };
+    for component in &location.directories {
         let child = match open_directory_at(&directory, component, true) {
             Ok(child) => child,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
-                create_directory_at(&directory, component, directory_mode)?;
-                open_directory_at(&directory, component, true).map_err(classify_directory_error)?
+                let created = create_directory_at(&directory, component, 0o700)?;
+                let child = open_directory_at(&directory, component, true)
+                    .map_err(classify_directory_error)?;
+                if created {
+                    // Correct umask-filtered permissions through the opened descriptor.
+                    child
+                        .set_permissions(fs::Permissions::from_mode(0o700))
+                        .map_err(classify_directory_error)?;
+                }
+                child
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(classify_directory_error(error)),
@@ -298,17 +310,17 @@ fn create_directory_at(
     parent: &File,
     name: &OsStr,
     mode: libc::mode_t,
-) -> Result<(), DirectoryError> {
+) -> Result<bool, DirectoryError> {
     let name = CString::new(name.as_bytes()).map_err(|_| DirectoryError::Invalid)?;
     // SAFETY: `parent` is an open directory and `name` is one NUL-terminated
     // path component interpreted relative to that descriptor.
     let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) };
     if result == 0 {
-        return Ok(());
+        return Ok(true);
     }
     let error = std::io::Error::last_os_error();
     if error.kind() == std::io::ErrorKind::AlreadyExists {
-        Ok(())
+        Ok(false)
     } else {
         Err(classify_directory_error(error))
     }
@@ -347,7 +359,7 @@ fn open_settings_file(directory: &File, name: &CStr) -> Result<Option<File>, Set
     // SAFETY: successful `openat` returned a newly owned descriptor.
     let file = unsafe { File::from_raw_fd(descriptor) };
     let metadata = file.metadata().map_err(|_| SettingsError::Read)?;
-    if !metadata.file_type().is_file() {
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
         return Err(SettingsError::Invalid);
     }
     file.set_permissions(fs::Permissions::from_mode(0o600))
@@ -502,6 +514,54 @@ mod tests {
         let dir = env::temp_dir().join(format!("ferrum-settings-{}-{nonce}", std::process::id()));
         (dir.clone(), SettingsStore::at(dir.join("settings.toml")))
     }
+    #[cfg(unix)]
+    fn restrictive_umask_child_config() -> Option<PathBuf> {
+        const CHILD: &str = "FERRUM_SETTINGS_UMASK_TEST_CHILD";
+        const TEST_ROOT: &str = "FERRUM_SETTINGS_UMASK_TEST_ROOT";
+
+        let marker = env::var(CHILD).ok()?;
+        let (parent_pid, nonce) = marker.split_once(':')?;
+        let parent_pid = parent_pid.parse::<u32>().ok()?;
+        // SAFETY: `getppid` has no pointer arguments or memory-safety preconditions.
+        let actual_parent_pid = unsafe { libc::getppid() as u32 };
+        if parent_pid != actual_parent_pid || nonce.parse::<u128>().ok()? == 0 {
+            return None;
+        }
+
+        let test_root = env::var_os(TEST_ROOT).map(PathBuf::from)?;
+        if !test_root.is_absolute() || !test_root.starts_with(env::temp_dir()) {
+            return None;
+        }
+        let test_root_metadata = fs::symlink_metadata(&test_root).ok()?;
+        let existing_xdg_parent = test_root.join("existing-xdg-parent");
+        let existing_xdg_parent_metadata = fs::symlink_metadata(&existing_xdg_parent).ok()?;
+        if !test_root_metadata.file_type().is_dir()
+            || !existing_xdg_parent_metadata.file_type().is_dir()
+        {
+            return None;
+        }
+        let root_prefix = format!("ferrum-settings-{parent_pid}-");
+        if test_root
+            .file_name()?
+            .to_str()?
+            .strip_prefix(&root_prefix)?
+            != nonce
+        {
+            return None;
+        }
+
+        let config_home = test_root.join("existing-xdg-parent/missing-xdg-root");
+        if env::var_os("XDG_CONFIG_HOME").as_deref() != Some(config_home.as_os_str())
+            || env::var_os("HOME").as_deref() != Some(config_home.as_os_str())
+        {
+            return None;
+        }
+        match fs::symlink_metadata(&config_home) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+        Some(config_home)
+    }
 
     #[test]
     fn config_path_uses_only_absolute_config_roots() {
@@ -530,6 +590,26 @@ mod tests {
         let (dir, store) = store();
         assert_eq!(store.load(), (Settings::default(), None));
         assert!(!dir.exists(), "load must not create missing directories");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn loading_missing_settings_restricts_existing_directory_permissions() {
+        let (dir, store) = store();
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let settings_path = dir.join("settings.toml");
+
+        let result = store.load();
+        let directory_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+        let settings_file_exists = settings_path.exists();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(result, (Settings::default(), None));
+        assert_eq!(directory_mode, 0o700);
+        assert!(
+            !settings_file_exists,
+            "loading must not create a settings file"
+        );
     }
 
     #[test]
@@ -577,6 +657,30 @@ mod tests {
             0o600
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_rejects_hardlinked_settings_without_changing_sibling_permissions() {
+        let (dir, store) = store();
+        let path = dir.join("settings.toml");
+        let sentinel = dir.join("sentinel");
+        let sentinel_contents = b"auto_connect_on_startup = false\n";
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&sentinel, sentinel_contents).unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&sentinel, &path).unwrap();
+
+        let result = store.load();
+        let sentinel_after = fs::read(&sentinel).unwrap();
+        let sentinel_mode = fs::metadata(&sentinel).unwrap().permissions().mode() & 0o777;
+        let directory_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(result, (Settings::default(), Some(SettingsError::Invalid)));
+        assert_eq!(sentinel_after, sentinel_contents);
+        assert_eq!(sentinel_mode, 0o644);
+        assert_eq!(directory_mode, 0o700);
     }
 
     #[cfg(unix)]
@@ -942,36 +1046,249 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn saved_settings_file_keeps_owner_permissions_under_restrictive_umask() {
+    fn saving_under_restrictive_umask_normalizes_only_new_directories() {
         const CHILD: &str = "FERRUM_SETTINGS_UMASK_TEST_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            let (dir, store) = store();
-            fs::create_dir_all(&dir).unwrap();
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-            // SAFETY: this isolated child process runs only this exact test.
+        const TEST_ROOT: &str = "FERRUM_SETTINGS_UMASK_TEST_ROOT";
+        if restrictive_umask_child_config().is_some() {
+            // SAFETY: the marker and both config paths were validated for this child.
             unsafe {
                 libc::umask(0o200 as libc::mode_t);
             }
-            store.save(&Settings::default()).unwrap();
-            let mode = fs::metadata(dir.join("settings.toml"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            let _ = fs::remove_dir_all(dir);
-            assert_eq!(mode, 0o600);
+            SettingsStore::new().save(&Settings::default()).unwrap();
             return;
         }
+
+        let pid = std::process::id();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("ferrum-settings-{pid}-{nonce}"));
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
+        let existing_ancestor = dir.join("existing-xdg-parent");
+        fs::create_dir(&existing_ancestor).unwrap();
+        fs::set_permissions(&existing_ancestor, fs::Permissions::from_mode(0o751)).unwrap();
+        let config_home = existing_ancestor.join("missing-xdg-root");
+        let settings_directory = config_home.join("ferrum");
+        let settings_file = settings_directory.join("settings.toml");
+        let home_fallback_file = config_home.join(".config/ferrum/settings.toml");
+        let child_marker = format!("{pid}:{nonce}");
 
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "settings::tests::saved_settings_file_keeps_owner_permissions_under_restrictive_umask",
+                "settings::tests::saving_under_restrictive_umask_normalizes_only_new_directories",
             ])
-            .env(CHILD, "1")
+            .env(CHILD, &child_marker)
+            .env(TEST_ROOT, &dir)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("HOME", &config_home)
             .status()
             .unwrap();
-        assert!(status.success(), "child settings permission test failed");
+
+        let mode = |path: &Path| {
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| metadata.permissions().mode() & 0o7777)
+        };
+        let child_succeeded = status.success();
+        let created_directory_modes = [mode(&config_home), mode(&settings_directory)];
+        let settings_file_mode = mode(&settings_file);
+        let pre_existing_ancestor_modes = [mode(&dir), mode(&existing_ancestor)];
+        let home_fallback_file_exists = home_fallback_file.exists();
+        let umask_probe = dir.join("umask-probe");
+        fs::create_dir(&umask_probe).unwrap();
+        let umask_probe_mode = fs::metadata(&umask_probe).unwrap().permissions().mode() & 0o7777;
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(child_succeeded, "settings save failed under umask 0200");
+        assert_eq!(
+            created_directory_modes,
+            [Some(0o700), Some(0o700)],
+            "each directory created by Ferrum must be exactly 0700"
+        );
+        assert_eq!(
+            settings_file_mode,
+            Some(0o600),
+            "settings file at XDG_CONFIG_HOME/ferrum/settings.toml must be exactly 0600"
+        );
+        assert!(
+            !home_fallback_file_exists,
+            "the HOME/.config fallback must not be used when XDG_CONFIG_HOME is set"
+        );
+        assert_eq!(
+            pre_existing_ancestor_modes,
+            [Some(0o750), Some(0o751)],
+            "pre-existing ancestors must retain their modes"
+        );
+        println!("FERRUM_SETTINGS_UMASK_TEST_PROBE={umask_probe_mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_umask_child_marker_cannot_touch_ambient_settings_or_umask() {
+        const CHILD: &str = "FERRUM_SETTINGS_UMASK_TEST_CHILD";
+        const TEST_ROOT: &str = "FERRUM_SETTINGS_UMASK_TEST_ROOT";
+
+        let pid = std::process::id();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("ferrum-settings-{pid}-{nonce}"));
+        fs::create_dir(&dir).unwrap();
+        fs::create_dir(dir.join("existing-xdg-parent")).unwrap();
+        let expected_config_home = dir.join("existing-xdg-parent/missing-xdg-root");
+        fs::create_dir_all(&expected_config_home).unwrap();
+        let malformed_config_home = dir.join("inherited-marker-config");
+        fs::create_dir(&malformed_config_home).unwrap();
+        let cases = [
+            ("1".to_owned(), malformed_config_home),
+            (format!("{pid}:{nonce}"), expected_config_home),
+        ];
+        use std::os::unix::process::CommandExt;
+
+        for (marker, config_home) in cases {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "settings::tests::saving_under_restrictive_umask_normalizes_only_new_directories",
+                    "--nocapture",
+                ])
+                .env(CHILD, marker)
+                .env(TEST_ROOT, &dir)
+                .env("XDG_CONFIG_HOME", &config_home)
+                .env("HOME", &config_home);
+            // SAFETY: the pre-exec closure only calls async-signal-safe `umask`.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::umask(0o027);
+                    Ok(())
+                });
+            }
+
+            let output = command.output().unwrap();
+            let output_text = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "the inherited-marker test process failed: {output_text}"
+            );
+            assert!(
+                !config_home.join("ferrum/settings.toml").exists(),
+                "an inherited child marker must not save at ambient XDG/HOME"
+            );
+            assert!(
+                output_text
+                    .lines()
+                    .any(|line| line == "FERRUM_SETTINGS_UMASK_TEST_PROBE=750"),
+                "the inherited marker changed the test process umask: {output_text}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_valid_marker_cannot_write_through_symlinked_test_roots() {
+        const CHILD: &str = "FERRUM_SETTINGS_UMASK_TEST_CHILD";
+        const TEST_ROOT: &str = "FERRUM_SETTINGS_UMASK_TEST_ROOT";
+
+        let pid = std::process::id();
+        use std::os::unix::process::CommandExt;
+
+        for (index, symlink_test_root) in [true, false].into_iter().enumerate() {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                + index as u128;
+            let test_root = env::temp_dir().join(format!("ferrum-settings-{pid}-{nonce}"));
+            let target_root = env::temp_dir().join(format!("ferrum-settings-target-{pid}-{nonce}"));
+            let target_parent = target_root.join("existing-xdg-parent");
+            fs::create_dir_all(&target_parent).unwrap();
+            let target_sentinel = target_root.join("sentinel");
+            let sentinel_contents = b"preserve this sentinel";
+            fs::write(&target_sentinel, sentinel_contents).unwrap();
+            let target_sentinel_mode =
+                fs::metadata(&target_sentinel).unwrap().permissions().mode() & 0o7777;
+            if symlink_test_root {
+                std::os::unix::fs::symlink(&target_root, &test_root).unwrap();
+            } else {
+                fs::create_dir(&test_root).unwrap();
+                std::os::unix::fs::symlink(&target_parent, test_root.join("existing-xdg-parent"))
+                    .unwrap();
+            }
+
+            let target_config_root = target_parent.join("missing-xdg-root");
+            let config_home = test_root.join("existing-xdg-parent/missing-xdg-root");
+            let target_settings = target_config_root.join("ferrum/settings.toml");
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "settings::tests::saving_under_restrictive_umask_normalizes_only_new_directories",
+                    "--nocapture",
+                ])
+                .env(CHILD, format!("{pid}:{nonce}"))
+                .env(TEST_ROOT, &test_root)
+                .env("XDG_CONFIG_HOME", &config_home)
+                .env("HOME", &config_home);
+            // SAFETY: the pre-exec closure only calls async-signal-safe `umask`.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::umask(0o027);
+                    Ok(())
+                });
+            }
+
+            let output = command.output().unwrap();
+            let output_text = String::from_utf8_lossy(&output.stdout);
+            let child_succeeded = output.status.success();
+            let settings_were_written = target_settings.exists();
+            let target_config_root_was_created = target_config_root.exists();
+            let target_sentinel_unchanged = fs::read(&target_sentinel)
+                .map(|contents| {
+                    contents.as_slice() == sentinel_contents
+                        && fs::metadata(&target_sentinel)
+                            .map(|metadata| {
+                                metadata.permissions().mode() & 0o7777 == target_sentinel_mode
+                            })
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let umask_unchanged = output_text
+                .lines()
+                .any(|line| line == "FERRUM_SETTINGS_UMASK_TEST_PROBE=750");
+            if symlink_test_root {
+                fs::remove_file(&test_root).unwrap();
+            } else {
+                fs::remove_dir_all(&test_root).unwrap();
+            }
+            let _ = fs::remove_dir_all(&target_root);
+
+            assert!(
+                child_succeeded,
+                "the inherited-marker helper failed: {output_text}"
+            );
+            assert!(
+                !settings_were_written,
+                "an inherited marker must not save through a symlinked test root"
+            );
+            assert!(
+                !target_config_root_was_created,
+                "the symlink target's missing config root must remain missing"
+            );
+            assert!(
+                target_sentinel_unchanged,
+                "the symlink target sentinel must remain unchanged"
+            );
+            assert!(
+                umask_unchanged,
+                "the child must not enter umask mode and must preserve its 027 umask: {output_text}"
+            );
+        }
     }
 
     #[cfg(unix)]
