@@ -40,10 +40,12 @@ The engine adapter targets Linux local Unix sockets. Startup precedence is an
 explicit `DOCKER_CONTEXT` (a local Unix-socket Docker CLI context), a local
 `DOCKER_HOST`, the current non-default Docker CLI context, then
 `$XDG_RUNTIME_DIR/docker.sock` and `/var/run/docker.sock`. Context selection
-requires Docker CLI. Remote endpoints remain unsupported; Podman/rootless
+requires Docker CLI. Direct remote `DOCKER_HOST` TCP/HTTP/HTTPS/SSH values and
+remote Docker contexts return typed unsupported errors without fallback to local
+socket discovery. Ferrum does not read remote TLS/SSH credentials. Podman/rootless
 behavior is unvalidated. The terminal does not extend this scope: issue #10
-remains open for Podman/rootless and remote compatibility. Windows and macOS
-remain deferred to issue #21/M8.
+remains open for Podman/rootless and broader endpoint validation. Windows and
+macOS remain deferred to issue #21/M8.
 
 ## Checks
 

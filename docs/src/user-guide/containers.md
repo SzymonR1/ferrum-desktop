@@ -119,7 +119,8 @@ and any open inspection.
 The current implementation is Linux-only. Local Unix-socket Docker CLI contexts
 can be selected for the current session. Listing and switching contexts requires
 the Docker CLI; direct local `DOCKER_HOST` and automatic socket discovery do
-not. Remote TCP/HTTP/TLS/SSH contexts are rejected. Podman/rootless behavior is
-not validated, and Windows/macOS remain deferred to issue
+not. Direct remote `DOCKER_HOST` values and remote TCP/HTTP/HTTPS/SSH contexts
+return typed unsupported errors without local fallback. Podman/rootless behavior
+is not validated, and Windows/macOS remain deferred to issue
 [#21](https://github.com/SzymonR1/ferrum-desktop/issues/21) / M8. See the
 [platform support matrix](../platform-support.md) for current evidence.

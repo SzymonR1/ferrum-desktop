@@ -476,15 +476,8 @@ impl EngineClient {
                 }
                 StartupSource::DockerHost => {
                     let host = docker_host.as_deref().unwrap_or_default();
-                    if is_remote_endpoint(host) {
-                        return Err(EngineError::UnsupportedRemoteTransport);
-                    }
+                    let path = local_socket_path_from_docker_host(host)?;
                     let endpoint_label = configured_endpoint_label(host);
-                    let path = host
-                        .strip_prefix("unix://")
-                        .filter(|path| !path.is_empty())
-                        .map(PathBuf::from)
-                        .ok_or(EngineError::UnsupportedRemoteTransport)?;
                     return Self::connect_unix_socket(&path, endpoint_label).await;
                 }
                 StartupSource::DefaultDiscovery => {}
@@ -1016,6 +1009,16 @@ fn configured_endpoint_label(host: &str) -> &'static str {
     } else {
         "configured endpoint"
     }
+}
+#[cfg(target_os = "linux")]
+fn local_socket_path_from_docker_host(host: &str) -> Result<PathBuf, EngineError> {
+    if is_remote_endpoint(host) {
+        return Err(EngineError::UnsupportedRemoteTransport);
+    }
+    host.strip_prefix("unix://")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or(EngineError::UnsupportedRemoteTransport)
 }
 
 #[cfg(target_os = "linux")]
@@ -2500,5 +2503,32 @@ mod context_selection_tests {
             EngineClient::connect_context_record(&catalog[0]).await,
             Err(EngineError::UnsupportedContextTransport)
         ));
+    }
+    #[test]
+    fn rejects_direct_remote_docker_host_schemes_with_safe_typed_error() {
+        for host in [
+            "tcp://engine.example:2376",
+            "http://engine.example:2375",
+            "https://engine.example:2376",
+            "ssh://user@engine.example",
+            "HTTPS://engine.example:2376",
+        ] {
+            let error = local_socket_path_from_docker_host(host)
+                .expect_err("explicit remote Docker endpoints must fail closed");
+            assert!(matches!(error, EngineError::UnsupportedRemoteTransport));
+            assert!(
+                !error.to_string().contains("engine.example"),
+                "configured endpoint details must not appear in user-facing errors"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_local_unix_docker_host_socket() {
+        assert_eq!(
+            local_socket_path_from_docker_host("unix:///tmp/docker.sock")
+                .expect("a local Unix socket is supported"),
+            PathBuf::from("/tmp/docker.sock")
+        );
     }
 }

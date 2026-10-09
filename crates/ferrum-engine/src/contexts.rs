@@ -330,6 +330,10 @@ mod tests {
             StartupSource::DockerHost
         );
         assert_eq!(
+            resolve_startup_source(None, Some("tcp://engine.example:2376"), current.first()),
+            StartupSource::DockerHost
+        );
+        assert_eq!(
             resolve_startup_source(None, None, current.first()),
             StartupSource::CurrentContext
         );

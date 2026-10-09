@@ -9,7 +9,7 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 ## Current mitigations
 
 - Do not elevate privileges, install services, change socket permissions, or start an engine automatically.
-- Keep remote TCP/HTTP/TLS/SSH transports disabled in the first slice. Reject explicitly configured remote schemes rather than downgrade to plaintext.
+- Keep direct remote `DOCKER_HOST` TCP/HTTP/HTTPS/SSH and remote Docker context transports disabled. Return typed unsupported errors without fallback to local discovery, and do not read remote TLS/SSH credentials.
 - Do not log or display raw `DOCKER_HOST` values, which may contain sensitive endpoint data.
 - Keep Docker CLI context selection session-only; do not log or display raw context endpoints.
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
