@@ -29,6 +29,11 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   opened descriptor is a regular file before changing permissions, and reject
   final-component symlinks or non-regular files. Parent path components still
   follow the configured XDG/HOME path.
+- When saving, open the final settings directory without following a symlink
+  and apply `0700` to the opened directory descriptor before writing. A
+  symlinked final directory is rejected. User-configured parent components and
+  later path-based temporary-file/rename resolution are not protected by a
+  directory-descriptor containment boundary.
 
 ## Deferred attack surfaces
 
