@@ -1,6 +1,7 @@
 # Ferrum threat model
 
-**Status:** Initial scope documented; this is not a security audit. Ferrum provides inventory, inspection, scoped container lifecycle actions, logs, and an experimental embedded terminal over the Linux local-engine path.
+**Status:** Initial scope documented; this is not a security audit. Ferrum provides inventory, inspection, image tagging, scoped container lifecycle actions, logs, and an experimental embedded terminal over the Linux local-engine path.
+
 
 ## Trust boundaries
 
@@ -23,6 +24,19 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   counts are exposed. Daemon error details are discarded, never logged or
   displayed. Closing Ferrum's client stream does not guarantee that the daemon
   stops its pull.
+- Send image-tag requests only to the selected local Docker Unix-socket engine
+  using the negotiated API version and the bounded 8-second request timeout.
+  Validate the image ID and bound the combined `repository:tag` target to 512
+  bytes; validate Docker tag syntax while leaving full repository grammar to
+  the engine. Do not send `force`, `X-Registry-Auth`, stored credentials, or
+  read/display response bodies. Typed failures expose only a safe endpoint label
+  and HTTP status where applicable. Tagging changes a local repository/tag
+  association only; it does not contact a registry. Require explicit
+  confirmation before every request because Engine v1.56 may reassign an
+  existing `repository:tag`; the image data remains. Page/context invalidation
+  ignores stale UI results but does not abort or claim to cancel an in-flight
+  request.
+
 - Emit a structured local tracing event when a Ferrum container lifecycle
   request returns. Record the action, `success` or `request_error` outcome, and
   a container ID only when it is exactly 64 hexadecimal characters. A request
@@ -57,10 +71,11 @@ These surfaces must receive explicit design and tests before their implementatio
 
 ## Validation plan
 
-Read-only live-engine tests cover version, inventory, and inspection without mutation. Separate opt-in ignored lifecycle and logs tests mutate engine state using one uniquely named disposable container and only its validated full ID as cleanup authority. Logs test requires a locally installed image with `/bin/sh` and `/bin/sleep`, never pulls, and uses no mounts or ports. On failure, best-effort cleanup may force-remove only that exact test-owned ID; it never removes volumes. See [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
-
-The ignored terminal integration test must use an explicitly owned disposable
-container, clean up only that test-owned container, never pull an image, and use
-no mounts or ports. See [issue #15](https://github.com/SzymonR1/ferrum-desktop/issues/15).
-
+Read-only live-engine tests cover version, inventory, and inspection without
+image mutation. Fake-Unix-socket image protocol tests and headless Images UI
+tests cover tag request/confirmation behavior without contacting a real engine
+or mutating images. Separate opt-in ignored lifecycle, logs, and terminal tests
+mutate engine state using one uniquely named disposable container and only its
+validated full ID as cleanup authority. Logs and terminal tests require locally
+installed images and never pull or tag images. See [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
 

@@ -26,19 +26,22 @@ means Ferrum did not receive success confirmation; the engine state may still
 be changing. Raw errors, endpoints, names, and daemon response bodies are
 excluded. These events are not a persistent or tamper-proof audit store.
 
-The **Images** page provides read-only image listing and inspection and offers
-anonymous pulls of public references through a local Docker Unix socket on
-Linux. Ferrum does not read registry credentials or send registry
-authentication; private-registry pulls are unavailable. **Stop monitoring**
-aborts only Ferrum's client-side progress stream; it does not cancel or claim
-to stop a daemon-side image transfer. Tag, remove, build, and push
-remain unavailable. This sub-slice is not a release and issue
+The **Images** page provides image listing and inspection, anonymous public
+pulls, and local image tagging through the Linux local Docker Unix socket.
+Tagging changes only the local repository/tag association; every request
+requires explicit confirmation because Docker Engine v1.56 may reassign an
+existing `repository:tag`, while the image data remains. Ferrum does not read
+registry credentials or send registry authentication. **Stop monitoring**
+aborts only Ferrum's client-side pull progress stream; it does not cancel or
+claim to stop a daemon-side image transfer. Remove, build, and push remain
+unavailable. This sub-slice is not a release and issue
 [#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) remains open.
 Podman/rootless and remote image endpoints remain unsupported or unvalidated;
 broader endpoint validation remains tracked by the still-open
-[#10](https://github.com/SzymonR1/ferrum-desktop/issues/10). No live pull or
-native image-page visual validation is claimed. See the
-[Images guide](docs/src/user-guide/images.md).
+[#10](https://github.com/SzymonR1/ferrum-desktop/issues/10). No live image tag
+or pull operation, image-mutation test, or native image-page visual validation
+is claimed. See the [Images guide](docs/src/user-guide/images.md).
+
 
 An X11-backend screenshot captured via XWayland showed actual container names,
 images, states, and statuses. A no-engine X11 launch showed a connection error
@@ -85,7 +88,10 @@ cargo test -p ferrum-engine --test live_engine local_engine_returns_a_well_forme
 It reads version and inventory and may inspect one existing container; it does not mutate resources.
 The ignored local image list/inspect smoke test is read-only and requires
 `FERRUM_TEST_IMAGE` to name an image already installed locally; it does not pull
-or modify images. See the testing guide for its exact command.
+or modify images. Image tag behavior is covered only by fake-socket contract
+tests and headless UI tests; no live tagging request or image mutation test is
+run. See the testing guide for the exact commands.
+
 
 An ignored lifecycle integration test is mutating; see the testing guide for its exact command and prerequisites. It requires a locally present `FERRUM_TEST_IMAGE` containing `/bin/sleep`; tests do not pull images and clean up only the created container by its returned full ID.
 

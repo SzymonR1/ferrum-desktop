@@ -94,22 +94,30 @@ The workspace includes headless AccessKit tests for labels, focus, keyboard
 activation, large-inventory virtualization, and stream error/reconnect states.
 
 The Images page has headless `egui_kittest` coverage for navigation, searchable
-and virtualized rows, image selection and details, loading/error/empty states,
-keyboard interaction, and stale-result rejection. Run only these UI tests with:
+and virtualized rows, image selection/details, loading/error/empty states,
+keyboard interaction, and stale-result rejection. Tag UI coverage checks the
+accessible repository/tag fields, bounded target validation, disabled invalid
+targets, explicit confirmation because Docker Engine v1.56 may reassign an
+existing `repository:tag` while image data remains, cancel-without-request
+behavior, loading, safe success/error display, single-request gating, stale
+generation rejection, and successful-inventory-refresh state. Run the headless UI tests with:
 
 ```sh
 cargo test -p ferrum-app images::tests
 ```
 
-These UI tests use fixed image data and do not call an engine. The pull
-presentation tests use fixed progress values only; no live image pull was run
-or is provided as a test. Tests must not pull, delete, or otherwise mutate user
-images or engines.
+These UI tests use fixed image data and do not call an engine. Pull presentation
+tests use fixed progress values only. Tag tests exercise local state and fake
+completion events only; they do not send requests or mutate images. No live tag
+or pull operation is claimed. Tests must not pull, tag, delete, or otherwise
+mutate user images or engines.
 
-Engine pull-stream contract tests use a fake Unix socket, not a Docker engine or
-registry, and never pull an image. They cover query encoding, chunked progress,
-response/event errors, malformed or oversized input, and invalid references.
-Run them directly with:
+Engine image pull and tag contract tests use a fake Unix socket, not a Docker
+engine or registry, and never pull or tag an image. Tag cases cover encoded
+request paths/queries, the `201` success response, omitted force/auth fields,
+invalid input without a connection, and safe typed status rejection. Pull cases
+cover query encoding, chunked progress, response/event errors, malformed or
+oversized input, and invalid references. Run the image protocol tests with:
 
 ```sh
 cargo test -p ferrum-engine image_pull::tests
@@ -117,14 +125,13 @@ cargo test -p ferrum-engine image_pull::tests
 
 The separate opt-in ignored
 `local_engine_lists_and_inspects_preinstalled_image_read_only` test exercises
-image list and inspect requests against the local Docker Unix socket. On
-2026-10-09, it listed and inspected the preinstalled `hello-world:latest` image
-and confirmed its ID appeared in the inventory without pulling or modifying
-images. The native Images page was not clicked or visually captured because
-the desktop provider cannot enumerate Ferrum or take screenshots.
+image list and inspect requests against the local Docker Unix socket. It is
+read-only and does not tag, pull, or modify images. No live tag request or image
+mutation test is provided.
 
-Image pull uses the validated local Docker Unix-socket endpoint; private-registry
-authentication is not implemented.
+Image pull and tag requests use the validated local Docker Unix-socket endpoint;
+private-registry authentication is not implemented.
+
 Manual release-mode performance samples are opt-in and have no timing
 thresholds. See the [performance and accessibility evidence](../performance.md)
 for the host, dataset, methodology, results, and known validation limits.

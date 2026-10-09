@@ -61,7 +61,7 @@ pub(crate) async fn open_image_pull(
     let path = format!(
         "/v{}/images/create?fromImage={}",
         engine.api_version,
-        encode_query_component(reference),
+        crate::encode_query_component(reference),
     );
     let response = timeout(OPEN_TIMEOUT, async {
         let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
@@ -177,21 +177,6 @@ fn valid_reference(reference: &str) -> bool {
         && !reference
             .bytes()
             .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-}
-
-fn encode_query_component(value: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut encoded = String::with_capacity(value.len().saturating_mul(3));
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push('%');
-            encoded.push(char::from(HEX[(byte >> 4) as usize]));
-            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
-        }
-    }
-    encoded
 }
 
 fn parse_line(bytes: &[u8]) -> Result<Option<ImagePullProgress>, PullParseError> {
@@ -318,6 +303,98 @@ mod tests {
     fn cleanup(socket: &Path, directory: &Path) {
         fs::remove_file(socket).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tags_image_with_encoded_request_and_accepts_created() {
+        let (socket, directory) = temporary_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = String::from_utf8(read_request(&mut stream).await).unwrap();
+            assert!(request.starts_with(
+                "POST /v1.45/images/sha256%3Aabc%2Fdef%3Ftag/tag?repo=registry.example%3A5000%2Fteam%2Fapp&tag=v1_blue HTTP/1.1\r\n"
+            ));
+            assert!(!request.contains("force="));
+            assert!(!request.to_ascii_lowercase().contains("x-registry-auth"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            request
+        });
+
+        engine(socket.clone())
+            .tag_image(
+                "sha256:abc/def?tag",
+                "registry.example:5000/team/app",
+                "v1_blue",
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_tag_inputs_without_contacting_engine() {
+        let (socket, directory) = temporary_socket();
+        let client = engine(socket.clone());
+        assert!(matches!(
+            client.tag_image("", "repo", "tag").await,
+            Err(EngineError::InvalidImageId)
+        ));
+        assert!(matches!(
+            client.tag_image(&"x".repeat(4097), "repo", "tag").await,
+            Err(EngineError::InvalidImageId)
+        ));
+
+        let too_long_target = "r".repeat(508);
+        let too_long_tag = "t".repeat(129);
+        for (repository, tag) in [
+            ("", "tag"),
+            ("repo", ""),
+            ("repo with-space", "tag"),
+            ("repo", "bad/tag"),
+            ("repo", ".bad"),
+            ("repo", &too_long_target),
+            ("repo", too_long_tag.as_str()),
+        ] {
+            assert!(matches!(
+                client.tag_image("image-id", repository, tag).await,
+                Err(EngineError::InvalidImageTagTarget)
+            ));
+        }
+        assert!(!socket.exists());
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_http_tag_error_without_exposing_response_body() {
+        let (socket, directory) = temporary_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSECRET registry credentials")
+                .await
+                .unwrap();
+        });
+
+        let error = engine(socket.clone())
+            .tag_image("image-id", "registry.example/team/app", "latest")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::ImageTagRejected { status: 500, .. }
+        ));
+        assert!(!error.to_string().contains("SECRET"));
+        server.await.unwrap();
+        cleanup(&socket, &directory);
     }
 
     #[tokio::test]

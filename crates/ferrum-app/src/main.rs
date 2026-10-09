@@ -127,6 +127,11 @@ enum EngineEvent {
         generation: u64,
         result: Result<(), EngineError>,
     },
+    ImageTagged {
+        generation: u64,
+        result: Result<(), EngineError>,
+    },
+
     ImageInspected {
         generation: u64,
         inspection_generation: u64,
@@ -693,6 +698,10 @@ struct FerrumApp {
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
     image_pull_task: Option<JoinHandle<()>>,
+    // Keep a submitted tag POST alive across page invalidation; aborting it
+    // would not undo a mutation the engine may already have accepted.
+    image_tag_task: Option<JoinHandle<()>>,
+
     loading: bool,
     refresh_error: Option<String>,
     contexts: Vec<DockerContext>,
@@ -861,8 +870,10 @@ impl FerrumApp {
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
+            image_tag_task: None,
             loading: false,
             refresh_error: None,
+
             contexts: Vec::new(),
             selected_context: None,
             context_error: None,
@@ -1083,6 +1094,48 @@ impl FerrumApp {
             }
         }));
     }
+    #[cfg(target_os = "linux")]
+    fn start_image_tag(&mut self, context: egui::Context) {
+        if self.image_tag_task.is_some() {
+            self.images.cancel_tag_confirmation();
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            self.images.cancel_tag_confirmation();
+            return;
+        };
+        let Some(request) = self.images.begin_tag() else {
+            return;
+        };
+
+        let sender = self.sender.clone();
+        self.image_tag_task = Some(self.runtime.spawn(async move {
+            let result = engine
+                .tag_image(&request.image_id, &request.repository, &request.tag)
+                .await;
+            if sender
+                .send(EngineEvent::ImageTagged {
+                    generation: request.generation,
+                    result,
+                })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
+
+    // Even a stale UI result can signal a successful mutation; refresh the
+    // currently visible Images inventory without showing that stale result.
+    fn finish_image_tag(&mut self, generation: u64, result: Result<(), EngineError>) -> bool {
+        let succeeded = result.is_ok();
+        self.images
+            .finish_tag(generation, result.map_err(|error| error.to_string()));
+        self.image_tag_task = None;
+        succeeded && self.page == images::AppPage::Images
+    }
+
     fn inspect_image(&mut self, request: images::ImageInspectionRequest, context: egui::Context) {
         let Some(engine) = self.engine.clone() else {
             return;
@@ -1323,6 +1376,12 @@ impl FerrumApp {
                         }
                     }
                 }
+                EngineEvent::ImageTagged { generation, result } => {
+                    if self.finish_image_tag(generation, result) {
+                        self.load_images(context.clone());
+                    }
+                }
+
                 EngineEvent::ImageInspected {
                     generation,
                     inspection_generation,
@@ -1830,7 +1889,10 @@ impl FerrumApp {
             connected,
             message,
             cfg!(target_os = "linux") && connected,
+            cfg!(target_os = "linux") && connected,
+            self.image_tag_task.is_some() && !self.images.is_tagging(),
         );
+
         if self.images.take_pull_requested() {
             #[cfg(target_os = "linux")]
             self.start_image_pull(ui.ctx().clone());
@@ -1838,6 +1900,11 @@ impl FerrumApp {
         if self.images.take_cancel_requested() {
             self.cancel_image_pull();
         }
+        if self.images.take_tag_requested() {
+            #[cfg(target_os = "linux")]
+            self.start_image_tag(ui.ctx().clone());
+        }
+
         inspection
     }
 
@@ -1850,7 +1917,11 @@ impl FerrumApp {
     ) {
         let page_loading = self.loading
             || (self.page == images::AppPage::Images
-                && (self.images.is_loading() || self.images.is_pulling()));
+                && (self.images.is_loading()
+                    || self.images.is_pulling()
+                    || self.images.is_tagging()
+                    || self.image_tag_task.is_some()));
+
         egui::Panel::top("header")
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 14)))
             .show(ui, |ui| {
@@ -2715,7 +2786,10 @@ impl eframe::App for FerrumApp {
         if self.loading
             || self.action_busy()
             || (self.page == images::AppPage::Images
-                && (self.images.is_loading() || self.images.is_pulling()))
+                && (self.images.is_loading()
+                    || self.images.is_pulling()
+                    || self.images.is_tagging()
+                    || self.image_tag_task.is_some()))
         {
             context.request_repaint_after(Duration::from_millis(250));
         }
@@ -3104,6 +3178,7 @@ mod event_reconciliation_tests {
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
+            image_tag_task: None,
             loading: false,
             refresh_error: None,
             contexts: Vec::new(),
@@ -3184,6 +3259,17 @@ mod event_reconciliation_tests {
             settings_error: None,
         };
         (app, sender)
+    }
+
+    #[test]
+    fn successful_tag_result_refreshes_only_when_images_is_current() {
+        let (mut app, _sender) = app_with_open_inspection();
+        app.page = images::AppPage::Images;
+        // A stale view generation suppresses the result in ImagesView, but a
+        // successful daemon operation still refreshes the current Images page.
+        assert!(app.finish_image_tag(1, Ok(())));
+        app.page = images::AppPage::Containers;
+        assert!(!app.finish_image_tag(2, Ok(())));
     }
 
     #[test]

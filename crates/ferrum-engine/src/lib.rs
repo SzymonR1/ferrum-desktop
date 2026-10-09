@@ -292,6 +292,33 @@ pub enum EngineError {
     #[cfg(target_os = "linux")]
     #[error("The image reference for the pull request is invalid.")]
     InvalidImageReference,
+    /// The repository or tag supplied for an image tag operation is invalid.
+    #[cfg(target_os = "linux")]
+    #[error("The image repository and tag target is invalid.")]
+    InvalidImageTagTarget,
+    /// The image tag request could not reach the local engine.
+    #[cfg(target_os = "linux")]
+    #[error("Image tagging is unavailable at the {endpoint_label}.")]
+    ImageTagUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The image tag request exceeded its bounded wait; the tag may still change.
+    #[cfg(target_os = "linux")]
+    #[error("Image tagging at the {endpoint_label} timed out; the tag may still have changed.")]
+    ImageTagTimedOut {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The local engine rejected the image tag request.
+    #[cfg(target_os = "linux")]
+    #[error("The image tag request was rejected at the {endpoint_label} (HTTP {status}).")]
+    ImageTagRejected {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+        /// HTTP response status.
+        status: u16,
+    },
     /// The engine could not open the image pull progress stream.
     #[cfg(target_os = "linux")]
     #[error("Image pull progress is unavailable at the {endpoint_label}.")]
@@ -490,6 +517,63 @@ impl EngineClient {
         initial_size: TerminalSize,
     ) -> Result<ExecSession, EngineError> {
         exec::open_exec_session(self, container_id, command, initial_size).await
+    }
+    /// Assigns a repository and tag to an existing local image.
+    ///
+    /// The image identifier must be nonempty and no longer than 4096 bytes.
+    /// The repository and tag must be nonempty, contain no ASCII whitespace or
+    /// control characters, and together fit within 512 bytes including `:`.
+    /// The tag must follow Docker's tag grammar. The engine validates the
+    /// repository. If that repository/tag already exists, Docker may reassign
+    /// it to this image; image data is not removed. No registry credentials are
+    /// read or sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidImageId` or `InvalidImageTagTarget` for invalid input,
+    /// or a safe availability, timeout, or HTTP rejection error.
+    #[cfg(target_os = "linux")]
+    pub async fn tag_image(
+        &self,
+        image_id: &str,
+        repository: &str,
+        tag: &str,
+    ) -> Result<(), EngineError> {
+        if image_id.is_empty() || image_id.len() > 4096 {
+            return Err(EngineError::InvalidImageId);
+        }
+        if !valid_image_tag_target(repository, tag) {
+            return Err(EngineError::InvalidImageTagTarget);
+        }
+
+        let endpoint_label = self.info.endpoint_label;
+        let mut path = resource_request_path(&self.api_version, "images", image_id, "/tag")
+            .map_err(|_| EngineError::InvalidImageId)?;
+        path.push_str("?repo=");
+        path.push_str(&encode_query_component(repository));
+        path.push_str("&tag=");
+        path.push_str(&encode_query_component(tag));
+        let response = timeout(REQUEST_TIMEOUT, async {
+            let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(Uri::new(&self.socket_path, &path))
+                .body(Empty::<Bytes>::new())
+                .map_err(|_| ())?;
+            client.request(request).await.map_err(|_| ())
+        })
+        .await
+        .map_err(|_| EngineError::ImageTagTimedOut { endpoint_label })?
+        .map_err(|_| EngineError::ImageTagUnavailable { endpoint_label })?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(EngineError::ImageTagRejected {
+                endpoint_label,
+                status: response.status().as_u16(),
+            })
+        }
     }
     /// Opens an anonymous Docker image pull and streams bounded progress.
     ///
@@ -1198,6 +1282,22 @@ fn configured_endpoint_label(host: &str) -> &'static str {
     }
 }
 #[cfg(target_os = "linux")]
+fn valid_image_tag_target(repository: &str, tag: &str) -> bool {
+    let tag_bytes = tag.as_bytes();
+    !repository.is_empty()
+        && !tag.is_empty()
+        && repository.len().saturating_add(1).saturating_add(tag.len()) <= 512
+        && !repository
+            .bytes()
+            .chain(tag.bytes())
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        && tag_bytes.len() <= 128
+        && (tag_bytes[0].is_ascii_alphanumeric() || tag_bytes[0] == b'_')
+        && tag_bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+#[cfg(target_os = "linux")]
 fn local_socket_path_from_docker_host(host: &str) -> Result<PathBuf, EngineError> {
     if is_remote_endpoint(host) {
         return Err(EngineError::UnsupportedRemoteTransport);
@@ -1276,6 +1376,22 @@ fn container_request_path(
 #[cfg(target_os = "linux")]
 fn image_inspect_request_path(api_version: &str, id: &str) -> Result<String, RequestJsonError> {
     resource_request_path(api_version, "images", id, "/json")
+}
+
+#[cfg(target_os = "linux")]
+fn encode_query_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len().saturating_mul(3));
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
 }
 
 #[cfg(target_os = "linux")]
