@@ -1,8 +1,15 @@
 use std::{
     env,
+    ffi::{CStr, CString},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{OpenOptionsExt, PermissionsExt},
+        },
+    },
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -89,29 +96,30 @@ impl SettingsStore {
     }
 
     pub(super) fn save(&self, settings: &Settings) -> Result<(), SettingsError> {
-        self.save_using(settings, |from, to| fs::rename(from, to))
+        self.save_using(settings, rename_temp_at)
     }
 
     fn save_using(
         &self,
         settings: &Settings,
-        replace: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+        replace: impl FnOnce(&File, &CStr, &CStr) -> std::io::Result<()>,
     ) -> Result<(), SettingsError> {
         let path = self.path.as_ref().ok_or(SettingsError::Unavailable)?;
+        let file_name = settings_file_name(path)?;
         let parent = path.parent().ok_or(SettingsError::Unavailable)?;
         fs::create_dir_all(parent).map_err(|_| SettingsError::Write)?;
         let directory = open_private_settings_directory(parent)?;
         let mut persisted = settings.clone();
         persisted.schema_version = SCHEMA_VERSION;
         let serialized = toml::to_string_pretty(&persisted).map_err(|_| SettingsError::Write)?;
-        let (temp_path, mut file) = create_temp(parent)?;
+        let (temp_name, mut file) = create_temp(&directory)?;
         let result = (|| {
             file.write_all(serialized.as_bytes())
                 .map_err(|_| SettingsError::Write)?;
             file.flush().map_err(|_| SettingsError::Write)?;
             file.sync_all().map_err(|_| SettingsError::Write)?;
             drop(file);
-            replace(&temp_path, path).map_err(|_| SettingsError::Write)?;
+            replace(&directory, &temp_name, &file_name).map_err(|_| SettingsError::Write)?;
             let directory_sync = directory.sync_all();
             if directory_sync.is_err() {
                 tracing::warn!(
@@ -122,7 +130,7 @@ impl SettingsStore {
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
+            let _ = unlink_temp_at(&directory, &temp_name);
         }
         result
     }
@@ -167,22 +175,66 @@ fn open_private_settings_directory(parent: &std::path::Path) -> Result<File, Set
     Ok(directory)
 }
 
-fn create_temp(parent: &std::path::Path) -> Result<(PathBuf, File), SettingsError> {
+fn settings_file_name(path: &std::path::Path) -> Result<CString, SettingsError> {
+    let name = path.file_name().ok_or(SettingsError::Unavailable)?;
+    CString::new(name.as_bytes()).map_err(|_| SettingsError::Unavailable)
+}
+
+fn create_temp(directory: &File) -> Result<(CString, File), SettingsError> {
     for _ in 0..32 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(".settings-{}-{sequence}.tmp", std::process::id()));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return Err(SettingsError::Write),
+        let name = CString::new(format!(".settings-{}-{sequence}.tmp", std::process::id()))
+            .map_err(|_| SettingsError::Write)?;
+        // SAFETY: `directory` is an open directory, `name` is NUL-terminated, and
+        // the flags/mode are valid for creating a new private regular file.
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::mode_t,
+            )
+        };
+        if descriptor >= 0 {
+            // SAFETY: a successful `openat` call returned a newly owned descriptor.
+            let file = unsafe { File::from_raw_fd(descriptor) };
+            return Ok((name, file));
         }
+        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists {
+            continue;
+        }
+        return Err(SettingsError::Write);
     }
     Err(SettingsError::Write)
+}
+
+fn rename_temp_at(directory: &File, temp_name: &CStr, file_name: &CStr) -> std::io::Result<()> {
+    // SAFETY: the directory descriptor stays open and both names are valid NUL-terminated
+    // single components, interpreted relative to that directory.
+    let result = unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            temp_name.as_ptr(),
+            directory.as_raw_fd(),
+            file_name.as_ptr(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn unlink_temp_at(directory: &File, temp_name: &CStr) -> std::io::Result<()> {
+    // SAFETY: the directory descriptor stays open and `temp_name` is a valid
+    // NUL-terminated single component, interpreted relative to that directory.
+    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), temp_name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -462,6 +514,110 @@ mod tests {
         assert!(!settings_file_exists);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn replacing_settings_directory_path_does_not_redirect_save() {
+        let (settings_directory, store) = store();
+        let directory_name = settings_directory.file_name().unwrap().to_string_lossy();
+        let moved_directory = settings_directory.with_file_name(format!("{directory_name}-moved"));
+        let decoy_directory = settings_directory.with_file_name(format!("{directory_name}-decoy"));
+        fs::create_dir_all(&settings_directory).unwrap();
+        fs::create_dir_all(&decoy_directory).unwrap();
+        let decoy_settings = decoy_directory.join("settings.toml");
+        let decoy_contents = b"leave the replacement target untouched";
+        fs::write(&decoy_settings, decoy_contents).unwrap();
+        let replacement = Settings {
+            auto_connect_on_startup: false,
+            ..Settings::default()
+        };
+
+        let result = store.save_using(&replacement, |directory, temp_name, settings_name| {
+            fs::rename(&settings_directory, &moved_directory)?;
+            std::os::unix::fs::symlink(&decoy_directory, &settings_directory)?;
+            rename_temp_at(directory, temp_name, settings_name)
+        });
+        let decoy_after = fs::read(&decoy_settings).ok();
+        let relocated_settings = SettingsStore::at(moved_directory.join("settings.toml")).load();
+        let moved_entries = fs::read_dir(&moved_directory)
+            .map(|entries| entries.count())
+            .ok();
+        fs::remove_file(&settings_directory).unwrap();
+        fs::remove_dir_all(&moved_directory).unwrap();
+        fs::remove_dir_all(&decoy_directory).unwrap();
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(decoy_after, Some(decoy_contents.to_vec()));
+        assert_eq!(relocated_settings, (replacement, None));
+        assert_eq!(moved_entries, Some(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_file_stays_in_opened_settings_directory_after_path_replacement() {
+        let (settings_directory, _) = store();
+        let directory_name = settings_directory.file_name().unwrap().to_string_lossy();
+        let moved_directory = settings_directory.with_file_name(format!("{directory_name}-moved"));
+        let decoy_directory = settings_directory.with_file_name(format!("{directory_name}-decoy"));
+        fs::create_dir_all(&settings_directory).unwrap();
+        fs::create_dir_all(&decoy_directory).unwrap();
+        let directory = open_private_settings_directory(&settings_directory).unwrap();
+
+        fs::rename(&settings_directory, &moved_directory).unwrap();
+        std::os::unix::fs::symlink(&decoy_directory, &settings_directory).unwrap();
+        let (temp_name, file) = create_temp(&directory).unwrap();
+        let temp_name_for_paths = temp_name.to_str().unwrap();
+        let created_in_moved = moved_directory.join(temp_name_for_paths).exists();
+        let created_in_decoy = decoy_directory.join(temp_name_for_paths).exists();
+        drop(file);
+        drop(directory);
+        let _ = fs::remove_file(moved_directory.join(temp_name_for_paths));
+        let _ = fs::remove_file(decoy_directory.join(temp_name_for_paths));
+        fs::remove_file(&settings_directory).unwrap();
+        fs::remove_dir_all(&moved_directory).unwrap();
+        fs::remove_dir_all(&decoy_directory).unwrap();
+
+        assert!(created_in_moved);
+        assert!(!created_in_decoy);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_save_cleans_temp_in_opened_directory_after_path_replacement() {
+        let (settings_directory, store) = store();
+        let directory_name = settings_directory.file_name().unwrap().to_string_lossy();
+        let moved_directory = settings_directory.with_file_name(format!("{directory_name}-moved"));
+        let decoy_directory = settings_directory.with_file_name(format!("{directory_name}-decoy"));
+        fs::create_dir_all(&settings_directory).unwrap();
+        fs::create_dir_all(&decoy_directory).unwrap();
+        let settings_path = settings_directory.join("settings.toml");
+        let original = b"auto_connect_on_startup = true\n";
+        fs::write(&settings_path, original).unwrap();
+        let replacement = Settings {
+            auto_connect_on_startup: false,
+            ..Settings::default()
+        };
+
+        let result = store.save_using(&replacement, |_, _, _| {
+            fs::rename(&settings_directory, &moved_directory)?;
+            std::os::unix::fs::symlink(&decoy_directory, &settings_directory)?;
+            Err(std::io::Error::other("injected replacement failure"))
+        });
+        let original_after = fs::read(moved_directory.join("settings.toml")).ok();
+        let moved_entries = fs::read_dir(&moved_directory)
+            .map(|entries| entries.count())
+            .ok();
+        let decoy_entries = fs::read_dir(&decoy_directory)
+            .map(|entries| entries.count())
+            .ok();
+        fs::remove_file(&settings_directory).unwrap();
+        fs::remove_dir_all(&moved_directory).unwrap();
+        fs::remove_dir_all(&decoy_directory).unwrap();
+
+        assert_eq!(result, Err(SettingsError::Write));
+        assert_eq!(original_after, Some(original.to_vec()));
+        assert_eq!(moved_entries, Some(1));
+        assert_eq!(decoy_entries, Some(0));
+    }
     #[test]
     fn failed_atomic_replacement_preserves_previous_settings() {
         let (dir, store) = store();
@@ -474,7 +630,7 @@ mod tests {
             ..Settings::default()
         };
 
-        let result = store.save_using(&replacement, |_, _| {
+        let result = store.save_using(&replacement, |_, _, _| {
             Err(std::io::Error::other("injected replacement failure"))
         });
 

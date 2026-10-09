@@ -15,10 +15,13 @@ rejected. Parent path components follow the selected XDG/HOME location.
 The final settings directory is opened without following a symlink before
 Ferrum applies owner-only (`0700`) permissions; a symlinked final directory is
 rejected. Existing settings files are restricted to owner-only (`0600`) when
-loaded, and temporary write files use the same permissions. Writes use a
-same-directory temporary file and atomic rename.
-The no-follow checks apply at final-component open time only. User-configured
-parent components and later path-based temporary-file/rename resolution are not
-a directory-descriptor containment boundary.
+loaded. Save creates the private temporary file with `openat`, atomically
+replaces the target with `renameat`, and removes failed temporary files with
+`unlinkat`, all relative to the opened directory descriptor. Replacing the
+final directory path after it is opened cannot redirect these save operations.
+
+No-follow applies to the final settings-file and settings-directory components.
+Configured XDG/HOME parent components are resolved before opening the directory
+and are not descriptor-contained.
 
 Ferrum does not persist credentials, secrets, endpoints, or remote contexts. Credentials and remote connection contexts are not supported by this Linux-only settings slice.
