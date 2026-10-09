@@ -59,24 +59,11 @@ impl SettingsStore {
         let Some(path) = self.path.as_ref() else {
             return (Settings::default(), Some(SettingsError::Unavailable));
         };
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return (Settings::default(), None);
-            }
-            Ok(_) => return (Settings::default(), Some(SettingsError::Invalid)),
-            Err(_) => return (Settings::default(), Some(SettingsError::Read)),
-        }
-        let file = match File::open(path) {
-            Ok(file) => file,
-            Err(_) => return (Settings::default(), Some(SettingsError::Read)),
+        let file = match open_settings_file(path) {
+            Ok(Some(file)) => file,
+            Ok(None) => return (Settings::default(), None),
+            Err(error) => return (Settings::default(), Some(error)),
         };
-        if file
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .is_err()
-        {
-            return (Settings::default(), Some(SettingsError::Read));
-        }
         let mut content = String::new();
         let bytes_read = match file
             .take(MAX_SETTINGS_BYTES + 1)
@@ -140,6 +127,27 @@ impl SettingsStore {
         }
         result
     }
+}
+fn open_settings_file(path: &std::path::Path) -> Result<Option<File>, SettingsError> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(SettingsError::Invalid);
+        }
+        Err(_) => return Err(SettingsError::Read),
+    };
+    let metadata = file.metadata().map_err(|_| SettingsError::Read)?;
+    if !metadata.file_type().is_file() {
+        return Err(SettingsError::Invalid);
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|_| SettingsError::Read)?;
+    Ok(Some(file))
 }
 
 fn create_temp(parent: &std::path::Path) -> Result<(PathBuf, File), SettingsError> {
@@ -311,6 +319,35 @@ mod tests {
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o644
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn settings_file_open_rejects_symlinks_and_nonregular_files() {
+        let (dir, _store) = store();
+        let path = dir.join("settings.toml");
+        let target = dir.join("other-file");
+        let directory = dir.join("settings-directory");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&target, "not Ferrum settings").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(matches!(
+            open_settings_file(&path),
+            Err(SettingsError::Invalid)
+        ));
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&directory).unwrap();
+        assert!(matches!(
+            open_settings_file(&directory),
+            Err(SettingsError::Invalid)
+        ));
         let _ = fs::remove_dir_all(dir);
     }
 

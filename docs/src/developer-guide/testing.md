@@ -15,6 +15,9 @@ The default suite does not require a host engine. Ignored live-engine tests for
 version, inventory, and Docker CLI contexts are read-only. The general
 local-engine inventory test may inspect an existing container; these tests do
 not mutate resources.
+Settings tests cover missing/corrupt settings, symlink rejection without
+changing the target permissions, and rejection of non-regular settings files.
+They run in the default suite and use only temporary paths.
 
 The opt-in image list/inspect test is read-only and requires
 `FERRUM_TEST_IMAGE` to name an image already present on the current local Docker
