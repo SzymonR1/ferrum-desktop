@@ -99,14 +99,30 @@ keyboard interaction, and stale-result rejection. Run only these UI tests with:
 cargo test -p ferrum-app images::tests
 ```
 
-These tests use fixed image data and do not call an engine. The separate
-opt-in ignored `local_engine_lists_and_inspects_preinstalled_image_read_only`
-test exercises image list and inspect requests against the local Docker Unix
-socket. On 2026-10-09, it listed and inspected the preinstalled
-`hello-world:latest` image and confirmed its ID appeared in the inventory
-without pulling or modifying images. The native Images page was not clicked or
-visually captured because the desktop provider cannot enumerate Ferrum or take
-screenshots.
+These UI tests use fixed image data and do not call an engine. The pull
+presentation tests use fixed progress values only; no live image pull was run
+or is provided as a test. Tests must not pull, delete, or otherwise mutate user
+images or engines.
+
+Engine pull-stream contract tests use a fake Unix socket, not a Docker engine or
+registry, and never pull an image. They cover query encoding, chunked progress,
+response/event errors, malformed or oversized input, and invalid references.
+Run them directly with:
+
+```sh
+cargo test -p ferrum-engine image_pull::tests
+```
+
+The separate opt-in ignored
+`local_engine_lists_and_inspects_preinstalled_image_read_only` test exercises
+image list and inspect requests against the local Docker Unix socket. On
+2026-10-09, it listed and inspected the preinstalled `hello-world:latest` image
+and confirmed its ID appeared in the inventory without pulling or modifying
+images. The native Images page was not clicked or visually captured because
+the desktop provider cannot enumerate Ferrum or take screenshots.
+
+Image pull uses the validated local Docker Unix-socket endpoint; private-registry
+authentication is not implemented.
 Manual release-mode performance samples are opt-in and have no timing
 thresholds. See the [performance and accessibility evidence](../performance.md)
 for the host, dataset, methodology, results, and known validation limits.

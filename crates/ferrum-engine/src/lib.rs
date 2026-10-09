@@ -6,11 +6,15 @@ mod contexts;
 #[cfg(target_os = "linux")]
 mod exec;
 #[cfg(target_os = "linux")]
+mod image_pull;
+#[cfg(target_os = "linux")]
 mod logs;
 
 pub use contexts::{ContextTransport, DockerContext};
 #[cfg(target_os = "linux")]
 pub use exec::{ExecResizeHandle, ExecSession, TerminalSize};
+#[cfg(target_os = "linux")]
+pub use image_pull::ImagePullStream;
 #[cfg(target_os = "linux")]
 pub use logs::{ContainerLogStream, ContainerLogsOptions};
 #[cfg(target_os = "linux")]
@@ -284,6 +288,44 @@ pub enum EngineError {
     #[cfg(target_os = "linux")]
     #[error("The image identifier for the inspection request is invalid.")]
     InvalidImageId,
+    /// The image reference supplied for a pull is invalid.
+    #[cfg(target_os = "linux")]
+    #[error("The image reference for the pull request is invalid.")]
+    InvalidImageReference,
+    /// The engine could not open the image pull progress stream.
+    #[cfg(target_os = "linux")]
+    #[error("Image pull progress is unavailable at the {endpoint_label}.")]
+    ImagePullUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The engine rejected the image pull request.
+    #[cfg(target_os = "linux")]
+    #[error("The image pull request was rejected at the {endpoint_label} (HTTP {status}).")]
+    ImagePullRejected {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+        /// HTTP response status.
+        status: u16,
+    },
+    /// Opening the image pull stream exceeded its bounded wait.
+    #[cfg(target_os = "linux")]
+    #[error("Opening image pull progress at the {endpoint_label} timed out.")]
+    ImagePullTimedOut {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// Image pull progress ended, stalled, or returned invalid or oversized data.
+    #[cfg(target_os = "linux")]
+    #[error("Image pull progress from the {endpoint_label} was interrupted.")]
+    ImagePullStreamInterrupted {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The engine reported that the image pull failed.
+    #[cfg(target_os = "linux")]
+    #[error("The engine could not pull the requested image.")]
+    ImagePullFailed,
     /// An image inspection response omitted its required engine identifier.
     #[cfg(target_os = "linux")]
     #[error("The engine at the {endpoint_label} returned image details without an identifier.")]
@@ -448,6 +490,23 @@ impl EngineClient {
         initial_size: TerminalSize,
     ) -> Result<ExecSession, EngineError> {
         exec::open_exec_session(self, container_id, command, initial_size).await
+    }
+    /// Opens an anonymous Docker image pull and streams bounded progress.
+    ///
+    /// The reference must be nonempty, at most 512 bytes, and contain no ASCII
+    /// whitespace or control characters. Registry credentials are never read
+    /// or sent. Dropping the returned stream cancels Ferrum's HTTP response
+    /// stream, but does not guarantee that the daemon-side pull stops. Progress
+    /// reads use a 60-second idle timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidImageReference` for an invalid reference,
+    /// `ImagePullRejected` when the engine rejects the request, or a safe
+    /// availability/timeout error when the stream cannot be opened.
+    #[cfg(target_os = "linux")]
+    pub async fn open_image_pull(&self, reference: &str) -> Result<ImagePullStream, EngineError> {
+        image_pull::open_image_pull(self, reference).await
     }
 }
 impl EngineClient {
