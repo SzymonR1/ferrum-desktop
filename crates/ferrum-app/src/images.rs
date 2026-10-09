@@ -13,6 +13,7 @@ pub(super) enum AppPage {
     Containers,
     Images,
     Volumes,
+    Networks,
 }
 
 impl AppPage {
@@ -21,13 +22,19 @@ impl AppPage {
             Self::Containers => "Containers",
             Self::Images => "Images",
             Self::Volumes => "Volumes",
+            Self::Networks => "Networks",
         }
     }
 }
 
 pub(super) fn show_navigation(ui: &mut egui::Ui, active: AppPage) -> Option<AppPage> {
     let mut requested = None;
-    for page in [AppPage::Containers, AppPage::Images, AppPage::Volumes] {
+    for page in [
+        AppPage::Containers,
+        AppPage::Images,
+        AppPage::Volumes,
+        AppPage::Networks,
+    ] {
         let response = ui.add(egui::Button::new(page.title()).selected(active == page));
         if response.clicked() && active != page {
             requested = Some(page);
@@ -1265,6 +1272,25 @@ mod tests {
         harness.run();
         assert_eq!(harness.state().page, AppPage::Volumes);
         let _volumes = harness.get_by_role_and_label(Role::Label, "Volumes");
+    }
+    #[test]
+    fn navigation_opens_the_networks_page_through_an_accessible_action() {
+        let mut harness = Harness::new_ui_state(
+            |ui, state: &mut NavigationUi| {
+                if let Some(page) = show_navigation(ui, state.page) {
+                    state.page = page;
+                }
+                ui.heading(state.page.title());
+            },
+            NavigationUi::default(),
+        );
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Networks")
+            .click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().page, AppPage::Networks);
+        let _networks = harness.get_by_role_and_label(Role::Label, "Networks");
     }
 
     #[test]

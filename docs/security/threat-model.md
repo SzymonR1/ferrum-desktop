@@ -16,6 +16,7 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
 - Use a private bounded request path for version, inventory, inspect, and lifecycle operations. Version/inventory/inspection and event-subscription setup use an 8-second timeout; lifecycle requests use a bounded 30-second timeout for graceful Stop/Restart. Timed-out actions may still be changing state, so errors advise refresh before retry. Remove requires confirmation and sends neither force nor volume-removal parameters. Never log or expose raw response bodies.
 - Restrict volume listing/inspection to the selected local Docker Unix socket on Linux, using the bounded read-only API path. Retain/display only volume name, driver, scope, creation time, and mountpoint as plain text; never expose labels/options/status or raw bodies. List/inspect do not provide `UsageData`, so do not imply size or reference counts. The UI offers no volume mutation, network operation, or filesystem browsing; Podman/rootless and remote endpoints remain unsupported.
+- Keep network listing and inspection read-only on the selected local Docker Unix socket on Linux. Retain/display only ID, name, driver, scope, creation time, internal, attachable, EnableIPv4, and EnableIPv6. Inspect may retain only an optional point-in-time count of the `Containers` map; list responses may omit attached-container details. Discard container IDs, names, endpoint records, MAC/IP addresses, labels, options, IPAM, peers, services, status, and raw bodies. Do not access credentials, offer usage statistics or network create/remove/connect/disconnect, or claim Podman/rootless and remote support.
 - Anonymous image pulls are restricted to the selected local Unix-socket Docker
   engine and send no `X-Registry-Auth` header or stored credentials. Progress
   responses are bounded to 1 MiB per HTTP frame and 64 KiB per JSON record;
@@ -89,11 +90,15 @@ These surfaces must receive explicit design and tests before their implementatio
 ## Validation plan
 
 Read-only live-engine tests cover version, inventory, and inspection without
-image mutation. Fake-Unix-socket image protocol tests and headless Images UI
-tests cover tag and removal request/confirmation behavior without contacting a
-real engine or mutating images. There is no live image deletion or other live
-image-mutation test. Separate opt-in ignored lifecycle, logs, and terminal tests
-mutate engine state using one uniquely named disposable container and only its
-validated full ID as cleanup authority. Logs and terminal tests require locally
-installed images and never pull, tag, or delete images. See [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
+image mutation. The optional ignored network list/inspect test requires
+`FERRUM_TEST_NETWORK` to name an existing local network; it lists networks and
+inspects the matching listed ID without mutation or cleanup. Default tests and
+fake-socket/headless UI tests do not contact a live engine. Fake-Unix-socket
+image protocol tests and headless Images UI tests cover tag and removal
+request/confirmation behavior without contacting a real engine or mutating
+images. There is no live image deletion or other live image-mutation test.
+Separate opt-in ignored lifecycle, logs, and terminal tests mutate engine state
+using one uniquely named disposable container and only its validated full ID as
+cleanup authority. Logs and terminal tests require locally installed images and
+never pull, tag, or delete images. See [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
 

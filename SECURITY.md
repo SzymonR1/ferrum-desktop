@@ -20,3 +20,15 @@ scope, creation time, and a plain-text mountpoint; it does not expose labels,
 options, status, or usage estimates. No volume mutation, network operations,
 Podman/rootless, or remote endpoint support is provided. Issue #17 remains open.
 
+The Networks page is read-only and limited to listing and inspecting existing
+networks through the selected local Docker Unix socket on Linux. Its allowlist
+is ID, name, driver, scope, creation time, internal/attachable, and EnableIPv4/
+EnableIPv6. Inspect may report only an optional point-in-time count from the
+`Containers` map; list responses may omit attached-container details. Ferrum
+does not retain or display container IDs, names, endpoint records, MAC/IP
+addresses, labels, options, IPAM, peers, services, status, or raw bodies. It
+does not access credentials, provide usage statistics, or offer network
+create/remove/connect/disconnect operations. Podman/rootless and remote
+endpoints remain unsupported or unvalidated. Issues #17 and #10 remain open;
+no release is claimed.
+

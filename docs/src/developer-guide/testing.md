@@ -46,6 +46,22 @@ It only lists volumes and inspects that name. It does not create, remove,
 modify, or clean up any resource. Headless Volumes UI tests and fake-socket
 protocol tests need no live engine and perform no mutations.
 
+The optional ignored network list/inspect test is read-only and requires
+`FERRUM_TEST_NETWORK` to name an existing network on the selected local Docker
+context. It lists networks, then inspects the matching listed network ID:
+
+```sh
+FERRUM_TEST_NETWORK=my-existing-network cargo test -p ferrum-engine --test live_engine local_engine_lists_and_inspects_existing_network_read_only -- --exact --ignored
+```
+
+It does not create, remove, connect, disconnect, modify, or clean up resources.
+This live test is distinct from the default suite, which skips ignored tests,
+and from headless UI/fake-socket protocol tests, which do not contact a live
+engine. Network list results may omit attached-container information. Inspect
+may report an optional point-in-time attached-container count; no container
+identifiers, names, endpoint data, or other non-allowlisted network fields are
+retained or displayed. There are no live mutation tests for networks.
+
 The lifecycle and logs tests below are separate opt-in ignored tests and mutate
 the engine by creating one disposable container.
 

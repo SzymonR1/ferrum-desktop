@@ -43,9 +43,13 @@ use contexts::{
 
 use ferrum_core::{
     ContainerAction, ContainerChange, ContainerDetails, ContainerMount, ContainerState,
-    ContainerSummary, ImageDetails, ImageSummary, VolumeDetails, VolumeSummary,
+    ContainerSummary, ImageDetails, ImageSummary, NetworkDetails, NetworkSummary, VolumeDetails,
+    VolumeSummary,
 };
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{
+    Deserialize,
+    de::{DeserializeOwned, IgnoredAny},
+};
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
@@ -169,6 +173,64 @@ struct InspectConfig {
     image: Option<String>,
     tty: Option<bool>,
 }
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct NetworkResponse {
+    id: Option<String>,
+    name: Option<String>,
+    driver: Option<String>,
+    scope: Option<String>,
+    created: Option<String>,
+    internal: Option<bool>,
+    attachable: Option<bool>,
+    #[serde(rename = "EnableIPv4")]
+    enable_ipv4: Option<bool>,
+    #[serde(rename = "EnableIPv6")]
+    enable_ipv6: Option<bool>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct NetworkInspectResponse {
+    #[serde(flatten)]
+    network: NetworkResponse,
+    #[serde(default)]
+    containers: Option<NetworkContainerCount>,
+}
+
+#[cfg(target_os = "linux")]
+struct NetworkContainerCount(usize);
+
+#[cfg(target_os = "linux")]
+impl<'de> Deserialize<'de> for NetworkContainerCount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CountVisitor;
+        impl<'de> serde::de::Visitor<'de> for CountVisitor {
+            type Value = NetworkContainerCount;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a map of attached container endpoints")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut count = 0usize;
+                while map.next_key::<IgnoredAny>()?.is_some() {
+                    map.next_value::<IgnoredAny>()?;
+                    count = count.saturating_add(1);
+                }
+                Ok(NetworkContainerCount(count))
+            }
+        }
+        deserializer.deserialize_map(CountVisitor)
+    }
+}
+
 /// Version information reported by the connected engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineInfo {
@@ -313,6 +375,24 @@ pub enum EngineError {
     #[cfg(target_os = "linux")]
     #[error("The volume name for the engine request is invalid.")]
     InvalidVolumeName,
+    /// The engine could not return a valid, bounded network inventory.
+    #[cfg(target_os = "linux")]
+    #[error("The engine at the {endpoint_label} could not return safe network information.")]
+    NetworkInventoryUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// Network inspection failed or returned an invalid, oversized response.
+    #[cfg(target_os = "linux")]
+    #[error("The engine at the {endpoint_label} could not return safe network details.")]
+    NetworkInspectionUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The network identifier supplied to an inspection request is invalid.
+    #[cfg(target_os = "linux")]
+    #[error("The network identifier for the engine request is invalid.")]
+    InvalidNetworkId,
     /// Image inspection failed or returned an invalid, oversized response.
     #[cfg(target_os = "linux")]
     #[error("The engine at the {endpoint_label} could not return safe image details.")]
@@ -925,6 +1005,96 @@ impl EngineClient {
             Err(EngineError::UnsupportedPlatform)
         }
     }
+    /// Lists local networks from the connected Docker-compatible engine.
+    ///
+    /// Only identity and the allowlisted scalar network fields are retained.
+    /// Attached-container counts are not provided by the network list endpoint
+    /// and are available only as a point-in-time count from inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe typed error if the bounded local Unix-socket request
+    /// fails, the response is invalid or oversized, or any item lacks a
+    /// non-empty ID or name. Unsupported platforms return
+    /// `UnsupportedPlatform`.
+    pub async fn list_networks(&self) -> Result<Vec<NetworkSummary>, EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            let endpoint_label = self.info.endpoint_label;
+            let path = format!("/v{}/networks", self.api_version);
+            let networks: Vec<NetworkResponse> = request_json(
+                &self.socket_path,
+                &path,
+                MAX_LIST_RESPONSE_BYTES,
+                REQUEST_TIMEOUT,
+            )
+            .await
+            .map_err(|_| EngineError::NetworkInventoryUnavailable { endpoint_label })?;
+            networks
+                .into_iter()
+                .map(|network| {
+                    map_network(network)
+                        .map_err(|()| EngineError::NetworkInventoryUnavailable { endpoint_label })
+                })
+                .collect()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
+
+    /// Inspects one local network by its engine ID or name.
+    ///
+    /// The identifier must be non-empty, at most 4096 bytes, and not `.` or
+    /// `..`. Endpoint keys and values are discarded while computing an
+    /// optional point-in-time attached-container count.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidNetworkId` before connecting for an invalid identifier,
+    /// or a safe typed error if the bounded request fails, the response is
+    /// invalid or oversized, or it lacks a non-empty ID or name. Unsupported
+    /// platforms return `UnsupportedPlatform`.
+    pub async fn inspect_network(&self, id: &str) -> Result<NetworkDetails, EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            if !network_id_path_safe(id) {
+                return Err(EngineError::InvalidNetworkId);
+            }
+            let path = resource_request_path(&self.api_version, "networks", id, "")
+                .map_err(|_| EngineError::InvalidNetworkId)?;
+            let endpoint_label = self.info.endpoint_label;
+            let response: NetworkInspectResponse = request_json(
+                &self.socket_path,
+                &path,
+                MAX_INSPECT_RESPONSE_BYTES,
+                REQUEST_TIMEOUT,
+            )
+            .await
+            .map_err(|_| EngineError::NetworkInspectionUnavailable { endpoint_label })?;
+            let summary = map_network(response.network)
+                .map_err(|()| EngineError::NetworkInspectionUnavailable { endpoint_label })?;
+            Ok(NetworkDetails {
+                id: summary.id,
+                name: summary.name,
+                driver: summary.driver,
+                scope: summary.scope,
+                created_at: summary.created_at,
+                internal: summary.internal,
+                attachable: summary.attachable,
+                enable_ipv4: summary.enable_ipv4,
+                enable_ipv6: summary.enable_ipv6,
+                attached_container_count: response.containers.map(|count| count.0),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = id;
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
+
     /// Lists local volumes. Only name, driver, and scope are retained.
     ///
     /// A missing or null `Volumes` field is treated as an empty inventory, as
@@ -1655,6 +1825,31 @@ fn negotiate_api_version(client: &str, server: &str) -> Option<String> {
         client.to_owned()
     } else {
         server.to_owned()
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn network_id_path_safe(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 4096 && !matches!(id, "." | "..")
+}
+
+#[cfg(target_os = "linux")]
+fn map_network(response: NetworkResponse) -> Result<NetworkSummary, ()> {
+    let id = response
+        .id
+        .filter(|id| network_id_path_safe(id))
+        .ok_or(())?;
+    let name = response.name.filter(|name| !name.is_empty()).ok_or(())?;
+    Ok(NetworkSummary {
+        id,
+        name,
+        driver: response.driver,
+        scope: response.scope,
+        created_at: response.created,
+        internal: response.internal,
+        attachable: response.attachable,
+        enable_ipv4: response.enable_ipv4,
+        enable_ipv6: response.enable_ipv6,
     })
 }
 
@@ -3192,19 +3387,23 @@ mod container_logs_http_tests {
 mod container_lifecycle_http_tests {
     use super::*;
     use ferrum_core::ContainerAction;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::UnixListener,
     };
 
+    static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
     fn temporary_directory() -> std::path::PathBuf {
+        let sequence = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "ferrum-lifecycle-{}-{}",
+            "ferrum-lifecycle-{}-{timestamp}-{sequence}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after the Unix epoch")
-                .as_nanos()
         ));
         std::fs::create_dir(&directory).expect("temporary directory should be created");
         directory
@@ -3411,19 +3610,23 @@ mod container_lifecycle_http_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod container_change_stream_tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::UnixListener,
     };
 
+    static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
     fn temporary_directory() -> std::path::PathBuf {
+        let sequence = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "ferrum-events-{}-{}",
+            "ferrum-events-{}-{timestamp}-{sequence}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after the Unix epoch")
-                .as_nanos()
         ));
         std::fs::create_dir(&directory).expect("temporary directory should be created");
         directory
@@ -3678,5 +3881,277 @@ mod context_selection_tests {
                 .expect("a local Unix socket is supported"),
             PathBuf::from("/tmp/docker.sock")
         );
+    }
+}
+#[cfg(all(test, target_os = "linux"))]
+mod network_api_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixListener,
+    };
+
+    static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_directory() -> std::path::PathBuf {
+        let sequence = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "ferrum-networks-{}-{timestamp}-{sequence}",
+            std::process::id(),
+            timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&directory).expect("temporary directory should be created");
+        directory
+    }
+
+    fn client(socket_path: std::path::PathBuf) -> EngineClient {
+        EngineClient {
+            info: EngineInfo {
+                version: "fixture".to_owned(),
+                api_version: "1.45".to_owned(),
+                endpoint_label: "test endpoint",
+            },
+            api_version: "1.45".to_owned(),
+            selected_context: None,
+            socket_path,
+        }
+    }
+
+    async fn fixture(
+        response: Vec<u8>,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        tokio::task::JoinHandle<String>,
+    ) {
+        let directory = temporary_directory();
+        let socket_path = directory.join("engine.sock");
+        let listener = UnixListener::bind(&socket_path).expect("Unix socket should bind");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("request should be read");
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8(request).expect("request should be UTF-8");
+            let _ = stream.write_all(&response).await;
+            request
+        });
+        (socket_path, directory, server)
+    }
+
+    fn response(status: &str, body: &[u8]) -> Vec<u8> {
+        let mut result = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        result.extend_from_slice(body);
+        result
+    }
+
+    fn cleanup(socket: &std::path::Path, directory: &std::path::Path) {
+        std::fs::remove_file(socket).expect("socket should be removed");
+        std::fs::remove_dir(directory).expect("directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn lists_networks_from_versioned_endpoint_and_maps_only_allowlisted_fields() {
+        let body = br#"[{"Id":"network-id","Name":"bridge","Driver":"bridge","Scope":"local","Created":"created","Internal":false,"Attachable":true,"EnableIPv4":true,"EnableIPv6":false,"Labels":{"secret":"label"},"Options":{"secret":"option"},"IPAM":{"secret":"ipam"},"Ingress":true,"Status":{"secret":"status"}}]"#;
+        let (socket, directory, server) = fixture(response("200 OK", body)).await;
+        let networks = client(socket.clone())
+            .list_networks()
+            .await
+            .expect("inventory");
+        let request = server.await.expect("server");
+        assert!(request.starts_with("GET /v1.45/networks HTTP/1.1\r\n"));
+        assert_eq!(
+            networks,
+            vec![NetworkSummary {
+                id: "network-id".to_owned(),
+                name: "bridge".to_owned(),
+                driver: Some("bridge".to_owned()),
+                scope: Some("local".to_owned()),
+                created_at: Some("created".to_owned()),
+                internal: Some(false),
+                attachable: Some(true),
+                enable_ipv4: Some(true),
+                enable_ipv6: Some(false),
+            }]
+        );
+        assert!(!format!("{networks:?}").contains("secret"));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn list_requires_nonempty_network_identity_and_preserves_missing_optionals() {
+        for body in [
+            br#"[{"Name":"bridge"}]"#.as_slice(),
+            br#"[{"Id":"","Name":"bridge"}]"#.as_slice(),
+            br#"[{"Id":"..","Name":"bridge"}]"#.as_slice(),
+            br#"[{"Id":"id"}]"#.as_slice(),
+            br#"[{"Id":"id","Name":""}]"#.as_slice(),
+        ] {
+            let (socket, directory, server) = fixture(response("200 OK", body)).await;
+            assert!(matches!(
+                client(socket.clone()).list_networks().await,
+                Err(EngineError::NetworkInventoryUnavailable { .. })
+            ));
+            server.await.expect("server");
+            cleanup(&socket, &directory);
+        }
+
+        let (socket, directory, server) =
+            fixture(response("200 OK", br#"[{"Id":"id","Name":"bridge"}]"#)).await;
+        let summary = client(socket.clone())
+            .list_networks()
+            .await
+            .expect("inventory")
+            .remove(0);
+        assert_eq!(summary.driver, None);
+        assert_eq!(summary.enable_ipv4, None);
+        server.await.expect("server");
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn inspection_encodes_id_and_discards_endpoint_keys_and_values() {
+        let body = br#"{"Id":"network-id","Name":"bridge","Driver":"bridge","Scope":"local","Created":"created","Internal":true,"Attachable":false,"EnableIPv4":true,"EnableIPv6":true,"Containers":{"secret-container-id":{"Name":"secret-name","EndpointID":"secret-endpoint","MacAddress":"secret-mac","IPv4Address":"secret-ipv4","IPv6Address":"secret-ipv6"}},"Labels":{"secret":"label"},"Options":{"secret":"option"},"IPAM":{"secret":"ipam"},"Peers":[{"secret":"peer"}],"Services":{"secret":"service"},"Status":{"secret":"status"}}"#;
+        let (socket, directory, server) = fixture(response("200 OK", body)).await;
+        let details = client(socket.clone())
+            .inspect_network("a/b c")
+            .await
+            .expect("details");
+        let request = server.await.expect("server");
+        assert!(request.starts_with("GET /v1.45/networks/a%2Fb%20c HTTP/1.1\r\n"));
+        assert_eq!(
+            details,
+            NetworkDetails {
+                id: "network-id".to_owned(),
+                name: "bridge".to_owned(),
+                driver: Some("bridge".to_owned()),
+                scope: Some("local".to_owned()),
+                created_at: Some("created".to_owned()),
+                internal: Some(true),
+                attachable: Some(false),
+                enable_ipv4: Some(true),
+                enable_ipv6: Some(true),
+                attached_container_count: Some(1),
+            }
+        );
+        let debug = format!("{details:?}");
+        for secret in [
+            "secret-container-id",
+            "secret-name",
+            "secret-endpoint",
+            "secret-mac",
+            "secret-ipv4",
+            "secret-ipv6",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn missing_null_and_empty_containers_have_distinct_count_shapes() {
+        for (containers, expected) in [
+            ("", None),
+            (r#","Containers":null"#, None),
+            (r#","Containers":{}"#, Some(0)),
+        ] {
+            let body = format!(r#"{{"Id":"id","Name":"bridge"{containers}}}"#);
+            let (socket, directory, server) = fixture(response("200 OK", body.as_bytes())).await;
+            assert_eq!(
+                client(socket.clone())
+                    .inspect_network("id")
+                    .await
+                    .expect("details")
+                    .attached_container_count,
+                expected
+            );
+            server.await.expect("server");
+            cleanup(&socket, &directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_network_ids_before_socket_connection() {
+        let engine = client(std::path::PathBuf::from("/path/that/does/not/exist"));
+        let too_long = "x".repeat(4097);
+        for id in ["", ".", "..", too_long.as_str()] {
+            assert!(matches!(
+                engine.inspect_network(id).await,
+                Err(EngineError::InvalidNetworkId)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_inspection_without_nonempty_identity() {
+        for body in [
+            br#"{"Name":"bridge"}"#.as_slice(),
+            br#"{"Id":"","Name":"bridge"}"#.as_slice(),
+            br#"{"Id":"id"}"#.as_slice(),
+            br#"{"Id":"id","Name":""}"#.as_slice(),
+        ] {
+            let (socket, directory, server) = fixture(response("200 OK", body)).await;
+            assert!(matches!(
+                client(socket.clone()).inspect_network("id").await,
+                Err(EngineError::NetworkInspectionUnavailable { .. })
+            ));
+            server.await.expect("server");
+            cleanup(&socket, &directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn maps_http_malformed_and_oversized_network_responses_to_safe_errors() {
+        for (status, body) in [
+            ("404 Not Found", b"private daemon body".as_slice()),
+            ("200 OK", b"{".as_slice()),
+        ] {
+            let (socket, directory, server) = fixture(response(status, body)).await;
+            let error = client(socket.clone())
+                .inspect_network("id")
+                .await
+                .expect_err("invalid response should fail");
+            server.await.expect("server");
+            assert!(matches!(
+                error,
+                EngineError::NetworkInspectionUnavailable { .. }
+            ));
+            assert!(!error.to_string().contains("private"));
+            cleanup(&socket, &directory);
+        }
+
+        for (cap, method) in [
+            (MAX_LIST_RESPONSE_BYTES, 0_u8),
+            (MAX_INSPECT_RESPONSE_BYTES, 1_u8),
+        ] {
+            let body = vec![b' '; cap + 1];
+            let (socket, directory, server) = fixture(response("200 OK", &body)).await;
+            let result = if method == 0 {
+                client(socket.clone()).list_networks().await.map(|_| ())
+            } else {
+                client(socket.clone())
+                    .inspect_network("id")
+                    .await
+                    .map(|_| ())
+            };
+            assert!(result.is_err());
+            server.await.expect("server");
+            cleanup(&socket, &directory);
+        }
     }
 }

@@ -52,7 +52,16 @@ broader endpoint validation remains tracked by the still-open
 pull, tag, or removal operation or test that mutates image resources is claimed;
 native image-page visual validation is not claimed. See the [Images guide](docs/src/user-guide/images.md).
 
-The **Volumes** page offers read-only listing and inspection of Docker volumes on the selected local Docker Unix socket on Linux. It displays only name, driver, scope, creation time, and host mountpoint as plain text. Docker's list/inspect endpoints do not report usage; Ferrum shows no size or reference counts. Creating, removing, connecting, disconnecting, networking, usage reporting, Podman/rootless, and remote endpoints are not supported. Issue #17 remains open; issue #10 remains open for Podman/rootless and endpoint-matrix work. See the [Volumes guide](docs/src/user-guide/volumes.md).
+The **Networks** page is read-only and lists/inspects existing networks through
+the selected local Docker Unix socket on Linux. The list displays names;
+inspection displays the ID, driver, scope, creation time, internal/attachable,
+and EnableIPv4/EnableIPv6 flags when reported. Inspect may add an optional
+point-in-time attached-container count; list responses may omit container
+details, and no container IDs, names, endpoint data, or other network metadata
+is retained or displayed. No usage statistics, network mutations, or credential
+access. Podman/rootless and remote endpoints are unsupported or unvalidated.
+Issues #17 and #10 remain open; this slice is not a release. See the
+[Networks guide](docs/src/user-guide/networks.md).
 
 
 An X11-backend screenshot captured via XWayland showed actual container names,
@@ -104,7 +113,11 @@ or modify images. Pull, tag, and removal behavior is covered only by fake-socket
 contract tests and headless UI tests; no live image mutation is performed. The
 ignored read-only volume list/inspect test requires `FERRUM_TEST_VOLUME` to name
 an existing local volume and only lists/inspects it; it does not mutate or clean
-up resources. See the testing guide for exact commands.
+up resources. The ignored read-only network list/inspect test requires
+`FERRUM_TEST_NETWORK` to name an existing local network. It lists networks and
+inspects the matching listed ID; it performs no mutation or cleanup. Default and
+fake-socket tests do not contact a live engine. See the testing guide for exact
+commands.
 
 
 An ignored lifecycle integration test is mutating; see the testing guide for its exact command and prerequisites. It requires a locally present `FERRUM_TEST_IMAGE` containing `/bin/sleep`; tests do not pull images and clean up only the created container by its returned full ID.
@@ -117,6 +130,7 @@ An ignored lifecycle integration test is mutating; see the testing guide for its
 - [Platform support](docs/src/platform-support.md)
 - [Architecture decisions](docs/decisions/)
 - [Embedded terminal guide](docs/src/user-guide/terminal.md)
+- [Networks guide](docs/src/user-guide/networks.md)
 - [Performance and accessibility evidence](docs/src/performance.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 

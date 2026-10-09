@@ -172,6 +172,60 @@ pub struct VolumeSummary {
     /// Driver scope, when reported by the engine.
     pub scope: Option<String>,
 }
+/// Read-only summary information about one local Docker network.
+///
+/// Only the documented scalar inventory fields are retained. Docker's network
+/// list endpoint does not provide the attached-container count.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkSummary {
+    /// Engine-assigned network identifier.
+    pub id: String,
+    /// Human-readable network name.
+    pub name: String,
+    /// Network driver reported by the engine, when available.
+    pub driver: Option<String>,
+    /// Network scope reported by the engine, when available.
+    pub scope: Option<String>,
+    /// Engine-reported creation time, when available.
+    pub created_at: Option<String>,
+    /// Whether the network is internal, when reported.
+    pub internal: Option<bool>,
+    /// Whether containers can be attached while running, when reported.
+    pub attachable: Option<bool>,
+    /// Whether IPv4 is enabled, when reported.
+    pub enable_ipv4: Option<bool>,
+    /// Whether IPv6 is enabled, when reported.
+    pub enable_ipv6: Option<bool>,
+}
+
+/// Read-only details about one local Docker network.
+///
+/// Optional values remain absent when the engine does not report them. The
+/// attached-container count is a point-in-time count from inspect only; endpoint
+/// identifiers, names, addresses, and values are never retained.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkDetails {
+    /// Engine-assigned network identifier.
+    pub id: String,
+    /// Human-readable network name.
+    pub name: String,
+    /// Network driver reported by the engine, when available.
+    pub driver: Option<String>,
+    /// Network scope reported by the engine, when available.
+    pub scope: Option<String>,
+    /// Engine-reported creation time, when available.
+    pub created_at: Option<String>,
+    /// Whether the network is internal, when reported.
+    pub internal: Option<bool>,
+    /// Whether containers can be attached while running, when reported.
+    pub attachable: Option<bool>,
+    /// Whether IPv4 is enabled, when reported.
+    pub enable_ipv4: Option<bool>,
+    /// Whether IPv6 is enabled, when reported.
+    pub enable_ipv6: Option<bool>,
+    /// Number of containers attached at the instant of inspection, if reported.
+    pub attached_container_count: Option<usize>,
+}
 
 /// Read-only details reported for one local volume.
 ///
