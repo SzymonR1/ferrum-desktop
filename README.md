@@ -26,14 +26,19 @@ means Ferrum did not receive success confirmation; the engine state may still
 be changing. Raw errors, endpoints, names, and daemon response bodies are
 excluded. These events are not a persistent or tamper-proof audit store.
 
-The **Images** page provides read-only image listing and inspection through a
-local Docker Unix socket on Linux. Pull, tag, remove, build, push, and registry
-authentication are not offered; Podman/rootless and remote image endpoints
-remain unsupported or unvalidated. Image operations remain tracked by
-[issue #16](https://github.com/SzymonR1/ferrum-desktop/issues/16), and broader
-engine endpoint validation remains tracked by the still-open
-[issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10). See the
-[Images guide](docs/src/user-guide/images.md) for scope and limitations.
+The **Images** page provides read-only image listing and inspection and offers
+anonymous pulls of public references through a local Docker Unix socket on
+Linux. Ferrum does not read registry credentials or send registry
+authentication; private-registry pulls are unavailable. **Stop monitoring**
+aborts only Ferrum's client-side progress stream; it does not cancel or claim
+to stop a daemon-side image transfer. Tag, remove, build, and push
+remain unavailable. This sub-slice is not a release and issue
+[#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) remains open.
+Podman/rootless and remote image endpoints remain unsupported or unvalidated;
+broader endpoint validation remains tracked by the still-open
+[#10](https://github.com/SzymonR1/ferrum-desktop/issues/10). No live pull or
+native image-page visual validation is claimed. See the
+[Images guide](docs/src/user-guide/images.md).
 
 An X11-backend screenshot captured via XWayland showed actual container names,
 images, states, and statuses. A no-engine X11 launch showed a connection error

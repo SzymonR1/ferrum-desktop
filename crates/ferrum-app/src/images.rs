@@ -1,7 +1,7 @@
 use crate::search::CaseInsensitiveQuery;
 
 use eframe::egui;
-use ferrum_core::{ImageDetails, ImageSummary};
+use ferrum_core::{ImageDetails, ImagePullProgress, ImageSummary};
 use std::fmt::Display;
 
 const IMAGE_ROW_HEIGHT: f32 = 34.0;
@@ -55,6 +55,15 @@ pub(super) struct ImagesView {
     error: Option<String>,
     generation: u64,
     inspection_generation: u64,
+    pull_generation: u64,
+    pull_reference: String,
+    pull_loading: bool,
+    pull_monitoring_stopped: bool,
+    pull_complete: bool,
+    pull_progress: Option<ImagePullProgress>,
+    pull_error: Option<String>,
+    pull_requested: bool,
+    cancel_requested: bool,
 }
 
 impl ImagesView {
@@ -64,8 +73,38 @@ impl ImagesView {
     pub(super) fn has_loaded(&self) -> bool {
         self.loaded
     }
+    pub(super) fn is_pulling(&self) -> bool {
+        self.pull_loading
+    }
+    #[cfg(test)]
+    pub(super) fn is_monitoring_stopped(&self) -> bool {
+        self.pull_monitoring_stopped
+    }
+    #[cfg(test)]
+    pub(super) fn is_pull_complete(&self) -> bool {
+        self.pull_complete
+    }
+    pub(super) fn take_pull_requested(&mut self) -> bool {
+        std::mem::take(&mut self.pull_requested)
+    }
+    pub(super) fn take_cancel_requested(&mut self) -> bool {
+        std::mem::take(&mut self.cancel_requested)
+    }
+    #[cfg(test)]
+    pub(super) fn set_pull_reference(&mut self, reference: String) {
+        self.pull_reference = reference;
+    }
+    #[cfg(test)]
+    pub(super) fn pull_progress(&self) -> Option<&ImagePullProgress> {
+        self.pull_progress.as_ref()
+    }
 
     pub(super) fn invalidate(&mut self) {
+        self.reset_inventory();
+        self.cancel_pull();
+    }
+
+    fn reset_inventory(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.inspection_generation = self.inspection_generation.wrapping_add(1);
         self.loading = false;
@@ -76,8 +115,69 @@ impl ImagesView {
         self.clear_selection();
     }
 
+    pub(super) fn pull_reference_valid(&self) -> bool {
+        let reference = self.pull_reference.as_str();
+        !reference.is_empty()
+            && reference.len() <= 512
+            && !reference
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    }
+
+    pub(super) fn begin_pull(&mut self) -> Option<(u64, String)> {
+        if !self.pull_reference_valid() || self.pull_loading {
+            return None;
+        }
+        self.pull_generation = self.pull_generation.wrapping_add(1);
+        self.pull_loading = true;
+        self.pull_monitoring_stopped = false;
+        self.pull_complete = false;
+        self.pull_progress = None;
+        self.pull_error = None;
+        Some((self.pull_generation, self.pull_reference.clone()))
+    }
+
+    pub(super) fn update_pull(&mut self, generation: u64, progress: ImagePullProgress) -> bool {
+        if generation != self.pull_generation || !self.pull_loading {
+            return false;
+        }
+        self.pull_progress = Some(progress);
+        true
+    }
+    pub(super) fn finish_pull(&mut self, generation: u64, result: Result<(), String>) -> bool {
+        if generation != self.pull_generation
+            || (!self.pull_loading && !self.pull_monitoring_stopped)
+        {
+            return false;
+        }
+        self.pull_loading = false;
+        self.pull_monitoring_stopped = false;
+        match result {
+            Ok(()) => self.pull_complete = true,
+            Err(error) => self.pull_error = Some(error),
+        }
+        true
+    }
+    pub(super) fn stop_pull_monitoring(&mut self) {
+        self.pull_loading = false;
+        self.pull_monitoring_stopped = true;
+        self.pull_progress = None;
+        self.pull_error = None;
+        self.pull_complete = false;
+    }
+    pub(super) fn cancel_pull(&mut self) {
+        self.pull_generation = self.pull_generation.wrapping_add(1);
+        self.pull_loading = false;
+        self.pull_monitoring_stopped = false;
+        self.pull_complete = false;
+        self.pull_progress = None;
+        self.pull_error = None;
+        self.pull_requested = false;
+        self.cancel_requested = false;
+    }
+
     pub(super) fn begin_load(&mut self) -> u64 {
-        self.invalidate();
+        self.reset_inventory();
         self.loading = true;
         self.generation
     }
@@ -138,7 +238,52 @@ impl ImagesView {
         ui: &mut egui::Ui,
         connected: bool,
         connection_message: &str,
+        pull_allowed: bool,
     ) -> Option<ImageInspectionRequest> {
+        ui.group(|ui| {
+            ui.heading("Pull public image");
+            ui.label("Anonymous pulls only; private registry authentication is not supported.");
+            ui.horizontal(|ui| {
+                let label = ui.label("Image reference");
+                ui.text_edit_singleline(&mut self.pull_reference)
+                    .labelled_by(label.id);
+                if ui
+                    .add_enabled(
+                        connected
+                            && pull_allowed
+                            && self.pull_reference_valid()
+                            && !self.pull_loading,
+                        egui::Button::new("Pull image"),
+                    )
+                    .clicked()
+                {
+                    self.pull_requested = true;
+                }
+                if self.pull_loading && ui.button("Stop monitoring").clicked() {
+                    self.cancel_requested = true;
+                }
+            });
+            if self.pull_loading {
+                ui.spinner();
+                ui.label("Pulling image…");
+                if let Some(progress) = &self.pull_progress {
+                    ui.label(&progress.status);
+                    if let Some(current) = progress.current_bytes {
+                        ui.label(format!("{current} bytes downloaded"));
+                    }
+                    if let Some(total) = progress.total_bytes {
+                        ui.label(format!("Total: {total} bytes"));
+                    }
+                }
+            } else if self.pull_monitoring_stopped {
+                ui.label("Monitoring stopped. The image transfer may continue in the engine.");
+            } else if self.pull_complete {
+                ui.label("Image pull complete.");
+            } else if let Some(error) = &self.pull_error {
+                ui.label("Image pull failed");
+                ui.label(error);
+            }
+        });
         if !connected {
             ui.heading("Image list unavailable");
             ui.label(connection_message);
@@ -336,7 +481,10 @@ fn format_size(size: Option<u64>) -> String {
 mod tests {
     use super::*;
     use egui::accesskit::Role;
-    use egui_kittest::{Harness, kittest::Queryable};
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT, Queryable},
+    };
 
     #[derive(Default)]
     struct NavigationUi {
@@ -351,7 +499,7 @@ mod tests {
     fn harness_for(view: ImagesView) -> Harness<'static, ImagesUi> {
         Harness::new_ui_state(
             |ui, state: &mut ImagesUi| {
-                if let Some(request) = state.view.show(ui, true, "") {
+                if let Some(request) = state.view.show(ui, true, "", true) {
                     state.inspection = Some(request);
                 }
             },
@@ -423,7 +571,7 @@ mod tests {
         harness.event(egui::Event::Text("ALPINE".to_owned()));
         harness.run();
         let row = harness.get_by_role_and_label(Role::Button, "alpine:3.20");
-        assert_eq!(harness.get_all_by_role(Role::Button).count(), 1);
+        assert_eq!(harness.state().view.visible.len(), 1);
         row.focus();
         harness.run();
         harness.key_down(egui::Key::Space);
@@ -527,7 +675,7 @@ mod tests {
         let mut harness = harness_for(view);
         harness.run();
         let _current = harness.get_by_role_and_label(Role::Button, "current:tag");
-        assert_eq!(harness.get_all_by_role(Role::Button).count(), 1);
+        assert_eq!(harness.state().view.visible.len(), 1);
 
         harness
             .get_by_role_and_label(Role::Button, "current:tag")
@@ -542,7 +690,7 @@ mod tests {
         );
         harness.run();
         let _fresh = harness.get_by_role_and_label(Role::Button, "fresh:tag");
-        assert_eq!(harness.get_all_by_role(Role::Button).count(), 1);
+        assert_eq!(harness.state().view.visible.len(), 1);
         harness
             .get_by_role_and_label(Role::Button, "fresh:tag")
             .click_accesskit();
@@ -566,5 +714,225 @@ mod tests {
         );
         harness.run();
         let _fresh_tag = harness.get_by_role_and_label(Role::Label, "fresh:tag");
+    }
+
+    fn progress(
+        status: &str,
+        current_bytes: Option<u64>,
+        total_bytes: Option<u64>,
+    ) -> ImagePullProgress {
+        ImagePullProgress {
+            status: status.to_owned(),
+            current_bytes,
+            total_bytes,
+        }
+    }
+
+    #[test]
+    fn accessible_pull_action_starts_only_from_connected_view_without_engine_calls() {
+        let mut harness = harness_for(ImagesView::default());
+        harness
+            .state_mut()
+            .view
+            .set_pull_reference("alpine:latest".to_owned());
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Pull image")
+            .click_accesskit();
+        harness.run();
+        assert!(harness.state().view.pull_requested);
+        assert!(harness.state_mut().view.take_pull_requested());
+        let (generation, reference) = harness.state_mut().view.begin_pull().unwrap();
+        assert_eq!(reference, "alpine:latest");
+        assert!(harness.state().view.pull_loading);
+        assert!(
+            harness
+                .state_mut()
+                .view
+                .update_pull(generation, progress("Downloading", Some(10), Some(100)))
+        );
+        assert!(
+            harness
+                .state_mut()
+                .view
+                .update_pull(generation, progress("Extracting", Some(75), None))
+        );
+        assert_eq!(
+            harness.state().view.pull_progress.as_ref().unwrap().status,
+            "Extracting"
+        );
+        assert_eq!(
+            harness
+                .state()
+                .view
+                .pull_progress
+                .as_ref()
+                .unwrap()
+                .total_bytes,
+            None
+        );
+        harness.step();
+        let _latest = harness.get_by_role_and_label(Role::Label, "Extracting");
+        harness.state_mut().view.finish_pull(generation, Ok(()));
+        harness.run();
+        let _complete = harness.get_by_role_and_label(Role::Label, "Image pull complete.");
+    }
+
+    #[test]
+    fn disconnected_view_disables_pull_without_engine_access() {
+        let mut harness = Harness::new_ui_state(
+            |ui, view: &mut ImagesView| {
+                view.show(ui, false, "offline", false);
+            },
+            ImagesView::default(),
+        );
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, "Pull image")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(!harness.state().pull_requested);
+    }
+
+    #[test]
+    fn pull_error_is_visible_and_stale_generations_are_ignored() {
+        let mut view = ImagesView {
+            pull_reference: "alpine:latest".to_owned(),
+            ..ImagesView::default()
+        };
+        let (stale, _) = view.begin_pull().unwrap();
+        view.cancel_pull();
+        let (current, _) = view.begin_pull().unwrap();
+        assert!(!view.update_pull(stale, progress("stale", Some(1), Some(2))));
+        assert!(!view.finish_pull(stale, Ok(())));
+        assert!(view.finish_pull(current, Err("Image pull failed safely.".to_owned())));
+        let mut harness = harness_for(view);
+        harness.run();
+        let _error = harness.get_by_role_and_label(Role::Label, "Image pull failed");
+        let _message = harness.get_by_role_and_label(Role::Label, "Image pull failed safely.");
+    }
+
+    #[test]
+    fn reference_validation_disables_invalid_lengths_and_characters() {
+        let mut view = ImagesView::default();
+        assert!(!view.pull_reference_valid());
+        view.pull_reference = " ".to_owned();
+        assert!(!view.pull_reference_valid());
+        view.pull_reference = "alpine latest".to_owned();
+        assert!(!view.pull_reference_valid());
+        view.pull_reference = "alpine\nlatest".to_owned();
+        assert!(!view.pull_reference_valid());
+        view.pull_reference = "x".repeat(513);
+        assert!(!view.pull_reference_valid());
+        view.pull_reference = "x".repeat(513);
+        let mut invalid_harness = Harness::new_ui_state(
+            |ui, view: &mut ImagesView| {
+                view.show(ui, true, "", true);
+            },
+            view,
+        );
+        invalid_harness.run();
+        assert!(
+            invalid_harness
+                .get_by_role_and_label(Role::Button, "Pull image")
+                .accesskit_node()
+                .is_disabled()
+        );
+        let boundary_view = ImagesView {
+            pull_reference: "x".repeat(512),
+            ..ImagesView::default()
+        };
+        let mut boundary_harness = Harness::new_ui_state(
+            |ui, view: &mut ImagesView| {
+                view.show(ui, true, "", true);
+            },
+            boundary_view,
+        );
+        boundary_harness.run();
+        assert!(
+            !boundary_harness
+                .get_by_role_and_label(Role::Button, "Pull image")
+                .accesskit_node()
+                .is_disabled()
+        );
+    }
+
+    #[test]
+    fn completed_pull_notice_survives_inventory_refresh() {
+        let mut view = ImagesView {
+            pull_reference: "alpine:latest".to_owned(),
+            ..ImagesView::default()
+        };
+        let (generation, _) = view.begin_pull().unwrap();
+        assert!(view.finish_pull(generation, Ok(())));
+        view.begin_load();
+        let mut harness = harness_for(view);
+        harness.step();
+        let _complete = harness.get_by_role_and_label(Role::Label, "Image pull complete.");
+    }
+
+    #[test]
+    fn zero_total_displays_reported_bytes_without_a_percentage() {
+        let view = ImagesView {
+            pull_loading: true,
+            pull_progress: Some(progress("Downloading", Some(0), Some(0))),
+            ..ImagesView::default()
+        };
+        let mut harness = harness_for(view);
+        harness.step();
+        let _current = harness.get_by_role_and_label(Role::Label, "0 bytes downloaded");
+        let _total = harness.get_by_role_and_label(Role::Label, "Total: 0 bytes");
+    }
+    #[test]
+    fn accessible_stop_monitoring_requests_local_stream_abort() {
+        let mut view = ImagesView {
+            pull_reference: "alpine:latest".to_owned(),
+            ..ImagesView::default()
+        };
+        let (generation, _) = view.begin_pull().unwrap();
+        view.update_pull(generation, progress("Downloading", Some(10), Some(100)));
+        let mut harness = harness_for(view);
+        harness.step();
+        harness
+            .get_by_role_and_label(Role::Button, "Stop monitoring")
+            .click_accesskit();
+        harness.step();
+        assert!(harness.state().view.cancel_requested);
+        harness.state_mut().view.cancel_requested = false;
+        harness.state_mut().view.stop_pull_monitoring();
+        assert!(!harness.state().view.is_pulling());
+        assert!(harness.state().view.is_monitoring_stopped());
+        assert!(harness.state().view.pull_progress().is_none());
+    }
+    #[test]
+    fn queued_success_after_stop_monitoring_completes_and_remains_refreshable() {
+        let mut view = ImagesView::default();
+        view.set_pull_reference("alpine:latest".to_owned());
+        let (generation, _) = view.begin_pull().unwrap();
+        view.stop_pull_monitoring();
+        assert!(view.is_monitoring_stopped());
+        assert!(view.finish_pull(generation, Ok(())));
+        assert!(view.is_pull_complete());
+        assert!(!view.is_monitoring_stopped());
+        view.begin_load();
+        let mut harness = harness_for(view);
+        harness.step();
+        let _complete = harness.get_by_role_and_label(Role::Label, "Image pull complete.");
+    }
+
+    #[test]
+    fn a_new_pull_rejects_completion_from_stopped_attempt() {
+        let mut view = ImagesView::default();
+        view.set_pull_reference("alpine:latest".to_owned());
+        let (stale_generation, _) = view.begin_pull().unwrap();
+        view.stop_pull_monitoring();
+        let (current_generation, _) = view.begin_pull().unwrap();
+        assert_ne!(stale_generation, current_generation);
+        assert!(!view.finish_pull(stale_generation, Ok(())));
+        assert!(!view.update_pull(stale_generation, progress("old attempt", Some(1), Some(2))));
+        assert!(view.is_pulling());
+        assert!(!view.is_pull_complete());
     }
 }

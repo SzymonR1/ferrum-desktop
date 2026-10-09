@@ -1,6 +1,6 @@
 # Images
 
-**Status:** Read-only listing and inspection for a local Docker Unix socket.
+**Status:** Local Docker Unix-socket image listing/inspection and anonymous public pulls on Linux.
 
 Open **Images** in the sidebar to view images returned by the connected local
 Docker engine. Search is case-insensitive across repository tags and image IDs.
@@ -14,14 +14,21 @@ loaded inventory; use **Refresh** to request a new image list.
 
 ## Scope and limitations
 
-This slice supports only read-only image list and inspect requests through a
-local Docker Unix socket on Linux. It does not offer image pull, tag, remove,
-build, push, or registry authentication. Those image operations remain tracked
-by [issue #16](https://github.com/SzymonR1/ferrum-desktop/issues/16), which is
-still open.
+This slice supports image listing and inspection plus anonymous pulls through
+a local Docker Unix socket on Linux. The pull form accepts a public image
+reference only; it does not read credentials or send registry authentication.
+While a pull is active, **Stop monitoring** aborts Ferrum's client-side
+progress stream and shows a stopped-monitoring notice; it does not cancel or
+guarantee stopping the daemon's image transfer. A completion event already
+received by Ferrum may still update the page and trigger an inventory refresh.
 
-Podman and rootless-engine behavior remain unvalidated. Remote endpoints are
-unsupported and unvalidated by this slice. Broader engine and endpoint
-validation remains tracked by [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10),
-which is still open. Windows and macOS remain outside the current platform
-scope; see the [platform support matrix](../platform-support.md).
+After a successful pull, Ferrum refreshes the list; the image remains in the
+connected engine's image store.
+
+Tag, remove, build, push, and private-registry authentication are not offered.
+Issue [#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) remains open;
+this sub-slice is not a release. Podman/rootless behavior, remote endpoints,
+and broader engine compatibility remain unsupported or unvalidated under the
+still-open [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10).
+No live pull or native visual validation is claimed. See the
+[platform support matrix](../platform-support.md).

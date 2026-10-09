@@ -68,6 +68,17 @@ impl std::fmt::Display for ContainerAction {
     }
 }
 
+/// A bounded progress update reported while an image is being pulled.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImagePullProgress {
+    /// Sanitized status text suitable for display.
+    pub status: String,
+    /// Number of bytes reported as downloaded, if provided by the engine.
+    pub current_bytes: Option<u64>,
+    /// Total number of bytes reported for the current progress item, if provided.
+    pub total_bytes: Option<u64>,
+}
+
 /// A container lifecycle change reported by the engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContainerChange {
