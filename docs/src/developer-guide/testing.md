@@ -17,8 +17,10 @@ local-engine inventory test may inspect an existing container; these tests do
 not mutate resources.
 Settings tests cover missing/corrupt settings, file symlink rejection without
 changing target permissions, non-regular file rejection, and refusal to chmod
-or write through a symlinked settings directory. They run in the default suite
-and use only temporary paths.
+or write through a symlinked settings directory. A deterministic path-replacement
+test verifies temp creation, replacement, and failure cleanup stay on the
+opened directory descriptor while a symlink target remains untouched. These
+tests run in the default suite and use only temporary paths.
 
 The opt-in image list/inspect test is read-only and requires
 `FERRUM_TEST_IMAGE` to name an image already present on the current local Docker
