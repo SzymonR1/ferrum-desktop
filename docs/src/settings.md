@@ -12,6 +12,13 @@ opened without following symlinks, and Ferrum verifies the opened descriptor is
 a regular file before changing its permissions. Non-regular settings files are
 rejected. Parent path components follow the selected XDG/HOME location.
 
-The config directory is created with owner-only (`0700`) permissions. Existing settings files are restricted to owner-only (`0600`) when loaded, and temporary write files use the same permissions. Writes use a same-directory temporary file and atomic rename.
+The final settings directory is opened without following a symlink before
+Ferrum applies owner-only (`0700`) permissions; a symlinked final directory is
+rejected. Existing settings files are restricted to owner-only (`0600`) when
+loaded, and temporary write files use the same permissions. Writes use a
+same-directory temporary file and atomic rename.
+The no-follow checks apply at final-component open time only. User-configured
+parent components and later path-based temporary-file/rename resolution are not
+a directory-descriptor containment boundary.
 
 Ferrum does not persist credentials, secrets, endpoints, or remote contexts. Credentials and remote connection contexts are not supported by this Linux-only settings slice.

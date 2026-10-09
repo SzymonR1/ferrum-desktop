@@ -100,8 +100,7 @@ impl SettingsStore {
         let path = self.path.as_ref().ok_or(SettingsError::Unavailable)?;
         let parent = path.parent().ok_or(SettingsError::Unavailable)?;
         fs::create_dir_all(parent).map_err(|_| SettingsError::Write)?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .map_err(|_| SettingsError::Write)?;
+        let directory = open_private_settings_directory(parent)?;
         let mut persisted = settings.clone();
         persisted.schema_version = SCHEMA_VERSION;
         let serialized = toml::to_string_pretty(&persisted).map_err(|_| SettingsError::Write)?;
@@ -113,7 +112,7 @@ impl SettingsStore {
             file.sync_all().map_err(|_| SettingsError::Write)?;
             drop(file);
             replace(&temp_path, path).map_err(|_| SettingsError::Write)?;
-            let directory_sync = File::open(parent).and_then(|directory| directory.sync_all());
+            let directory_sync = directory.sync_all();
             if directory_sync.is_err() {
                 tracing::warn!(
                     error_kind = "settings_directory_sync",
@@ -148,6 +147,24 @@ fn open_settings_file(path: &std::path::Path) -> Result<Option<File>, SettingsEr
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|_| SettingsError::Read)?;
     Ok(Some(file))
+}
+fn open_private_settings_directory(parent: &std::path::Path) -> Result<File, SettingsError> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let directory = options.open(parent).map_err(|_| SettingsError::Write)?;
+    if !directory
+        .metadata()
+        .map_err(|_| SettingsError::Write)?
+        .is_dir()
+    {
+        return Err(SettingsError::Write);
+    }
+    directory
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(|_| SettingsError::Write)?;
+    Ok(directory)
 }
 
 fn create_temp(parent: &std::path::Path) -> Result<(PathBuf, File), SettingsError> {
@@ -414,6 +431,35 @@ mod tests {
         );
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejecting_symlinked_settings_directory_preserves_target_and_writes_nothing() {
+        let (dir, _) = store();
+        let target_directory = dir.join("target");
+        let settings_directory = dir.join("ferrum");
+        let settings_path = settings_directory.join("settings.toml");
+        fs::create_dir_all(&target_directory).unwrap();
+        fs::set_permissions(&target_directory, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target_directory, &settings_directory).unwrap();
+        let store = SettingsStore::at(settings_path);
+        let settings = Settings {
+            auto_connect_on_startup: false,
+            ..Settings::default()
+        };
+
+        let result = store.save(&settings);
+        let target_mode = fs::metadata(&target_directory)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let settings_file_exists = target_directory.join("settings.toml").exists();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(result, Err(SettingsError::Write));
+        assert_eq!(target_mode, 0o755);
+        assert!(!settings_file_exists);
     }
 
     #[test]
