@@ -130,7 +130,7 @@ enum EngineEvent {
         generation: u64,
         inspection_generation: u64,
         name: String,
-        result: Result<ferrum_core::VolumeDetails, EngineError>,
+        result: volumes::VolumeInspectionResult,
     },
     NetworksListed {
         generation: u64,
@@ -1196,7 +1196,16 @@ impl FerrumApp {
                 && inspection_generation == self.volumes.inspection_generation =>
             {
                 self.resource_read_task = Some(self.runtime.spawn(async move {
-                    let result = engine.inspect_volume(&name).await;
+                    let result = match engine.inspect_volume(&name).await {
+                        Ok(details) => {
+                            let usage = engine
+                                .volume_usage(&name)
+                                .await
+                                .map_err(|error| error.to_string());
+                            Ok((details, usage))
+                        }
+                        Err(error) => Err(error.to_string()),
+                    };
                     if sender
                         .send(EngineEvent::VolumeInspected {
                             generation,
@@ -1686,7 +1695,7 @@ impl FerrumApp {
                         generation,
                         inspection_generation,
                         &name,
-                        result.map_err(|error| error.to_string()),
+                        result,
                     );
                     self.resource_read_task = None;
                     self.start_pending_resource_read(context.clone());

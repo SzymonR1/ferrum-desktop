@@ -16,4 +16,6 @@ The canonical records live in `docs/decisions/` and are included here so the web
 
 {{#include ../../decisions/0007-embedded-terminal.md}}
 
+{{#include ../../decisions/0008-volume-usage-deadline.md}}
+
 {{#include ../../decisions/0006-bounded-container-logs.md}}

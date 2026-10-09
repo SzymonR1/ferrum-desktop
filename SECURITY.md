@@ -14,11 +14,16 @@ an active pull reader: Ferrum drains the response and keeps the mutation gate
 closed until a terminal event. Closing Ferrum does not guarantee that the
 daemon-side pull stops.
 
-The Volumes page is read-only and limited to listing and inspecting volumes on
-the selected local Docker Unix socket on Linux. It displays only name, driver,
-scope, creation time, and a plain-text mountpoint; it does not expose labels,
-options, status, or usage estimates. No volume mutation, network operations,
-Podman/rootless, or remote endpoint support is provided. Issue #17 remains open.
+The Volumes page is read-only and limited to the selected local Docker Unix
+socket on Linux. It lists and inspects volumes, then makes a separate filtered
+read-only usage request; only `Size` in bytes and the point-in-time `RefCount`
+for an exact inventory-matched volume are displayed when reported. Missing,
+negative, or unknown metric values remain unavailable. A usage failure is shown
+separately while successful inspect metadata stays visible. Labels, options,
+status, and raw response bodies are not exposed, and the mountpoint is shown
+only as untrusted plain text without accessing it. No volume or network
+mutations, filesystem browsing, or remote endpoint support is provided.
+Podman/rootless behavior remains unvalidated. Issues #17 and #10 remain open.
 
 The Networks page is read-only and limited to listing and inspecting existing
 networks through the selected local Docker Unix socket on Linux. Its allowlist

@@ -35,16 +35,25 @@ FERRUM_TEST_IMAGE=busybox:1.37.0 cargo test -p ferrum-engine --test live_engine 
 The pull is an optional manual prerequisite, not part of the test. A smoke run
 against an image already present needs only the second command.
 
-The ignored read-only volume list/inspect test requires `FERRUM_TEST_VOLUME`
-to name a volume already present on the selected local Docker context:
+The ignored read-only volume test requires `FERRUM_TEST_VOLUME` to name a
+volume already present on the selected local Docker Unix socket:
 
 ```sh
 FERRUM_TEST_VOLUME=my-existing-volume cargo test -p ferrum-engine --test live_engine local_engine_lists_and_inspects_existing_volume_read_only -- --exact --ignored
 ```
 
-It only lists volumes and inspects that name. It does not create, remove,
-modify, or clean up any resource. Headless Volumes UI tests and fake-socket
-protocol tests need no live engine and perform no mutations.
+It lists volumes, inspects the exact configured name, and reads volume usage
+with `GET /v{api}/system/df?verbose=true&type=volume`. Ferrum accepts usage only
+for a response name that exactly matches the loaded inventory entry. The
+volume-usage request has a scoped 30-second total request deadline and a 16 MiB
+response limit. Only volume-usage calls receive this longer bound; volume list
+and inspect requests retain their existing eight-second timeout. This opt-in
+test remains read-only: it does not create, remove, modify, or clean up any
+resource.
+Headless Volumes UI and fake-socket protocol tests need no live engine and
+perform no mutations. UI coverage checks reported zero versus unavailable
+values, separate usage errors, and stale responses. The native Volumes page has
+not been visually validated.
 
 The optional ignored network list/inspect test is read-only and requires
 `FERRUM_TEST_NETWORK` to name an existing network on the selected local Docker
