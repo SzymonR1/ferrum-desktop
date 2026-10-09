@@ -3,6 +3,7 @@ use std::{
     ffi::{CStr, CString, OsStr, OsString},
     fs::{self, File},
     io::{Read, Write},
+    mem::MaybeUninit,
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::{ffi::OsStrExt, fs::PermissionsExt},
@@ -125,6 +126,7 @@ impl SettingsStore {
         let directory = open_settings_directory(location, true)
             .map_err(|_| SettingsError::Write)?
             .ok_or(SettingsError::Write)?;
+        validate_settings_save_target(&directory, &location.file_name)?;
         directory
             .set_permissions(fs::Permissions::from_mode(0o700))
             .map_err(|_| SettingsError::Write)?;
@@ -137,7 +139,7 @@ impl SettingsStore {
                 .map_err(|_| SettingsError::Write)?;
             file.flush().map_err(|_| SettingsError::Write)?;
             file.sync_all().map_err(|_| SettingsError::Write)?;
-            drop(file);
+            validate_settings_save_target(&directory, &location.file_name)?;
             replace(&directory, &temp_name, &location.file_name)
                 .map_err(|_| SettingsError::Write)?;
             let directory_sync = directory.sync_all();
@@ -351,6 +353,33 @@ fn open_settings_file(directory: &File, name: &CStr) -> Result<Option<File>, Set
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|_| SettingsError::Read)?;
     Ok(Some(file))
+}
+fn validate_settings_save_target(directory: &File, name: &CStr) -> Result<(), SettingsError> {
+    let mut metadata = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `directory` is an open directory, `name` is a single
+    // NUL-terminated filename, and `fstatat` writes the status on success.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(SettingsError::Write)
+        };
+    }
+    // SAFETY: a successful `fstatat` initialized the metadata structure.
+    let metadata = unsafe { metadata.assume_init() };
+    if metadata.st_mode & libc::S_IFMT as libc::mode_t == libc::S_IFREG as libc::mode_t {
+        Ok(())
+    } else {
+        Err(SettingsError::Write)
+    }
 }
 
 fn create_temp(directory: &File) -> Result<(CString, File), SettingsError> {
@@ -617,7 +646,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn saving_replaces_a_settings_file_symlink_without_following_its_target() {
+    fn saving_rejects_a_settings_file_symlink_without_changing_its_target() {
         let (dir, store) = store();
         let path = dir.join("settings.toml");
         let target = dir.join("other-settings.toml");
@@ -634,9 +663,61 @@ mod tests {
         let result = store.save(&settings);
         let target_after = fs::read(&target).unwrap();
         let target_mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        let settings_entry_is_symlink = fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(result, Err(SettingsError::Write));
+        assert_eq!(target_after, original);
+        assert_eq!(target_mode, 0o644);
+        assert!(settings_entry_is_symlink);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn saving_rejects_a_non_regular_settings_entry_without_changing_it() {
+        use std::os::unix::{fs::FileTypeExt, net::UnixListener};
+
+        let (dir, store) = store();
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("settings.toml");
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let result = store.save(&Settings::default());
+        let entry_is_socket = fs::symlink_metadata(&path).unwrap().file_type().is_socket();
+        let directory_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        drop(listener);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(result, Err(SettingsError::Write));
+        assert!(entry_is_socket);
+        assert_eq!(directory_mode, 0o755);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_does_not_follow_a_symlink_substituted_before_rename() {
+        let (dir, store) = store();
+        let path = dir.join("settings.toml");
+        let target = dir.join("other-settings.toml");
+        fs::create_dir_all(&dir).unwrap();
+        let original = b"auto_connect_on_startup = true\n";
+        fs::write(&target, original).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let settings = Settings {
+            auto_connect_on_startup: false,
+            ..Settings::default()
+        };
+
+        let result = store.save_using(&settings, |directory, temp_name, settings_name| {
+            std::os::unix::fs::symlink(&target, &path)?;
+            rename_temp_at(directory, temp_name, settings_name)
+        });
+        let target_after = fs::read(&target).unwrap();
+        let target_mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         let saved_metadata = fs::symlink_metadata(&path).unwrap();
         let saved_contents = fs::read(&path).unwrap();
-        let saved_mode = saved_metadata.permissions().mode() & 0o777;
         let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(result, Ok(()));
@@ -647,7 +728,6 @@ mod tests {
             saved_contents,
             toml::to_string_pretty(&settings).unwrap().as_bytes()
         );
-        assert_eq!(saved_mode, 0o600);
     }
 
     #[cfg(unix)]

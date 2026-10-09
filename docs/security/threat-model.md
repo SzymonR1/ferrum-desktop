@@ -74,11 +74,12 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   location remains user-trusted and is not confined to `HOME`.
 - Traverse every remaining settings-directory component relative to the
   retained descriptor with `openat` and `O_NOFOLLOW`. Save may create missing
-  components with `mkdirat`; load never creates directories. Reject symlinks
-  at the final app settings directory on both load and save, and reject
-  symlinked `settings.toml` entries during load. On save, `renameat` atomically
-  replaces the settings-file directory entry and never follows its symlink
-  target. Verify settings files are regular files before changing permissions.
+  components with `mkdirat`; load never creates directories. Reject symlinks at
+  the final app settings directory on load and save, and reject symlinked or
+  non-regular `settings.toml` entries on both load and save. Before saving,
+  inspect the directory entry with `fstatat(AT_SYMLINK_NOFOLLOW)`;
+  `renameat` never follows a symlink target if the entry changes concurrently.
+  Verify opened settings files are regular files before changing permissions.
 - Apply `0700` only to the final app settings directory. Keep settings and
   temporary files at `0600`. Create save-time temporary files with `openat`,
   replace settings with `renameat`, and remove failed temporary files with

@@ -29,10 +29,10 @@ It does not add settings support on other platforms or complete security issue
   load never creates directories; missing directories or a missing settings
   file leave defaults in use.
 - Reject symlinks at the final `ferrum` settings directory on load and save.
-  Loading rejects symlinked `settings.toml` entries. Saving atomically replaces
-  the settings-file directory entry with `renameat` and never follows its
-  symlink target. Open settings files without following symlinks and verify
-  they are regular files before changing permissions.
+  Loading rejects symlinked or non-regular `settings.toml` entries. Saving
+  uses `fstatat` with `AT_SYMLINK_NOFOLLOW` to reject an existing symlink or
+  non-regular entry before writing. The `renameat` replacement never follows a
+  symlink target if the directory entry changes concurrently.
 - Apply `0700` only to the final app settings directory. Keep settings files
   and save-time temporary files at `0600`. Create temporary files with
   `openat`, replace the settings file with `renameat`, and clean up failed
@@ -76,9 +76,9 @@ protects settings without changing permissions on its parent directories.
   remaining directories below the retained anchor.
 - Replacing the selected absolute parent path after initialization cannot
   redirect access away from the pinned descriptor. Symlinks in remaining
-  directory components or at the final settings directory are rejected;
-  loading rejects settings-file symlinks, and saving never follows their
-  targets.
+  components or at the final settings directory are rejected; symlinked or
+  non-regular file entries are rejected before load/save, and a concurrent
+  replacement never causes `renameat` to follow a symlink target.
 - The chosen XDG/HOME location remains user-trusted and may be outside `HOME`.
   This decision is Linux-only and makes no Windows, macOS, Podman, rootless, or
   remote-engine support claim.

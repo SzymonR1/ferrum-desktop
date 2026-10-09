@@ -23,11 +23,11 @@ Ferrum traverses the remaining directory components relative to that descriptor
 with `openat` and `O_NOFOLLOW`. It creates missing components with `mkdirat`
 only when saving. A load never creates directories, and a missing directory or
 settings file leaves the defaults in use. The final `ferrum` directory rejects
-symlinks on load and save. Loads reject symlinked `settings.toml` entries
-before reading or changing their permissions. A save never follows or modifies
-the target of a symlink at the settings-file entry. Opened settings files are
-verified to be regular files before permissions are changed.
-
+symlinks on load and save. Loads reject symlinked or non-regular `settings.toml`
+entries before reading or changing their permissions. Saves reject an existing
+symlink or non-regular settings-file entry before writing; `renameat` never
+follows a destination symlink. Opened settings files are verified to be regular
+files before permissions are changed.
 Only the final `ferrum` directory receives owner-only (`0700`) permissions.
 Settings files and save-time temporary files use owner-only (`0600`) permissions.
 Save creates the temporary file with `openat`, atomically replaces the settings
@@ -38,7 +38,6 @@ redirect settings access away from the pinned directory.
 
 The configured XDG/HOME location remains user-trusted. Ferrum honors its
 existing symlink aliases and does not confine it to `HOME`. All suffix
-components are opened relative to the pinned descriptor; saves replace the
-settings-file entry without following a symlink target.
-
+components are opened relative to the pinned descriptor; an entry changed
+concurrently cannot redirect `renameat` to a symlink target.
 Ferrum does not persist credentials, secrets, endpoints, or remote contexts. Credentials and remote connection contexts are not supported by this Linux-only settings slice.

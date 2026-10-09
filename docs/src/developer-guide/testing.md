@@ -26,13 +26,15 @@ store is initialized and confirm that Ferrum honors that selected location.
 Use temporary directory trees to check that loads with missing directories use
 defaults without creating directories, while saves create remaining components
 relative to the retained descriptor. Insert symlinks in the remaining directory
-components and at the final app directory; load and save must reject them
-without changing or writing through their targets. Loads reject symlinked
-settings files. Saves atomically replace the settings-file directory entry
-without following or modifying a symlink target. Verify that only the final app
+components and at the final app directory; load and save must reject them without
+changing or writing through their targets. Loads reject symlinked or non-regular
+settings files. Saves reject a pre-existing symlink or non-regular entry before
+writing; if the destination changes concurrently into a symlink, `renameat`
+replaces the link entry without following its target. Verify only the final app
 settings directory changes to `0700`, settings and temporary files use `0600`,
 and parent-directory modes remain unchanged. Keep migration, default, corrupt
-file, and unknown-secret-field checks. The default suite must use temporary
+file, and unknown-secret-field checks.
+The default suite must use temporary
 paths and must not change the user's real XDG or HOME settings tree.
 
 The opt-in image list/inspect test is read-only and requires
