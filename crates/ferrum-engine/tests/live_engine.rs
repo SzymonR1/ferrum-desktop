@@ -45,6 +45,38 @@ async fn local_engine_lists_and_inspects_existing_volume_read_only() {
     assert_eq!(details.name, name);
 }
 
+/// Read-only opt-in check: inspects only a caller-specified existing network.
+///
+/// Requires `FERRUM_TEST_NETWORK` to name an existing network. This test only
+/// lists and inspects; it never creates, removes, connects, disconnects, or
+/// cleans up networks.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires a local Docker-compatible engine and existing FERRUM_TEST_NETWORK; reads only"]
+async fn local_engine_lists_and_inspects_existing_network_read_only() {
+    let name = std::env::var("FERRUM_TEST_NETWORK")
+        .expect("set FERRUM_TEST_NETWORK to the name of an existing network");
+    assert!(!name.is_empty(), "FERRUM_TEST_NETWORK must not be empty");
+    let engine = EngineClient::connect_default()
+        .await
+        .expect("local engine should be accessible");
+    let networks = engine
+        .list_networks()
+        .await
+        .expect("network inventory should be readable");
+    let listed = networks
+        .iter()
+        .find(|network| network.name == name)
+        .expect("configured existing network must appear in inventory");
+    let details = engine
+        .inspect_network(&listed.id)
+        .await
+        .expect("configured existing network should be inspectable");
+    assert_eq!(details.id, listed.id);
+    assert_eq!(details.name, name);
+    let _: Option<usize> = details.attached_container_count;
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires a current local Docker context and a preinstalled FERRUM_TEST_IMAGE"]

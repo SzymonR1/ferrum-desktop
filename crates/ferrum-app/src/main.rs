@@ -29,10 +29,11 @@ mod audit;
 mod images;
 mod inventory;
 mod logs;
+mod networks;
 mod retry;
 mod search;
 mod volumes;
-use ferrum_core::VolumeSummary;
+use ferrum_core::{NetworkSummary, VolumeSummary};
 #[cfg(target_os = "linux")]
 mod terminal;
 #[cfg(target_os = "linux")]
@@ -131,6 +132,16 @@ enum EngineEvent {
         name: String,
         result: Result<ferrum_core::VolumeDetails, EngineError>,
     },
+    NetworksListed {
+        generation: u64,
+        result: Result<Vec<NetworkSummary>, EngineError>,
+    },
+    NetworkInspected {
+        generation: u64,
+        inspection_generation: u64,
+        id: String,
+        result: Result<ferrum_core::NetworkDetails, EngineError>,
+    },
     ImagePullProgress {
         generation: u64,
         progress: ImagePullProgress,
@@ -172,17 +183,24 @@ enum EngineEvent {
     },
 }
 #[derive(Debug, PartialEq, Eq)]
-enum PendingVolumeRead {
-    List {
+enum PendingResourceRead {
+    VolumeList {
         generation: u64,
     },
-    Inspect {
+    VolumeInspect {
         generation: u64,
         inspection_generation: u64,
         name: String,
     },
+    NetworkList {
+        generation: u64,
+    },
+    NetworkInspect {
+        generation: u64,
+        inspection_generation: u64,
+        id: String,
+    },
 }
-
 struct Inspection {
     generation: u64,
     container_id: String,
@@ -723,9 +741,9 @@ struct FerrumApp {
     page: images::AppPage,
     images: images::ImagesView,
     volumes: volumes::VolumesView,
-    volume_list_task: Option<JoinHandle<()>>,
-    pending_volume_read: Option<PendingVolumeRead>,
-    volume_inspection_task: Option<JoinHandle<()>>,
+    networks: networks::NetworksView,
+    resource_read_task: Option<JoinHandle<()>>,
+    pending_resource_read: Option<PendingResourceRead>,
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
     // Hold the reader until the terminal response event releases the mutation gate.
@@ -905,9 +923,9 @@ impl FerrumApp {
             page: images::AppPage::default(),
             images: images::ImagesView::default(),
             volumes: volumes::VolumesView::default(),
-            volume_list_task: None,
-            pending_volume_read: None,
-            volume_inspection_task: None,
+            networks: networks::NetworksView::default(),
+            resource_read_task: None,
+            pending_resource_read: None,
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
@@ -1075,8 +1093,17 @@ impl FerrumApp {
     }
 
     fn invalidate_volumes(&mut self) {
-        self.pending_volume_read = None;
+        self.pending_resource_read = None;
         self.volumes.invalidate();
+    }
+    fn invalidate_networks(&mut self) {
+        self.pending_resource_read = None;
+        self.networks.invalidate();
+    }
+    fn invalidate_resource_reads(&mut self) {
+        self.pending_resource_read = None;
+        self.volumes.invalidate();
+        self.networks.invalidate();
     }
     fn load_volumes(&mut self, context: egui::Context) {
         if self.loading
@@ -1086,8 +1113,8 @@ impl FerrumApp {
             return;
         }
         let generation = self.volumes.begin_list();
-        self.pending_volume_read = Some(PendingVolumeRead::List { generation });
-        self.start_pending_volume_read(context);
+        self.pending_resource_read = Some(PendingResourceRead::VolumeList { generation });
+        self.start_pending_resource_read(context);
     }
     fn inspect_volume(&mut self, name: String, context: egui::Context) {
         if !cfg!(target_os = "linux")
@@ -1097,24 +1124,47 @@ impl FerrumApp {
             return;
         }
         let (generation, inspection_generation, name) = self.volumes.begin_inspection(name);
-        self.pending_volume_read = Some(PendingVolumeRead::Inspect {
+        self.pending_resource_read = Some(PendingResourceRead::VolumeInspect {
             generation,
             inspection_generation,
             name,
         });
-        self.start_pending_volume_read(context);
+        self.start_pending_resource_read(context);
     }
-    fn start_pending_volume_read(&mut self, context: egui::Context) {
-        if self.volume_list_task.is_some() || self.volume_inspection_task.is_some() {
+    fn load_networks(&mut self, context: egui::Context) {
+        if self.loading
+            || !cfg!(target_os = "linux")
+            || !matches!(&self.connection, ConnectionState::Connected)
+        {
             return;
         }
-        let Some(operation) = self.pending_volume_read.take() else {
-            return;
-        };
-        if self.page != images::AppPage::Volumes
+        let generation = self.networks.begin_list();
+        self.pending_resource_read = Some(PendingResourceRead::NetworkList { generation });
+        self.start_pending_resource_read(context);
+    }
+    fn inspect_network(&mut self, id: String, context: egui::Context) {
+        if !cfg!(target_os = "linux")
             || self.loading
             || !matches!(&self.connection, ConnectionState::Connected)
         {
+            return;
+        }
+        let (generation, inspection_generation, id) = self.networks.begin_inspection(id);
+        self.pending_resource_read = Some(PendingResourceRead::NetworkInspect {
+            generation,
+            inspection_generation,
+            id,
+        });
+        self.start_pending_resource_read(context);
+    }
+    fn start_pending_resource_read(&mut self, context: egui::Context) {
+        if self.resource_read_task.is_some() {
+            return;
+        }
+        let Some(operation) = self.pending_resource_read.take() else {
+            return;
+        };
+        if self.loading || !matches!(&self.connection, ConnectionState::Connected) {
             return;
         }
         let Some(engine) = self.engine.clone() else {
@@ -1122,8 +1172,11 @@ impl FerrumApp {
         };
         let sender = self.sender.clone();
         match operation {
-            PendingVolumeRead::List { generation } if generation == self.volumes.generation => {
-                self.volume_list_task = Some(self.runtime.spawn(async move {
+            PendingResourceRead::VolumeList { generation }
+                if self.page == images::AppPage::Volumes
+                    && generation == self.volumes.generation =>
+            {
+                self.resource_read_task = Some(self.runtime.spawn(async move {
                     let result = engine.list_volumes().await;
                     if sender
                         .send(EngineEvent::VolumesListed { generation, result })
@@ -1134,20 +1187,60 @@ impl FerrumApp {
                     }
                 }));
             }
-            PendingVolumeRead::Inspect {
+            PendingResourceRead::VolumeInspect {
                 generation,
                 inspection_generation,
                 name,
-            } if generation == self.volumes.generation
+            } if self.page == images::AppPage::Volumes
+                && generation == self.volumes.generation
                 && inspection_generation == self.volumes.inspection_generation =>
             {
-                self.volume_inspection_task = Some(self.runtime.spawn(async move {
+                self.resource_read_task = Some(self.runtime.spawn(async move {
                     let result = engine.inspect_volume(&name).await;
                     if sender
                         .send(EngineEvent::VolumeInspected {
                             generation,
                             inspection_generation,
                             name,
+                            result,
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        context.request_repaint();
+                    }
+                }));
+            }
+            PendingResourceRead::NetworkList { generation }
+                if self.page == images::AppPage::Networks
+                    && generation == self.networks.generation =>
+            {
+                self.resource_read_task = Some(self.runtime.spawn(async move {
+                    let result = engine.list_networks().await;
+                    if sender
+                        .send(EngineEvent::NetworksListed { generation, result })
+                        .await
+                        .is_ok()
+                    {
+                        context.request_repaint();
+                    }
+                }));
+            }
+            PendingResourceRead::NetworkInspect {
+                generation,
+                inspection_generation,
+                id,
+            } if self.page == images::AppPage::Networks
+                && generation == self.networks.generation
+                && inspection_generation == self.networks.inspection_generation =>
+            {
+                self.resource_read_task = Some(self.runtime.spawn(async move {
+                    let result = engine.inspect_network(&id).await;
+                    if sender
+                        .send(EngineEvent::NetworkInspected {
+                            generation,
+                            inspection_generation,
+                            id,
                             result,
                         })
                         .await
@@ -1369,11 +1462,17 @@ impl FerrumApp {
         if previous == images::AppPage::Volumes {
             self.invalidate_volumes();
         }
+        if previous == images::AppPage::Networks {
+            self.invalidate_networks();
+        }
         if page == images::AppPage::Images && !self.loading && self.engine.is_some() {
             self.load_images(context.clone());
         }
         if page == images::AppPage::Volumes && !self.loading && self.engine.is_some() {
-            self.load_volumes(context);
+            self.load_volumes(context.clone());
+        }
+        if page == images::AppPage::Networks && !self.loading && self.engine.is_some() {
+            self.load_networks(context);
         }
     }
 
@@ -1420,8 +1519,7 @@ impl FerrumApp {
         }
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
-        self.cancel_inspection();
-        self.invalidate_volumes();
+        self.invalidate_resource_reads();
         self.loading = true;
         self.context_error = None;
         let sender = self.sender.clone();
@@ -1458,6 +1556,14 @@ impl FerrumApp {
         if self.page == images::AppPage::Volumes {
             if self.engine.is_some() {
                 self.load_volumes(context);
+            } else {
+                self.connect(context);
+            }
+            return;
+        }
+        if self.page == images::AppPage::Networks {
+            if self.engine.is_some() {
+                self.load_networks(context);
             } else {
                 self.connect(context);
             }
@@ -1540,7 +1646,7 @@ impl FerrumApp {
                             #[cfg(target_os = "linux")]
                             self.cancel_terminal_session();
                             self.invalidate_images();
-                            self.invalidate_volumes();
+                            self.invalidate_resource_reads();
                             self.engine = None;
                             self.engine_info = None;
                             self.containers.clear();
@@ -1567,8 +1673,8 @@ impl FerrumApp {
                 EngineEvent::VolumesListed { generation, result } => {
                     self.volumes
                         .finish_list(generation, result.map_err(|error| error.to_string()));
-                    self.volume_list_task = None;
-                    self.start_pending_volume_read(context.clone());
+                    self.resource_read_task = None;
+                    self.start_pending_resource_read(context.clone());
                 }
                 EngineEvent::VolumeInspected {
                     generation,
@@ -1582,8 +1688,29 @@ impl FerrumApp {
                         &name,
                         result.map_err(|error| error.to_string()),
                     );
-                    self.volume_inspection_task = None;
-                    self.start_pending_volume_read(context.clone());
+                    self.resource_read_task = None;
+                    self.start_pending_resource_read(context.clone());
+                }
+                EngineEvent::NetworksListed { generation, result } => {
+                    self.networks
+                        .finish_list(generation, result.map_err(|error| error.to_string()));
+                    self.resource_read_task = None;
+                    self.start_pending_resource_read(context.clone());
+                }
+                EngineEvent::NetworkInspected {
+                    generation,
+                    inspection_generation,
+                    id,
+                    result,
+                } => {
+                    self.networks.finish_inspection(
+                        generation,
+                        inspection_generation,
+                        &id,
+                        result.map_err(|error| error.to_string()),
+                    );
+                    self.resource_read_task = None;
+                    self.start_pending_resource_read(context.clone());
                 }
                 EngineEvent::ImagesListed { generation, result } => {
                     if self.images.complete_load(generation, result) {
@@ -1824,7 +1951,7 @@ impl FerrumApp {
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
         self.cancel_inspection();
-        self.invalidate_volumes();
+        self.invalidate_resource_reads();
         if let Some(task) = self.action_task.take() {
             task.abort();
         }
@@ -1841,7 +1968,10 @@ impl FerrumApp {
             self.load_images(context.clone());
         }
         if self.page == images::AppPage::Volumes {
-            self.load_volumes(context);
+            self.load_volumes(context.clone());
+        }
+        if self.page == images::AppPage::Networks {
+            self.load_networks(context);
         }
     }
 
@@ -2132,6 +2262,43 @@ impl FerrumApp {
             ConnectionState::Connected => "",
         };
         self.volumes.show(ui, supported, message)
+    }
+    fn draw_networks(&mut self, ui: &mut egui::Ui) -> Option<String> {
+        if let Some(error) = &self.context_error {
+            ui.colored_label(Color32::from_rgb(224, 174, 109), "Context switch failed");
+            ui.label("The previous engine connection remains active.");
+            ui.label(error);
+            ui.add_space(10.0);
+        }
+        if self.loading {
+            ui.spinner();
+            ui.heading("Waiting for the engine context");
+            return self
+                .networks
+                .show(ui, false, "Context selection is in progress.");
+        }
+        if self.engine.is_some()
+            && cfg!(target_os = "linux")
+            && !self.networks.loading
+            && !self.networks.loaded
+        {
+            self.load_networks(ui.ctx().clone());
+        }
+        let supported = cfg!(target_os = "linux")
+            && self.engine.is_some()
+            && matches!(&self.connection, ConnectionState::Connected);
+        let message = match &self.connection {
+            ConnectionState::Connecting => "Connecting to the selected local engine.",
+            ConnectionState::Disconnected(message) => message.as_str(),
+            ConnectionState::Connected if self.engine.is_none() => {
+                "The engine connection is unavailable."
+            }
+            ConnectionState::Connected if !cfg!(target_os = "linux") => {
+                "Network access is implemented only on Linux for a local Docker Unix socket."
+            }
+            ConnectionState::Connected => "",
+        };
+        self.networks.show(ui, supported, message)
     }
     fn draw_images(&mut self, ui: &mut egui::Ui) -> Option<images::ImageInspectionRequest> {
         if let Some(error) = &self.context_error {
@@ -2997,11 +3164,8 @@ impl Drop for FerrumApp {
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
         self.cancel_image_read_tasks();
-        self.pending_volume_read = None;
-        if let Some(task) = self.volume_list_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.volume_inspection_task.take() {
+        self.pending_resource_read = None;
+        if let Some(task) = self.resource_read_task.take() {
             task.abort();
         }
         if let Some(task) = self.inspection_task.take() {
@@ -3056,12 +3220,14 @@ impl eframe::App for FerrumApp {
         let mut inspect_index = None;
         let mut image_inspection = None;
         let mut volume_selection = None;
+        let mut network_selection = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 18)))
             .show(ui, |ui| match self.page {
                 images::AppPage::Containers => inspect_index = self.draw_inventory(ui),
                 images::AppPage::Images => image_inspection = self.draw_images(ui),
                 images::AppPage::Volumes => volume_selection = self.draw_volumes(ui),
+                images::AppPage::Networks => network_selection = self.draw_networks(ui),
             });
         if let Some(index) = inspect_index {
             let container = &self.containers[index];
@@ -3074,6 +3240,9 @@ impl eframe::App for FerrumApp {
         }
         if let Some(name) = volume_selection {
             self.inspect_volume(name, context.clone());
+        }
+        if let Some(id) = network_selection {
+            self.inspect_network(id, context.clone());
         }
         self.draw_inspection(context.clone());
         self.draw_settings(context.clone());
@@ -3091,6 +3260,7 @@ impl eframe::App for FerrumApp {
                     || self.images.is_removing()
                     || self.image_remove_task.is_some()))
             || (self.page == images::AppPage::Volumes && self.volumes.is_loading())
+            || (self.page == images::AppPage::Networks && self.networks.is_loading())
         {
             context.request_repaint_after(Duration::from_millis(250));
         }
@@ -3478,9 +3648,9 @@ mod event_reconciliation_tests {
             page: images::AppPage::default(),
             images: images::ImagesView::default(),
             volumes: volumes::VolumesView::default(),
-            volume_list_task: None,
-            volume_inspection_task: None,
-            pending_volume_read: None,
+            networks: networks::NetworksView::default(),
+            resource_read_task: None,
+            pending_resource_read: None,
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
@@ -4606,11 +4776,23 @@ mod event_reconciliation_tests {
 
         assert!(app.loading);
         assert!(app.engine.is_none());
-        assert!(app.volume_list_task.is_none());
+        assert!(app.resource_read_task.is_none());
+    }
+    #[test]
+    fn refreshing_disconnected_networks_retries_engine_connection() {
+        let (mut app, _) = app_with_open_inspection();
+        app.page = images::AppPage::Networks;
+        app.connection = ConnectionState::Disconnected("offline".to_owned());
+
+        app.refresh(egui::Context::default());
+
+        assert!(app.loading);
+        assert!(app.engine.is_none());
+        assert!(app.resource_read_task.is_none());
     }
 
     #[test]
-    fn volume_reads_keep_one_active_task_and_only_latest_pending_read_survives() {
+    fn volume_and_network_reads_share_one_active_task_and_latest_pending_read() {
         let (mut app, sender) = app_with_open_inspection();
         app.page = images::AppPage::Volumes;
         let active_generation = app.volumes.begin_list();
@@ -4632,33 +4814,44 @@ mod event_reconciliation_tests {
             .block_on(started_receiver)
             .expect("fake volume list task should start");
         let abort = task.abort_handle();
-        app.volume_list_task = Some(task);
+        app.resource_read_task = Some(task);
 
         app.load_volumes(egui::Context::default());
         let list_generation = app.volumes.generation;
         assert!(matches!(
-            &app.pending_volume_read,
-            Some(PendingVolumeRead::List { generation }) if *generation == list_generation
+            &app.pending_resource_read,
+            Some(PendingResourceRead::VolumeList { generation }) if *generation == list_generation
         ));
-        assert!(app.volume_list_task.is_some());
-
-        app.inspect_volume("older".to_owned(), egui::Context::default());
+        assert!(app.resource_read_task.is_some());
         app.inspect_volume("latest".to_owned(), egui::Context::default());
         assert!(matches!(
-            &app.pending_volume_read,
-            Some(PendingVolumeRead::Inspect { name, .. }) if name == "latest"
+            &app.pending_resource_read,
+            Some(PendingResourceRead::VolumeInspect { name, .. }) if name == "latest"
         ));
-        assert!(app.volume_list_task.is_some());
+        assert!(app.resource_read_task.is_some());
+        app.page = images::AppPage::Networks;
+        app.load_networks(egui::Context::default());
+        assert!(matches!(
+            &app.pending_resource_read,
+            Some(PendingResourceRead::NetworkList { .. })
+        ));
+        app.inspect_network("older".to_owned(), egui::Context::default());
+        app.inspect_network("latest-network".to_owned(), egui::Context::default());
+        assert!(matches!(
+            &app.pending_resource_read,
+            Some(PendingResourceRead::NetworkInspect { id, .. }) if id == "latest-network"
+        ));
+        assert!(app.resource_read_task.is_some());
 
         app.set_page(images::AppPage::Images, egui::Context::default());
-        assert!(app.pending_volume_read.is_none());
-        assert!(app.volume_list_task.is_some());
+        assert!(app.pending_resource_read.is_none());
+        assert!(app.resource_read_task.is_some());
         assert!(!abort.is_finished(), "invalidation must retain active read");
 
         assert!(release_sender.send(()).is_ok());
         app.runtime.block_on(tokio::task::yield_now());
         app.receive_events(egui::Context::default());
-        assert!(app.volume_list_task.is_none());
+        assert!(app.resource_read_task.is_none());
         assert!(!app.volumes.loaded, "stale page result must not render");
     }
 
