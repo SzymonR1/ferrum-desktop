@@ -112,17 +112,13 @@ impl VolumesView {
         match result {
             VolumeInspectionResult::Inspected {
                 details,
-                usage_result: Ok(usage),
+                usage_result,
             } => {
                 self.details = Some(details);
-                self.usage = usage;
-            }
-            VolumeInspectionResult::Inspected {
-                details,
-                usage_result: Err(error),
-            } => {
-                self.details = Some(details);
-                self.usage_error = Some(error);
+                match usage_result {
+                    Ok(usage) => self.usage = usage,
+                    Err(error) => self.usage_error = Some(error),
+                }
             }
             VolumeInspectionResult::InspectionFailed(error) => {
                 self.detail_error = Some(error);
