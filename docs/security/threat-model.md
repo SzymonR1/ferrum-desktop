@@ -25,6 +25,10 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 - Keep the experimental embedded terminal restricted to the selected local Docker-compatible Unix socket on Linux and the negotiated API version. Terminal output is untrusted; ignore OSC 52 clipboard and title requests, expose clipboard actions only to explicit user controls, and never put terminal bytes or daemon bodies in logs or errors. Closing the exec session closes its connection only; it does not stop or remove the container.
 - Persist only the schema version and startup auto-connect boolean; reject unknown fields, bound input size, and keep config files/private temporary files owner-only.
 - Do not include configuration paths or contents in settings errors or logs. Corrupt settings fall back to defaults and are not overwritten until explicit user save.
+- Open settings files with Unix `O_NOFOLLOW` and `O_NONBLOCK` flags, verify the
+  opened descriptor is a regular file before changing permissions, and reject
+  final-component symlinks or non-regular files. Parent path components still
+  follow the configured XDG/HOME path.
 
 ## Deferred attack surfaces
 
