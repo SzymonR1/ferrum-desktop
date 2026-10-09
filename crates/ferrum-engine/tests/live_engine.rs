@@ -18,6 +18,49 @@ use ferrum_engine::{ContextTransport, DockerContext, EngineClient};
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[ignore = "requires a current local Docker context and a preinstalled FERRUM_TEST_IMAGE"]
+async fn local_engine_lists_and_inspects_preinstalled_image_read_only() {
+    let image_reference = std::env::var("FERRUM_TEST_IMAGE")
+        .expect("set FERRUM_TEST_IMAGE to an image already installed locally");
+    let image_reference = image_reference.trim();
+    assert!(
+        valid_test_image_reference(image_reference),
+        "FERRUM_TEST_IMAGE must be a valid image reference, not a Docker CLI option"
+    );
+
+    let contexts = EngineClient::available_contexts()
+        .await
+        .expect("Docker CLI context discovery should succeed");
+    let context = contexts
+        .iter()
+        .find(|context| context.is_current())
+        .expect("Docker CLI should report its current context");
+    assert_eq!(
+        context.transport(),
+        ContextTransport::LocalUnix,
+        "the image test requires a local Unix Docker context"
+    );
+    let context_name = context.name().to_owned();
+    let engine = EngineClient::connect_context(&context_name)
+        .await
+        .expect("the current local Docker context should connect");
+
+    let images = engine
+        .list_images()
+        .await
+        .expect("the engine should return its installed images");
+    let details = engine
+        .inspect_image(image_reference)
+        .await
+        .expect("the preinstalled FERRUM_TEST_IMAGE should be inspectable");
+    assert!(
+        images.iter().any(|image| image.id == details.id),
+        "the inspected image should be present in the listed local image inventory"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 #[ignore = "requires the current local Docker context and FERRUM_TEST_IMAGE already present locally with /bin/sh and /bin/sleep"]
 async fn local_engine_logs_stream_history_follow_and_cancel() {
     let image = std::env::var("FERRUM_TEST_IMAGE").expect(

@@ -20,6 +20,15 @@ event updates use bounded delivery and report when synchronization is
 unavailable, while manual refresh remains available. Logs are plain text,
 bounded in memory, and stream only from the selected local Unix socket.
 
+The **Images** page provides read-only image listing and inspection through a
+local Docker Unix socket on Linux. Pull, tag, remove, build, push, and registry
+authentication are not offered; Podman/rootless and remote image endpoints
+remain unsupported or unvalidated. Image operations remain tracked by
+[issue #16](https://github.com/SzymonR1/ferrum-desktop/issues/16), and broader
+engine endpoint validation remains tracked by the still-open
+[issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10). See the
+[Images guide](docs/src/user-guide/images.md) for scope and limitations.
+
 An X11-backend screenshot captured via XWayland showed actual container names,
 images, states, and statuses. A no-engine X11 launch showed a connection error
 rather than an empty list. The default app launch on this Wayland-configured
@@ -63,6 +72,9 @@ A read-only live-engine inventory test uses this exact filter:
 cargo test -p ferrum-engine --test live_engine local_engine_returns_a_well_formed_container_inventory -- --exact --ignored
 ```
 It reads version and inventory and may inspect one existing container; it does not mutate resources.
+The ignored local image list/inspect smoke test is read-only and requires
+`FERRUM_TEST_IMAGE` to name an image already installed locally; it does not pull
+or modify images. See the testing guide for its exact command.
 
 An ignored lifecycle integration test is mutating; see the testing guide for its exact command and prerequisites. It requires a locally present `FERRUM_TEST_IMAGE` containing `/bin/sleep`; tests do not pull images and clean up only the created container by its returned full ID.
 
