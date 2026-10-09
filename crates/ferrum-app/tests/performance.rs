@@ -68,7 +68,7 @@ fn process_sample(pid: u32) -> io::Result<(u64, u64)> {
     Ok((rss_kib, user_ticks + system_ticks))
 }
 
-fn forward_log_lines<R>(reader: R, sender: mpsc::Sender<String>) -> thread::JoinHandle<()>
+fn forward_log_lines<R>(reader: R, sender: mpsc::SyncSender<String>) -> thread::JoinHandle<()>
 where
     R: io::Read + Send + 'static,
 {
@@ -76,12 +76,22 @@ where
         for line in BufReader::new(reader).lines() {
             match line {
                 Ok(line) => {
-                    if sender.send(line).is_err() {
+                    // Drop excess diagnostics rather than block the app; preserve readiness.
+                    let is_inventory = line.contains("Loaded local container inventory");
+                    let result = if is_inventory {
+                        sender.send(line).map_err(|_| ())
+                    } else {
+                        match sender.try_send(line) {
+                            Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
+                            Err(mpsc::TrySendError::Disconnected(_)) => Err(()),
+                        }
+                    };
+                    if result.is_err() {
                         break;
                     }
                 }
                 Err(error) => {
-                    let _ = sender.send(format!("log reader failed: {error}"));
+                    let _ = sender.try_send(format!("log reader failed: {error}"));
                     break;
                 }
             }
@@ -97,21 +107,19 @@ fn measures_release_launch_inventory_memory_and_idle_cpu() {
         "an active X11 display is required"
     );
 
-    let launch_started = Instant::now();
     let config_home = ConfigHome::new();
-    let mut child = AppProcess(
-        Command::new(env!("CARGO_BIN_EXE_ferrum"))
-            .env("WINIT_UNIX_BACKEND", "x11")
-            .env("XDG_CONFIG_HOME", &config_home.0)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start the Ferrum release binary"),
-    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ferrum"));
+    command
+        .env("WINIT_UNIX_BACKEND", "x11")
+        .env("XDG_CONFIG_HOME", &config_home.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let launch_started = Instant::now();
+    let mut child = AppProcess(command.spawn().expect("start the Ferrum release binary"));
     let pid = child.0.id();
     let stdout = child.0.stdout.take().expect("stdout was piped");
     let stderr = child.0.stderr.take().expect("stderr was piped");
-    let (line_sender, line_receiver) = mpsc::channel();
+    let (line_sender, line_receiver) = mpsc::sync_channel(64);
     let stdout_reader = forward_log_lines(stdout, line_sender.clone());
     let stderr_reader = forward_log_lines(stderr, line_sender);
 
