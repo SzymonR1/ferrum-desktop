@@ -3,6 +3,19 @@ use eframe::egui;
 use ferrum_core::{NetworkDetails, NetworkSummary};
 
 const ROW_HEIGHT: f32 = 34.0;
+const MAX_NETWORK_NAME_BYTES: usize = 255;
+
+pub(super) enum NetworksAction {
+    Inspect(String),
+    Create { generation: u64, name: String },
+}
+
+fn valid_network_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NETWORK_NAME_BYTES
+        && !name.trim().is_empty()
+        && !name.chars().any(char::is_control)
+}
 
 fn bool_label(value: Option<bool>) -> Option<&'static str> {
     value.map(|value| if value { "Yes" } else { "No" })
@@ -17,6 +30,11 @@ pub(super) struct NetworksView {
     selected: Option<String>,
     details: Option<NetworkDetails>,
     attached_container_count_display: Option<String>,
+    create_name: String,
+    create_generation: u64,
+    creating: bool,
+    create_success: Option<String>,
+    create_error: Option<String>,
     pub(super) loading: bool,
     pub(super) loaded: bool,
     inspecting: bool,
@@ -30,6 +48,7 @@ impl NetworksView {
     pub(super) fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.inspection_generation = self.inspection_generation.wrapping_add(1);
+        self.create_generation = self.create_generation.wrapping_add(1);
         self.networks.clear();
         self.visible.clear();
         self.selected = None;
@@ -38,6 +57,9 @@ impl NetworksView {
         self.loading = false;
         self.loaded = false;
         self.inspecting = false;
+        self.creating = false;
+        self.create_success = None;
+        self.create_error = None;
         self.error = None;
         self.detail_error = None;
     }
@@ -82,6 +104,59 @@ impl NetworksView {
         }
     }
 
+    fn begin_create(&mut self) -> Option<NetworksAction> {
+        if self.creating || !valid_network_name(&self.create_name) {
+            return None;
+        }
+        self.create_generation = self.create_generation.wrapping_add(1);
+        self.creating = true;
+        self.create_success = None;
+        self.create_error = None;
+        Some(NetworksAction::Create {
+            generation: self.create_generation,
+            name: self.create_name.clone(),
+        })
+    }
+
+    pub(super) fn finish_create(
+        &mut self,
+        generation: u64,
+        name: &str,
+        result: Result<(), String>,
+    ) -> bool {
+        if generation != self.create_generation || !self.creating {
+            return false;
+        }
+        self.creating = false;
+        match result {
+            Ok(()) => {
+                self.create_success = Some(name.to_owned());
+                self.create_error = None;
+                if self.create_name == name {
+                    self.create_name.clear();
+                }
+            }
+            Err(error) => {
+                self.create_success = None;
+                self.create_error = Some(error);
+            }
+        }
+        true
+    }
+
+    pub(super) fn mark_list_stale(&mut self) {
+        self.loading = false;
+        self.loaded = false;
+        self.networks.clear();
+        self.visible.clear();
+        self.selected = None;
+        self.details = None;
+        self.attached_container_count_display = None;
+        self.inspecting = false;
+        self.error = None;
+        self.detail_error = None;
+    }
+
     pub(super) fn begin_inspection(&mut self, id: String) -> (u64, u64, String) {
         self.inspection_generation = self.inspection_generation.wrapping_add(1);
         self.selected = Some(id.clone());
@@ -120,7 +195,7 @@ impl NetworksView {
     }
 
     pub(super) fn is_loading(&self) -> bool {
-        self.loading || self.inspecting
+        self.loading || self.inspecting || self.creating
     }
 
     fn rebuild_visible(&mut self) {
@@ -142,15 +217,55 @@ impl NetworksView {
         ui: &mut egui::Ui,
         supported: bool,
         connection_message: &str,
-    ) -> Option<String> {
+        create_in_flight: bool,
+    ) -> Option<NetworksAction> {
         ui.heading("Networks");
-        ui.label("Read-only inventory for the selected local Docker Unix socket on Linux.");
-        ui.label("Network create, remove, connect, and disconnect operations are not offered.");
+        ui.label(
+            "Inventory and default bridge network creation for the selected local Docker Unix socket on Linux.",
+        );
+        ui.label("Network removal, connect, and disconnect operations are not offered.");
         if !supported {
             ui.label("Networks require a connected local Docker Unix socket on Linux.");
             ui.label(connection_message);
             return None;
         }
+        let mut action = None;
+        ui.group(|ui| {
+            ui.heading("Create default bridge network");
+            let operation_in_flight = create_in_flight || self.creating;
+            if operation_in_flight {
+                ui.spinner();
+                ui.label("Creating network…");
+            }
+            if let Some(name) = &self.create_success {
+                ui.label(format!("Network '{name}' created."));
+            }
+            if let Some(error) = &self.create_error {
+                ui.colored_label(egui::Color32::LIGHT_RED, "Could not create network:");
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+            let name_label = ui.label("Network name");
+            ui.add_enabled(
+                !operation_in_flight,
+                egui::TextEdit::singleline(&mut self.create_name),
+            )
+            .labelled_by(name_label.id);
+            let name_is_valid = valid_network_name(&self.create_name);
+            if !self.create_name.is_empty() && !name_is_valid {
+                ui.label(
+                    "Enter a non-whitespace network name up to 255 UTF-8 bytes with no control characters.",
+                );
+            }
+            if ui
+                .add_enabled(
+                    name_is_valid && !operation_in_flight,
+                    egui::Button::new("Create network"),
+                )
+                .clicked()
+            {
+                action = self.begin_create();
+            }
+        });
         let search_label = ui.label("Search networks");
         let search = ui.text_edit_singleline(&mut self.query);
         if search.labelled_by(search_label.id).changed() {
@@ -217,7 +332,7 @@ impl NetworksView {
                 self.attached_container_count_display.as_deref(),
             );
         }
-        selected
+        action.or_else(|| selected.map(NetworksAction::Inspect))
     }
 }
 
@@ -225,7 +340,10 @@ impl NetworksView {
 mod tests {
     use super::*;
     use egui::accesskit::Role;
-    use egui_kittest::{Harness, kittest::Queryable};
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT, Queryable},
+    };
 
     fn summary(id: &str, name: &str) -> NetworkSummary {
         NetworkSummary {
@@ -257,12 +375,157 @@ mod tests {
     fn harness_for(view: NetworksView, supported: bool) -> Harness<'static, NetworksView> {
         Harness::new_ui_state(
             move |ui, view: &mut NetworksView| {
-                if let Some(id) = view.show(ui, supported, "offline") {
+                if let Some(NetworksAction::Inspect(id)) =
+                    view.show(ui, supported, "offline", false)
+                {
                     view.begin_inspection(id);
                 }
             },
             view,
         )
+    }
+
+    #[test]
+    fn accessible_create_network_name_validation_disables_invalid_names() {
+        let mut empty = harness_for(NetworksView::default(), true);
+        empty.run();
+        assert!(
+            empty
+                .get_by_role_and_label(Role::Button, "Create network")
+                .accesskit_node()
+                .is_disabled()
+        );
+
+        let too_long = "n".repeat(MAX_NETWORK_NAME_BYTES + 1);
+        let mut invalid = harness_for(NetworksView::default(), true);
+        invalid.run();
+        invalid
+            .get_by_role_and_label(Role::TextInput, "Network name")
+            .focus();
+        invalid.run();
+        invalid
+            .get_by_role_and_label(Role::TextInput, "Network name")
+            .type_text(&too_long);
+        invalid.run();
+        let _invalid_help = invalid.get_by_role_and_label(
+            Role::Label,
+            "Enter a non-whitespace network name up to 255 UTF-8 bytes with no control characters.",
+        );
+        assert!(
+            invalid
+                .get_by_role_and_label(Role::Button, "Create network")
+                .accesskit_node()
+                .is_disabled()
+        );
+
+        let mut valid = harness_for(NetworksView::default(), true);
+        valid.run();
+        valid
+            .get_by_role_and_label(Role::TextInput, "Network name")
+            .focus();
+        valid.run();
+        valid
+            .get_by_role_and_label(Role::TextInput, "Network name")
+            .type_text("work^net");
+        valid.run();
+        assert!(
+            !valid
+                .get_by_role_and_label(Role::Button, "Create network")
+                .accesskit_node()
+                .is_disabled()
+        );
+        let maximum_name = "n".repeat(MAX_NETWORK_NAME_BYTES);
+        let mut maximum = harness_for(NetworksView::default(), true);
+        maximum.run();
+        maximum
+            .get_by_role_and_label(Role::TextInput, "Network name")
+            .focus();
+        maximum.run();
+        maximum
+            .get_by_role_and_label(Role::TextInput, "Network name")
+            .type_text(&maximum_name);
+        maximum.run();
+        assert!(
+            !maximum
+                .get_by_role_and_label(Role::Button, "Create network")
+                .accesskit_node()
+                .is_disabled()
+        );
+    }
+
+    #[test]
+    fn network_creation_is_single_flight_and_rejects_stale_results() {
+        let mut view = NetworksView {
+            create_name: "work-net".to_owned(),
+            ..NetworksView::default()
+        };
+        let (generation, name) = match view.begin_create() {
+            Some(NetworksAction::Create { generation, name }) => (generation, name),
+            _ => panic!("valid network name should begin creation"),
+        };
+        assert!(view.begin_create().is_none());
+
+        let mut harness = Harness::new_ui_state(
+            |ui, view: &mut NetworksView| {
+                let _ = view.show(ui, true, "", true);
+            },
+            view,
+        );
+        harness.step();
+        assert!(harness.state().creating);
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, "Create network")
+                .accesskit_node()
+                .is_disabled()
+        );
+
+        harness.state_mut().invalidate();
+        assert!(!harness.state_mut().finish_create(generation, &name, Ok(())));
+        let current_generation = harness.state().create_generation;
+        assert!(
+            !harness
+                .state_mut()
+                .finish_create(current_generation, "not-started", Ok(()))
+        );
+        assert!(harness.state().create_success.is_none());
+    }
+
+    #[test]
+    fn successful_network_creation_is_announced_accessibly() {
+        let mut view = NetworksView {
+            create_name: "new-bridge".to_owned(),
+            ..NetworksView::default()
+        };
+        let (generation, name) = match view.begin_create() {
+            Some(NetworksAction::Create { generation, name }) => (generation, name),
+            _ => panic!("valid network name should begin creation"),
+        };
+        assert!(view.finish_create(generation, &name, Ok(())));
+
+        let mut harness = harness_for(view, true);
+        harness.run();
+        let _success = harness.get_by_role_and_label(Role::Label, "Network 'new-bridge' created.");
+    }
+
+    #[test]
+    fn failed_network_creation_is_announced_and_keeps_name_for_retry() {
+        let mut view = NetworksView {
+            create_name: "work-net".to_owned(),
+            ..NetworksView::default()
+        };
+        let (generation, name) = match view.begin_create() {
+            Some(NetworksAction::Create { generation, name }) => (generation, name),
+            _ => panic!("valid network name should begin creation"),
+        };
+        let message = "Network creation was rejected at the test endpoint (HTTP 409).";
+        assert!(view.finish_create(generation, &name, Err(message.to_owned())));
+
+        let mut harness = harness_for(view, true);
+        harness.run();
+        let _title = harness.get_by_role_and_label(Role::Label, "Could not create network:");
+        let _message = harness.get_by_role_and_label(Role::Label, message);
+        assert_eq!(harness.state().create_name, "work-net");
     }
 
     #[test]

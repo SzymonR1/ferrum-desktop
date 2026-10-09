@@ -13,7 +13,7 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-use ferrum_core::{ContainerAction, ContainerState};
+use ferrum_core::{ContainerAction, ContainerState, NetworkSummary};
 use ferrum_engine::{ContextTransport, DockerContext, EngineClient};
 
 /// Read-only opt-in check: inspects only a caller-specified existing volume.
@@ -75,6 +75,71 @@ async fn local_engine_lists_and_inspects_existing_network_read_only() {
     assert_eq!(details.id, listed.id);
     assert_eq!(details.name, name);
     let _: Option<usize> = details.attached_container_count;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "creates and removes one unique test-owned network through the current local Docker context"]
+async fn local_engine_creates_default_bridge_network_and_cleans_up_exact_id() {
+    let contexts = EngineClient::available_contexts()
+        .await
+        .expect("Docker CLI context discovery should succeed");
+    let context = contexts
+        .iter()
+        .find(|context| context.is_current())
+        .expect("Docker CLI should report its current context");
+    assert_eq!(
+        context.transport(),
+        ContextTransport::LocalUnix,
+        "network creation requires the current local Unix Docker context"
+    );
+    let context_name = context.name().to_owned();
+    let engine = EngineClient::connect_context(&context_name)
+        .await
+        .expect("the current local Docker context should connect");
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after the Unix epoch")
+        .as_nanos();
+    let sequence = NEXT_NETWORK_NAME.fetch_add(1, Ordering::Relaxed);
+    let name = format!(
+        "ferrum-live-network-{}-{timestamp}-{sequence}",
+        std::process::id()
+    );
+    let existing_networks = engine
+        .list_networks()
+        .await
+        .expect("the local network inventory should be readable before creation");
+    assert!(
+        network_name_is_available(&name, &existing_networks),
+        "the generated test network name must not already exist"
+    );
+
+    let returned_id = engine
+        .create_network(&name)
+        .await
+        .expect("the unique test-owned network should be created");
+    let created_networks = engine
+        .list_networks()
+        .await
+        .expect("the local network inventory should be readable after creation");
+    let (created, verified_id) = verify_created_network(&returned_id, &name, &created_networks)
+        .expect("the exact returned ID must identify the generated network name");
+    let mut network = DisposableNetwork::new(verified_id, context_name);
+
+    assert_eq!(created.driver.as_deref(), Some("bridge"));
+
+    network.remove_exact_id();
+    let remaining = engine
+        .list_networks()
+        .await
+        .expect("the local network inventory should be readable after cleanup");
+    assert!(
+        !remaining.iter().any(|listed| listed.id == network.id()),
+        "the test-owned network should be absent after exact-ID cleanup"
+    );
+    network.disarm();
 }
 
 #[cfg(target_os = "linux")]
@@ -593,6 +658,8 @@ async fn assert_context_connects_and_returns_a_valid_inventory(context: &DockerC
 
 #[cfg(target_os = "linux")]
 static NEXT_CONTAINER_NAME: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static NEXT_NETWORK_NAME: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
@@ -795,12 +862,12 @@ impl DisposableContainer {
     }
 
     fn id_for_cleanup(&self) -> Option<String> {
-        if is_full_container_id(&self.id) {
+        if is_full_docker_resource_id(&self.id) {
             return Some(self.id.clone());
         }
         let id = std::fs::read_to_string(self.cid_directory.cid_file()).ok()?;
         let id = id.trim();
-        is_full_container_id(id).then(|| id.to_owned())
+        is_full_docker_resource_id(id).then(|| id.to_owned())
     }
 
     fn id(&self) -> &str {
@@ -838,7 +905,130 @@ impl Drop for DisposableContainer {
 }
 
 #[cfg(target_os = "linux")]
-fn is_full_container_id(id: &str) -> bool {
+struct DisposableNetwork {
+    id: VerifiedNetworkId,
+    context_name: String,
+    cleanup_required: bool,
+}
+
+#[cfg(target_os = "linux")]
+struct VerifiedNetworkId(String);
+
+#[cfg(target_os = "linux")]
+impl VerifiedNetworkId {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl DisposableNetwork {
+    fn new(id: VerifiedNetworkId, context_name: String) -> Self {
+        Self {
+            id,
+            context_name,
+            cleanup_required: true,
+        }
+    }
+
+    fn id(&self) -> &str {
+        self.id.as_str()
+    }
+
+    fn remove_exact_id(&self) {
+        let output = Command::new("docker")
+            .args([
+                "--context",
+                self.context_name.as_str(),
+                "network",
+                "rm",
+                self.id.as_str(),
+            ])
+            .output()
+            .expect("Docker CLI should be available to clean up the exact network ID");
+        assert!(output.status.success(), "exact-ID network cleanup failed");
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup_required = false;
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DisposableNetwork {
+    fn drop(&mut self) {
+        if self.cleanup_required {
+            let _ = Command::new("docker")
+                .args([
+                    "--context",
+                    self.context_name.as_str(),
+                    "network",
+                    "rm",
+                    self.id.as_str(),
+                ])
+                .output();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn network_name_is_available(name: &str, networks: &[NetworkSummary]) -> bool {
+    !networks.iter().any(|network| network.name == name)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_created_network<'a>(
+    returned_id: &str,
+    requested_name: &str,
+    networks: &'a [NetworkSummary],
+) -> Option<(&'a NetworkSummary, VerifiedNetworkId)> {
+    if !is_full_docker_resource_id(returned_id) {
+        return None;
+    }
+    networks
+        .iter()
+        .find(|network| network.id == returned_id && network.name == requested_name)
+        .map(|network| (network, VerifiedNetworkId(returned_id.to_owned())))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_network_cleanup_requires_an_unused_name_and_verified_id() {
+    let network = |id: &str, name: &str| NetworkSummary {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        driver: None,
+        scope: None,
+        created_at: None,
+        internal: None,
+        attachable: None,
+        enable_ipv4: None,
+        enable_ipv6: None,
+    };
+    let id = "a".repeat(64);
+    let name = "ferrum-live-network-123";
+
+    assert!(network_name_is_available(
+        name,
+        &[network("another-id", "another-name")]
+    ));
+    assert!(!network_name_is_available(
+        name,
+        &[network("existing-id", name)]
+    ));
+    let exact_inventory = [network(&id, name)];
+    let verified = verify_created_network(&id, name, &exact_inventory);
+    assert_eq!(
+        verified.as_ref().map(|(_, verified)| verified.as_str()),
+        Some(id.as_str())
+    );
+    assert!(verify_created_network(&id, name, &[network(&id, "different-name")]).is_none());
+    assert!(verify_created_network("short-id", name, &[network("short-id", name)]).is_none());
+    let non_hex = "g".repeat(64);
+    assert!(verify_created_network(&non_hex, name, &[network(&non_hex, name)]).is_none());
+}
+#[cfg(target_os = "linux")]
+fn is_full_docker_resource_id(id: &str) -> bool {
     id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 

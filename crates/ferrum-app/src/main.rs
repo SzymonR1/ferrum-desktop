@@ -136,6 +136,11 @@ enum EngineEvent {
         generation: u64,
         result: Result<Vec<NetworkSummary>, EngineError>,
     },
+    NetworkCreated {
+        generation: u64,
+        name: String,
+        result: Result<String, EngineError>,
+    },
     NetworkInspected {
         generation: u64,
         inspection_generation: u64,
@@ -742,6 +747,9 @@ struct FerrumApp {
     images: images::ImagesView,
     volumes: volumes::VolumesView,
     networks: networks::NetworksView,
+    // Keep a submitted network create alive across page invalidation; Docker may
+    // already have accepted the mutation and its success should refresh inventory.
+    network_create_task: Option<JoinHandle<()>>,
     resource_read_task: Option<JoinHandle<()>>,
     pending_resource_read: Option<PendingResourceRead>,
     image_list_task: Option<JoinHandle<()>>,
@@ -924,6 +932,7 @@ impl FerrumApp {
             images: images::ImagesView::default(),
             volumes: volumes::VolumesView::default(),
             networks: networks::NetworksView::default(),
+            network_create_task: None,
             resource_read_task: None,
             pending_resource_read: None,
             image_list_task: None,
@@ -1142,6 +1151,34 @@ impl FerrumApp {
         self.pending_resource_read = Some(PendingResourceRead::NetworkList { generation });
         self.start_pending_resource_read(context);
     }
+    fn start_network_create(&mut self, generation: u64, name: String, context: egui::Context) {
+        if self.network_create_task.is_some()
+            || self.loading
+            || !cfg!(target_os = "linux")
+            || !matches!(&self.connection, ConnectionState::Connected)
+        {
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        let sender = self.sender.clone();
+        self.network_create_task = Some(self.runtime.spawn(async move {
+            let result = engine.create_network(&name).await;
+            if sender
+                .send(EngineEvent::NetworkCreated {
+                    generation,
+                    name,
+                    result,
+                })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
+
     fn inspect_network(&mut self, id: String, context: egui::Context) {
         if !cfg!(target_os = "linux")
             || self.loading
@@ -1514,7 +1551,7 @@ impl FerrumApp {
         });
     }
     fn switch_context(&mut self, selected: Option<String>, context: egui::Context) {
-        if self.loading || self.action_busy() {
+        if self.loading || self.action_busy() || self.network_create_task.is_some() {
             return;
         }
         #[cfg(target_os = "linux")]
@@ -1696,6 +1733,23 @@ impl FerrumApp {
                         .finish_list(generation, result.map_err(|error| error.to_string()));
                     self.resource_read_task = None;
                     self.start_pending_resource_read(context.clone());
+                }
+                EngineEvent::NetworkCreated {
+                    generation,
+                    name,
+                    result,
+                } => {
+                    let succeeded = result.is_ok();
+                    self.networks.finish_create(
+                        generation,
+                        &name,
+                        result.map(|_| ()).map_err(|error| error.to_string()),
+                    );
+                    self.network_create_task = None;
+                    if succeeded && self.page == images::AppPage::Networks {
+                        self.networks.mark_list_stale();
+                        self.load_networks(context.clone());
+                    }
                 }
                 EngineEvent::NetworkInspected {
                     generation,
@@ -2263,7 +2317,7 @@ impl FerrumApp {
         };
         self.volumes.show(ui, supported, message)
     }
-    fn draw_networks(&mut self, ui: &mut egui::Ui) -> Option<String> {
+    fn draw_networks(&mut self, ui: &mut egui::Ui) -> Option<networks::NetworksAction> {
         if let Some(error) = &self.context_error {
             ui.colored_label(Color32::from_rgb(224, 174, 109), "Context switch failed");
             ui.label("The previous engine connection remains active.");
@@ -2273,9 +2327,12 @@ impl FerrumApp {
         if self.loading {
             ui.spinner();
             ui.heading("Waiting for the engine context");
-            return self
-                .networks
-                .show(ui, false, "Context selection is in progress.");
+            return self.networks.show(
+                ui,
+                false,
+                "Context selection is in progress.",
+                self.network_create_task.is_some(),
+            );
         }
         if self.engine.is_some()
             && cfg!(target_os = "linux")
@@ -2298,7 +2355,8 @@ impl FerrumApp {
             }
             ConnectionState::Connected => "",
         };
-        self.networks.show(ui, supported, message)
+        self.networks
+            .show(ui, supported, message, self.network_create_task.is_some())
     }
     fn draw_images(&mut self, ui: &mut egui::Ui) -> Option<images::ImageInspectionRequest> {
         if let Some(error) = &self.context_error {
@@ -2375,6 +2433,7 @@ impl FerrumApp {
                     || self.images.is_removing()
                     || self.image_tag_task.is_some()
                     || self.image_remove_task.is_some()));
+        let network_create_in_flight = self.network_create_task.is_some();
 
         egui::Panel::top("header")
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 14)))
@@ -2393,56 +2452,66 @@ impl FerrumApp {
                             ui.colored_label(Color32::from_rgb(227, 113, 102), "Disconnected");
                         }
                     }
-                    ui.add_enabled_ui(!page_loading && !self.action_busy(), |ui| {
-                        let selected_name = match self.selected_context.as_deref() {
-                            Some(name) => self
-                                .contexts
-                                .iter()
-                                .find(|context| context.name() == name)
-                                .map(DockerContext::display_name)
-                                .unwrap_or("Selected Docker context"),
-                            None => "Automatic local discovery",
-                        };
-                        egui::ComboBox::from_id_salt("docker-context-selector")
-                            .selected_text(selected_name)
-                            .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_label(
-                                        self.selected_context.is_none(),
-                                        "Automatic local discovery",
-                                    )
-                                    .clicked()
-                                {
-                                    *context_requested = Some(None);
-                                }
-                                for context in &self.contexts {
-                                    let label = match context.transport() {
-                                        ContextTransport::LocalUnix => {
-                                            context.display_name().to_owned()
-                                        }
-                                        ContextTransport::Unsupported => {
-                                            format!(
-                                                "{} (unsupported transport)",
-                                                context.display_name()
-                                            )
-                                        }
-                                        ContextTransport::Invalid => {
-                                            format!("{} (invalid endpoint)", context.display_name())
-                                        }
-                                    };
-                                    let response = ui.add_enabled(
-                                        context.transport() == ContextTransport::LocalUnix,
-                                        egui::Button::new(label).selected(
-                                            self.selected_context.as_deref()
-                                                == Some(context.name()),
-                                        ),
-                                    );
-                                    if response.clicked() {
-                                        *context_requested = Some(Some(context.name().to_owned()));
+                    ui.add_enabled_ui(
+                        !page_loading && !self.action_busy() && !network_create_in_flight,
+                        |ui| {
+                            let selected_name = match self.selected_context.as_deref() {
+                                Some(name) => self
+                                    .contexts
+                                    .iter()
+                                    .find(|context| context.name() == name)
+                                    .map(DockerContext::display_name)
+                                    .unwrap_or("Selected Docker context"),
+                                None => "Automatic local discovery",
+                            };
+                            egui::ComboBox::from_label("Docker context")
+                                .selected_text(selected_name)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(
+                                            self.selected_context.is_none(),
+                                            "Automatic local discovery",
+                                        )
+                                        .clicked()
+                                    {
+                                        *context_requested = Some(None);
                                     }
-                                }
-                            });
-                    });
+                                    for context in &self.contexts {
+                                        let label = match context.transport() {
+                                            ContextTransport::LocalUnix => {
+                                                context.display_name().to_owned()
+                                            }
+                                            ContextTransport::Unsupported => {
+                                                format!(
+                                                    "{} (unsupported transport)",
+                                                    context.display_name()
+                                                )
+                                            }
+                                            ContextTransport::Invalid => {
+                                                format!(
+                                                    "{} (invalid endpoint)",
+                                                    context.display_name()
+                                                )
+                                            }
+                                        };
+                                        let response = ui.add_enabled(
+                                            context.transport() == ContextTransport::LocalUnix,
+                                            egui::Button::new(label).selected(
+                                                self.selected_context.as_deref()
+                                                    == Some(context.name()),
+                                            ),
+                                        );
+                                        if response.clicked() {
+                                            *context_requested =
+                                                Some(Some(context.name().to_owned()));
+                                        }
+                                    }
+                                });
+                        },
+                    );
+                    if network_create_in_flight {
+                        ui.label("Network creation is in progress; context switching is disabled.");
+                    }
                     if let Some(info) = &self.engine_info {
                         ui.separator();
                         ui.label("Docker-compatible API");
@@ -3220,14 +3289,14 @@ impl eframe::App for FerrumApp {
         let mut inspect_index = None;
         let mut image_inspection = None;
         let mut volume_selection = None;
-        let mut network_selection = None;
+        let mut network_action = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 18)))
             .show(ui, |ui| match self.page {
                 images::AppPage::Containers => inspect_index = self.draw_inventory(ui),
                 images::AppPage::Images => image_inspection = self.draw_images(ui),
                 images::AppPage::Volumes => volume_selection = self.draw_volumes(ui),
-                images::AppPage::Networks => network_selection = self.draw_networks(ui),
+                images::AppPage::Networks => network_action = self.draw_networks(ui),
             });
         if let Some(index) = inspect_index {
             let container = &self.containers[index];
@@ -3241,8 +3310,15 @@ impl eframe::App for FerrumApp {
         if let Some(name) = volume_selection {
             self.inspect_volume(name, context.clone());
         }
-        if let Some(id) = network_selection {
-            self.inspect_network(id, context.clone());
+        if let Some(action) = network_action {
+            match action {
+                networks::NetworksAction::Inspect(id) => {
+                    self.inspect_network(id, context.clone());
+                }
+                networks::NetworksAction::Create { generation, name } => {
+                    self.start_network_create(generation, name, context.clone());
+                }
+            }
         }
         self.draw_inspection(context.clone());
         self.draw_settings(context.clone());
@@ -3260,7 +3336,8 @@ impl eframe::App for FerrumApp {
                     || self.images.is_removing()
                     || self.image_remove_task.is_some()))
             || (self.page == images::AppPage::Volumes && self.volumes.is_loading())
-            || (self.page == images::AppPage::Networks && self.networks.is_loading())
+            || (self.page == images::AppPage::Networks
+                && (self.networks.is_loading() || self.network_create_task.is_some()))
         {
             context.request_repaint_after(Duration::from_millis(250));
         }
@@ -3657,6 +3734,7 @@ mod event_reconciliation_tests {
             #[cfg(target_os = "linux")]
             image_pull_progress_reporting: None,
             image_tag_task: None,
+            network_create_task: None,
             image_remove_task: None,
             loading: false,
             refresh_error: None,
@@ -3738,6 +3816,68 @@ mod event_reconciliation_tests {
             settings_error: None,
         };
         (app, sender)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_network_creation_refreshes_the_current_inventory_in_headless_app() {
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let (mut app, sender) = app_with_open_inspection();
+        app.page = images::AppPage::Networks;
+        let previous_generation = app.networks.begin_list();
+        app.networks
+            .finish_list(previous_generation, Ok(Vec::new()));
+        let (action_sender, action_receiver) = std::sync::mpsc::channel();
+        let mut harness = Harness::new_ui_state(
+            move |ui, app: &mut FerrumApp| {
+                let context = ui.ctx().clone();
+                app.receive_events(context);
+                if let Some(action) = app.networks.show(ui, true, "", false) {
+                    let _ = action_sender.send(action);
+                }
+            },
+            app,
+        );
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::TextInput, "Network name")
+            .focus();
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::TextInput, "Network name")
+            .type_text("work-net");
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Create network")
+            .click();
+        harness.step();
+        let (generation, name) = match action_receiver
+            .try_recv()
+            .expect("the Networks UI should request creation")
+        {
+            networks::NetworksAction::Create { generation, name } => (generation, name),
+            networks::NetworksAction::Inspect(_) => {
+                panic!("the create button should return a create action")
+            }
+        };
+
+        harness
+            .state()
+            .runtime
+            .block_on(sender.send(EngineEvent::NetworkCreated {
+                generation,
+                name,
+                result: Ok("created-network-id".to_owned()),
+            }))
+            .expect("create result should be queued");
+        harness.step();
+        assert!(harness.state().networks.generation > previous_generation);
+        assert!(harness.state().networks.loading);
+        assert!(!harness.state().networks.loaded);
+        assert!(harness.state().network_create_task.is_none());
+        let _success = harness.get_by_role_and_label(Role::Label, "Network 'work-net' created.");
     }
 
     #[test]
@@ -4344,6 +4484,53 @@ mod event_reconciliation_tests {
         assert!(!harness.state().terminal_pending);
         assert!(harness.state().terminal.is_none());
         assert!(harness.state().action_task.is_none());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_network_creation_disables_context_selector_accessibly() {
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let (mut app, _) = app_with_open_inspection();
+        app.network_create_task = Some(app.runtime.spawn(std::future::pending()));
+        let mut harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| {
+                let mut refresh_requested = false;
+                let mut settings_requested = false;
+                let mut context_requested = None;
+                app.draw_header(
+                    ui,
+                    &mut refresh_requested,
+                    &mut settings_requested,
+                    &mut context_requested,
+                );
+            },
+            app,
+        );
+
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(Role::ComboBox, "Docker context")
+                .accesskit_node()
+                .is_disabled()
+        );
+        let _status = harness.get_by_role_and_label(
+            Role::Label,
+            "Network creation is in progress; context switching is disabled.",
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn context_switch_is_rejected_while_network_creation_is_pending() {
+        let (mut app, _) = app_with_open_inspection();
+        app.network_create_task = Some(app.runtime.spawn(std::future::pending()));
+
+        app.switch_context(Some("other-context".to_owned()), egui::Context::default());
+
+        assert!(!app.loading);
+        assert_eq!(app.selected_context, None);
+        assert!(app.network_create_task.is_some());
     }
     #[cfg(target_os = "linux")]
     #[test]

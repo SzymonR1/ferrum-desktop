@@ -17,18 +17,24 @@ daemon-side pull stops.
 The Volumes page is read-only and limited to listing and inspecting volumes on
 the selected local Docker Unix socket on Linux. It displays only name, driver,
 scope, creation time, and a plain-text mountpoint; it does not expose labels,
-options, status, or usage estimates. No volume mutation, network operations,
-Podman/rootless, or remote endpoint support is provided. Issue #17 remains open.
+options, status, or usage estimates. No volume mutation is available. Podman/rootless
+and remote endpoint support is not provided. Issue #17 remains open.
 
-The Networks page is read-only and limited to listing and inspecting existing
-networks through the selected local Docker Unix socket on Linux. Its allowlist
-is ID, name, driver, scope, creation time, internal/attachable, and EnableIPv4/
-EnableIPv6. Inspect may report only an optional point-in-time count from the
-`Containers` map; list responses may omit attached-container details. Ferrum
-does not retain or display container IDs, names, endpoint records, MAC/IP
-addresses, labels, options, IPAM, peers, services, status, or raw bodies. It
-does not access credentials, provide usage statistics, or offer network
-create/remove/connect/disconnect operations. Podman/rootless and remote
-endpoints remain unsupported or unvalidated. Issues #17 and #10 remain open;
-no release is claimed.
+The Networks page lists and inspects networks and creates networks by name
+through the selected local Docker Unix socket on Linux. Creation sends only
+the required `Name` field to the negotiated network-create endpoint and relies
+on Docker's default bridge driver; no driver, IPAM, or options controls are
+exposed. Names must be non-whitespace, at most 255 UTF-8 bytes, and contain no
+control characters. The request body is bounded to 1 KiB and successful
+response bodies to 64 KiB; daemon bodies are not displayed or logged.
+
+Its inventory allowlist is ID, name, driver, scope, creation time,
+internal/attachable, and EnableIPv4/EnableIPv6. Inspect may report only an
+optional point-in-time count from the `Containers` map; list responses may omit
+attached-container details. Ferrum does not retain or display container IDs,
+names, endpoint records, MAC/IP addresses, labels, options, IPAM, peers,
+services, status, or raw bodies. It does not access credentials, provide usage
+statistics, or offer network remove/connect/disconnect operations. Podman,
+rootless, and remote endpoints remain unsupported or unvalidated. Issues #17
+and #10 remain open; no release is claimed.
 

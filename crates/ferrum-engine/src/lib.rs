@@ -21,7 +21,7 @@ pub use logs::{ContainerLogStream, ContainerLogsOptions};
 use std::{env, path::PathBuf, time::Duration};
 
 #[cfg(target_os = "linux")]
-use http_body_util::{BodyExt, Empty, Limited};
+use http_body_util::{BodyExt, Empty, Full, Limited};
 #[cfg(target_os = "linux")]
 use hyper::body::Incoming;
 #[cfg(target_os = "linux")]
@@ -46,6 +46,8 @@ use ferrum_core::{
     ContainerSummary, ImageDetails, ImageSummary, NetworkDetails, NetworkSummary, VolumeDetails,
     VolumeSummary,
 };
+#[cfg(target_os = "linux")]
+use serde::Serialize;
 use serde::{
     Deserialize,
     de::{DeserializeOwned, IgnoredAny},
@@ -73,6 +75,12 @@ const MAX_INSPECT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LIST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_VERSION_RESPONSE_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_NETWORK_NAME_BYTES: usize = 255;
+#[cfg(target_os = "linux")]
+const MAX_NETWORK_CREATE_BODY_BYTES: usize = 1024;
+#[cfg(target_os = "linux")]
+const MAX_NETWORK_CREATE_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[cfg(target_os = "linux")]
 #[derive(Deserialize)]
@@ -188,6 +196,19 @@ struct NetworkResponse {
     enable_ipv4: Option<bool>,
     #[serde(rename = "EnableIPv6")]
     enable_ipv6: Option<bool>,
+}
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct NetworkCreateRequest<'a> {
+    name: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct NetworkCreateResponse {
+    id: Option<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -393,6 +414,37 @@ pub enum EngineError {
     #[cfg(target_os = "linux")]
     #[error("The network identifier for the engine request is invalid.")]
     InvalidNetworkId,
+    /// The network name supplied for creation is invalid.
+    #[cfg(target_os = "linux")]
+    #[error(
+        "The network name must be non-whitespace, at most 255 UTF-8 bytes, and contain no control characters."
+    )]
+    InvalidNetworkName,
+    /// The engine could not return a valid, bounded network creation response.
+    #[cfg(target_os = "linux")]
+    #[error("Network creation is unavailable at the {endpoint_label}.")]
+    NetworkCreationUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The network creation request exceeded its bounded wait; creation may have succeeded.
+    #[cfg(target_os = "linux")]
+    #[error(
+        "Network creation at the {endpoint_label} timed out; the network may have been created."
+    )]
+    NetworkCreationTimedOut {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The local engine rejected the network creation request.
+    #[cfg(target_os = "linux")]
+    #[error("Network creation was rejected at the {endpoint_label} (HTTP {status}).")]
+    NetworkCreationRejected {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+        /// HTTP response status.
+        status: u16,
+    },
     /// Image inspection failed or returned an invalid, oversized response.
     #[cfg(target_os = "linux")]
     #[error("The engine at the {endpoint_label} could not return safe image details.")]
@@ -1040,6 +1092,75 @@ impl EngineClient {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
+
+    /// Creates a default bridge network on the connected Linux local Docker
+    /// Unix socket.
+    ///
+    /// Only the required `Name` field is sent; Docker's default bridge driver is
+    /// used. The encoded body is bounded to 1024 bytes and successful response
+    /// bodies to 64 KiB. Names must be non-whitespace, at most 255 UTF-8 bytes,
+    /// and contain no control characters. The returned value is the exact
+    /// network ID reported by the engine. Ferrum does not read or send
+    /// credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidNetworkName` without sending a request for invalid
+    /// names, or a safe typed availability, timeout, or HTTP rejection error.
+    /// Successful responses must contain a safe non-empty network ID.
+    /// Unsupported platforms return `UnsupportedPlatform`.
+    pub async fn create_network(&self, name: &str) -> Result<String, EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            if !valid_network_name(name) {
+                return Err(EngineError::InvalidNetworkName);
+            }
+            let endpoint_label = self.info.endpoint_label;
+            let body = serde_json::to_vec(&NetworkCreateRequest { name })
+                .map_err(|_| EngineError::NetworkCreationUnavailable { endpoint_label })?;
+            if body.len() > MAX_NETWORK_CREATE_BODY_BYTES {
+                return Err(EngineError::InvalidNetworkName);
+            }
+            let path = format!("/v{}/networks/create", self.api_version);
+            timeout(REQUEST_TIMEOUT, async {
+                let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
+                let request = Request::builder()
+                    .method(Method::POST)
+                    .header("content-type", "application/json")
+                    .uri(Uri::new(&self.socket_path, &path))
+                    .body(Full::new(Bytes::from(body)))
+                    .map_err(|_| EngineError::NetworkCreationUnavailable { endpoint_label })?;
+                let response = client
+                    .request(request)
+                    .await
+                    .map_err(|_| EngineError::NetworkCreationUnavailable { endpoint_label })?;
+                if !response.status().is_success() {
+                    return Err(EngineError::NetworkCreationRejected {
+                        endpoint_label,
+                        status: response.status().as_u16(),
+                    });
+                }
+                let body = Limited::new(response.into_body(), MAX_NETWORK_CREATE_RESPONSE_BYTES)
+                    .collect()
+                    .await
+                    .map_err(|_| EngineError::NetworkCreationUnavailable { endpoint_label })?
+                    .to_bytes();
+                let response: NetworkCreateResponse = serde_json::from_slice(&body)
+                    .map_err(|_| EngineError::NetworkCreationUnavailable { endpoint_label })?;
+                response
+                    .id
+                    .filter(|id| network_id_path_safe(id))
+                    .ok_or(EngineError::NetworkCreationUnavailable { endpoint_label })
+            })
+            .await
+            .map_err(|_| EngineError::NetworkCreationTimedOut { endpoint_label })?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = name;
             Err(EngineError::UnsupportedPlatform)
         }
     }
@@ -1831,6 +1952,14 @@ fn negotiate_api_version(client: &str, server: &str) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn network_id_path_safe(id: &str) -> bool {
     !id.is_empty() && id.len() <= 4096 && !matches!(id, "." | "..")
+}
+
+#[cfg(target_os = "linux")]
+fn valid_network_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NETWORK_NAME_BYTES
+        && !name.trim().is_empty()
+        && !name.chars().any(char::is_control)
 }
 
 #[cfg(target_os = "linux")]
@@ -3935,11 +4064,35 @@ mod network_api_tests {
             let (mut stream, _) = listener.accept().await.expect("client should connect");
             let mut request = Vec::new();
             let mut buffer = [0_u8; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let header_end = loop {
+                if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    break position + 4;
+                }
                 let count = stream
                     .read(&mut buffer)
                     .await
                     .expect("request should be read");
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            };
+            let headers = std::str::from_utf8(&request[..header_end])
+                .expect("request headers should be UTF-8");
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim())
+                })
+                .map(|value| value.parse::<usize>().expect("valid content length"))
+                .unwrap_or(0);
+            let request_end = header_end + content_length;
+            while request.len() < request_end {
+                let count = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("request body should be read");
                 assert_ne!(count, 0);
                 request.extend_from_slice(&buffer[..count]);
             }
@@ -3963,6 +4116,127 @@ mod network_api_tests {
     fn cleanup(socket: &std::path::Path, directory: &std::path::Path) {
         std::fs::remove_file(socket).expect("socket should be removed");
         std::fs::remove_dir(directory).expect("directory should be removed");
+    }
+    #[tokio::test]
+    async fn creates_network_with_name_only_on_versioned_endpoint() {
+        let (socket, directory, server) = fixture(response(
+            "201 Created",
+            br#"{"Id":"created-network-id","Warning":""}"#,
+        ))
+        .await;
+
+        let id = client(socket.clone())
+            .create_network("^")
+            .await
+            .expect("network should be created");
+        let request = server.await.expect("server should finish");
+        let (headers, body) = request
+            .split_once("\r\n\r\n")
+            .expect("HTTP request should contain headers and a body");
+        assert!(
+            headers.starts_with("POST /v1.45/networks/create HTTP/1.1\r\n"),
+            "unexpected create request: {headers}"
+        );
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("content-type: application/json")
+        );
+        assert_eq!(body, r#"{"Name":"^"}"#);
+        assert_eq!(id, "created-network-id");
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn create_network_bounds_the_maximum_name_json_body() {
+        let name = "\"".repeat(MAX_NETWORK_NAME_BYTES);
+        let (socket, directory, server) =
+            fixture(response("201 Created", br#"{"Id":"created-network-id"}"#)).await;
+
+        let id = client(socket.clone())
+            .create_network(&name)
+            .await
+            .expect("a maximum-length network name should be accepted");
+        let request = server.await.expect("server should finish");
+        let (_, body) = request
+            .split_once("\r\n\r\n")
+            .expect("HTTP request should contain a JSON body");
+        let decoded: serde_json::Value =
+            serde_json::from_str(body).expect("the request body should be valid JSON");
+        assert_eq!(decoded["Name"], name);
+        assert_eq!(decoded.as_object().expect("JSON object").len(), 1);
+        assert!(body.len() <= MAX_NETWORK_CREATE_BODY_BYTES);
+        assert_eq!(id, "created-network-id");
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn create_network_http_failures_are_typed_and_redacted() {
+        let rejection_body = b"private daemon response test-network";
+        let (socket, directory, server) = fixture(response("409 Conflict", rejection_body)).await;
+        let error = client(socket.clone())
+            .create_network("test-network")
+            .await
+            .expect_err("HTTP rejection should fail");
+        server.await.expect("server should finish");
+        assert!(matches!(
+            error,
+            EngineError::NetworkCreationRejected { status: 409, .. }
+        ));
+        let debug = format!("{error:?}");
+        let display = error.to_string();
+        assert!(!debug.contains("private daemon response"));
+        assert!(!debug.contains("test-network"));
+        assert!(!display.contains("private daemon response"));
+        assert!(!display.contains("test-network"));
+        cleanup(&socket, &directory);
+
+        let (socket, directory, server) = fixture(response(
+            "200 OK",
+            br#"{"Id":"..","Warning":"private warning"}"#,
+        ))
+        .await;
+        let error = client(socket.clone())
+            .create_network("test-network")
+            .await
+            .expect_err("unsafe response ID should fail");
+        server.await.expect("server should finish");
+        assert!(matches!(
+            error,
+            EngineError::NetworkCreationUnavailable { .. }
+        ));
+        assert!(!format!("{error:?}").contains("private warning"));
+        cleanup(&socket, &directory);
+
+        let oversized = vec![b' '; MAX_NETWORK_CREATE_RESPONSE_BYTES + 1];
+        let (socket, directory, server) = fixture(response("201 Created", &oversized)).await;
+        assert!(matches!(
+            client(socket.clone()).create_network("test-network").await,
+            Err(EngineError::NetworkCreationUnavailable { .. })
+        ));
+        server.await.expect("server should finish");
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn invalid_network_names_are_rejected_before_socket_connection() {
+        let engine = client(std::path::PathBuf::from("/path/that/does/not/exist"));
+        let too_long = "n".repeat(MAX_NETWORK_NAME_BYTES + 1);
+        let too_long_utf8 = "ü".repeat(MAX_NETWORK_NAME_BYTES / "ü".len() + 1);
+        for name in [
+            "",
+            "  ",
+            "\t",
+            "newline\nname",
+            "\0",
+            too_long.as_str(),
+            too_long_utf8.as_str(),
+        ] {
+            assert!(matches!(
+                engine.create_network(name).await,
+                Err(EngineError::InvalidNetworkName)
+            ));
+        }
     }
 
     #[tokio::test]
