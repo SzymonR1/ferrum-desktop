@@ -131,6 +131,10 @@ enum EngineEvent {
         generation: u64,
         result: Result<(), EngineError>,
     },
+    ImageRemoved {
+        generation: u64,
+        result: Result<(), EngineError>,
+    },
 
     ImageInspected {
         generation: u64,
@@ -701,6 +705,9 @@ struct FerrumApp {
     // Keep a submitted tag POST alive across page invalidation; aborting it
     // would not undo a mutation the engine may already have accepted.
     image_tag_task: Option<JoinHandle<()>>,
+    // A submitted removal may already have reached Docker; never abort it as
+    // though that could roll back the mutation.
+    image_remove_task: Option<JoinHandle<()>>,
 
     loading: bool,
     refresh_error: Option<String>,
@@ -871,6 +878,7 @@ impl FerrumApp {
             image_inspection_task: None,
             image_pull_task: None,
             image_tag_task: None,
+            image_remove_task: None,
             loading: false,
             refresh_error: None,
 
@@ -1057,8 +1065,19 @@ impl FerrumApp {
         }));
     }
 
+    fn image_mutation_busy(&self) -> bool {
+        self.image_pull_task.is_some()
+            || self.image_tag_task.is_some()
+            || self.image_remove_task.is_some()
+            || self.images.has_mutation_in_flight()
+    }
+
     #[cfg(target_os = "linux")]
     fn start_image_pull(&mut self, context: egui::Context) {
+        if self.image_mutation_busy() {
+            return;
+        }
+
         let Some(engine) = self.engine.clone() else {
             return;
         };
@@ -1096,6 +1115,10 @@ impl FerrumApp {
     }
     #[cfg(target_os = "linux")]
     fn start_image_tag(&mut self, context: egui::Context) {
+        if self.image_mutation_busy() {
+            self.images.cancel_tag_confirmation();
+            return;
+        }
         if self.image_tag_task.is_some() {
             self.images.cancel_tag_confirmation();
             return;
@@ -1124,6 +1147,46 @@ impl FerrumApp {
                 context.request_repaint();
             }
         }));
+    }
+    #[cfg(target_os = "linux")]
+    fn start_image_remove(&mut self, context: egui::Context) {
+        if self.image_mutation_busy() {
+            self.images.cancel_remove_confirmation();
+            return;
+        }
+        if self.image_remove_task.is_some() {
+            self.images.cancel_remove_confirmation();
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            self.images.cancel_remove_confirmation();
+            return;
+        };
+        let Some(request) = self.images.begin_remove() else {
+            return;
+        };
+        let sender = self.sender.clone();
+        self.image_remove_task = Some(self.runtime.spawn(async move {
+            let result = engine.remove_image(&request.image_id).await;
+            if sender
+                .send(EngineEvent::ImageRemoved {
+                    generation: request.generation,
+                    result,
+                })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
+
+    fn finish_image_remove(&mut self, generation: u64, result: Result<(), EngineError>) -> bool {
+        let succeeded = result.is_ok();
+        self.images
+            .finish_remove(generation, result.map_err(|error| error.to_string()));
+        self.image_remove_task = None;
+        succeeded && self.page == images::AppPage::Images
     }
 
     // Even a stale UI result can signal a successful mutation; refresh the
@@ -1378,6 +1441,11 @@ impl FerrumApp {
                 }
                 EngineEvent::ImageTagged { generation, result } => {
                     if self.finish_image_tag(generation, result) {
+                        self.load_images(context.clone());
+                    }
+                }
+                EngineEvent::ImageRemoved { generation, result } => {
+                    if self.finish_image_remove(generation, result) {
                         self.load_images(context.clone());
                     }
                 }
@@ -1884,13 +1952,13 @@ impl FerrumApp {
             }
             ConnectionState::Connected => (true, ""),
         };
+        let mutation_busy = self.image_mutation_busy();
         let inspection = self.images.show(
             ui,
             connected,
             message,
             cfg!(target_os = "linux") && connected,
-            cfg!(target_os = "linux") && connected,
-            self.image_tag_task.is_some() && !self.images.is_tagging(),
+            mutation_busy,
         );
 
         if self.images.take_pull_requested() {
@@ -1903,6 +1971,10 @@ impl FerrumApp {
         if self.images.take_tag_requested() {
             #[cfg(target_os = "linux")]
             self.start_image_tag(ui.ctx().clone());
+        }
+        if self.images.take_remove_requested() {
+            #[cfg(target_os = "linux")]
+            self.start_image_remove(ui.ctx().clone());
         }
 
         inspection
@@ -1920,7 +1992,9 @@ impl FerrumApp {
                 && (self.images.is_loading()
                     || self.images.is_pulling()
                     || self.images.is_tagging()
-                    || self.image_tag_task.is_some()));
+                    || self.images.is_removing()
+                    || self.image_tag_task.is_some()
+                    || self.image_remove_task.is_some()));
 
         egui::Panel::top("header")
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 14)))
@@ -2789,7 +2863,8 @@ impl eframe::App for FerrumApp {
                 && (self.images.is_loading()
                     || self.images.is_pulling()
                     || self.images.is_tagging()
-                    || self.image_tag_task.is_some()))
+                    || self.images.is_removing()
+                    || self.image_remove_task.is_some()))
         {
             context.request_repaint_after(Duration::from_millis(250));
         }
@@ -3179,6 +3254,7 @@ mod event_reconciliation_tests {
             image_inspection_task: None,
             image_pull_task: None,
             image_tag_task: None,
+            image_remove_task: None,
             loading: false,
             refresh_error: None,
             contexts: Vec::new(),
@@ -3262,14 +3338,26 @@ mod event_reconciliation_tests {
     }
 
     #[test]
-    fn successful_tag_result_refreshes_only_when_images_is_current() {
+    fn successful_image_mutations_refresh_only_when_images_is_current() {
         let (mut app, _sender) = app_with_open_inspection();
         app.page = images::AppPage::Images;
-        // A stale view generation suppresses the result in ImagesView, but a
-        // successful daemon operation still refreshes the current Images page.
+        // Stale view generations suppress result notices, but successful daemon
+        // mutations still refresh the currently visible Images inventory.
         assert!(app.finish_image_tag(1, Ok(())));
+        assert!(app.finish_image_remove(1, Ok(())));
+
         app.page = images::AppPage::Containers;
         assert!(!app.finish_image_tag(2, Ok(())));
+        assert!(!app.finish_image_remove(2, Ok(())));
+
+        app.page = images::AppPage::Images;
+        assert!(!app.finish_image_remove(
+            3,
+            Err(EngineError::ImageRemovalRejected {
+                endpoint_label: "test endpoint",
+                status: 409
+            })
+        ));
     }
 
     #[test]

@@ -100,37 +100,43 @@ accessible repository/tag fields, bounded target validation, disabled invalid
 targets, explicit confirmation because Docker Engine v1.56 may reassign an
 existing `repository:tag` while image data remains, cancel-without-request
 behavior, loading, safe success/error display, single-request gating, stale
-generation rejection, and successful-inventory-refresh state. Run the headless UI tests with:
+generation rejection, and successful-inventory-refresh state. Removal UI
+coverage checks the accessible confirmation with a snapshot of the selected
+image ID and known tags, final-reference warning, non-force/in-use and
+multi-tag warnings, `noprune=true` parent preservation, Cancel-without-request,
+successful request state, safe errors, stale invalidation, and one-mutation-at-
+a-time gating across pull/tag/remove. These tests use fixed image data and
+local state/events only; they never contact an engine or delete an image.
 
-```sh
-cargo test -p ferrum-app images::tests
-```
+Pull presentation tests use fixed progress values. Tag and removal tests
+exercise fake completion events only; they do not send requests or mutate image
+resources. No live pull, tag, or image-removal operation is claimed. Tests must
+not pull, tag, delete, or otherwise mutate user images or engines.
 
-These UI tests use fixed image data and do not call an engine. Pull presentation
-tests use fixed progress values only. Tag tests exercise local state and fake
-completion events only; they do not send requests or mutate images. No live tag
-or pull operation is claimed. Tests must not pull, tag, delete, or otherwise
-mutate user images or engines.
-
-Engine image pull and tag contract tests use a fake Unix socket, not a Docker
-engine or registry, and never pull or tag an image. Tag cases cover encoded
-request paths/queries, the `201` success response, omitted force/auth fields,
-invalid input without a connection, and safe typed status rejection. Pull cases
-cover query encoding, chunked progress, response/event errors, malformed or
-oversized input, and invalid references. Run the image protocol tests with:
+Engine image pull, tag, and removal contract tests use fake Unix sockets, not a
+Docker engine or registry, and never pull, tag, or delete an image. Tag cases
+cover encoded request paths/queries, success response, omitted force/auth
+fields, invalid input without a connection, and safe typed status rejection.
+Pull cases cover query encoding, chunked progress, response/event errors,
+malformed or oversized input, and invalid references. Removal cases cover the
+encoded image ID, DELETE with `noprune=true`, omitted force/auth fields, success,
+invalid input without a connection, and safe rejection/status without response
+body exposure. Run the image protocol tests with:
 
 ```sh
 cargo test -p ferrum-engine image_pull::tests
+cargo test -p ferrum-engine image_api_tests
 ```
 
 The separate opt-in ignored
 `local_engine_lists_and_inspects_preinstalled_image_read_only` test exercises
 image list and inspect requests against the local Docker Unix socket. It is
-read-only and does not tag, pull, or modify images. No live tag request or image
-mutation test is provided.
+read-only and does not tag, pull, or modify images. No live image tag, pull, or
+removal request or image mutation test is provided.
 
-Image pull and tag requests use the validated local Docker Unix-socket endpoint;
-private-registry authentication is not implemented.
+Image pull, tag, and removal requests use the validated local Docker Unix-socket
+endpoint; private-registry authentication is not implemented.
+
 
 Manual release-mode performance samples are opt-in and have no timing
 thresholds. See the [performance and accessibility evidence](../performance.md)

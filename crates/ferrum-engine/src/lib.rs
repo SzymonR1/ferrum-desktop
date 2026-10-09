@@ -284,9 +284,9 @@ pub enum EngineError {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
     },
-    /// The image identifier supplied to an inspection request is invalid.
+    /// The image identifier supplied to an engine request is invalid.
     #[cfg(target_os = "linux")]
-    #[error("The image identifier for the inspection request is invalid.")]
+    #[error("The image identifier for the engine request is invalid.")]
     InvalidImageId,
     /// The image reference supplied for a pull is invalid.
     #[cfg(target_os = "linux")]
@@ -314,6 +314,29 @@ pub enum EngineError {
     #[cfg(target_os = "linux")]
     #[error("The image tag request was rejected at the {endpoint_label} (HTTP {status}).")]
     ImageTagRejected {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+        /// HTTP response status.
+        status: u16,
+    },
+    /// The image removal request could not reach the local engine.
+    #[cfg(target_os = "linux")]
+    #[error("Image removal is unavailable at the {endpoint_label}.")]
+    ImageRemovalUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// Image removal timed out; the image state may have changed.
+    #[cfg(target_os = "linux")]
+    #[error("Image removal at the {endpoint_label} timed out; image state may have changed.")]
+    ImageRemovalTimedOut {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The local engine safely rejected the image removal request.
+    #[cfg(target_os = "linux")]
+    #[error("Image removal was rejected at the {endpoint_label} (HTTP {status}).")]
+    ImageRemovalRejected {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
         /// HTTP response status.
@@ -899,6 +922,54 @@ impl EngineClient {
             Err(EngineError::UnsupportedPlatform)
         }
     }
+    /// Removes an image by its engine identifier without forcing removal.
+    ///
+    /// Untagged parent images are preserved. The engine may reject images in
+    /// use or carrying other tags.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe typed error when the identifier is invalid, the request
+    /// is unavailable or times out, or the engine rejects removal.
+    pub async fn remove_image(&self, image_id: &str) -> Result<(), EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            if image_id.is_empty() || image_id.len() > 4096 {
+                return Err(EngineError::InvalidImageId);
+            }
+            let endpoint_label = self.info.endpoint_label;
+            let path = image_remove_request_path(&self.api_version, image_id)
+                .map_err(|_| EngineError::InvalidImageId)?;
+            let result = timeout(LIFECYCLE_REQUEST_TIMEOUT, async {
+                let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
+                let request = Request::builder()
+                    .method(Method::DELETE)
+                    .uri(Uri::new(&self.socket_path, &path))
+                    .body(Empty::<Bytes>::new())
+                    .map_err(|_| ())?;
+                client.request(request).await.map_err(|_| ())
+            })
+            .await;
+            let response = match result {
+                Ok(Ok(response)) => response,
+                Ok(Err(())) => return Err(EngineError::ImageRemovalUnavailable { endpoint_label }),
+                Err(_) => return Err(EngineError::ImageRemovalTimedOut { endpoint_label }),
+            };
+            if response.status().is_success() {
+                Ok(())
+            } else {
+                Err(EngineError::ImageRemovalRejected {
+                    endpoint_label,
+                    status: response.status().as_u16(),
+                })
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = image_id;
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
 
     /// Returns read-only details for a container identified by its engine ID.
     ///
@@ -1376,6 +1447,16 @@ fn container_request_path(
 #[cfg(target_os = "linux")]
 fn image_inspect_request_path(api_version: &str, id: &str) -> Result<String, RequestJsonError> {
     resource_request_path(api_version, "images", id, "/json")
+}
+
+#[cfg(target_os = "linux")]
+fn image_remove_request_path(
+    api_version: &str,
+    image_id: &str,
+) -> Result<String, RequestJsonError> {
+    let mut path = resource_request_path(api_version, "images", image_id, "")?;
+    path.push_str("?noprune=true");
+    Ok(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -2198,6 +2279,63 @@ mod image_api_tests {
                 endpoint_label: "test endpoint"
             }
         ));
+        cleanup(&socket, &directory);
+    }
+    #[tokio::test]
+    async fn removes_image_with_encoded_id_and_preserves_untagged_parents() {
+        let (socket, directory, server) =
+            fixture(http_response("200 OK", br#"{"Untagged":[],"Deleted":[]}"#)).await;
+        client(socket.clone())
+            .remove_image("a/b c")
+            .await
+            .expect("image removal should succeed");
+        let request = server.await.expect("fixture server should finish");
+        assert!(
+            request.starts_with("DELETE /v1.45/images/a%2Fb%20c?noprune=true HTTP/1.1\r\n"),
+            "unexpected image removal request: {request}"
+        );
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(!request_line.contains("force"));
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_image_id_before_connecting() {
+        let missing_socket = std::env::temp_dir().join("ferrum-image-remove-must-not-connect.sock");
+        let engine = client(missing_socket);
+        assert!(matches!(
+            engine.remove_image("").await,
+            Err(EngineError::InvalidImageId)
+        ));
+        assert!(matches!(
+            engine.remove_image(&"x".repeat(4097)).await,
+            Err(EngineError::InvalidImageId)
+        ));
+    }
+
+    #[tokio::test]
+    async fn image_removal_rejection_is_typed_and_does_not_expose_response_body() {
+        let (socket, directory, server) = fixture(http_response(
+            "409 Conflict",
+            b"private engine response body",
+        ))
+        .await;
+        let error = client(socket.clone())
+            .remove_image("image-id")
+            .await
+            .expect_err("409 should be rejected");
+        let request = server.await.expect("fixture server should finish");
+        assert!(request.starts_with("DELETE /v1.45/images/image-id?noprune=true HTTP/1.1\r\n"));
+        assert!(matches!(
+            error,
+            EngineError::ImageRemovalRejected {
+                endpoint_label: "test endpoint",
+                status: 409
+            }
+        ));
+        assert!(!format!("{error:?}").contains("private engine response body"));
+        assert!(!error.to_string().contains("private engine response body"));
         cleanup(&socket, &directory);
     }
 }

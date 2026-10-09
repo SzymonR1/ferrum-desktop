@@ -39,6 +39,10 @@ pub(super) struct ImageInspectionRequest {
     pub(super) inspection_generation: u64,
     pub(super) id: String,
 }
+pub(super) struct ImageRemoveRequest {
+    pub(super) generation: u64,
+    pub(super) image_id: String,
+}
 pub(super) struct ImageTagRequest {
     pub(super) generation: u64,
     pub(super) image_id: String,
@@ -81,6 +85,15 @@ pub(super) struct ImagesView {
     tag_complete: bool,
     tag_result_target: Option<String>,
     tag_error: Option<String>,
+    remove_generation: u64,
+    remove_confirmation_open: bool,
+    remove_confirmation_image_id: Option<String>,
+    remove_confirmed: bool,
+    remove_requested: bool,
+    remove_loading: bool,
+    remove_complete: bool,
+    remove_error: Option<String>,
+    remove_result_image_id: Option<String>,
 }
 impl ImagesView {
     pub(super) fn is_loading(&self) -> bool {
@@ -103,6 +116,9 @@ impl ImagesView {
     #[cfg(test)]
     pub(super) fn is_pull_complete(&self) -> bool {
         self.pull_complete
+    }
+    pub(super) fn has_mutation_in_flight(&self) -> bool {
+        self.pull_loading || self.tag_loading || self.remove_loading
     }
     pub(super) fn take_pull_requested(&mut self) -> bool {
         std::mem::take(&mut self.pull_requested)
@@ -131,6 +147,19 @@ impl ImagesView {
         self.tag_complete = false;
         self.tag_result_target = None;
         self.tag_error = None;
+        self.remove_generation = self.remove_generation.wrapping_add(1);
+        self.remove_confirmation_open = false;
+        self.remove_confirmation_image_id = None;
+        self.remove_confirmed = false;
+        self.remove_requested = false;
+        self.remove_loading = false;
+        self.remove_complete = false;
+        self.remove_error = None;
+        self.remove_result_image_id = None;
+    }
+
+    pub(super) fn is_removing(&self) -> bool {
+        self.remove_loading
     }
 
     fn reset_inventory(&mut self) {
@@ -147,6 +176,12 @@ impl ImagesView {
             self.tag_confirmation_image_id = None;
             self.tag_confirmed = false;
             self.tag_requested = false;
+        }
+        self.remove_confirmation_open = false;
+        if !self.remove_loading {
+            self.remove_confirmation_image_id = None;
+            self.remove_confirmed = false;
+            self.remove_requested = false;
         }
     }
 
@@ -194,6 +229,71 @@ impl ImagesView {
             self.tag_error = None;
         }
     }
+    pub(super) fn begin_remove_confirmation(&mut self) {
+        if !self.remove_loading
+            && !self.remove_confirmation_open
+            && let Some(image_id) = &self.selected_id
+        {
+            self.remove_confirmation_image_id = Some(image_id.clone());
+            self.remove_confirmation_open = true;
+            self.remove_complete = false;
+            self.remove_error = None;
+        }
+    }
+
+    pub(super) fn cancel_remove_confirmation(&mut self) {
+        self.remove_confirmation_open = false;
+        self.remove_confirmation_image_id = None;
+        self.remove_confirmed = false;
+        self.remove_requested = false;
+    }
+
+    pub(super) fn confirm_remove(&mut self) {
+        if self.remove_confirmation_open
+            && self.remove_confirmation_image_id.is_some()
+            && !self.remove_loading
+        {
+            self.remove_confirmation_open = false;
+            self.remove_confirmed = true;
+            self.remove_requested = true;
+        }
+    }
+
+    pub(super) fn take_remove_requested(&mut self) -> bool {
+        std::mem::take(&mut self.remove_requested)
+    }
+
+    pub(super) fn begin_remove(&mut self) -> Option<ImageRemoveRequest> {
+        if !std::mem::take(&mut self.remove_confirmed) || self.has_mutation_in_flight() {
+            return None;
+        }
+        let image_id = self.remove_confirmation_image_id.take()?;
+        self.remove_generation = self.remove_generation.wrapping_add(1);
+        self.remove_loading = true;
+        self.remove_complete = false;
+        self.remove_error = None;
+        self.remove_result_image_id = Some(image_id.clone());
+        Some(ImageRemoveRequest {
+            generation: self.remove_generation,
+            image_id,
+        })
+    }
+
+    pub(super) fn finish_remove<E: Display>(
+        &mut self,
+        generation: u64,
+        result: Result<(), E>,
+    ) -> bool {
+        if generation != self.remove_generation || !self.remove_loading {
+            return false;
+        }
+        self.remove_loading = false;
+        match result {
+            Ok(()) => self.remove_complete = true,
+            Err(error) => self.remove_error = Some(error.to_string()),
+        }
+        true
+    }
 
     pub(super) fn cancel_tag_confirmation(&mut self) {
         self.tag_confirmation_open = false;
@@ -219,7 +319,9 @@ impl ImagesView {
     }
 
     pub(super) fn begin_tag(&mut self) -> Option<ImageTagRequest> {
-        if !std::mem::take(&mut self.tag_confirmed) || self.tag_loading || !self.tag_target_valid()
+        if !std::mem::take(&mut self.tag_confirmed)
+            || self.has_mutation_in_flight()
+            || !self.tag_target_valid()
         {
             return None;
         }
@@ -254,7 +356,7 @@ impl ImagesView {
     }
 
     pub(super) fn begin_pull(&mut self) -> Option<(u64, String)> {
-        if !self.pull_reference_valid() || self.pull_loading {
+        if !self.pull_reference_valid() || self.has_mutation_in_flight() {
             return None;
         }
         self.pull_generation = self.pull_generation.wrapping_add(1);
@@ -367,13 +469,15 @@ impl ImagesView {
         ui: &mut egui::Ui,
         connected: bool,
         connection_message: &str,
-        pull_allowed: bool,
-        tag_allowed: bool,
-        tag_request_busy: bool,
+        operations_allowed: bool,
+        mutation_busy: bool,
     ) -> Option<ImageInspectionRequest> {
         ui.group(|ui| {
             ui.heading("Pull public image");
             ui.label("Anonymous pulls only; private registry authentication is not supported.");
+            if mutation_busy && !self.pull_loading {
+                ui.label("Another image operation is in progress; wait for its result before starting a new pull, tag, or removal.");
+            }
             ui.horizontal(|ui| {
                 let label = ui.label("Image reference");
                 ui.text_edit_singleline(&mut self.pull_reference)
@@ -381,9 +485,10 @@ impl ImagesView {
                 if ui
                     .add_enabled(
                         connected
-                            && pull_allowed
+                            && operations_allowed
                             && self.pull_reference_valid()
-                            && !self.pull_loading,
+                            && !self.pull_loading
+                            && !mutation_busy,
                         egui::Button::new("Pull image"),
                     )
                     .clicked()
@@ -418,7 +523,7 @@ impl ImagesView {
         if !connected {
             ui.heading("Image list unavailable");
             ui.label(connection_message);
-            self.draw_tag_controls(ui, false, tag_allowed, tag_request_busy);
+            self.draw_remove_controls(ui, false, operations_allowed, mutation_busy);
             return None;
         }
 
@@ -458,7 +563,8 @@ impl ImagesView {
 
         let request = selected_id.map(|id| self.select_image(id));
         self.draw_details(ui);
-        self.draw_tag_controls(ui, connected, tag_allowed, tag_request_busy);
+        self.draw_tag_controls(ui, connected, operations_allowed, mutation_busy);
+        self.draw_remove_controls(ui, connected, operations_allowed, mutation_busy);
         request
     }
 
@@ -592,8 +698,8 @@ impl ImagesView {
         &mut self,
         ui: &mut egui::Ui,
         connected: bool,
-        tag_allowed: bool,
-        tag_request_busy: bool,
+        operations_allowed: bool,
+        mutation_busy: bool,
     ) {
         ui.add_space(8.0);
         ui.group(|ui| {
@@ -601,11 +707,8 @@ impl ImagesView {
             if self.selected_id.is_none() {
                 ui.label("Select an image before tagging it.");
             }
-            if !tag_allowed && connected && !tag_request_busy {
+            if !operations_allowed && connected && !mutation_busy {
                 ui.label("Image tagging is available only through the local Docker Unix socket on Linux.");
-            }
-            if tag_request_busy && !self.tag_loading {
-                ui.label("A previous image tag request is still in progress; wait for its result before starting another.");
             }
             ui.add_enabled_ui(!self.tag_loading && !self.tag_confirmation_open, |ui| {
                 ui.horizontal(|ui| {
@@ -626,8 +729,8 @@ impl ImagesView {
             if ui
                 .add_enabled(
                     connected
-                        && tag_allowed
-                        && !tag_request_busy
+                        && operations_allowed
+                        && !mutation_busy
                         && self.selected_id.is_some()
                         && target_valid
                         && !self.tag_loading
@@ -672,6 +775,76 @@ impl ImagesView {
                 }
             } else if let Some(error) = &self.tag_error {
                 ui.label("Image tag request failed.");
+                ui.label(error);
+            }
+        });
+    }
+    fn draw_remove_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        connected: bool,
+        operations_allowed: bool,
+        mutation_busy: bool,
+    ) {
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.heading("Remove selected image");
+            if self.selected_id.is_none() {
+                ui.label("Select an image before removing it.");
+            }
+            if !operations_allowed && connected {
+                ui.label("Image removal is available only through the local Docker Unix socket on Linux.");
+            }
+            if ui
+                .add_enabled(
+                    connected && operations_allowed && !mutation_busy
+                        && self.selected_id.is_some() && !self.remove_loading
+                        && !self.remove_confirmation_open,
+                    egui::Button::new("Remove image"),
+                )
+                .clicked()
+            {
+                self.begin_remove_confirmation();
+            }
+            if self.remove_confirmation_open
+                && let Some(image_id) = self.remove_confirmation_image_id.clone()
+            {
+                let tags = self.images.iter()
+                    .find(|image| image.id == image_id)
+                    .map(|image| if image.repo_tags.is_empty() {
+                        "Untagged image".to_owned()
+                    } else {
+                        image.repo_tags.join(", ")
+                    })
+                    .unwrap_or_else(|| "Tags unavailable".to_owned());
+                ui.group(|ui| {
+                    ui.heading("Confirm image removal");
+                    ui.label(format!(
+                        "Remove image ID {image_id} (known tags: {tags})? Force is not used. Untagged parent images are preserved. The engine may refuse images in use by containers or with other tags. If this removes the last reference, image data may be deleted. Confirm to send this request to the connected local Docker engine."
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("Confirm removal").clicked() {
+                            self.confirm_remove();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.cancel_remove_confirmation();
+                        }
+                    });
+                });
+            }
+            if self.remove_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    if let Some(image_id) = self.remove_result_image_id.as_deref() {
+                        ui.label(format!("Removing image {image_id}…"));
+                    }
+                });
+            } else if self.remove_complete {
+                if let Some(image_id) = &self.remove_result_image_id {
+                    ui.label(format!("Image removal succeeded for {image_id}."));
+                }
+            } else if let Some(error) = &self.remove_error {
+                ui.label("Image removal failed; the engine state may have changed.");
                 ui.label(error);
             }
         });
@@ -733,7 +906,7 @@ mod tests {
     fn harness_for(view: ImagesView) -> Harness<'static, ImagesUi> {
         Harness::new_ui_state(
             |ui, state: &mut ImagesUi| {
-                if let Some(request) = state.view.show(ui, true, "", true, true, false) {
+                if let Some(request) = state.view.show(ui, true, "", true, false) {
                     state.inspection = Some(request);
                 }
             },
@@ -846,7 +1019,7 @@ mod tests {
     fn outstanding_tag_request_disables_a_second_request() {
         let mut harness = Harness::new_ui_state(
             |ui, view: &mut ImagesView| {
-                view.show(ui, true, "", true, true, true);
+                view.show(ui, true, "", true, true);
             },
             taggable_view(),
         );
@@ -859,8 +1032,56 @@ mod tests {
         );
         let _notice = harness.get_by_role_and_label(
             Role::Label,
-            "A previous image tag request is still in progress; wait for its result before starting another.",
+            "Another image operation is in progress; wait for its result before starting a new pull, tag, or removal.",
         );
+    }
+
+    #[test]
+    fn an_in_flight_image_mutation_disables_competing_operations() {
+        let mut view = taggable_view();
+        view.pull_reference = "alpine:3.20".to_owned();
+        let mut harness = Harness::new_ui_state(
+            |ui, view: &mut ImagesView| {
+                view.show(ui, true, "", true, true);
+            },
+            view,
+        );
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, "Pull image")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, "Tag image")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, "Remove image")
+                .accesskit_node()
+                .is_disabled()
+        );
+        let _busy_notice = harness.get_by_role_and_label(
+            Role::Label,
+            "Another image operation is in progress; wait for its result before starting a new pull, tag, or removal.",
+        );
+
+        let mut active = taggable_view();
+        active.tag_loading = true;
+        active.remove_confirmed = true;
+        assert!(active.begin_remove().is_none());
+        active.pull_reference = "alpine:3.20".to_owned();
+        assert!(active.begin_pull().is_none());
+        let mut active = taggable_view();
+        active.remove_loading = true;
+        active.tag_confirmed = true;
+        assert!(active.begin_tag().is_none());
+        active.pull_reference = "alpine:3.20".to_owned();
+        assert!(active.begin_pull().is_none());
     }
 
     #[test]
@@ -995,6 +1216,49 @@ mod tests {
         let _images = harness.get_by_role_and_label(Role::Label, "Images");
     }
 
+    #[test]
+    fn image_removal_requires_named_confirmation_and_cancel_sends_no_request() {
+        let mut harness = harness_for(taggable_view());
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Remove image")
+            .click_accesskit();
+        harness.run();
+        let _confirmation = harness.get_by_role_and_label(Role::Label, "Confirm image removal");
+        let _warning = harness.get_by_role_and_label(
+            Role::Label,
+            "Remove image ID sha256:image (known tags: existing:tag)? Force is not used. Untagged parent images are preserved. The engine may refuse images in use by containers or with other tags. If this removes the last reference, image data may be deleted. Confirm to send this request to the connected local Docker engine.",
+        );
+        assert!(!harness.state().view.remove_requested);
+        harness
+            .get_by_role_and_label(Role::Button, "Cancel")
+            .click_accesskit();
+        harness.run();
+        assert!(!harness.state_mut().view.take_remove_requested());
+        assert!(!harness.state().view.remove_loading);
+    }
+
+    #[test]
+    fn image_removal_snapshots_selected_id_and_stale_results_are_ignored() {
+        let mut view = taggable_view();
+        view.begin_remove_confirmation();
+        view.selected_id = Some("sha256:changed".to_owned());
+        view.confirm_remove();
+        assert!(view.take_remove_requested());
+        let request = view.begin_remove().unwrap();
+        assert_eq!(request.image_id, "sha256:image");
+        assert!(view.finish_remove(request.generation, Ok::<_, &str>(())));
+        assert!(view.remove_complete);
+
+        let mut view = taggable_view();
+        view.begin_remove_confirmation();
+        view.confirm_remove();
+        let stale = view.begin_remove().unwrap();
+        view.invalidate();
+        assert!(!view.finish_remove(stale.generation, Ok::<_, &str>(())));
+        assert!(!view.remove_complete);
+        assert!(view.remove_error.is_none());
+    }
     #[test]
     fn search_and_keyboard_selection_show_inspected_image_details() {
         let mut harness = harness_for(loaded_view(vec![
@@ -1219,7 +1483,7 @@ mod tests {
     fn disconnected_view_disables_pull_without_engine_access() {
         let mut harness = Harness::new_ui_state(
             |ui, view: &mut ImagesView| {
-                view.show(ui, false, "offline", false, false, false);
+                view.show(ui, false, "offline", false, false);
             },
             ImagesView::default(),
         );
@@ -1267,7 +1531,7 @@ mod tests {
         view.pull_reference = "x".repeat(513);
         let mut invalid_harness = Harness::new_ui_state(
             |ui, view: &mut ImagesView| {
-                view.show(ui, true, "", true, true, false);
+                view.show(ui, true, "", true, false);
             },
             view,
         );
@@ -1285,7 +1549,7 @@ mod tests {
         };
         let mut boundary_harness = Harness::new_ui_state(
             |ui, view: &mut ImagesView| {
-                view.show(ui, true, "", true, true, false);
+                view.show(ui, true, "", true, false);
             },
             boundary_view,
         );
