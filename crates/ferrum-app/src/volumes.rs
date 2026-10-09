@@ -3,8 +3,13 @@ use eframe::egui;
 use ferrum_core::{VolumeDetails, VolumeSummary, VolumeUsage};
 
 const ROW_HEIGHT: f32 = 34.0;
-pub(super) type VolumeInspectionResult =
-    Result<(VolumeDetails, Result<Option<VolumeUsage>, String>), String>;
+pub(super) enum VolumeInspectionResult {
+    InspectionFailed(String),
+    Inspected {
+        details: VolumeDetails,
+        usage_result: Result<Option<VolumeUsage>, String>,
+    },
+}
 
 #[derive(Default)]
 pub(super) struct VolumesView {
@@ -105,15 +110,23 @@ impl VolumesView {
         }
         self.inspecting = false;
         match result {
-            Ok((details, Ok(usage))) => {
+            VolumeInspectionResult::Inspected {
+                details,
+                usage_result: Ok(usage),
+            } => {
                 self.details = Some(details);
                 self.usage = usage;
             }
-            Ok((details, Err(error))) => {
+            VolumeInspectionResult::Inspected {
+                details,
+                usage_result: Err(error),
+            } => {
                 self.details = Some(details);
                 self.usage_error = Some(error);
             }
-            Err(error) => self.detail_error = Some(error),
+            VolumeInspectionResult::InspectionFailed(error) => {
+                self.detail_error = Some(error);
+            }
         }
     }
     pub(super) fn is_loading(&self) -> bool {
@@ -266,7 +279,10 @@ mod tests {
         details: VolumeDetails,
         usage: Result<Option<VolumeUsage>, String>,
     ) -> VolumeInspectionResult {
-        Ok((details, usage))
+        VolumeInspectionResult::Inspected {
+            details,
+            usage_result: usage,
+        }
     }
 
     fn loaded_view(names: &[&str]) -> VolumesView {
@@ -309,6 +325,22 @@ mod tests {
         assert!(view.details.is_none());
         assert!(view.usage.is_none());
         assert!(view.selected.is_none());
+    }
+    #[test]
+    fn inspection_failure_is_separate_from_usage_failure() {
+        let mut view = loaded_view(&["data"]);
+        let (generation, inspection_generation, name) = view.begin_inspection("data".into());
+        view.finish_inspection(
+            generation,
+            inspection_generation,
+            &name,
+            VolumeInspectionResult::InspectionFailed("inspect unavailable".into()),
+        );
+        assert_eq!(view.detail_error.as_deref(), Some("inspect unavailable"));
+        assert!(view.details.is_none());
+        assert!(view.usage.is_none());
+        assert!(view.usage_error.is_none());
+        assert!(!view.inspecting);
     }
     #[test]
     fn listing_error_and_empty_are_distinct() {

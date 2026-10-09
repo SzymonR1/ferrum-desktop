@@ -1198,13 +1198,18 @@ impl FerrumApp {
                 self.resource_read_task = Some(self.runtime.spawn(async move {
                     let result = match engine.inspect_volume(&name).await {
                         Ok(details) => {
-                            let usage = engine
+                            let usage_result = engine
                                 .volume_usage(&name)
                                 .await
                                 .map_err(|error| error.to_string());
-                            Ok((details, usage))
+                            volumes::VolumeInspectionResult::Inspected {
+                                details,
+                                usage_result,
+                            }
                         }
-                        Err(error) => Err(error.to_string()),
+                        Err(error) => {
+                            volumes::VolumeInspectionResult::InspectionFailed(error.to_string())
+                        }
                     };
                     if sender
                         .send(EngineEvent::VolumeInspected {
