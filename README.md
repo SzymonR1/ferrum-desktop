@@ -52,6 +52,8 @@ broader endpoint validation remains tracked by the still-open
 pull, tag, or removal operation or test that mutates image resources is claimed;
 native image-page visual validation is not claimed. See the [Images guide](docs/src/user-guide/images.md).
 
+The **Volumes** page offers read-only listing and inspection of Docker volumes on the selected local Docker Unix socket on Linux. It displays only name, driver, scope, creation time, and host mountpoint as plain text. Docker's list/inspect endpoints do not report usage; Ferrum shows no size or reference counts. Creating, removing, connecting, disconnecting, networking, usage reporting, Podman/rootless, and remote endpoints are not supported. Issue #17 remains open; issue #10 remains open for Podman/rootless and endpoint-matrix work. See the [Volumes guide](docs/src/user-guide/volumes.md).
+
 
 An X11-backend screenshot captured via XWayland showed actual container names,
 images, states, and statuses. A no-engine X11 launch showed a connection error
@@ -99,8 +101,10 @@ It reads version and inventory and may inspect one existing container; it does n
 The ignored local image list/inspect smoke test is read-only and requires
 `FERRUM_TEST_IMAGE` to name an image already installed locally; it does not pull
 or modify images. Pull, tag, and removal behavior is covered only by fake-socket
-contract tests and headless UI tests; no live image mutation is performed. See
-the testing guide for the exact commands.
+contract tests and headless UI tests; no live image mutation is performed. The
+ignored read-only volume list/inspect test requires `FERRUM_TEST_VOLUME` to name
+an existing local volume and only lists/inspects it; it does not mutate or clean
+up resources. See the testing guide for exact commands.
 
 
 An ignored lifecycle integration test is mutating; see the testing guide for its exact command and prerequisites. It requires a locally present `FERRUM_TEST_IMAGE` containing `/bin/sleep`; tests do not pull images and clean up only the created container by its returned full ID.

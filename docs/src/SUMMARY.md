@@ -7,6 +7,7 @@
 - [Containers](user-guide/containers.md)
 - [Images](user-guide/images.md)
 - [Embedded terminal](user-guide/terminal.md)
+- [Volumes](user-guide/volumes.md)
 
 # Developer guide
 

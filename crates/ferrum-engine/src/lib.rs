@@ -43,7 +43,7 @@ use contexts::{
 
 use ferrum_core::{
     ContainerAction, ContainerChange, ContainerDetails, ContainerMount, ContainerState,
-    ContainerSummary, ImageDetails, ImageSummary,
+    ContainerSummary, ImageDetails, ImageSummary, VolumeDetails, VolumeSummary,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -111,6 +111,24 @@ struct ImageInspectResponse {
     author: Option<String>,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct VolumeListResponse {
+    volumes: Option<Vec<VolumeResponse>>,
+}
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct VolumeResponse {
+    name: Option<String>,
+    driver: Option<String>,
+    scope: Option<String>,
+    created_at: Option<String>,
+    mountpoint: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct InspectResponse {
@@ -277,6 +295,24 @@ pub enum EngineError {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
     },
+    /// The engine could not return a valid, bounded volume inventory.
+    #[cfg(target_os = "linux")]
+    #[error("The engine at the {endpoint_label} could not return safe volume information.")]
+    VolumeInventoryUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// Volume inspection failed or returned an invalid, oversized response.
+    #[cfg(target_os = "linux")]
+    #[error("The engine at the {endpoint_label} could not return safe volume details.")]
+    VolumeInspectionUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The volume name supplied to an inspection request is invalid.
+    #[cfg(target_os = "linux")]
+    #[error("The volume name for the engine request is invalid.")]
+    InvalidVolumeName,
     /// Image inspection failed or returned an invalid, oversized response.
     #[cfg(target_os = "linux")]
     #[error("The engine at the {endpoint_label} could not return safe image details.")]
@@ -889,6 +925,97 @@ impl EngineClient {
             Err(EngineError::UnsupportedPlatform)
         }
     }
+    /// Lists local volumes. Only name, driver, and scope are retained.
+    ///
+    /// A missing or null `Volumes` field is treated as an empty inventory, as
+    /// permitted by the Docker Engine API schema. Request failures and invalid
+    /// or oversized responses remain errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe typed error if the bounded local-socket request fails or
+    /// the response is invalid or oversized. Unsupported platforms return
+    /// `UnsupportedPlatform`.
+    pub async fn list_volumes(&self) -> Result<Vec<VolumeSummary>, EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            let endpoint_label = self.info.endpoint_label;
+            let path = format!("/v{}/volumes", self.api_version);
+            let response: VolumeListResponse = request_json(
+                &self.socket_path,
+                &path,
+                MAX_LIST_RESPONSE_BYTES,
+                REQUEST_TIMEOUT,
+            )
+            .await
+            .map_err(|_| EngineError::VolumeInventoryUnavailable { endpoint_label })?;
+            response
+                .volumes
+                .unwrap_or_default()
+                .into_iter()
+                .map(|volume| {
+                    let name = volume
+                        .name
+                        .filter(|name| volume_name_path_safe(name))
+                        .ok_or(EngineError::VolumeInventoryUnavailable { endpoint_label })?;
+                    Ok(VolumeSummary {
+                        name,
+                        driver: volume.driver,
+                        scope: volume.scope,
+                    })
+                })
+                .collect()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
+
+    /// Inspects a named local volume and retains only documented display fields.
+    ///
+    /// The mountpoint is untrusted path text and is not accessed by Ferrum.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidVolumeName` before connecting for an invalid name, or a
+    /// safe typed error for unavailable, invalid, or oversized responses.
+    /// Unsupported platforms return `UnsupportedPlatform`.
+    pub async fn inspect_volume(&self, name: &str) -> Result<VolumeDetails, EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            if !volume_name_path_safe(name) {
+                return Err(EngineError::InvalidVolumeName);
+            }
+            let path = resource_request_path(&self.api_version, "volumes", name, "")
+                .map_err(|_| EngineError::InvalidVolumeName)?;
+            let endpoint_label = self.info.endpoint_label;
+            let response: VolumeResponse = request_json(
+                &self.socket_path,
+                &path,
+                MAX_INSPECT_RESPONSE_BYTES,
+                REQUEST_TIMEOUT,
+            )
+            .await
+            .map_err(|_| EngineError::VolumeInspectionUnavailable { endpoint_label })?;
+            let name = response
+                .name
+                .filter(|name| !name.is_empty())
+                .ok_or(EngineError::VolumeInspectionUnavailable { endpoint_label })?;
+            Ok(VolumeDetails {
+                name,
+                driver: response.driver,
+                scope: response.scope,
+                created_at: response.created_at,
+                mountpoint: response.mountpoint,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = name;
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
 
     /// Returns read-only details for an image identified by its engine ID.
     ///
@@ -1473,6 +1600,11 @@ fn encode_query_component(value: &str) -> String {
         }
     }
     encoded
+}
+
+#[cfg(target_os = "linux")]
+fn volume_name_path_safe(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 4096 && !matches!(name, "." | "..")
 }
 
 #[cfg(target_os = "linux")]
@@ -2336,6 +2468,255 @@ mod image_api_tests {
         ));
         assert!(!format!("{error:?}").contains("private engine response body"));
         assert!(!error.to_string().contains("private engine response body"));
+        cleanup(&socket, &directory);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod volume_api_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixListener,
+    };
+
+    static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_directory() -> std::path::PathBuf {
+        let sequence = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "ferrum-volumes-{}-{timestamp}-{sequence}",
+            std::process::id(),
+            timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&directory).expect("temporary directory should be created");
+        directory
+    }
+
+    fn client(socket_path: std::path::PathBuf) -> EngineClient {
+        EngineClient {
+            info: EngineInfo {
+                version: "fixture".to_owned(),
+                api_version: "1.45".to_owned(),
+                endpoint_label: "test endpoint",
+            },
+            api_version: "1.45".to_owned(),
+            selected_context: None,
+            socket_path,
+        }
+    }
+
+    async fn fixture(
+        response: Vec<u8>,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        tokio::task::JoinHandle<String>,
+    ) {
+        let directory = temporary_directory();
+        let socket_path = directory.join("engine.sock");
+        let listener = UnixListener::bind(&socket_path).expect("Unix socket should bind");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("request should be read");
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8(request).expect("request should be UTF-8");
+            let _ = stream.write_all(&response).await;
+            request
+        });
+        (socket_path, directory, server)
+    }
+
+    fn response(status: &str, body: &[u8]) -> Vec<u8> {
+        let mut result = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        result.extend_from_slice(body);
+        result
+    }
+
+    fn cleanup(socket: &std::path::Path, directory: &std::path::Path) {
+        std::fs::remove_file(socket).expect("socket should be removed");
+        std::fs::remove_dir(directory).expect("directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn lists_volumes_from_versioned_endpoint_and_maps_allowlisted_fields() {
+        let body = br#"{"Volumes":[{"Name":"data","Driver":"local","Scope":"local","Labels":{"secret":"label"},"Options":{"secret":"option"},"UsageData":{"Size":7},"Status":{"secret":"status"}}]}"#;
+        let (socket, directory, server) = fixture(response("200 OK", body)).await;
+        let volumes = client(socket.clone())
+            .list_volumes()
+            .await
+            .expect("inventory");
+        let request = server.await.expect("server");
+        assert!(request.starts_with("GET /v1.45/volumes HTTP/1.1\r\n"));
+        assert_eq!(
+            volumes,
+            vec![VolumeSummary {
+                name: "data".to_owned(),
+                driver: Some("local".to_owned()),
+                scope: Some("local".to_owned()),
+            }]
+        );
+        assert!(!format!("{volumes:?}").contains("secret"));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn accepts_missing_or_null_volume_lists_as_empty() {
+        for body in [br#"{}"#.as_slice(), br#"{"Volumes":null}"#.as_slice()] {
+            let (socket, directory, server) = fixture(response("200 OK", body)).await;
+            assert!(
+                client(socket.clone())
+                    .list_volumes()
+                    .await
+                    .expect("inventory")
+                    .is_empty()
+            );
+            let request = server.await.expect("server");
+            assert!(request.starts_with("GET /v1.45/volumes HTTP/1.1\r\n"));
+            cleanup(&socket, &directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_volume_list_entries_without_safe_names() {
+        for body in [
+            br#"{"Volumes":[{"Driver":"local","Scope":"local"}]}"#.as_slice(),
+            br#"{"Volumes":[{"Name":"","Driver":"local","Scope":"local"}]}"#.as_slice(),
+            br#"{"Volumes":[{"Name":"..","Driver":"local","Scope":"local"}]}"#.as_slice(),
+        ] {
+            let (socket, directory, server) = fixture(response("200 OK", body)).await;
+            assert!(matches!(
+                client(socket.clone()).list_volumes().await,
+                Err(EngineError::VolumeInventoryUnavailable { .. })
+            ));
+            server.await.expect("server");
+            cleanup(&socket, &directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn inspects_encoded_volume_name_and_maps_allowlisted_fields() {
+        let body = br#"{"Name":"a/b c","Driver":"local","Scope":"local","CreatedAt":"created","Mountpoint":"/host/data","Labels":{"secret":"label"},"Options":{"secret":"option"},"UsageData":{"Size":7},"Status":{"secret":"status"}}"#;
+        let (socket, directory, server) = fixture(response("200 OK", body)).await;
+        let details = client(socket.clone())
+            .inspect_volume("a/b c")
+            .await
+            .expect("volume details");
+        let request = server.await.expect("server");
+        assert!(request.starts_with("GET /v1.45/volumes/a%2Fb%20c HTTP/1.1\r\n"));
+        assert_eq!(
+            details,
+            VolumeDetails {
+                name: "a/b c".to_owned(),
+                driver: Some("local".to_owned()),
+                scope: Some("local".to_owned()),
+                created_at: Some("created".to_owned()),
+                mountpoint: Some("/host/data".to_owned()),
+            }
+        );
+        assert!(!format!("{details:?}").contains("secret"));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_inspection_names_before_socket_connection() {
+        let engine = client(std::path::PathBuf::from("/path/that/does/not/exist"));
+        let too_long = "x".repeat(4097);
+        for name in ["", ".", "..", too_long.as_str()] {
+            assert!(matches!(
+                engine.inspect_volume(name).await,
+                Err(EngineError::InvalidVolumeName)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_inspection_response_without_volume_name() {
+        let (socket, directory, server) =
+            fixture(response("200 OK", br#"{"Driver":"local"}"#)).await;
+        let error = client(socket.clone())
+            .inspect_volume("data")
+            .await
+            .expect_err("inspection without a name should be rejected");
+        server.await.expect("server");
+        assert!(matches!(
+            error,
+            EngineError::VolumeInspectionUnavailable { .. }
+        ));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn maps_http_and_malformed_volume_responses_to_safe_errors() {
+        for (status, body) in [
+            (
+                "500 Internal Server Error",
+                br#"{"message":"private"}"#.as_slice(),
+            ),
+            ("200 OK", b"{".as_slice()),
+        ] {
+            let (socket, directory, server) = fixture(response(status, body)).await;
+            let result = client(socket.clone()).list_volumes().await;
+            server.await.expect("server");
+            assert!(matches!(
+                result,
+                Err(EngineError::VolumeInventoryUnavailable { .. })
+            ));
+            cleanup(&socket, &directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_volume_inventory_safely() {
+        let body = vec![b' '; MAX_LIST_RESPONSE_BYTES + 1];
+        let (socket, directory, server) = fixture(response("200 OK", &body)).await;
+        assert!(matches!(
+            client(socket.clone()).list_volumes().await,
+            Err(EngineError::VolumeInventoryUnavailable { .. })
+        ));
+        server.await.expect("server");
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn inspects_volume_rejects_http_and_oversized_responses_safely() {
+        let (socket, directory, server) =
+            fixture(response("404 Not Found", b"private daemon body")).await;
+        let error = client(socket.clone())
+            .inspect_volume("volume")
+            .await
+            .expect_err("HTTP error should be rejected");
+        server.await.expect("server");
+        assert!(matches!(
+            error,
+            EngineError::VolumeInspectionUnavailable { .. }
+        ));
+        assert!(!error.to_string().contains("private"));
+        cleanup(&socket, &directory);
+
+        let body = vec![b' '; MAX_INSPECT_RESPONSE_BYTES + 1];
+        let (socket, directory, server) = fixture(response("200 OK", &body)).await;
+        assert!(matches!(
+            client(socket.clone()).inspect_volume("volume").await,
+            Err(EngineError::VolumeInspectionUnavailable { .. })
+        ));
+        server.await.expect("server");
         cleanup(&socket, &directory);
     }
 }

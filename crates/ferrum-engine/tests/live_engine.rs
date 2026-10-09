@@ -16,6 +16,35 @@ use std::{
 use ferrum_core::{ContainerAction, ContainerState};
 use ferrum_engine::{ContextTransport, DockerContext, EngineClient};
 
+/// Read-only opt-in check: inspects only a caller-specified existing volume.
+///
+/// Requires `FERRUM_TEST_VOLUME` to name an existing volume. This test only
+/// lists and inspects; it does not create, remove, modify, or clean up volumes.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires a local Docker-compatible engine and existing FERRUM_TEST_VOLUME; reads only"]
+async fn local_engine_lists_and_inspects_existing_volume_read_only() {
+    let name = std::env::var("FERRUM_TEST_VOLUME")
+        .expect("set FERRUM_TEST_VOLUME to the name of an existing volume");
+    assert!(!name.is_empty(), "FERRUM_TEST_VOLUME must not be empty");
+    let engine = EngineClient::connect_default()
+        .await
+        .expect("local engine should be accessible");
+    let volumes = engine
+        .list_volumes()
+        .await
+        .expect("volume inventory should be readable");
+    assert!(
+        volumes.iter().any(|volume| volume.name == name),
+        "configured existing volume must appear in inventory"
+    );
+    let details = engine
+        .inspect_volume(&name)
+        .await
+        .expect("configured existing volume should be inspectable");
+    assert_eq!(details.name, name);
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires a current local Docker context and a preinstalled FERRUM_TEST_IMAGE"]

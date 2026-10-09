@@ -31,6 +31,8 @@ mod inventory;
 mod logs;
 mod retry;
 mod search;
+mod volumes;
+use ferrum_core::VolumeSummary;
 #[cfg(target_os = "linux")]
 mod terminal;
 #[cfg(target_os = "linux")]
@@ -118,6 +120,16 @@ enum EngineEvent {
     ImagesListed {
         generation: u64,
         result: Result<Vec<ImageSummary>, EngineError>,
+    },
+    VolumesListed {
+        generation: u64,
+        result: Result<Vec<VolumeSummary>, EngineError>,
+    },
+    VolumeInspected {
+        generation: u64,
+        inspection_generation: u64,
+        name: String,
+        result: Result<ferrum_core::VolumeDetails, EngineError>,
     },
     ImagePullProgress {
         generation: u64,
@@ -699,6 +711,9 @@ struct FerrumApp {
     inventory_view: InventoryView,
     page: images::AppPage,
     images: images::ImagesView,
+    volumes: volumes::VolumesView,
+    volume_list_task: Option<JoinHandle<()>>,
+    volume_inspection_task: Option<JoinHandle<()>>,
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
     // Hold the reader until the terminal response event releases the mutation gate.
@@ -877,6 +892,9 @@ impl FerrumApp {
             inventory_view: InventoryView::default(),
             page: images::AppPage::default(),
             images: images::ImagesView::default(),
+            volumes: volumes::VolumesView::default(),
+            volume_list_task: None,
+            volume_inspection_task: None,
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
@@ -1043,6 +1061,72 @@ impl FerrumApp {
         self.images.hide_pull_progress();
     }
 
+    fn invalidate_volumes(&mut self) {
+        if let Some(task) = self.volume_list_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.volume_inspection_task.take() {
+            task.abort();
+        }
+        self.volumes.invalidate();
+    }
+    fn load_volumes(&mut self, context: egui::Context) {
+        if self.loading
+            || !cfg!(target_os = "linux")
+            || !matches!(&self.connection, ConnectionState::Connected)
+        {
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        if let Some(task) = self.volume_list_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.volume_inspection_task.take() {
+            task.abort();
+        }
+        let generation = self.volumes.begin_list();
+        let sender = self.sender.clone();
+        self.volume_list_task = Some(self.runtime.spawn(async move {
+            let result = engine.list_volumes().await;
+            if sender
+                .send(EngineEvent::VolumesListed { generation, result })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
+    fn inspect_volume(&mut self, name: String, context: egui::Context) {
+        if !cfg!(target_os = "linux")
+            || self.loading
+            || !matches!(&self.connection, ConnectionState::Connected)
+        {
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        let (generation, inspection_generation, name) = self.volumes.begin_inspection(name);
+        let sender = self.sender.clone();
+        self.volume_inspection_task = Some(self.runtime.spawn(async move {
+            let result = engine.inspect_volume(&name).await;
+            if sender
+                .send(EngineEvent::VolumeInspected {
+                    generation,
+                    inspection_generation,
+                    name,
+                    result,
+                })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
     fn invalidate_images(&mut self) {
         self.cancel_image_read_tasks();
         #[cfg(target_os = "linux")]
@@ -1249,8 +1333,14 @@ impl FerrumApp {
         if previous == images::AppPage::Images {
             self.invalidate_images();
         }
+        if previous == images::AppPage::Volumes {
+            self.invalidate_volumes();
+        }
         if page == images::AppPage::Images && !self.loading && self.engine.is_some() {
-            self.load_images(context);
+            self.load_images(context.clone());
+        }
+        if page == images::AppPage::Volumes && !self.loading && self.engine.is_some() {
+            self.load_volumes(context);
         }
     }
 
@@ -1298,7 +1388,7 @@ impl FerrumApp {
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
         self.cancel_inspection();
-        self.invalidate_images();
+        self.invalidate_volumes();
         self.loading = true;
         self.context_error = None;
         let sender = self.sender.clone();
@@ -1330,6 +1420,10 @@ impl FerrumApp {
 
         if self.page == images::AppPage::Images {
             self.load_images(context);
+            return;
+        }
+        if self.page == images::AppPage::Volumes {
+            self.load_volumes(context);
             return;
         }
         let Some(engine) = self.engine.clone() else {
@@ -1409,6 +1503,7 @@ impl FerrumApp {
                             #[cfg(target_os = "linux")]
                             self.cancel_terminal_session();
                             self.invalidate_images();
+                            self.invalidate_volumes();
                             self.engine = None;
                             self.engine_info = None;
                             self.containers.clear();
@@ -1430,6 +1525,31 @@ impl FerrumApp {
                                 self.load_images(context.clone());
                             }
                         }
+                    }
+                }
+                EngineEvent::VolumesListed { generation, result } => {
+                    self.volumes
+                        .finish_list(generation, result.map_err(|error| error.to_string()));
+                    if generation == self.volumes.generation {
+                        self.volume_list_task = None;
+                    }
+                }
+                EngineEvent::VolumeInspected {
+                    generation,
+                    inspection_generation,
+                    name,
+                    result,
+                } => {
+                    self.volumes.finish_inspection(
+                        generation,
+                        inspection_generation,
+                        &name,
+                        result.map_err(|error| error.to_string()),
+                    );
+                    if generation == self.volumes.generation
+                        && inspection_generation == self.volumes.inspection_generation
+                    {
+                        self.volume_inspection_task = None;
                     }
                 }
                 EngineEvent::ImagesListed { generation, result } => {
@@ -1671,7 +1791,7 @@ impl FerrumApp {
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
         self.cancel_inspection();
-        self.invalidate_images();
+        self.invalidate_volumes();
         if let Some(task) = self.action_task.take() {
             task.abort();
         }
@@ -1686,6 +1806,9 @@ impl FerrumApp {
         self.start_event_stream(engine, context.clone());
         if self.page == images::AppPage::Images {
             self.load_images(context.clone());
+        }
+        if self.page == images::AppPage::Volumes {
+            self.load_volumes(context);
         }
     }
 
@@ -1940,6 +2063,43 @@ impl FerrumApp {
         page_requested
     }
 
+    fn draw_volumes(&mut self, ui: &mut egui::Ui) -> Option<String> {
+        if let Some(error) = &self.context_error {
+            ui.colored_label(Color32::from_rgb(224, 174, 109), "Context switch failed");
+            ui.label("The previous engine connection remains active.");
+            ui.label(error);
+            ui.add_space(10.0);
+        }
+        if self.loading {
+            ui.spinner();
+            ui.heading("Waiting for the engine context");
+            return self
+                .volumes
+                .show(ui, false, "Context selection is in progress.");
+        }
+        if self.engine.is_some()
+            && cfg!(target_os = "linux")
+            && !self.volumes.loading
+            && !self.volumes.loaded
+        {
+            self.load_volumes(ui.ctx().clone());
+        }
+        let supported = cfg!(target_os = "linux")
+            && self.engine.is_some()
+            && matches!(&self.connection, ConnectionState::Connected);
+        let message = match &self.connection {
+            ConnectionState::Connecting => "Connecting to the selected local engine.",
+            ConnectionState::Disconnected(message) => message.as_str(),
+            ConnectionState::Connected if self.engine.is_none() => {
+                "The engine connection is unavailable."
+            }
+            ConnectionState::Connected if !cfg!(target_os = "linux") => {
+                "Volume access is implemented only on Linux for a local Docker Unix socket."
+            }
+            ConnectionState::Connected => "",
+        };
+        self.volumes.show(ui, supported, message)
+    }
     fn draw_images(&mut self, ui: &mut egui::Ui) -> Option<images::ImageInspectionRequest> {
         if let Some(error) = &self.context_error {
             ui.colored_label(Color32::from_rgb(224, 174, 109), "Context switch failed");
@@ -2804,6 +2964,7 @@ impl Drop for FerrumApp {
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
         self.cancel_image_read_tasks();
+        self.invalidate_volumes();
         if let Some(task) = self.inspection_task.take() {
             task.abort();
         }
@@ -2855,11 +3016,13 @@ impl eframe::App for FerrumApp {
         }
         let mut inspect_index = None;
         let mut image_inspection = None;
+        let mut volume_selection = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 18)))
             .show(ui, |ui| match self.page {
                 images::AppPage::Containers => inspect_index = self.draw_inventory(ui),
                 images::AppPage::Images => image_inspection = self.draw_images(ui),
+                images::AppPage::Volumes => volume_selection = self.draw_volumes(ui),
             });
         if let Some(index) = inspect_index {
             let container = &self.containers[index];
@@ -2869,6 +3032,9 @@ impl eframe::App for FerrumApp {
         }
         if let Some(request) = image_inspection {
             self.inspect_image(request, context.clone());
+        }
+        if let Some(name) = volume_selection {
+            self.inspect_volume(name, context.clone());
         }
         self.draw_inspection(context.clone());
         self.draw_settings(context.clone());
@@ -2885,12 +3051,12 @@ impl eframe::App for FerrumApp {
                     || self.images.is_tagging()
                     || self.images.is_removing()
                     || self.image_remove_task.is_some()))
+            || (self.page == images::AppPage::Volumes && self.volumes.is_loading())
         {
             context.request_repaint_after(Duration::from_millis(250));
         }
     }
 }
-
 fn add_cell(ui: &mut egui::Ui, text: &str, width: f32) {
     ui.add_sized(
         [width, CELL_HEIGHT],
@@ -3272,6 +3438,9 @@ mod event_reconciliation_tests {
             inventory_view: InventoryView::default(),
             page: images::AppPage::default(),
             images: images::ImagesView::default(),
+            volumes: volumes::VolumesView::default(),
+            volume_list_task: None,
+            volume_inspection_task: None,
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
