@@ -141,6 +141,14 @@ enum EngineEvent {
         name: String,
         result: Result<String, EngineError>,
     },
+    NetworkRemoved {
+        generation: u64,
+        inspection_generation: u64,
+        removal_generation: u64,
+        id: String,
+        name: String,
+        result: Result<(), EngineError>,
+    },
     NetworkInspected {
         generation: u64,
         inspection_generation: u64,
@@ -747,9 +755,10 @@ struct FerrumApp {
     images: images::ImagesView,
     volumes: volumes::VolumesView,
     networks: networks::NetworksView,
-    // Keep a submitted network create alive across page invalidation; Docker may
-    // already have accepted the mutation and its success should refresh inventory.
+    // Keep submitted network mutations alive across page invalidation; the
+    // engine may already have accepted them and success should refresh inventory.
     network_create_task: Option<JoinHandle<()>>,
+    network_remove_task: Option<JoinHandle<()>>,
     resource_read_task: Option<JoinHandle<()>>,
     pending_resource_read: Option<PendingResourceRead>,
     image_list_task: Option<JoinHandle<()>>,
@@ -933,6 +942,7 @@ impl FerrumApp {
             volumes: volumes::VolumesView::default(),
             networks: networks::NetworksView::default(),
             network_create_task: None,
+            network_remove_task: None,
             resource_read_task: None,
             pending_resource_read: None,
             image_list_task: None,
@@ -1151,8 +1161,16 @@ impl FerrumApp {
         self.pending_resource_read = Some(PendingResourceRead::NetworkList { generation });
         self.start_pending_resource_read(context);
     }
+    fn network_task_in_flight(&self) -> bool {
+        self.network_create_task.is_some() || self.network_remove_task.is_some()
+    }
+
+    fn network_mutation_busy(&self) -> bool {
+        self.network_task_in_flight() || self.networks.has_mutation_in_flight()
+    }
+
     fn start_network_create(&mut self, generation: u64, name: String, context: egui::Context) {
-        if self.network_create_task.is_some()
+        if self.network_task_in_flight()
             || self.loading
             || !cfg!(target_os = "linux")
             || !matches!(&self.connection, ConnectionState::Connected)
@@ -1168,6 +1186,54 @@ impl FerrumApp {
             if sender
                 .send(EngineEvent::NetworkCreated {
                     generation,
+                    name,
+                    result,
+                })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
+    fn start_network_remove(
+        &mut self,
+        generation: u64,
+        inspection_generation: u64,
+        removal_generation: u64,
+        id: String,
+        name: String,
+        context: egui::Context,
+    ) {
+        if self.network_task_in_flight()
+            || self.loading
+            || !cfg!(target_os = "linux")
+            || !matches!(&self.connection, ConnectionState::Connected)
+            || self.page != images::AppPage::Networks
+            || !self.networks.removal_is_pending(
+                generation,
+                inspection_generation,
+                removal_generation,
+                &id,
+                &name,
+            )
+        {
+            self.networks.cancel_remove_submission(removal_generation);
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            self.networks.cancel_remove_submission(removal_generation);
+            return;
+        };
+        let sender = self.sender.clone();
+        self.network_remove_task = Some(self.runtime.spawn(async move {
+            let result = engine.remove_network(&id).await;
+            if sender
+                .send(EngineEvent::NetworkRemoved {
+                    generation,
+                    inspection_generation,
+                    removal_generation,
+                    id,
                     name,
                     result,
                 })
@@ -1565,7 +1631,7 @@ impl FerrumApp {
         });
     }
     fn switch_context(&mut self, selected: Option<String>, context: egui::Context) {
-        if self.loading || self.action_busy() || self.network_create_task.is_some() {
+        if self.loading || self.action_busy() || self.network_mutation_busy() {
             return;
         }
         #[cfg(target_os = "linux")]
@@ -1760,6 +1826,29 @@ impl FerrumApp {
                         result.map(|_| ()).map_err(|error| error.to_string()),
                     );
                     self.network_create_task = None;
+                    if succeeded && self.page == images::AppPage::Networks {
+                        self.networks.mark_list_stale();
+                        self.load_networks(context.clone());
+                    }
+                }
+                EngineEvent::NetworkRemoved {
+                    generation,
+                    inspection_generation,
+                    removal_generation,
+                    id,
+                    name,
+                    result,
+                } => {
+                    let succeeded = result.is_ok();
+                    self.networks.finish_remove(
+                        generation,
+                        inspection_generation,
+                        removal_generation,
+                        &id,
+                        &name,
+                        result.map_err(|error| error.to_string()),
+                    );
+                    self.network_remove_task = None;
                     if succeeded && self.page == images::AppPage::Networks {
                         self.networks.mark_list_stale();
                         self.load_networks(context.clone());
@@ -2332,6 +2421,7 @@ impl FerrumApp {
         self.volumes.show(ui, supported, message)
     }
     fn draw_networks(&mut self, ui: &mut egui::Ui) -> Option<networks::NetworksAction> {
+        let network_mutation_in_flight = self.network_mutation_busy();
         if let Some(error) = &self.context_error {
             ui.colored_label(Color32::from_rgb(224, 174, 109), "Context switch failed");
             ui.label("The previous engine connection remains active.");
@@ -2345,7 +2435,7 @@ impl FerrumApp {
                 ui,
                 false,
                 "Context selection is in progress.",
-                self.network_create_task.is_some(),
+                network_mutation_in_flight,
             );
         }
         if self.engine.is_some()
@@ -2370,7 +2460,7 @@ impl FerrumApp {
             ConnectionState::Connected => "",
         };
         self.networks
-            .show(ui, supported, message, self.network_create_task.is_some())
+            .show(ui, supported, message, network_mutation_in_flight)
     }
     fn draw_images(&mut self, ui: &mut egui::Ui) -> Option<images::ImageInspectionRequest> {
         if let Some(error) = &self.context_error {
@@ -2447,7 +2537,7 @@ impl FerrumApp {
                     || self.images.is_removing()
                     || self.image_tag_task.is_some()
                     || self.image_remove_task.is_some()));
-        let network_create_in_flight = self.network_create_task.is_some();
+        let network_mutation_in_flight = self.network_mutation_busy();
 
         egui::Panel::top("header")
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 14)))
@@ -2467,7 +2557,7 @@ impl FerrumApp {
                         }
                     }
                     ui.add_enabled_ui(
-                        !page_loading && !self.action_busy() && !network_create_in_flight,
+                        !page_loading && !self.action_busy() && !network_mutation_in_flight,
                         |ui| {
                             let selected_name = match self.selected_context.as_deref() {
                                 Some(name) => self
@@ -2523,8 +2613,10 @@ impl FerrumApp {
                                 });
                         },
                     );
-                    if network_create_in_flight {
-                        ui.label("Network creation is in progress; context switching is disabled.");
+                    if network_mutation_in_flight {
+                        ui.label(
+                            "A network mutation is in progress; context switching is disabled.",
+                        );
                     }
                     if let Some(info) = &self.engine_info {
                         ui.separator();
@@ -3332,6 +3424,20 @@ impl eframe::App for FerrumApp {
                 networks::NetworksAction::Create { generation, name } => {
                     self.start_network_create(generation, name, context.clone());
                 }
+                networks::NetworksAction::Remove {
+                    generation,
+                    inspection_generation,
+                    removal_generation,
+                    id,
+                    name,
+                } => self.start_network_remove(
+                    generation,
+                    inspection_generation,
+                    removal_generation,
+                    id,
+                    name,
+                    context.clone(),
+                ),
             }
         }
         self.draw_inspection(context.clone());
@@ -3351,7 +3457,7 @@ impl eframe::App for FerrumApp {
                     || self.image_remove_task.is_some()))
             || (self.page == images::AppPage::Volumes && self.volumes.is_loading())
             || (self.page == images::AppPage::Networks
-                && (self.networks.is_loading() || self.network_create_task.is_some()))
+                && (self.networks.is_loading() || self.network_mutation_busy()))
         {
             context.request_repaint_after(Duration::from_millis(250));
         }
@@ -3749,6 +3855,7 @@ mod event_reconciliation_tests {
             image_pull_progress_reporting: None,
             image_tag_task: None,
             network_create_task: None,
+            network_remove_task: None,
             image_remove_task: None,
             loading: false,
             refresh_error: None,
@@ -3872,7 +3979,7 @@ mod event_reconciliation_tests {
             .expect("the Networks UI should request creation")
         {
             networks::NetworksAction::Create { generation, name } => (generation, name),
-            networks::NetworksAction::Inspect(_) => {
+            networks::NetworksAction::Inspect(_) | networks::NetworksAction::Remove { .. } => {
                 panic!("the create button should return a create action")
             }
         };
@@ -3892,6 +3999,106 @@ mod event_reconciliation_tests {
         assert!(!harness.state().networks.loaded);
         assert!(harness.state().network_create_task.is_none());
         let _success = harness.get_by_role_and_label(Role::Label, "Network 'work-net' created.");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_network_removal_refreshes_the_current_inventory_in_headless_app() {
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let (mut app, sender) = app_with_open_inspection();
+        app.page = images::AppPage::Networks;
+        let id = "a".repeat(64);
+        let list_generation = app.networks.begin_list();
+        app.networks.finish_list(
+            list_generation,
+            Ok(vec![NetworkSummary {
+                id: id.clone(),
+                name: "custom-net".to_owned(),
+                driver: Some("bridge".to_owned()),
+                scope: Some("local".to_owned()),
+                created_at: None,
+                internal: Some(false),
+                attachable: Some(false),
+                enable_ipv4: Some(true),
+                enable_ipv6: Some(false),
+            }]),
+        );
+        let (generation, inspection_generation, selected_id) =
+            app.networks.begin_inspection(id.clone());
+        app.networks.finish_inspection(
+            generation,
+            inspection_generation,
+            &selected_id,
+            Ok(ferrum_core::NetworkDetails {
+                id: id.clone(),
+                name: "custom-net".to_owned(),
+                driver: Some("bridge".to_owned()),
+                scope: Some("local".to_owned()),
+                created_at: None,
+                internal: Some(false),
+                attachable: Some(false),
+                enable_ipv4: Some(true),
+                enable_ipv6: Some(false),
+                attached_container_count: Some(0),
+            }),
+        );
+        let (action_sender, action_receiver) = std::sync::mpsc::channel();
+        let mut harness = Harness::new_ui_state(
+            move |ui, app: &mut FerrumApp| {
+                let context = ui.ctx().clone();
+                app.receive_events(context);
+                if let Some(action) = app.networks.show(ui, true, "", false) {
+                    action_sender
+                        .send(action)
+                        .expect("action receiver should stay open");
+                }
+            },
+            app,
+        );
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Remove network")
+            .click_accesskit();
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Confirm network removal")
+            .click_accesskit();
+        harness.step();
+        let networks::NetworksAction::Remove {
+            generation,
+            inspection_generation,
+            removal_generation,
+            id: removed_id,
+            name,
+        } = action_receiver
+            .try_recv()
+            .expect("explicit confirmation should submit removal")
+        else {
+            panic!("confirmation should submit network removal");
+        };
+        assert_eq!(removed_id, id);
+        let remove_task = harness.state().runtime.spawn(std::future::pending());
+        harness.state_mut().network_remove_task = Some(remove_task);
+        harness
+            .state()
+            .runtime
+            .block_on(sender.send(EngineEvent::NetworkRemoved {
+                generation,
+                inspection_generation,
+                removal_generation,
+                id: removed_id,
+                name,
+                result: Ok(()),
+            }))
+            .expect("removal completion should be queued");
+        harness.step();
+        assert!(harness.state().networks.generation > list_generation);
+        assert!(harness.state().networks.loading);
+        assert!(!harness.state().networks.loaded);
+        assert!(harness.state().network_remove_task.is_none());
+        let _success =
+            harness.get_by_role_and_label(Role::Label, "Network 'custom-net' was removed.");
     }
 
     #[test]
@@ -4531,7 +4738,7 @@ mod event_reconciliation_tests {
         );
         let _status = harness.get_by_role_and_label(
             Role::Label,
-            "Network creation is in progress; context switching is disabled.",
+            "A network mutation is in progress; context switching is disabled.",
         );
     }
     #[cfg(target_os = "linux")]
@@ -4546,6 +4753,77 @@ mod event_reconciliation_tests {
         assert_eq!(app.selected_context, None);
         assert!(app.network_create_task.is_some());
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_network_removal_disables_context_selector_accessibly() {
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let (mut app, _) = app_with_open_inspection();
+        app.network_remove_task = Some(app.runtime.spawn(std::future::pending()));
+        let mut harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| {
+                let mut refresh_requested = false;
+                let mut settings_requested = false;
+                let mut context_requested = None;
+                app.draw_header(
+                    ui,
+                    &mut refresh_requested,
+                    &mut settings_requested,
+                    &mut context_requested,
+                );
+            },
+            app,
+        );
+
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(Role::ComboBox, "Docker context")
+                .accesskit_node()
+                .is_disabled()
+        );
+        let _status = harness.get_by_role_and_label(
+            Role::Label,
+            "A network mutation is in progress; context switching is disabled.",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn context_switch_is_rejected_while_network_removal_is_pending() {
+        let (mut app, _) = app_with_open_inspection();
+        app.network_remove_task = Some(app.runtime.spawn(std::future::pending()));
+
+        app.switch_context(Some("other-context".to_owned()), egui::Context::default());
+
+        assert!(!app.loading);
+        assert_eq!(app.selected_context, None);
+        assert!(app.network_remove_task.is_some());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_one_network_mutation_can_start_in_the_app() {
+        let (mut app, _) = app_with_open_inspection();
+        app.network_create_task = Some(app.runtime.spawn(std::future::pending()));
+        app.start_network_remove(
+            0,
+            0,
+            0,
+            "a".repeat(64),
+            "custom-net".to_owned(),
+            egui::Context::default(),
+        );
+        assert!(app.network_create_task.is_some());
+        assert!(app.network_remove_task.is_none());
+
+        let (mut app, _) = app_with_open_inspection();
+        app.network_remove_task = Some(app.runtime.spawn(std::future::pending()));
+        app.start_network_create(0, "new-net".to_owned(), egui::Context::default());
+        assert!(app.network_remove_task.is_some());
+        assert!(app.network_create_task.is_none());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn context_switch_aborts_a_pending_exec_open() {

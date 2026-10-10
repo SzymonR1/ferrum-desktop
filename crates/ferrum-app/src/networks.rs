@@ -7,7 +7,25 @@ const MAX_NETWORK_NAME_BYTES: usize = 255;
 
 pub(super) enum NetworksAction {
     Inspect(String),
-    Create { generation: u64, name: String },
+    Create {
+        generation: u64,
+        name: String,
+    },
+    Remove {
+        generation: u64,
+        inspection_generation: u64,
+        removal_generation: u64,
+        id: String,
+        name: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NetworkRemovalConfirmation {
+    generation: u64,
+    inspection_generation: u64,
+    id: String,
+    name: String,
 }
 
 fn valid_network_name(name: &str) -> bool {
@@ -19,6 +37,13 @@ fn valid_network_name(name: &str) -> bool {
 
 fn bool_label(value: Option<bool>) -> Option<&'static str> {
     value.map(|value| if value { "Yes" } else { "No" })
+}
+fn predefined_network(name: &str) -> bool {
+    matches!(name, "bridge" | "host" | "none")
+}
+
+fn valid_network_removal_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Default)]
@@ -35,6 +60,14 @@ pub(super) struct NetworksView {
     creating: bool,
     create_success: Option<String>,
     create_error: Option<String>,
+    remove_generation: u64,
+    remove_confirmation: Option<NetworkRemovalConfirmation>,
+    removing: bool,
+    remove_result_id: Option<String>,
+    remove_result_name: Option<String>,
+    remove_success: Option<String>,
+    remove_error: Option<String>,
+
     pub(super) loading: bool,
     pub(super) loaded: bool,
     inspecting: bool,
@@ -49,6 +82,7 @@ impl NetworksView {
         self.generation = self.generation.wrapping_add(1);
         self.inspection_generation = self.inspection_generation.wrapping_add(1);
         self.create_generation = self.create_generation.wrapping_add(1);
+        self.remove_generation = self.remove_generation.wrapping_add(1);
         self.networks.clear();
         self.visible.clear();
         self.selected = None;
@@ -60,6 +94,12 @@ impl NetworksView {
         self.creating = false;
         self.create_success = None;
         self.create_error = None;
+        self.remove_confirmation = None;
+        self.removing = false;
+        self.remove_result_id = None;
+        self.remove_result_name = None;
+        self.remove_success = None;
+        self.remove_error = None;
         self.error = None;
         self.detail_error = None;
     }
@@ -67,6 +107,7 @@ impl NetworksView {
     pub(super) fn begin_list(&mut self) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.inspection_generation = self.inspection_generation.wrapping_add(1);
+        self.remove_generation = self.remove_generation.wrapping_add(1);
         self.loading = true;
         self.loaded = false;
         self.error = None;
@@ -74,6 +115,10 @@ impl NetworksView {
         self.attached_container_count_display = None;
         self.selected = None;
         self.inspecting = false;
+        self.removing = false;
+        self.remove_confirmation = None;
+        self.remove_result_id = None;
+        self.remove_result_name = None;
         self.networks.clear();
         self.visible.clear();
         self.detail_error = None;
@@ -105,7 +150,10 @@ impl NetworksView {
     }
 
     fn begin_create(&mut self) -> Option<NetworksAction> {
-        if self.creating || !valid_network_name(&self.create_name) {
+        if self.has_mutation_in_flight()
+            || self.remove_confirmation.is_some()
+            || !valid_network_name(&self.create_name)
+        {
             return None;
         }
         self.create_generation = self.create_generation.wrapping_add(1);
@@ -143,16 +191,169 @@ impl NetworksView {
         }
         true
     }
+    pub(super) fn has_mutation_in_flight(&self) -> bool {
+        self.creating || self.removing
+    }
+
+    pub(super) fn can_remove_selected_network(&self) -> bool {
+        if self.inspecting || self.loading {
+            return false;
+        }
+        let Some(selected_id) = self.selected.as_deref() else {
+            return false;
+        };
+        let Some(details) = self.details.as_ref() else {
+            return false;
+        };
+        let Some(listed) = self
+            .networks
+            .iter()
+            .find(|network| network.id == selected_id)
+        else {
+            return false;
+        };
+        valid_network_removal_id(selected_id)
+            && details.id == selected_id
+            && details.name == listed.name
+            && !predefined_network(&listed.name)
+            && details.attached_container_count == Some(0)
+    }
+
+    fn begin_remove_confirmation(&mut self) {
+        if !self.has_mutation_in_flight()
+            && self.can_remove_selected_network()
+            && self.remove_confirmation.is_none()
+            && let Some(details) = self.details.as_ref()
+        {
+            self.remove_confirmation = Some(NetworkRemovalConfirmation {
+                generation: self.generation,
+                inspection_generation: self.inspection_generation,
+                id: details.id.clone(),
+                name: details.name.clone(),
+            });
+            self.remove_success = None;
+            self.remove_error = None;
+        }
+    }
+
+    fn cancel_remove_confirmation(&mut self) {
+        self.remove_confirmation = None;
+    }
+
+    fn confirmation_is_current(&self, confirmation: &NetworkRemovalConfirmation) -> bool {
+        !self.has_mutation_in_flight()
+            && confirmation.generation == self.generation
+            && confirmation.inspection_generation == self.inspection_generation
+            && self.selected.as_deref() == Some(confirmation.id.as_str())
+            && self.details.as_ref().is_some_and(|details| {
+                details.id == confirmation.id && details.name == confirmation.name
+            })
+            && self.can_remove_selected_network()
+    }
+
+    fn confirm_remove(&mut self) -> Option<NetworksAction> {
+        let confirmation = self.remove_confirmation.take()?;
+        if !self.confirmation_is_current(&confirmation) {
+            return None;
+        }
+        self.remove_generation = self.remove_generation.wrapping_add(1);
+        self.removing = true;
+        self.remove_result_id = Some(confirmation.id.clone());
+        self.remove_result_name = Some(confirmation.name.clone());
+        self.remove_success = None;
+        self.remove_error = None;
+        Some(NetworksAction::Remove {
+            generation: confirmation.generation,
+            inspection_generation: confirmation.inspection_generation,
+            removal_generation: self.remove_generation,
+            id: confirmation.id,
+            name: confirmation.name,
+        })
+    }
+
+    pub(super) fn removal_is_pending(
+        &self,
+        generation: u64,
+        inspection_generation: u64,
+        removal_generation: u64,
+        id: &str,
+        name: &str,
+    ) -> bool {
+        self.removing
+            && self.generation == generation
+            && self.inspection_generation == inspection_generation
+            && self.remove_generation == removal_generation
+            && self.selected.as_deref() == Some(id)
+            && self.remove_result_id.as_deref() == Some(id)
+            && self.remove_result_name.as_deref() == Some(name)
+            && self.can_remove_selected_network()
+    }
+
+    pub(super) fn cancel_remove_submission(&mut self, removal_generation: u64) {
+        if self.removing && self.remove_generation == removal_generation {
+            self.removing = false;
+            self.remove_result_id = None;
+            self.remove_result_name = None;
+        }
+    }
+
+    pub(super) fn finish_remove(
+        &mut self,
+        generation: u64,
+        inspection_generation: u64,
+        removal_generation: u64,
+        id: &str,
+        name: &str,
+        result: Result<(), String>,
+    ) -> bool {
+        if !self.removing
+            || self.remove_generation != removal_generation
+            || self.remove_result_id.as_deref() != Some(id)
+            || self.remove_result_name.as_deref() != Some(name)
+        {
+            return false;
+        }
+        self.removing = false;
+        self.remove_result_id = None;
+        self.remove_result_name = None;
+        if self.generation != generation
+            || self.inspection_generation != inspection_generation
+            || self.selected.as_deref() != Some(id)
+        {
+            return false;
+        }
+        self.details = None;
+        self.attached_container_count_display = None;
+        self.inspecting = false;
+        self.remove_confirmation = None;
+        match result {
+            Ok(()) => {
+                self.remove_success = Some(name.to_owned());
+                self.remove_error = None;
+            }
+            Err(error) => {
+                self.remove_success = None;
+                self.remove_error = Some(error);
+            }
+        }
+        true
+    }
 
     pub(super) fn mark_list_stale(&mut self) {
         self.loading = false;
         self.loaded = false;
+        self.inspection_generation = self.inspection_generation.wrapping_add(1);
+        self.remove_generation = self.remove_generation.wrapping_add(1);
         self.networks.clear();
         self.visible.clear();
         self.selected = None;
         self.details = None;
         self.attached_container_count_display = None;
         self.inspecting = false;
+        self.removing = false;
+        self.remove_confirmation = None;
+        self.remove_result_id = None;
+        self.remove_result_name = None;
         self.error = None;
         self.detail_error = None;
     }
@@ -163,6 +364,8 @@ impl NetworksView {
         self.details = None;
         self.attached_container_count_display = None;
         self.detail_error = None;
+        self.remove_confirmation = None;
+        self.remove_error = None;
         self.inspecting = true;
         (self.generation, self.inspection_generation, id)
     }
@@ -182,7 +385,7 @@ impl NetworksView {
         }
         self.inspecting = false;
         match result {
-            Ok(details) => {
+            Ok(details) if details.id == id => {
                 self.attached_container_count_display = Some(
                     details
                         .attached_container_count
@@ -190,12 +393,16 @@ impl NetworksView {
                 );
                 self.details = Some(details);
             }
+            Ok(_) => {
+                self.detail_error =
+                    Some("The inspected network did not match the selected network.".to_owned())
+            }
             Err(error) => self.detail_error = Some(error),
         }
     }
 
     pub(super) fn is_loading(&self) -> bool {
-        self.loading || self.inspecting || self.creating
+        self.loading || self.inspecting || self.has_mutation_in_flight()
     }
 
     fn rebuild_visible(&mut self) {
@@ -217,25 +424,31 @@ impl NetworksView {
         ui: &mut egui::Ui,
         supported: bool,
         connection_message: &str,
-        create_in_flight: bool,
+        network_mutation_in_flight: bool,
     ) -> Option<NetworksAction> {
         ui.heading("Networks");
         ui.label(
-            "Inventory and default bridge network creation for the selected local Docker Unix socket on Linux.",
+            "Inventory, default bridge creation, and confirmed removal of unused custom networks on the selected local Docker Unix socket on Linux.",
         );
-        ui.label("Network removal, connect, and disconnect operations are not offered.");
+        ui.label("Network connect and disconnect operations are not offered.");
         if !supported {
             ui.label("Networks require a connected local Docker Unix socket on Linux.");
             ui.label(connection_message);
             return None;
         }
+        let operation_in_flight = network_mutation_in_flight || self.has_mutation_in_flight();
         let mut action = None;
         ui.group(|ui| {
             ui.heading("Create default bridge network");
-            let operation_in_flight = create_in_flight || self.creating;
             if operation_in_flight {
                 ui.spinner();
-                ui.label("Creating network…");
+                if self.creating {
+                    ui.label("Creating network…");
+                } else if self.removing {
+                    ui.label("Removing network…");
+                } else {
+                    ui.label("A network operation is in progress.");
+                }
             }
             if let Some(name) = &self.create_success {
                 ui.label(format!("Network '{name}' created."));
@@ -246,7 +459,7 @@ impl NetworksView {
             }
             let name_label = ui.label("Network name");
             ui.add_enabled(
-                !operation_in_flight,
+                !operation_in_flight && self.remove_confirmation.is_none(),
                 egui::TextEdit::singleline(&mut self.create_name),
             )
             .labelled_by(name_label.id);
@@ -258,7 +471,9 @@ impl NetworksView {
             }
             if ui
                 .add_enabled(
-                    name_is_valid && !operation_in_flight,
+                    name_is_valid
+                        && !operation_in_flight
+                        && self.remove_confirmation.is_none(),
                     egui::Button::new("Create network"),
                 )
                 .clicked()
@@ -332,6 +547,83 @@ impl NetworksView {
                 self.attached_container_count_display.as_deref(),
             );
         }
+        ui.group(|ui| {
+            ui.heading("Remove unused custom network");
+            if self.selected.is_none() {
+                ui.label("Select and inspect a custom network before removal.");
+            } else if self.inspecting {
+                ui.label("Wait for the selected network inspection to finish.");
+            } else if let Some(details) = &self.details {
+                if predefined_network(&details.name) {
+                    ui.label("Predefined Docker networks (bridge, host, none) cannot be removed here.");
+                } else {
+                    match details.attached_container_count {
+                        Some(0) => {
+                            ui.label("Inspect reports zero attached containers; this is only a point-in-time snapshot.");
+                        }
+                        Some(count) => {
+                            ui.label(format!(
+                                "Removal is disabled while {count} attached container(s) are reported."
+                            ));
+                        }
+                        None => {
+                            ui.label("Removal is disabled because the attached-container count was not reported.");
+                        }
+                    }
+                }
+            } else {
+                ui.label("Inspect the selected network before removal.");
+            }
+            if self.removing
+                && let Some(name) = &self.remove_result_name
+            {
+                ui.spinner();
+                ui.label(format!("Removing network '{name}'…"));
+            }
+            if let Some(name) = &self.remove_success {
+                ui.label(format!("Network '{name}' was removed."));
+            }
+            if let Some(error) = &self.remove_error {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    "Network removal failed; the engine state may have changed.",
+                );
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+                ui.label("Inspect the network again before another removal attempt.");
+            }
+            if ui
+                .add_enabled(
+                    self.can_remove_selected_network()
+                        && !operation_in_flight
+                        && self.remove_confirmation.is_none(),
+                    egui::Button::new("Remove network"),
+                )
+                .clicked()
+            {
+                self.begin_remove_confirmation();
+            }
+            if let Some(confirmation) = self.remove_confirmation.clone() {
+                if self.confirmation_is_current(&confirmation) {
+                    ui.group(|ui| {
+                        ui.heading("Confirm network removal");
+                        ui.label(format!(
+                            "Remove custom network '{}' (ID {})? The latest inspect reported zero attached containers; this is only a point-in-time check. Docker may reject removal if dependencies change. Force and prune are not used. Confirm to submit this exact-ID request.",
+                            confirmation.name, confirmation.id
+                        ));
+                        ui.horizontal(|ui| {
+                            if ui.button("Confirm network removal").clicked() {
+                                action = self.confirm_remove();
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.cancel_remove_confirmation();
+                            }
+                        });
+                    });
+                } else {
+                    self.cancel_remove_confirmation();
+                }
+            }
+        });
         action.or_else(|| selected.map(NetworksAction::Inspect))
     }
 }
@@ -372,6 +664,21 @@ mod tests {
             attached_container_count: count,
         }
     }
+    fn removable_view(name: &str, count: Option<usize>) -> NetworksView {
+        let id = "a".repeat(64);
+        let mut view = NetworksView::default();
+        let generation = view.begin_list();
+        view.finish_list(generation, Ok(vec![summary(&id, name)]));
+        let (_, inspection_generation, inspected_id) = view.begin_inspection(id);
+        view.finish_inspection(
+            generation,
+            inspection_generation,
+            &inspected_id,
+            Ok(details(&inspected_id, name, count)),
+        );
+        view
+    }
+
     fn harness_for(view: NetworksView, supported: bool) -> Harness<'static, NetworksView> {
         Harness::new_ui_state(
             move |ui, view: &mut NetworksView| {
@@ -662,5 +969,186 @@ mod tests {
         let mut harness = harness_for(view, true);
         harness.run();
         let _not_reported = harness.get_by_role_and_label(Role::Label, "Not reported");
+    }
+    #[test]
+    fn removal_requires_a_fresh_zero_count_and_rejects_predefined_networks() {
+        for (name, inspected_count, enabled) in [
+            ("custom-net", None, false),
+            ("custom-net", Some(None), false),
+            ("custom-net", Some(Some(2)), false),
+            ("bridge", Some(Some(0)), false),
+            ("host", Some(Some(0)), false),
+            ("none", Some(Some(0)), false),
+            ("custom-net", Some(Some(0)), true),
+        ] {
+            let view = match inspected_count {
+                Some(count) => removable_view(name, count),
+                None => {
+                    let mut view = NetworksView::default();
+                    let generation = view.begin_list();
+                    view.finish_list(generation, Ok(vec![summary(&"a".repeat(64), name)]));
+                    view
+                }
+            };
+            let mut harness = harness_for(view, true);
+            harness.run();
+            assert_eq!(
+                harness
+                    .get_by_role_and_label(Role::Button, "Remove network")
+                    .accesskit_node()
+                    .is_disabled(),
+                !enabled,
+                "unexpected remove availability for {name} with count {inspected_count:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_removal_requires_named_confirmation_and_cancel_sends_no_action() {
+        let id = "a".repeat(64);
+        let (action_sender, action_receiver) = std::sync::mpsc::channel();
+        let mut harness = Harness::new_ui_state(
+            move |ui, view: &mut NetworksView| {
+                if let Some(action) = view.show(ui, true, "", false)
+                    && !matches!(&action, NetworksAction::Inspect(_))
+                {
+                    action_sender
+                        .send(action)
+                        .expect("action receiver should stay open");
+                }
+            },
+            removable_view("custom-net", Some(0)),
+        );
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Remove network")
+            .click_accesskit();
+        harness.run();
+        let _confirmation = harness.get_by_role_and_label(Role::Label, "Confirm network removal");
+        let expected_confirmation = format!(
+            "Remove custom network 'custom-net' (ID {id})? The latest inspect reported zero attached containers; this is only a point-in-time check. Docker may reject removal if dependencies change. Force and prune are not used. Confirm to submit this exact-ID request."
+        );
+        let _warning = harness.get_by_role_and_label(Role::Label, &expected_confirmation);
+        assert!(action_receiver.try_recv().is_err());
+        harness
+            .get_by_role_and_label(Role::Button, "Cancel")
+            .click_accesskit();
+        harness.run();
+        assert!(action_receiver.try_recv().is_err());
+
+        harness
+            .get_by_role_and_label(Role::Button, "Remove network")
+            .click_accesskit();
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Confirm network removal")
+            .click_accesskit();
+        harness.step();
+        assert!(matches!(
+            action_receiver.try_recv().expect("explicit confirmation should submit"),
+            NetworksAction::Remove {
+                id: submitted_id,
+                name,
+                ..
+            } if submitted_id == id && name == "custom-net"
+        ));
+        assert!(harness.state().removing);
+    }
+
+    #[test]
+    fn stale_network_removal_confirmation_and_results_are_rejected() {
+        let mut view = removable_view("custom-net", Some(0));
+        view.begin_remove_confirmation();
+        view.begin_inspection("other-network".to_owned());
+        assert!(view.confirm_remove().is_none());
+
+        let mut view = removable_view("custom-net", Some(0));
+        view.begin_remove_confirmation();
+        let action = view
+            .confirm_remove()
+            .expect("fresh confirmation should submit");
+        let NetworksAction::Remove {
+            generation,
+            inspection_generation,
+            removal_generation,
+            id,
+            name,
+        } = action
+        else {
+            panic!("confirmation should submit removal");
+        };
+        let other_id = "b".repeat(64);
+        assert!(!view.finish_remove(
+            generation,
+            inspection_generation,
+            removal_generation,
+            &other_id,
+            &name,
+            Ok(())
+        ));
+        assert!(view.removing);
+        assert!(!view.finish_remove(
+            generation.wrapping_add(1),
+            inspection_generation,
+            removal_generation,
+            &id,
+            &name,
+            Ok(())
+        ));
+        view.invalidate();
+        assert!(!view.finish_remove(
+            generation,
+            inspection_generation,
+            removal_generation,
+            &id,
+            &name,
+            Ok(())
+        ));
+        assert!(view.remove_success.is_none());
+        assert!(view.remove_error.is_none());
+    }
+
+    #[test]
+    fn only_one_network_mutation_can_start_and_failed_removal_requires_reinspection() {
+        let mut view = removable_view("custom-net", Some(0));
+        view.create_name = "another-net".to_owned();
+        view.begin_remove_confirmation();
+        let action = view.confirm_remove().expect("removal should be available");
+        assert!(matches!(&action, NetworksAction::Remove { .. }));
+        assert!(view.begin_create().is_none());
+        let NetworksAction::Remove {
+            generation,
+            inspection_generation,
+            removal_generation,
+            id,
+            name,
+        } = action
+        else {
+            unreachable!()
+        };
+        assert!(view.finish_remove(
+            generation,
+            inspection_generation,
+            removal_generation,
+            &id,
+            &name,
+            Err("Network removal was rejected (HTTP 409).".to_owned())
+        ));
+        assert!(!view.can_remove_selected_network());
+        assert!(view.remove_error.is_some());
+        let mut harness = harness_for(view, true);
+        harness.run();
+        let _failure = harness.get_by_role_and_label(
+            Role::Label,
+            "Network removal failed; the engine state may have changed.",
+        );
+        let _rejection =
+            harness.get_by_role_and_label(Role::Label, "Network removal was rejected (HTTP 409).");
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, "Remove network")
+                .accesskit_node()
+                .is_disabled()
+        );
     }
 }

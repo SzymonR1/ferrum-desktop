@@ -87,7 +87,7 @@ async fn local_engine_lists_and_inspects_existing_network_read_only() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "creates and removes one unique test-owned network through the current local Docker context"]
+#[ignore = "creates and removes one unique test-owned network with EngineClient; exact-ID Docker CLI cleanup is only the Drop fallback"]
 async fn local_engine_creates_default_bridge_network_and_cleans_up_exact_id() {
     let contexts = EngineClient::available_contexts()
         .await
@@ -138,7 +138,10 @@ async fn local_engine_creates_default_bridge_network_and_cleans_up_exact_id() {
 
     assert_eq!(created.driver.as_deref(), Some("bridge"));
 
-    network.remove_exact_id();
+    engine
+        .remove_network(network.id())
+        .await
+        .expect("EngineClient should remove only the verified network ID");
     let remaining = engine
         .list_networks()
         .await
@@ -941,20 +944,6 @@ impl DisposableNetwork {
 
     fn id(&self) -> &str {
         self.id.as_str()
-    }
-
-    fn remove_exact_id(&self) {
-        let output = Command::new("docker")
-            .args([
-                "--context",
-                self.context_name.as_str(),
-                "network",
-                "rm",
-                self.id.as_str(),
-            ])
-            .output()
-            .expect("Docker CLI should be available to clean up the exact network ID");
-        assert!(output.status.success(), "exact-ID network cleanup failed");
     }
 
     fn disarm(&mut self) {
