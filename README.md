@@ -52,20 +52,26 @@ broader endpoint validation remains tracked by the still-open
 pull, tag, or removal operation or test that mutates image resources is claimed;
 native image-page visual validation is not claimed. See the [Images guide](docs/src/user-guide/images.md).
 
-The **Networks** page lists and inspects networks through the selected local
-Docker Unix socket on Linux and creates networks by name only. It sends only
-the required `Name` field to the negotiated create endpoint and relies on
-Docker's default bridge driver; there are no driver, IPAM, or options controls.
-Creation refreshes the current inventory. The list displays names; inspection
-displays the ID, driver, scope, creation time, internal/attachable, and
-EnableIPv4/EnableIPv6 flags when reported. Inspect may add an optional
-point-in-time attached-container count; list responses may omit container
-details, and no container IDs, names, endpoint data, or other network metadata
-is retained or displayed. No usage statistics, remove/connect/disconnect, or
-credential access. Podman/rootless and remote endpoints remain unsupported or
-unvalidated. Issues #17 and #10 remain open; this slice is not a release.
-Native UI click/visual validation remains unverified. See the
-[Networks guide](docs/src/user-guide/networks.md).
+The **Networks** page lists, inspects, creates, and removes networks through the
+selected local Docker Unix socket on Linux. Creation sends only `Name` and uses
+Docker's default bridge driver; removal is restricted to selected custom
+networks with a fresh matching inspection reporting zero attached containers,
+and requires explicit full-ID confirmation. Neither operation uses force or
+prune. Connect/disconnect controls are limited to selected local custom
+networks whose fresh inspection contains a complete map of validated full IDs
+and whose target has an exact full-ID match in the current inventory with
+`Running` state. Stopped, paused, and unknown states are disabled. Actions
+require confirmation naming the network and container. Attachment requests
+send only the validated `Container` ID, no endpoint configuration or force
+flag, use an eight-second deadline, and are not retried.
+The Networks page refresh reads both inventories; container events and failed
+inventory reads keep attachment controls disabled until fresh state is available.
+Inspect retains attached IDs only when every `Containers` key is a full 64-character hexadecimal ID; endpoint values are discarded. Network usage statistics and credential access are not provided.
+Podman/rootless and remote endpoints remain unsupported or unvalidated. Issues
+[#17](https://github.com/SzymonR1/ferrum-desktop/issues/17) and
+[#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) remain open; this
+slice is not a release. Native UI click/visual validation remains unverified.
+See the [Networks guide](docs/src/user-guide/networks.md).
 
 
 An X11-backend screenshot captured via XWayland showed actual container names,

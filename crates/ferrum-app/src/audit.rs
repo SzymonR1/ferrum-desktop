@@ -39,6 +39,8 @@ pub(super) fn record_container_action_result(
 pub(super) enum NetworkMutation {
     Create,
     Remove,
+    Connect,
+    Disconnect,
 }
 
 impl NetworkMutation {
@@ -46,6 +48,8 @@ impl NetworkMutation {
         match self {
             Self::Create => "create",
             Self::Remove => "remove",
+            Self::Connect => "connect",
+            Self::Disconnect => "disconnect",
         }
     }
 }
@@ -79,6 +83,46 @@ pub(super) fn record_network_mutation_result(
             network_id,
             outcome = "request_error",
             "Network mutation request returned an error"
+        );
+    }
+}
+
+pub(super) fn record_network_attachment_result(
+    network_id: &str,
+    container_id: &str,
+    action: NetworkMutation,
+    request_succeeded: bool,
+) {
+    let (Some(network_id), Some(container_id)) = (
+        valid_resource_id(network_id),
+        valid_resource_id(container_id),
+    ) else {
+        return;
+    };
+    let outcome = if request_succeeded {
+        "success"
+    } else {
+        "request_error"
+    };
+    if request_succeeded {
+        tracing::info!(
+            target: "ferrum::audit",
+            audit_event = "network_mutation",
+            action = action.label(),
+            network_id,
+            container_id,
+            outcome,
+            "Network attachment request returned"
+        );
+    } else {
+        tracing::warn!(
+            target: "ferrum::audit",
+            audit_event = "network_mutation",
+            action = action.label(),
+            network_id,
+            container_id,
+            outcome,
+            "Network attachment request returned"
         );
     }
 }
@@ -204,7 +248,10 @@ mod tests {
     use super::record_volume_remove_result;
     #[cfg(target_os = "linux")]
     use super::{ImageMutation, record_image_mutation_result};
-    use super::{NetworkMutation, record_container_action_result, record_network_mutation_result};
+    use super::{
+        NetworkMutation, record_container_action_result, record_network_attachment_result,
+        record_network_mutation_result,
+    };
     use ferrum_core::ContainerAction;
     #[cfg(target_os = "linux")]
     use ferrum_engine::EngineError;
@@ -292,6 +339,13 @@ mod tests {
             record_network_mutation_result(Some(&non_hex_id), NetworkMutation::Create, false);
             record_network_mutation_result(Some(&long_id), NetworkMutation::Remove, false);
             record_network_mutation_result(None, NetworkMutation::Create, false);
+            record_network_attachment_result(&valid_id, &valid_id, NetworkMutation::Connect, true);
+            record_network_attachment_result(
+                &valid_id,
+                &valid_id,
+                NetworkMutation::Disconnect,
+                false,
+            );
         });
 
         let captured = match writer.0.lock() {
@@ -308,6 +362,8 @@ mod tests {
             ("create", "unavailable", "request_error"),
             ("remove", "unavailable", "request_error"),
             ("create", "unavailable", "request_error"),
+            ("connect", valid_id.as_str(), "success"),
+            ("disconnect", valid_id.as_str(), "request_error"),
         ];
         assert_eq!(events.len(), expected.len());
         for (line, (action, network_id, outcome)) in events.iter().zip(expected) {

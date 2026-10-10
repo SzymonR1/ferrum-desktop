@@ -146,7 +146,9 @@ enum EngineEvent {
     },
     NetworksListed {
         generation: u64,
-        result: Result<Vec<NetworkSummary>, EngineError>,
+        container_generation: u64,
+        network_result: Result<Vec<NetworkSummary>, EngineError>,
+        container_result: Result<Vec<ContainerSummary>, EngineError>,
     },
     NetworkCreated {
         generation: u64,
@@ -166,6 +168,19 @@ enum EngineEvent {
         inspection_generation: u64,
         id: String,
         result: Result<ferrum_core::NetworkDetails, EngineError>,
+    },
+    NetworkAttachmentFinished {
+        operation: networks::NetworkAttachmentOperation,
+        container_generation: u64,
+        mutation_result: Result<(), EngineError>,
+        refreshed: Result<
+            (
+                Vec<NetworkSummary>,
+                Vec<ContainerSummary>,
+                ferrum_core::NetworkDetails,
+            ),
+            EngineError,
+        >,
     },
     ImagePullProgress {
         generation: u64,
@@ -219,6 +234,7 @@ enum PendingResourceRead {
     },
     NetworkList {
         generation: u64,
+        container_generation: u64,
     },
     NetworkInspect {
         generation: u64,
@@ -762,6 +778,9 @@ struct FerrumApp {
     engine: Option<EngineClient>,
     engine_info: Option<EngineInfo>,
     containers: Vec<ContainerSummary>,
+    // Attachment controls fail closed until the current container inventory is refreshed.
+    container_inventory_fresh: bool,
+    container_inventory_generation: u64,
     inventory_view: InventoryView,
     page: images::AppPage,
     images: images::ImagesView,
@@ -771,6 +790,7 @@ struct FerrumApp {
     // engine may already have accepted them and success should refresh inventory.
     network_create_task: Option<JoinHandle<()>>,
     network_remove_task: Option<JoinHandle<()>>,
+    network_attachment_task: Option<JoinHandle<()>>,
     volume_create_task: Option<JoinHandle<()>>,
     volume_remove_task: Option<JoinHandle<()>>,
     resource_read_task: Option<JoinHandle<()>>,
@@ -950,6 +970,8 @@ impl FerrumApp {
             engine: None,
             engine_info: None,
             containers: Vec::new(),
+            container_inventory_fresh: false,
+            container_inventory_generation: 0,
             inventory_view: InventoryView::default(),
             page: images::AppPage::default(),
             images: images::ImagesView::default(),
@@ -957,6 +979,7 @@ impl FerrumApp {
             networks: networks::NetworksView::default(),
             network_create_task: None,
             network_remove_task: None,
+            network_attachment_task: None,
             volume_create_task: None,
             volume_remove_task: None,
             resource_read_task: None,
@@ -1139,6 +1162,7 @@ impl FerrumApp {
         self.pending_resource_read = None;
         self.volumes.invalidate();
         self.networks.invalidate();
+        self.invalidate_container_inventory();
     }
     fn load_volumes(&mut self, context: egui::Context) {
         if self.loading
@@ -1262,19 +1286,40 @@ impl FerrumApp {
             }
         }));
     }
+    fn invalidate_container_inventory(&mut self) {
+        self.container_inventory_generation = self.container_inventory_generation.wrapping_add(1);
+        self.container_inventory_fresh = false;
+        self.refresh_error = None;
+    }
+
+    fn replace_container_inventory(&mut self, containers: Vec<ContainerSummary>) {
+        self.container_inventory_generation = self.container_inventory_generation.wrapping_add(1);
+        self.containers = containers;
+        self.inventory_view.inventory_changed(&self.containers);
+        self.container_inventory_fresh = true;
+        self.refresh_error = None;
+    }
     fn load_networks(&mut self, context: egui::Context) {
         if self.loading
+            || self.network_mutation_busy()
             || !cfg!(target_os = "linux")
             || !matches!(&self.connection, ConnectionState::Connected)
         {
             return;
         }
+        self.invalidate_container_inventory();
         let generation = self.networks.begin_list();
-        self.pending_resource_read = Some(PendingResourceRead::NetworkList { generation });
+        let container_generation = self.container_inventory_generation;
+        self.pending_resource_read = Some(PendingResourceRead::NetworkList {
+            generation,
+            container_generation,
+        });
         self.start_pending_resource_read(context);
     }
     fn network_task_in_flight(&self) -> bool {
-        self.network_create_task.is_some() || self.network_remove_task.is_some()
+        self.network_create_task.is_some()
+            || self.network_remove_task.is_some()
+            || self.network_attachment_task.is_some()
     }
 
     fn network_mutation_busy(&self) -> bool {
@@ -1372,9 +1417,81 @@ impl FerrumApp {
         }));
     }
 
+    fn start_network_attachment(
+        &mut self,
+        operation: networks::NetworkAttachmentOperation,
+        context: egui::Context,
+    ) {
+        if self.network_task_in_flight()
+            || self.loading
+            || !cfg!(target_os = "linux")
+            || !matches!(&self.connection, ConnectionState::Connected)
+            || self.page != images::AppPage::Networks
+            || !self.container_inventory_fresh
+            || !self
+                .networks
+                .attachment_is_pending(&operation, &self.containers)
+        {
+            self.networks
+                .cancel_attachment_submission(operation.mutation_generation);
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            self.networks
+                .cancel_attachment_submission(operation.mutation_generation);
+            return;
+        };
+        let container_generation = self.container_inventory_generation;
+        let sender = self.sender.clone();
+        self.network_attachment_task = Some(self.runtime.spawn(async move {
+            let mutation_result = if operation.connect {
+                engine
+                    .connect_container_to_network(&operation.network_id, &operation.container_id)
+                    .await
+            } else {
+                engine
+                    .disconnect_container_from_network(
+                        &operation.network_id,
+                        &operation.container_id,
+                    )
+                    .await
+            };
+            audit::record_network_attachment_result(
+                &operation.network_id,
+                &operation.container_id,
+                if operation.connect {
+                    audit::NetworkMutation::Connect
+                } else {
+                    audit::NetworkMutation::Disconnect
+                },
+                mutation_result.is_ok(),
+            );
+            let refreshed = async {
+                let networks = engine.list_networks().await?;
+                let containers = engine.list_containers().await?;
+                let details = engine.inspect_network(&operation.network_id).await?;
+                Ok::<_, EngineError>((networks, containers, details))
+            }
+            .await;
+            if sender
+                .send(EngineEvent::NetworkAttachmentFinished {
+                    container_generation,
+                    operation,
+                    mutation_result,
+                    refreshed,
+                })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
+
     fn inspect_network(&mut self, id: String, context: egui::Context) {
         if !cfg!(target_os = "linux")
             || self.loading
+            || self.network_mutation_busy()
             || !matches!(&self.connection, ConnectionState::Connected)
         {
             return;
@@ -1455,14 +1572,22 @@ impl FerrumApp {
                     }
                 }));
             }
-            PendingResourceRead::NetworkList { generation }
-                if self.page == images::AppPage::Networks
-                    && generation == self.networks.generation =>
+            PendingResourceRead::NetworkList {
+                generation,
+                container_generation,
+            } if self.page == images::AppPage::Networks
+                && generation == self.networks.generation =>
             {
                 self.resource_read_task = Some(self.runtime.spawn(async move {
-                    let result = engine.list_networks().await;
+                    let (network_result, container_result) =
+                        tokio::join!(engine.list_networks(), engine.list_containers());
                     if sender
-                        .send(EngineEvent::NetworksListed { generation, result })
+                        .send(EngineEvent::NetworksListed {
+                            generation,
+                            container_generation,
+                            network_result,
+                            container_result,
+                        })
                         .await
                         .is_ok()
                     {
@@ -1897,10 +2022,10 @@ impl FerrumApp {
                             #[cfg(target_os = "linux")]
                             self.cancel_terminal_session();
                             self.invalidate_images();
-                            self.invalidate_resource_reads();
                             self.engine = None;
                             self.engine_info = None;
                             self.containers.clear();
+                            self.invalidate_container_inventory();
                             self.inventory_view.inventory_changed(&self.containers);
                             self.selected_context = None;
                             self.connection = ConnectionState::Disconnected(error.to_string());
@@ -1978,9 +2103,27 @@ impl FerrumApp {
                         self.load_volumes(context.clone());
                     }
                 }
-                EngineEvent::NetworksListed { generation, result } => {
-                    self.networks
-                        .finish_list(generation, result.map_err(|error| error.to_string()));
+                EngineEvent::NetworksListed {
+                    generation,
+                    container_generation,
+                    network_result,
+                    container_result,
+                } => {
+                    let request_is_current = generation == self.networks.generation
+                        && container_generation == self.container_inventory_generation;
+                    self.networks.finish_list(
+                        generation,
+                        network_result.map_err(|error| error.to_string()),
+                    );
+                    if request_is_current {
+                        match container_result {
+                            Ok(containers) => self.replace_container_inventory(containers),
+                            Err(error) => {
+                                self.invalidate_container_inventory();
+                                self.refresh_error = Some(error.to_string());
+                            }
+                        }
+                    }
                     self.resource_read_task = None;
                     self.start_pending_resource_read(context.clone());
                 }
@@ -2039,6 +2182,42 @@ impl FerrumApp {
                     self.resource_read_task = None;
                     self.start_pending_resource_read(context.clone());
                 }
+                EngineEvent::NetworkAttachmentFinished {
+                    operation,
+                    container_generation,
+                    mutation_result,
+                    refreshed,
+                } => {
+                    let applied = self.networks.finish_attachment(
+                        &operation,
+                        mutation_result.map_err(|error| error.to_string()),
+                    );
+                    self.network_attachment_task = None;
+                    if let Ok((networks, containers, details)) = refreshed {
+                        if container_generation == self.container_inventory_generation {
+                            self.replace_container_inventory(containers);
+                        } else if !self.container_inventory_fresh
+                            && self.page == images::AppPage::Networks
+                        {
+                            self.event_refresh_pending = true;
+                        }
+                        if applied {
+                            self.networks.refresh_after_attachment(
+                                networks,
+                                details,
+                                &operation.network_id,
+                            );
+                        }
+                    } else {
+                        self.invalidate_container_inventory();
+                        if applied {
+                            self.networks.mark_list_stale();
+                        }
+                        self.refresh_error = Some(
+                            "Could not refresh container inventory after network change.".into(),
+                        );
+                    }
+                }
                 EngineEvent::ImagesListed { generation, result } => {
                     if self.images.complete_load(generation, result) {
                         self.image_list_task = None;
@@ -2096,15 +2275,16 @@ impl FerrumApp {
                     self.loading = false;
                     match result {
                         Ok(containers) => {
-                            self.containers = containers;
-                            self.inventory_view.inventory_changed(&self.containers);
-                            self.refresh_error = None;
+                            self.replace_container_inventory(containers);
                             selected_container_changed |= self
                                 .inspection
                                 .as_ref()
                                 .is_some_and(|inspection| !inspection.action_busy);
                         }
-                        Err(error) => self.refresh_error = Some(error.to_string()),
+                        Err(error) => {
+                            self.invalidate_container_inventory();
+                            self.refresh_error = Some(error.to_string());
+                        }
                     }
                 }
                 EngineEvent::Inspected { generation, result } => {
@@ -2156,6 +2336,7 @@ impl FerrumApp {
                         action_error_after_reinspection = action_error;
                         selected_container_changed = true;
                     }
+                    self.invalidate_container_inventory();
                     self.event_refresh_pending = true;
                 }
                 EngineEvent::ContainerChanged {
@@ -2163,6 +2344,7 @@ impl FerrumApp {
                     container_id,
                 } if generation == self.event_generation => {
                     self.event_refresh_pending = true;
+                    self.invalidate_container_inventory();
                     selected_container_changed |=
                         self.inspection.as_ref().is_some_and(|inspection| {
                             !inspection.action_busy && inspection.container_id == container_id
@@ -2176,20 +2358,25 @@ impl FerrumApp {
                     }
                     match result {
                         Ok(containers) => {
-                            self.containers = containers;
-                            self.inventory_view.inventory_changed(&self.containers);
-                            self.refresh_error = None;
+                            self.replace_container_inventory(containers);
                             selected_container_changed |= self
                                 .inspection
                                 .as_ref()
                                 .is_some_and(|inspection| !inspection.action_busy);
                         }
-                        Err(error) => self.refresh_error = Some(error.to_string()),
+                        Err(error) => {
+                            self.invalidate_container_inventory();
+                            self.refresh_error = Some(error.to_string());
+                        }
                     }
                 }
                 EngineEvent::EventStreamEnded { generation }
                     if generation == self.event_generation =>
                 {
+                    self.invalidate_container_inventory();
+                    if self.page == images::AppPage::Networks {
+                        self.event_refresh_pending = true;
+                    }
                     self.event_warning = Some(
                         "Container event updates are unavailable; use Refresh to update inventory."
                             .into(),
@@ -2285,8 +2472,7 @@ impl FerrumApp {
         self.selected_context = engine.selected_context_name().map(str::to_owned);
         self.engine = Some(engine.clone());
         self.engine_info = Some(info);
-        self.containers = containers;
-        self.inventory_view.inventory_changed(&self.containers);
+        self.replace_container_inventory(containers);
         self.connection = ConnectionState::Connected;
         self.refresh_error = None;
         self.context_error = None;
@@ -2607,12 +2793,16 @@ impl FerrumApp {
                 false,
                 "Context selection is in progress.",
                 network_mutation_in_flight,
+                self.container_inventory_fresh,
+                &self.containers,
             );
         }
         if self.engine.is_some()
             && cfg!(target_os = "linux")
+            && !network_mutation_in_flight
             && !self.networks.loading
-            && !self.networks.loaded
+            && (!self.networks.loaded
+                || (!self.container_inventory_fresh && self.refresh_error.is_none()))
         {
             self.load_networks(ui.ctx().clone());
         }
@@ -2630,8 +2820,14 @@ impl FerrumApp {
             }
             ConnectionState::Connected => "",
         };
-        self.networks
-            .show(ui, supported, message, network_mutation_in_flight)
+        self.networks.show(
+            ui,
+            supported,
+            message,
+            network_mutation_in_flight,
+            self.container_inventory_fresh,
+            &self.containers,
+        )
     }
     fn draw_images(&mut self, ui: &mut egui::Ui) -> Option<images::ImageInspectionRequest> {
         if let Some(error) = &self.context_error {
@@ -3547,8 +3743,12 @@ impl eframe::App for FerrumApp {
             self.cancel_terminal_session();
         }
         if self.event_refresh_pending && !self.loading {
-            self.event_refresh_pending = false;
-            self.refresh(context.clone());
+            if self.page == images::AppPage::Networks && self.network_mutation_busy() {
+                // The mutation's refresh may predate this event; keep the event queued.
+            } else {
+                self.event_refresh_pending = false;
+                self.refresh(context.clone());
+            }
         }
         let page_requested = self.draw_sidebar(ui);
         if let Some(page) = page_requested {
@@ -3638,6 +3838,9 @@ impl eframe::App for FerrumApp {
                     name,
                     context.clone(),
                 ),
+                networks::NetworksAction::Attach(operation) => {
+                    self.start_network_attachment(operation, context.clone());
+                }
             }
         }
         self.draw_inspection(context.clone());
@@ -4041,6 +4244,8 @@ mod event_reconciliation_tests {
                 state: Some(ContainerState::Running),
                 status: Some("Up".to_owned()),
             }],
+            container_inventory_fresh: true,
+            container_inventory_generation: 0,
             inventory_view: InventoryView::default(),
             page: images::AppPage::default(),
             images: images::ImagesView::default(),
@@ -4058,6 +4263,7 @@ mod event_reconciliation_tests {
             image_tag_task: None,
             network_create_task: None,
             network_remove_task: None,
+            network_attachment_task: None,
             image_remove_task: None,
             loading: false,
             refresh_error: None,
@@ -4140,6 +4346,41 @@ mod event_reconciliation_tests {
         };
         (app, sender)
     }
+    #[cfg(target_os = "linux")]
+    fn app_with_zero_reference_volume() -> (FerrumApp, mpsc::Sender<EngineEvent>) {
+        let (mut app, sender) = app_with_open_inspection();
+        app.page = images::AppPage::Volumes;
+        let generation = app.volumes.begin_list();
+        app.volumes.finish_list(
+            generation,
+            Ok(vec![ferrum_core::VolumeSummary {
+                name: "owned-data".to_owned(),
+                driver: Some("local".to_owned()),
+                scope: Some("local".to_owned()),
+            }]),
+        );
+        let (generation, inspection_generation, name) =
+            app.volumes.begin_inspection("owned-data".to_owned());
+        app.volumes.finish_inspection(
+            generation,
+            inspection_generation,
+            &name,
+            volumes::VolumeInspectionResult::Inspected {
+                details: ferrum_core::VolumeDetails {
+                    name: name.clone(),
+                    driver: Some("local".to_owned()),
+                    scope: Some("local".to_owned()),
+                    created_at: None,
+                    mountpoint: None,
+                },
+                usage_result: Ok(Some(ferrum_core::VolumeUsage {
+                    size_bytes: Some(0),
+                    reference_count: Some(0),
+                })),
+            },
+        );
+        (app, sender)
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -4157,7 +4398,14 @@ mod event_reconciliation_tests {
             move |ui, app: &mut FerrumApp| {
                 let context = ui.ctx().clone();
                 app.receive_events(context);
-                if let Some(action) = app.networks.show(ui, true, "", false) {
+                if let Some(action) = app.networks.show(
+                    ui,
+                    true,
+                    "",
+                    false,
+                    app.container_inventory_fresh,
+                    &app.containers,
+                ) {
                     let _ = action_sender.send(action);
                 }
             },
@@ -4181,7 +4429,9 @@ mod event_reconciliation_tests {
             .expect("the Networks UI should request creation")
         {
             networks::NetworksAction::Create { generation, name } => (generation, name),
-            networks::NetworksAction::Inspect(_) | networks::NetworksAction::Remove { .. } => {
+            networks::NetworksAction::Inspect(_)
+            | networks::NetworksAction::Remove { .. }
+            | networks::NetworksAction::Attach(_) => {
                 panic!("the create button should return a create action")
             }
         };
@@ -4273,100 +4523,87 @@ mod event_reconciliation_tests {
     }
     #[cfg(target_os = "linux")]
     #[test]
-    fn successful_volume_removal_refreshes_current_inventory_in_headless_app() {
+    fn volume_removal_results_refresh_current_inventory_in_headless_app() {
         use egui::accesskit::Role;
         use egui_kittest::{Harness, kittest::Queryable};
 
-        let (mut app, sender) = app_with_open_inspection();
-        app.page = images::AppPage::Volumes;
-        let previous_generation = app.volumes.begin_list();
-        app.volumes.finish_list(
-            previous_generation,
-            Ok(vec![VolumeSummary {
-                name: "owned-data".to_owned(),
-                driver: Some("local".to_owned()),
-                scope: Some("local".to_owned()),
-            }]),
-        );
-        let (generation, inspection_generation, name) =
-            app.volumes.begin_inspection("owned-data".to_owned());
-        app.volumes.finish_inspection(
-            generation,
-            inspection_generation,
-            &name,
-            volumes::VolumeInspectionResult::Inspected {
-                details: VolumeDetails {
-                    name: name.clone(),
-                    driver: Some("local".to_owned()),
-                    scope: Some("local".to_owned()),
-                    created_at: None,
-                    mountpoint: None,
+        for result in [
+            Ok(()),
+            Err(EngineError::VolumeRemovalTimedOut {
+                endpoint_label: "selected local Docker socket",
+            }),
+        ] {
+            let succeeded = result.is_ok();
+            let (app, sender) = app_with_zero_reference_volume();
+            let previous_generation = app.volumes.generation;
+            let (action_sender, action_receiver) = std::sync::mpsc::channel();
+            let mut harness = Harness::new_ui_state(
+                move |ui, app: &mut FerrumApp| {
+                    let context = ui.ctx().clone();
+                    app.receive_events(context);
+                    if let Some(action) = app.volumes.show(ui, true, "")
+                        && matches!(&action, volumes::VolumesAction::Remove { .. })
+                    {
+                        action_sender
+                            .send(action)
+                            .expect("action receiver should stay open");
+                    }
                 },
-                usage_result: Ok(Some(ferrum_core::VolumeUsage {
-                    size_bytes: Some(0),
-                    reference_count: Some(0),
-                })),
-            },
-        );
-        let (action_sender, action_receiver) = std::sync::mpsc::channel();
-        let mut harness = Harness::new_ui_state(
-            move |ui, app: &mut FerrumApp| {
-                let context = ui.ctx().clone();
-                app.receive_events(context);
-                if let Some(action) = app.volumes.show(ui, true, "")
-                    && matches!(&action, volumes::VolumesAction::Remove { .. })
+                app,
+            );
+            harness.run();
+            harness
+                .get_by_role_and_label(Role::Button, "Remove volume")
+                .click_accesskit();
+            harness.run();
+            harness
+                .get_by_role_and_label(Role::Button, "Confirm volume removal")
+                .click_accesskit();
+            harness.step();
+            let (generation, inspection_generation, removal_generation, name) =
+                match action_receiver
+                    .try_recv()
+                    .expect("confirmed removal should return an action")
                 {
-                    action_sender
-                        .send(action)
-                        .expect("action receiver should stay open");
-                }
-            },
-            app,
-        );
-        harness.run();
-        harness
-            .get_by_role_and_label(Role::Button, "Remove volume")
-            .click_accesskit();
-        harness.run();
-        harness
-            .get_by_role_and_label(Role::Button, "Confirm volume removal")
-            .click_accesskit();
-        harness.step();
-        let (generation, inspection_generation, removal_generation, name) = match action_receiver
-            .try_recv()
-            .expect("confirmed removal should return an action")
-        {
-            volumes::VolumesAction::Remove {
-                generation,
-                inspection_generation,
-                removal_generation,
-                name,
-            } => (generation, inspection_generation, removal_generation, name),
-            volumes::VolumesAction::Inspect(_) | volumes::VolumesAction::Create { .. } => {
-                panic!("confirmation should return a remove action")
-            }
-        };
-        let pending_task = harness.state().runtime.spawn(std::future::pending());
-        harness.state_mut().volume_remove_task = Some(pending_task);
-        harness
-            .state()
-            .runtime
-            .block_on(sender.send(EngineEvent::VolumeRemoved {
-                generation,
-                inspection_generation,
-                removal_generation,
-                name,
-                result: Ok(()),
-            }))
-            .expect("removal result should be queued");
-        harness.step();
+                    volumes::VolumesAction::Remove {
+                        generation,
+                        inspection_generation,
+                        removal_generation,
+                        name,
+                    } => (generation, inspection_generation, removal_generation, name),
+                    volumes::VolumesAction::Inspect(_) | volumes::VolumesAction::Create { .. } => {
+                        panic!("confirmation should return a remove action")
+                    }
+                };
+            let pending_task = harness.state().runtime.spawn(std::future::pending());
+            harness.state_mut().volume_remove_task = Some(pending_task);
+            harness
+                .state()
+                .runtime
+                .block_on(sender.send(EngineEvent::VolumeRemoved {
+                    generation,
+                    inspection_generation,
+                    removal_generation,
+                    name,
+                    result,
+                }))
+                .expect("removal result should be queued");
+            harness.step();
 
-        assert!(harness.state().volumes.generation > previous_generation);
-        assert!(harness.state().volumes.loading);
-        assert!(!harness.state().volumes.loaded);
-        assert!(harness.state().volume_remove_task.is_none());
-        let _success =
-            harness.get_by_role_and_label(Role::Label, "Volume 'owned-data' was removed.");
+            assert!(harness.state().volumes.generation > previous_generation);
+            assert!(harness.state().volumes.loading);
+            assert!(!harness.state().volumes.loaded);
+            assert!(harness.state().volume_remove_task.is_none());
+            if succeeded {
+                let _success =
+                    harness.get_by_role_and_label(Role::Label, "Volume 'owned-data' was removed.");
+            } else {
+                let _error = harness.get_by_role_and_label(
+                    Role::Label,
+                    "Volume removal failed; the engine state may have changed.",
+                );
+            }
+        }
     }
     #[cfg(target_os = "linux")]
     #[test]
@@ -4489,6 +4726,7 @@ mod event_reconciliation_tests {
                 enable_ipv4: Some(true),
                 enable_ipv6: Some(false),
                 attached_container_count: Some(0),
+                attached_container_ids: None,
             }),
         );
         let (action_sender, action_receiver) = std::sync::mpsc::channel();
@@ -4496,7 +4734,14 @@ mod event_reconciliation_tests {
             move |ui, app: &mut FerrumApp| {
                 let context = ui.ctx().clone();
                 app.receive_events(context);
-                if let Some(action) = app.networks.show(ui, true, "", false) {
+                if let Some(action) = app.networks.show(
+                    ui,
+                    true,
+                    "",
+                    false,
+                    app.container_inventory_fresh,
+                    &app.containers,
+                ) {
                     action_sender
                         .send(action)
                         .expect("action receiver should stay open");
@@ -5270,6 +5515,104 @@ mod event_reconciliation_tests {
         app.start_network_create(0, "new-net".to_owned(), egui::Context::default());
         assert!(app.network_remove_task.is_some());
         assert!(app.network_create_task.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_network_attachment_survives_invalidation_and_blocks_context_switch() {
+        let (mut app, _) = app_with_open_inspection();
+        app.network_attachment_task = Some(app.runtime.spawn(std::future::pending()));
+
+        app.invalidate_resource_reads();
+        app.switch_context(Some("other-context".to_owned()), egui::Context::default());
+        app.start_network_create(0, "new-net".to_owned(), egui::Context::default());
+
+        assert!(!app.loading);
+        assert_eq!(app.selected_context, None);
+        assert!(app.network_attachment_task.is_some());
+        assert!(app.network_create_task.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_page_refreshes_container_state_and_fails_closed_when_unavailable() {
+        let (mut app, sender) = app_with_open_inspection();
+        app.page = images::AppPage::Networks;
+        app.container_inventory_fresh = false;
+        let generation = app.networks.generation;
+        let container_generation = app.container_inventory_generation;
+        let exited = ContainerSummary {
+            id: "container-id".to_owned(),
+            name: "example".to_owned(),
+            image: Some("example:old".to_owned()),
+            state: Some(ContainerState::Exited),
+            status: Some("Exited".to_owned()),
+        };
+        app.runtime
+            .block_on(sender.send(EngineEvent::NetworksListed {
+                generation,
+                container_generation,
+                network_result: Ok(Vec::new()),
+                container_result: Ok(vec![exited]),
+            }))
+            .expect("fresh network-page inventories should be queued");
+        app.receive_events(egui::Context::default());
+
+        assert!(app.container_inventory_fresh);
+        assert_eq!(app.containers[0].state, Some(ContainerState::Exited));
+
+        app.container_inventory_fresh = true;
+        app.runtime
+            .block_on(sender.send(EngineEvent::ContainerChanged {
+                generation: app.event_generation,
+                container_id: "container-id".to_owned(),
+            }))
+            .expect("container state changes should be queued");
+        app.receive_events(egui::Context::default());
+        let container_generation = app.container_inventory_generation;
+        assert!(!app.container_inventory_fresh);
+
+        app.runtime
+            .block_on(sender.send(EngineEvent::NetworksListed {
+                generation,
+                container_generation,
+                network_result: Ok(Vec::new()),
+                container_result: Err(EngineError::UnsupportedPlatform),
+            }))
+            .expect("failed container inventories should be queued");
+        app.receive_events(egui::Context::default());
+        assert!(!app.container_inventory_fresh);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_network_list_does_not_replace_current_container_inventory() {
+        let (mut app, sender) = app_with_open_inspection();
+        app.page = images::AppPage::Networks;
+        let stale_generation = app.networks.generation;
+        let stale_container_generation = app.container_inventory_generation;
+        app.invalidate_resource_reads();
+        app.container_inventory_fresh = false;
+        let stale_container = ContainerSummary {
+            id: "container-id".to_owned(),
+            name: "example".to_owned(),
+            image: Some("example:old".to_owned()),
+            state: Some(ContainerState::Exited),
+            status: Some("Exited".to_owned()),
+        };
+
+        app.runtime
+            .block_on(sender.send(EngineEvent::NetworksListed {
+                generation: stale_generation,
+                container_generation: stale_container_generation,
+                network_result: Ok(Vec::new()),
+                container_result: Ok(vec![stale_container]),
+            }))
+            .expect("stale network list result should be queued");
+        app.receive_events(egui::Context::default());
+
+        assert!(!app.container_inventory_fresh);
+        assert_eq!(app.containers[0].state, Some(ContainerState::Running));
     }
 
     #[cfg(target_os = "linux")]

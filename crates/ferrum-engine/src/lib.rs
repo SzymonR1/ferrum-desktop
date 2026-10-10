@@ -475,6 +475,13 @@ struct NetworkCreateRequest<'a> {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct NetworkAttachmentRequest<'a> {
+    container: &'a str,
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct NetworkCreateResponse {
@@ -488,21 +495,24 @@ struct NetworkInspectResponse {
     #[serde(flatten)]
     network: NetworkResponse,
     #[serde(default)]
-    containers: Option<NetworkContainerCount>,
+    containers: Option<NetworkContainerMembership>,
 }
 
 #[cfg(target_os = "linux")]
-struct NetworkContainerCount(usize);
+struct NetworkContainerMembership {
+    count: usize,
+    ids: Option<Vec<String>>,
+}
 
 #[cfg(target_os = "linux")]
-impl<'de> Deserialize<'de> for NetworkContainerCount {
+impl<'de> Deserialize<'de> for NetworkContainerMembership {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        struct CountVisitor;
-        impl<'de> serde::de::Visitor<'de> for CountVisitor {
-            type Value = NetworkContainerCount;
+        struct MembershipVisitor;
+        impl<'de> serde::de::Visitor<'de> for MembershipVisitor {
+            type Value = NetworkContainerMembership;
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("a map of attached container endpoints")
             }
@@ -511,14 +521,24 @@ impl<'de> Deserialize<'de> for NetworkContainerCount {
                 A: serde::de::MapAccess<'de>,
             {
                 let mut count = 0usize;
-                while map.next_key::<IgnoredAny>()?.is_some() {
+                let mut ids = Vec::new();
+                let mut valid = true;
+                while let Some(id) = map.next_key::<String>()? {
                     map.next_value::<IgnoredAny>()?;
                     count = count.saturating_add(1);
+                    if is_full_container_id(&id) {
+                        ids.push(id);
+                    } else {
+                        valid = false;
+                    }
                 }
-                Ok(NetworkContainerCount(count))
+                Ok(NetworkContainerMembership {
+                    count,
+                    ids: valid.then_some(ids),
+                })
             }
         }
-        deserializer.deserialize_map(CountVisitor)
+        deserializer.deserialize_map(MembershipVisitor)
     }
 }
 
@@ -797,6 +817,37 @@ pub enum EngineError {
         /// HTTP response status.
         status: u16,
     },
+    /// A network attachment request could not reach the local engine.
+    #[cfg(target_os = "linux")]
+    #[error("Network {action} is unavailable at the {endpoint_label}.")]
+    NetworkAttachmentUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+        /// Static request action: `connect` or `disconnect`.
+        action: &'static str,
+    },
+    /// A network attachment request exceeded its bounded wait.
+    #[cfg(target_os = "linux")]
+    #[error(
+        "Network {action} at the {endpoint_label} timed out; attachment state may have changed."
+    )]
+    NetworkAttachmentTimedOut {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+        /// Static request action: `connect` or `disconnect`.
+        action: &'static str,
+    },
+    /// The local engine rejected the network attachment request.
+    #[cfg(target_os = "linux")]
+    #[error("Network {action} was rejected at the {endpoint_label} (HTTP {status}).")]
+    NetworkAttachmentRejected {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+        /// Static request action: `connect` or `disconnect`.
+        action: &'static str,
+        /// HTTP response status.
+        status: u16,
+    },
 
     /// Image inspection failed or returned an invalid, oversized response.
     #[cfg(target_os = "linux")]
@@ -950,9 +1001,9 @@ pub enum EngineError {
     #[cfg(target_os = "linux")]
     #[error("Container log options are invalid.")]
     InvalidContainerLogsOptions,
-    /// The container identifier supplied to a log request is invalid.
+    /// A supplied container identifier is invalid.
     #[cfg(target_os = "linux")]
-    #[error("The container identifier for the logs request is invalid.")]
+    #[error("The container identifier for the engine request is invalid.")]
     InvalidContainerId,
     /// A local logs request could not be constructed.
     #[cfg(target_os = "linux")]
@@ -1341,6 +1392,17 @@ impl EngineClient {
     pub fn selected_context_name(&self) -> Option<&str> {
         self.selected_context.as_deref()
     }
+    /// Returns the local Unix socket used by this client.
+    ///
+    /// This endpoint is local configuration data, not a credential. Use it
+    /// only to direct trusted local tooling to the same already-authorized
+    /// daemon; do not display or log it. Normal socket permissions continue to
+    /// enforce access.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn local_socket_path(&self) -> &std::path::Path {
+        &self.socket_path
+    }
 
     /// Returns every container, including stopped containers, from the
     /// connected engine.
@@ -1521,8 +1583,9 @@ impl EngineClient {
     /// Inspects one local network by its engine ID or name.
     ///
     /// The identifier must be non-empty, at most 4096 bytes, and not `.` or
-    /// `..`. Endpoint keys and values are discarded while computing an
-    /// optional point-in-time attached-container count.
+    /// `..`. Endpoint values are discarded. Full 64-character hexadecimal
+    /// container IDs are retained only when every `Containers` map key is
+    /// valid; the point-in-time attached-container count remains separate.
     ///
     /// # Errors
     ///
@@ -1559,7 +1622,11 @@ impl EngineClient {
                 attachable: summary.attachable,
                 enable_ipv4: summary.enable_ipv4,
                 enable_ipv6: summary.enable_ipv6,
-                attached_container_count: response.containers.map(|count| count.0),
+                attached_container_count: response
+                    .containers
+                    .as_ref()
+                    .map(|containers| containers.count),
+                attached_container_ids: response.containers.and_then(|containers| containers.ids),
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -1618,6 +1685,121 @@ impl EngineClient {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = id;
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
+
+    /// Connects a container to a network over the selected Linux local Docker
+    /// Unix socket.
+    ///
+    /// Both identifiers must be full 64-character hexadecimal IDs. Sends only
+    /// the `Container` field, with no endpoint configuration, and does not retry.
+    /// The request has the standard eight-second deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidNetworkId` or `InvalidContainerId` before I/O for invalid
+    /// IDs, or a safe typed availability, timeout, or HTTP rejection error.
+    /// A timeout or transport error does not prove that the engine did not
+    /// change attachment state. Unsupported platforms return
+    /// `UnsupportedPlatform`.
+    pub async fn connect_container_to_network(
+        &self,
+        network_id: &str,
+        container_id: &str,
+    ) -> Result<(), EngineError> {
+        self.mutate_network_attachment(network_id, container_id, "connect")
+            .await
+    }
+
+    /// Disconnects a container from a network over the selected Linux local
+    /// Docker Unix socket.
+    ///
+    /// Both identifiers must be full 64-character hexadecimal IDs. Sends only
+    /// the `Container` field; it omits `Force`, retaining Docker's default
+    /// `false`. The request has the standard eight-second deadline and is not
+    /// retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidNetworkId` or `InvalidContainerId` before I/O for invalid
+    /// IDs, or a safe typed availability, timeout, or HTTP rejection error.
+    /// A timeout or transport error does not prove that the engine did not
+    /// change attachment state. Unsupported platforms return
+    /// `UnsupportedPlatform`.
+    pub async fn disconnect_container_from_network(
+        &self,
+        network_id: &str,
+        container_id: &str,
+    ) -> Result<(), EngineError> {
+        self.mutate_network_attachment(network_id, container_id, "disconnect")
+            .await
+    }
+
+    async fn mutate_network_attachment(
+        &self,
+        network_id: &str,
+        container_id: &str,
+        action: &'static str,
+    ) -> Result<(), EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            if !is_full_network_id(network_id) {
+                return Err(EngineError::InvalidNetworkId);
+            }
+            if !is_full_container_id(container_id) {
+                return Err(EngineError::InvalidContainerId);
+            }
+            let suffix = if action == "connect" {
+                "/connect"
+            } else {
+                "/disconnect"
+            };
+            let path = resource_request_path(&self.api_version, "networks", network_id, suffix)
+                .map_err(|_| EngineError::InvalidNetworkId)?;
+            let endpoint_label = self.info.endpoint_label;
+            let body = serde_json::to_vec(&NetworkAttachmentRequest {
+                container: container_id,
+            })
+            .map_err(|_| EngineError::NetworkAttachmentUnavailable {
+                endpoint_label,
+                action,
+            })?;
+            timeout(REQUEST_TIMEOUT, async {
+                let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
+                let request = Request::builder()
+                    .method(Method::POST)
+                    .header("content-type", "application/json")
+                    .uri(Uri::new(&self.socket_path, &path))
+                    .body(Full::new(Bytes::from(body)))
+                    .map_err(|_| EngineError::NetworkAttachmentUnavailable {
+                        endpoint_label,
+                        action,
+                    })?;
+                let response = client.request(request).await.map_err(|_| {
+                    EngineError::NetworkAttachmentUnavailable {
+                        endpoint_label,
+                        action,
+                    }
+                })?;
+                if !response.status().is_success() {
+                    return Err(EngineError::NetworkAttachmentRejected {
+                        endpoint_label,
+                        action,
+                        status: response.status().as_u16(),
+                    });
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| EngineError::NetworkAttachmentTimedOut {
+                endpoint_label,
+                action,
+            })?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (network_id, container_id, action);
             Err(EngineError::UnsupportedPlatform)
         }
     }
@@ -2597,6 +2779,11 @@ fn network_id_path_safe(id: &str) -> bool {
 #[cfg(target_os = "linux")]
 fn is_full_network_id(id: &str) -> bool {
     id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(target_os = "linux")]
+fn is_full_container_id(id: &str) -> bool {
+    is_full_network_id(id)
 }
 
 #[cfg(target_os = "linux")]
@@ -5278,6 +5465,91 @@ mod network_api_tests {
         cleanup(&socket, &directory);
     }
     #[tokio::test]
+    async fn network_connect_disconnect_send_minimal_container_body_to_versioned_paths() {
+        for action in ["connect", "disconnect"] {
+            let (socket, directory, server) = fixture(response("200 OK", b"")).await;
+            let network_id = "a".repeat(64);
+            let container_id = "b".repeat(64);
+            let engine = client(socket.clone());
+            if action == "connect" {
+                engine
+                    .connect_container_to_network(&network_id, &container_id)
+                    .await
+                    .expect("connect should succeed");
+            } else {
+                engine
+                    .disconnect_container_from_network(&network_id, &container_id)
+                    .await
+                    .expect("disconnect should succeed");
+            }
+            let request = server.await.expect("server should finish");
+            let (headers, body) = request.split_once("\r\n\r\n").expect("HTTP request");
+            assert!(headers.starts_with(&format!(
+                "POST /v1.45/networks/{network_id}/{action} HTTP/1.1\r\n"
+            )));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                serde_json::json!({"Container": container_id})
+            );
+            assert!(!body.contains("EndpointConfig"));
+            assert!(!body.contains("Force"));
+            assert!(!headers.to_ascii_lowercase().contains("force"));
+            cleanup(&socket, &directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn network_attachment_rejects_invalid_ids_before_socket_access() {
+        let engine = client(std::path::PathBuf::from("/path/that/does/not/exist"));
+        let valid = "a".repeat(64);
+        for invalid in ["", "short"] {
+            assert!(matches!(
+                engine.connect_container_to_network(invalid, &valid).await,
+                Err(EngineError::InvalidNetworkId)
+            ));
+            assert!(matches!(
+                engine
+                    .disconnect_container_from_network(&valid, invalid)
+                    .await,
+                Err(EngineError::InvalidContainerId)
+            ));
+        }
+        let invalid_hex = "g".repeat(64);
+        assert!(matches!(
+            engine
+                .connect_container_to_network(&valid, &invalid_hex)
+                .await,
+            Err(EngineError::InvalidContainerId)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_network_attachment_is_status_only_and_redacted() {
+        let network_id = "a".repeat(64);
+        let container_id = "b".repeat(64);
+        let (socket, directory, server) =
+            fixture(response("409 Conflict", b"private daemon response")).await;
+        let error = client(socket.clone())
+            .connect_container_to_network(&network_id, &container_id)
+            .await
+            .expect_err("daemon rejection should be returned");
+        server.await.expect("server");
+        assert!(matches!(
+            error,
+            EngineError::NetworkAttachmentRejected {
+                status: 409,
+                action: "connect",
+                ..
+            }
+        ));
+        let message = format!("{error:?} {error}");
+        assert!(!message.contains(&network_id));
+        assert!(!message.contains(&container_id));
+        assert!(!message.contains("private daemon response"));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
     async fn removes_network_by_exact_id_without_force_prune_or_query() {
         let (socket, directory, server) = fixture(response("204 No Content", b"")).await;
         let id = "a".repeat(64);
@@ -5440,6 +5712,7 @@ mod network_api_tests {
                 enable_ipv4: Some(true),
                 enable_ipv6: Some(true),
                 attached_container_count: Some(1),
+                attached_container_ids: None,
             }
         );
         let debug = format!("{details:?}");
@@ -5478,6 +5751,39 @@ mod network_api_tests {
         }
     }
 
+    #[tokio::test]
+    async fn inspection_retains_only_validated_attachment_ids_and_marks_incomplete_membership() {
+        let id = "c".repeat(64);
+        let body = format!(
+            r#"{{"Id":"network","Name":"custom","Containers":{{"{id}":{{"Name":"private-name","EndpointID":"private-endpoint","MacAddress":"private-mac","IPv4Address":"private-ip"}}}}}}"#
+        );
+        let (socket, directory, server) = fixture(response("200 OK", body.as_bytes())).await;
+        let details = client(socket.clone())
+            .inspect_network("network")
+            .await
+            .expect("details");
+        assert_eq!(details.attached_container_count, Some(1));
+        assert_eq!(details.attached_container_ids, Some(vec![id.clone()]));
+        let debug = format!("{details:?}");
+        assert!(!debug.contains("private-name"));
+        assert!(!debug.contains("private-endpoint"));
+        assert!(!debug.contains("private-mac"));
+        assert!(!debug.contains("private-ip"));
+        server.await.expect("server");
+        cleanup(&socket, &directory);
+
+        let body = br#"{"Id":"network","Name":"custom","Containers":{"short-id":{"Name":"private-name"}}}"#;
+        let (socket, directory, server) = fixture(response("200 OK", body)).await;
+        let details = client(socket.clone())
+            .inspect_network("network")
+            .await
+            .expect("details");
+        assert_eq!(details.attached_container_count, Some(1));
+        assert_eq!(details.attached_container_ids, None);
+        assert!(!format!("{details:?}").contains("short-id"));
+        server.await.expect("server");
+        cleanup(&socket, &directory);
+    }
     #[tokio::test]
     async fn rejects_invalid_network_ids_before_socket_connection() {
         let engine = client(std::path::PathBuf::from("/path/that/does/not/exist"));
