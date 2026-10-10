@@ -62,6 +62,13 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   container names, endpoints, raw errors, or daemon response bodies. These
   events use the configured process logger; they are not a persistent or
   tamper-proof audit store.
+- Emit a structured local tracing event when a network create/remove request
+  returns. Record the static action, `success` or `request_error` outcome, and
+  a network ID only when it is exactly 64 hexadecimal characters. Do not log
+  network names, endpoints, raw errors, or daemon response bodies. A request
+  error does not prove the engine state remained unchanged. These events use
+  the configured process logger; they are not a persistent or tamper-proof
+  audit store.
 - Keep historical/live container logs restricted to the selected local Unix-socket engine. Use the negotiated API version and streaming response body; accept only json-file/journald drivers. TTY is read from allowlisted `Config.Tty`: TTY output is raw and combined, while non-TTY output is decoded from Docker's 8-byte multiplex frames. Render logs as plain text, never as a terminal. Bound frames to 1 MiB, lines to 64 KiB, retention to 8 MiB or 10,000 lines, and delivery to a dedicated 16-message channel; discard oldest retained lines with a visible count. Pause suspends UI draining, applying bounded backpressure to producer reads without unbounded memory or dropped lines; Resume continues delivery. Copy and Export include only currently visible, retained rows and escape terminal control characters as `\xNN`.
 - Keep the experimental embedded terminal restricted to the selected local Docker-compatible Unix socket on Linux and the negotiated API version. Terminal output is untrusted; ignore OSC 52 clipboard and title requests, expose clipboard actions only to explicit user controls, and never put terminal bytes or daemon bodies in logs or errors. Closing the exec session closes its connection only; it does not stop or remove the container.
 - Persist only the schema version and startup auto-connect boolean; reject unknown fields, bound input size, and keep config files/private temporary files owner-only.

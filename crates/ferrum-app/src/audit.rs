@@ -9,7 +9,7 @@ pub(super) fn record_container_action_result(
     action: ContainerAction,
     engine_confirmed: bool,
 ) {
-    let container_id = valid_container_id(container_id);
+    let container_id = valid_resource_id(container_id);
     if engine_confirmed {
         tracing::info!(
             target: "ferrum::audit",
@@ -31,14 +31,62 @@ pub(super) fn record_container_action_result(
     }
 }
 
-fn valid_container_id(container_id: &str) -> Option<&str> {
-    (container_id.len() == 64 && container_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then_some(container_id)
+#[derive(Clone, Copy)]
+pub(super) enum NetworkMutation {
+    Create,
+    Remove,
+}
+
+impl NetworkMutation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Remove => "remove",
+        }
+    }
+}
+
+/// Emits a minimal local trace event when a network mutation request returns.
+///
+/// Only validated full network IDs are attached. Names, engine endpoints,
+/// errors, and daemon response data are never logged.
+pub(super) fn record_network_mutation_result(
+    network_id: Option<&str>,
+    action: NetworkMutation,
+    request_succeeded: bool,
+) {
+    let network_id = network_id
+        .and_then(valid_resource_id)
+        .unwrap_or("unavailable");
+    if request_succeeded {
+        tracing::info!(
+            target: "ferrum::audit",
+            audit_event = "network_mutation",
+            action = action.label(),
+            network_id,
+            outcome = "success",
+            "Network mutation request succeeded"
+        );
+    } else {
+        tracing::warn!(
+            target: "ferrum::audit",
+            audit_event = "network_mutation",
+            action = action.label(),
+            network_id,
+            outcome = "request_error",
+            "Network mutation request returned an error"
+        );
+    }
+}
+
+fn valid_resource_id(resource_id: &str) -> Option<&str> {
+    (resource_id.len() == 64 && resource_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(resource_id)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::record_container_action_result;
+    use super::{NetworkMutation, record_container_action_result, record_network_mutation_result};
     use ferrum_core::ContainerAction;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;
@@ -99,6 +147,55 @@ mod tests {
         assert!(output.contains("action=\"Stop\""));
         assert!(output.contains("outcome=\"request_error\""));
         assert!(output.contains("container_id=\"unavailable\""));
+        assert!(!output.contains("TOKEN=sentinel"));
+    }
+    #[test]
+    fn records_network_mutation_outcomes_with_validated_ids() {
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(writer.clone())
+            .finish();
+        let dispatcher = tracing::Dispatch::new(subscriber);
+        let valid_id = "b".repeat(64);
+        let malformed_id = "network\nTOKEN=sentinel";
+        let short_id = "c".repeat(63);
+        let non_hex_id = "g".repeat(64);
+        let long_id = "d".repeat(65);
+
+        tracing::dispatcher::with_default(&dispatcher, || {
+            record_network_mutation_result(Some(&valid_id), NetworkMutation::Create, true);
+            record_network_mutation_result(Some(&valid_id), NetworkMutation::Remove, false);
+            record_network_mutation_result(Some(malformed_id), NetworkMutation::Remove, false);
+            record_network_mutation_result(Some(&short_id), NetworkMutation::Remove, false);
+            record_network_mutation_result(Some(&non_hex_id), NetworkMutation::Create, false);
+            record_network_mutation_result(Some(&long_id), NetworkMutation::Remove, false);
+            record_network_mutation_result(None, NetworkMutation::Create, false);
+        });
+
+        let captured = match writer.0.lock() {
+            Ok(output) => output.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let output = String::from_utf8(captured).expect("audit events should be UTF-8");
+        let events = output.lines().collect::<Vec<_>>();
+        let expected = [
+            ("create", valid_id.as_str(), "success"),
+            ("remove", valid_id.as_str(), "request_error"),
+            ("remove", "unavailable", "request_error"),
+            ("remove", "unavailable", "request_error"),
+            ("create", "unavailable", "request_error"),
+            ("remove", "unavailable", "request_error"),
+            ("create", "unavailable", "request_error"),
+        ];
+        assert_eq!(events.len(), expected.len());
+        for (line, (action, network_id, outcome)) in events.iter().zip(expected) {
+            assert!(line.contains("audit_event=\"network_mutation\""));
+            assert!(line.contains(&format!("action=\"{action}\"")));
+            assert!(line.contains(&format!("network_id=\"{network_id}\"")));
+            assert!(line.contains(&format!("outcome=\"{outcome}\"")));
+        }
         assert!(!output.contains("TOKEN=sentinel"));
     }
 }
