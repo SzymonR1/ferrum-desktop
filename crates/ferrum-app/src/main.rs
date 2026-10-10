@@ -4102,6 +4102,36 @@ mod log_buffer_tests {
     }
 
     #[test]
+    fn log_rows_escape_bidi_and_invisible_formatting_before_display_and_copy() {
+        let mut buffer = logs::LogBuffer::new();
+        buffer.append(line(
+            ContainerLogSource::Stdout,
+            "invoice 123\u{202e}txt\u{200b}.pdf\u{e0001}\u{e0020}en\u{e007e}\u{e007f}",
+        ));
+
+        assert_eq!(
+            buffer.visible_entry_at(0).expect("log row").text,
+            "invoice 123\\u{202e}txt\\u{200b}.pdf\\u{e0001}\\u{e0020}en\\u{e007e}\\u{e007f}"
+        );
+        assert_eq!(
+            buffer.visible_text(),
+            "stdout: invoice 123\\u{202e}txt\\u{200b}.pdf\\u{e0001}\\u{e0020}en\\u{e007e}\\u{e007f}"
+        );
+    }
+
+    #[test]
+    fn escaped_log_expansion_respects_the_retention_budget() {
+        let mut buffer = logs::LogBuffer::new();
+        let spoofing_text = "\u{202e}".repeat(1_048_577);
+
+        buffer.append(line(ContainerLogSource::Stdout, &spoofing_text));
+
+        assert!(buffer.entries().is_empty());
+        assert_eq!(buffer.retained_bytes(), 0);
+        assert_eq!(buffer.dropped_lines(), 1);
+    }
+
+    #[test]
     fn reset_clears_entries_and_drop_count_but_preserves_filters() {
         let mut buffer = logs::LogBuffer::new();
         for index in 0..10_001 {

@@ -1,5 +1,5 @@
 use crate::search::CaseInsensitiveQuery;
-use ferrum_core::{ContainerLogLine, ContainerLogSource};
+use ferrum_core::{ContainerLogLine, ContainerLogSource, is_untrusted_display_character};
 use std::collections::VecDeque;
 #[cfg(target_os = "linux")]
 use std::{io, path::Path};
@@ -7,6 +7,74 @@ use std::{io, path::Path};
 const MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RETAINED_LINES: usize = 10_000;
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+fn escaped_log_text_length(text: &str) -> Option<usize> {
+    if text.len() > MAX_RETAINED_BYTES {
+        return None;
+    }
+    let escaped_len = text.chars().try_fold(text.len(), |length, character| {
+        if !is_untrusted_display_character(character) {
+            return Some(length);
+        }
+        let replacement_len = if character.is_control() {
+            4
+        } else {
+            4 + unicode_hex_digit_count(character as u32)
+        };
+        length.checked_add(replacement_len.checked_sub(character.len_utf8())?)
+    })?;
+    (escaped_len <= MAX_RETAINED_BYTES).then_some(escaped_len)
+}
+
+fn unicode_hex_digit_count(mut value: u32) -> usize {
+    let mut digits = 1;
+    while value >= 16 {
+        value >>= 4;
+        digits += 1;
+    }
+    digits
+}
+
+fn push_untrusted_log_character(output: &mut String, character: char) {
+    let value = character as u32;
+    if character.is_control() {
+        output.push_str("\\x");
+        output.push(char::from(HEX_DIGITS[((value >> 4) & 0xf) as usize]));
+        output.push(char::from(HEX_DIGITS[(value & 0xf) as usize]));
+        return;
+    }
+
+    output.push_str("\\u{");
+    let mut digits = [0; 6];
+    let mut start = digits.len();
+    let mut remaining = value;
+    loop {
+        start -= 1;
+        digits[start] = HEX_DIGITS[(remaining & 0xf) as usize];
+        remaining >>= 4;
+        if remaining == 0 {
+            break;
+        }
+    }
+    for digit in &digits[start..] {
+        output.push(char::from(*digit));
+    }
+    output.push('}');
+}
+
+fn escape_untrusted_log_text(text: String, escaped_len: usize) -> String {
+    if escaped_len == text.len() {
+        return text;
+    }
+    let mut escaped = String::with_capacity(escaped_len);
+    for character in text.chars() {
+        if is_untrusted_display_character(character) {
+            push_untrusted_log_character(&mut escaped, character);
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
 #[cfg(target_os = "linux")]
 /// Writes visible log output to the selected regular file by atomic replacement.
 ///
@@ -245,12 +313,13 @@ impl LogBuffer {
         }
     }
 
-    pub(super) fn append(&mut self, line: ContainerLogLine) {
-        let bytes = line.text.len();
-        if bytes > MAX_RETAINED_BYTES {
+    pub(super) fn append(&mut self, mut line: ContainerLogLine) {
+        let Some(escaped_len) = escaped_log_text_length(&line.text) else {
             self.dropped_lines = self.dropped_lines.saturating_add(1);
             return;
-        }
+        };
+        line.text = escape_untrusted_log_text(std::mem::take(&mut line.text), escaped_len);
+        let bytes = line.text.len();
         while self.entries.len() >= MAX_RETAINED_LINES
             || self.retained_bytes.saturating_add(bytes) > MAX_RETAINED_BYTES
         {
@@ -312,17 +381,10 @@ impl LogBuffer {
         let capacity = (0..visible_count)
             .filter_map(|row| self.visible_entry_at(row))
             .fold(visible_count.saturating_sub(1), |capacity, entry| {
-                let escaped_bytes = entry.text.chars().fold(entry.text.len(), |size, ch| {
-                    if ch.is_control() {
-                        size.saturating_add(4usize.saturating_sub(ch.len_utf8()))
-                    } else {
-                        size
-                    }
-                });
                 capacity
                     .saturating_add(source_label(&entry.source).len())
                     .saturating_add(2)
-                    .saturating_add(escaped_bytes)
+                    .saturating_add(entry.text.len())
             });
         let mut text = String::with_capacity(capacity);
         for row in 0..visible_count {
@@ -332,16 +394,7 @@ impl LogBuffer {
             if let Some(entry) = self.visible_entry_at(row) {
                 text.push_str(source_label(&entry.source));
                 text.push_str(": ");
-                for ch in entry.text.chars() {
-                    if ch.is_control() {
-                        text.push_str("\\x");
-                        let value = ch as u32;
-                        text.push(char::from(HEX_DIGITS[((value >> 4) & 0xf) as usize]));
-                        text.push(char::from(HEX_DIGITS[(value & 0xf) as usize]));
-                    } else {
-                        text.push(ch);
-                    }
-                }
+                text.push_str(&entry.text);
             }
         }
         text

@@ -250,6 +250,17 @@ The live logs test exercises history, follow, and cancellation behavior; it
 does not require the UI or visually validate the Logs view. Closing the Logs
 view cancels its stream.
 
+The headless `log_buffer_tests` verify that C0/C1 controls and selected
+bidirectional, zero-width, and invisible formatting characters are escaped
+before row text reaches the UI and before `visible_text` feeds Copy/Export.
+Escaped expansion is also rejected if it exceeds the existing 8 MiB retained
+buffer limit. This is data-level coverage, not native visual validation or
+secret detection. Run the focused tests with:
+
+```sh
+cargo test -p ferrum-app --bin ferrum log_buffer_tests
+```
+
 The engine integration targets Linux local Unix sockets. Podman/rootless
 behavior remains unvalidated, remote transports remain unsupported, and Windows
 named pipes and macOS remain deferred to issue #21/M8.

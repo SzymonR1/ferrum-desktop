@@ -2,6 +2,11 @@
 
 Ferrum treats access to a Linux Docker-compatible Unix socket as privileged. Windows/macOS engine integration is outside the current scope. The application must not elevate privileges, relax socket permissions, store plaintext credentials, or send remote engine traffic without explicit secure transport and identity validation. The experimental embedded terminal is limited to the selected local socket; terminal output is untrusted, OSC 52 clipboard and title requests are ignored, user clipboard actions are explicit, and terminal contents must not be logged.
 
+Container log text is untrusted. Ferrum escapes C0/C1 controls and selected
+bidirectional, zero-width, and invisible formatting characters before rendering,
+clipboard copy, and file export. This reduces display spoofing but does not
+detect or redact arbitrary data printed by a container.
+
 ## Reporting a vulnerability
 
 Please use the private vulnerability-reporting feature for this repository in GitHub Security Advisories when it is available. If that feature is unavailable, contact the repository owner through GitHub before sharing details publicly. Do not include credentials, private keys, or production endpoint secrets in public issues.
