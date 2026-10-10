@@ -1,6 +1,6 @@
 # Ferrum threat model
 
-**Status:** Initial scope documented; this is not a security audit. Ferrum provides container inventory and inspection, volume list/inspect/usage with name-only creation and dependency-gated removal, image tagging/removal, scoped container lifecycle actions, network list/inspect/create and constrained removal, logs, and an experimental embedded terminal over the Linux local-engine path.
+**Status:** Initial scope documented; this is not a security audit. Ferrum provides container inventory and inspection, volume list/inspect/usage with name-only creation and dependency-gated removal, image tagging/removal, scoped container lifecycle actions, network list/inspect/create/removal/connect/disconnect on the Linux local-engine path, logs, and an experimental embedded terminal.
 
 
 ## Trust boundaries
@@ -12,14 +12,14 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 - Do not elevate privileges, install services, change socket permissions, or start an engine automatically.
 - Keep direct remote `DOCKER_HOST` TCP/HTTP/HTTPS/SSH and remote Docker context transports disabled. Return typed unsupported errors without fallback to local discovery, and do not read remote TLS/SSH credentials.
 - Do not log or display raw `DOCKER_HOST` values, which may contain sensitive endpoint data.
-- Keep Docker CLI context selection session-only; do not log or display raw context endpoints.
+- Keep Docker CLI context selection session-only; do not log or display raw context endpoints. Linux `EngineClient::local_socket_path` exposes the already-connected local socket only so trusted local tooling can target the same daemon; it does not change socket permissions and must not be logged or displayed.
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
 - Use private bounded request paths for version, API negotiation, inventory, inspection, lifecycle, volume usage, and network creation/removal. Version/inventory/inspection and event-subscription setup use an 8-second timeout; lifecycle requests use a bounded 30-second timeout for graceful Stop/Restart; only the filtered volume-usage request uses a 30-second timeout with a 16 MiB response limit. Network creation uses bounded JSON `POST /v{negotiated}/networks/create` with only `Name`, a 1 KiB request-body limit, a 64 KiB success-response limit, and a safe typed response/error path. Network removal uses a bounded eight-second `DELETE /v{negotiated}/networks/{id}` after validating a full 64-character hexadecimal ID; it has no force/prune parameters, does not consume daemon response bodies, and exposes only safe typed errors. Timed-out or transport-interrupted mutations may still change state; never log or expose raw response bodies. Container Remove requires confirmation and sends neither force nor volume-removal parameters.
 - Restrict volume listing, inspection, and usage to the selected local Docker Unix socket on Linux. Retain/display only volume name, driver, scope, creation time, and mountpoint as untrusted plain text; never access the mountpoint. The separate filtered read-only `GET /v{api}/system/df?verbose=true&type=volume` provides usage only for an exact inventory-matched volume; retain/display only `Size` in bytes and point-in-time `RefCount` when reported. Missing, negative, or unknown metric values remain unavailable, and usage failures appear separately while successful inspect metadata remains visible. Discard unknown daemon fields, labels, options, status, and raw response bodies. A reference count is not a deletion-safety guarantee.
   Create only by sending `Name` to the negotiated `POST /v{api}/volumes/create` endpoint. Validate nonblank names of at most 4096 UTF-8 bytes, reject control or selected invisible formatting characters and `.`/`..`, and send no driver, labels, or options. Bound the request body to 16 KiB, response to 64 KiB, and total request to eight seconds. Require the response name to match the submitted name exactly; escape selected control, bidi, and invisible formatting characters in optional display fields as visible `\u{...}` text.
   Remove only a selected listed volume whose matching inspection reports the exact name and whose exact-name usage snapshot reports `Some(0)` references. Require explicit confirmation naming the volume; positive or unavailable counts cannot be submitted. Send only the negotiated `DELETE /v{api}/volumes/{name}` without `force`, bound it to eight seconds, and do not consume or expose daemon response bodies. The usage count is not atomic with deletion; Docker may reject the request if dependencies change. Timeouts or transport errors may follow a successful removal. Permit one volume mutation at a time, block context switching while pending, and refresh inventory after every result. Do not offer pruning, modification, connection, disconnection, or filesystem browsing. Podman/rootless remains unvalidated and remote endpoints remain unsupported; issues #17 and #10 stay open.
 - Emit local structured process traces for volume create/removal with only static action and `success`, `not_submitted`, or `request_error` outcome. Do not log volume names, mountpoints, endpoints, raw errors, or daemon bodies. A request error does not prove engine state remained unchanged; these are not a persistent or tamper-proof audit store.
-- Keep network listing and inspection allowlisted on the selected Linux local Docker Unix socket, and offer name-only default bridge creation with bounded `POST /v{negotiated}/networks/create` containing only `Name`. Names are non-whitespace, at most 255 UTF-8 bytes, and contain no control characters; no driver, IPAM, or options controls are sent. Retain/display only ID, name, driver, scope, creation time, internal, attachable, EnableIPv4, and EnableIPv6. Inspect may retain only an optional point-in-time count of the `Containers` map; list responses may omit attached-container details. Discard container IDs, names, endpoint records, MAC/IP addresses, labels, options, IPAM, peers, services, status, and raw bodies. Enable removal only for a selected custom network whose fresh matching inspection reports `Some(0)`; positive or unreported counts and the predefined `bridge`, `host`, and `none` networks cannot be submitted. Require explicit confirmation naming the exact network and full ID. The attached-container count is not atomic with deletion; Docker may reject removal if dependencies change. A timeout or transport error can follow a successful deletion. Keep one network mutation in flight and block context switching until completion; refresh the current inventory after success. Do not access credentials or offer network usage, connect, or disconnect. Podman/rootless and remote support are not claimed.
+- Keep network listing and inspection allowlisted on the selected Linux local Docker Unix socket; create networks with bounded `POST /v{negotiated}/networks/create` containing only non-whitespace, at-most-255-byte `Name`, with no driver, IPAM, or options controls. Retain/display only allowlisted network metadata. From inspect, retain the point-in-time `Containers` count and its keys only when every key is a full 64-character hexadecimal ID; discard endpoint values. The UI permits connect/disconnect only for a selected local custom network with a fresh complete membership set and a target full ID in current inventory whose state is `Running`; stopped, paused, and unknown states are disabled. Container-change events invalidate cached state; Networks refreshes both inventories and disables attachment actions until container inventory is current. Require explicit confirmation naming the exact network and container; send only `Container`, no endpoint configuration or `Force`, with an eight-second deadline and no retry. Disconnect uses Docker's default `Force=false`. Refresh network/container inventory and re-inspect after every result; treat transport errors/timeouts as potentially state-changing and stale refresh as requiring new inspection. Removal excludes `bridge`, `host`, and `none`, requires fresh matching inspection with `Some(0)` attached containers and explicit full-ID confirmation, and sends an eight-second DELETE without force/prune. Counts are not atomic with mutations. Keep one mutation in flight and block context switching; Podman/rootless and remote support remain unvalidated.
 - Anonymous image pulls are restricted to the selected local Unix-socket Docker
   engine and send no `X-Registry-Auth` header or stored credentials. Progress
   responses are bounded to 1 MiB per HTTP frame and 64 KiB per JSON record;
@@ -65,13 +65,7 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   container names, endpoints, raw errors, or daemon response bodies. These
   events use the configured process logger; they are not a persistent or
   tamper-proof audit store.
-- Emit a structured local tracing event when a network create/remove request
-  returns. Record the static action, `success` or `request_error` outcome, and
-  a network ID only when it is exactly 64 hexadecimal characters. Do not log
-  network names, endpoints, raw errors, or daemon response bodies. A request
-  error does not prove the engine state remained unchanged. These events use
-  the configured process logger; they are not a persistent or tamper-proof
-  audit store.
+- Emit a structured local tracing event when any network mutation returns. Record only the static create/remove/connect/disconnect action, `success` or `request_error`, and validated full network IDs when available; connect/disconnect events include a container ID only when it is also a full 64-character hexadecimal ID. Do not log network/container names, endpoints, raw errors, or daemon response bodies. A request error does not prove engine state remained unchanged. These events use the configured process logger; they are not a persistent or tamper-proof audit store.
 - Emit local structured tracing events when image pull, tag, or removal requests
   return, containing only the static action and `success`, `not_submitted`, or
   `request_error` outcome. `not_submitted` identifies local validation rejection
@@ -150,21 +144,38 @@ These surfaces must receive explicit design and tests before their implementatio
 
 Read-only live-engine tests cover version, inventory, and inspection without
 resource mutation. The optional ignored network list/inspect test requires
-`FERRUM_TEST_NETWORK` to name an existing local network; it lists networks and
-inspects the matching listed ID without mutation or cleanup. The separate
-ignored create-and-remove test preflights a generated name, then requires a
-full 64-character hexadecimal ID and an inventory entry matching that exact ID
-and generated name before arming cleanup. It removes only the verified ID via
-`EngineClient::remove_network` and confirms that ID is absent afterward. If
-ownership cannot be confirmed, it sends no removal or cleanup request and the
-created network may remain; the `Drop` guard's Docker CLI cleanup is an
-exact-ID fallback only and never removes by name or prunes. Default tests and
-fake-socket/headless network tests do not contact or mutate a live engine.
-Headless Networks tests cover fresh zero-count gating, positive and unavailable
-counts, predefined networks, named confirmation/cancel, stale ID/generation
-results, daemon rejection, and single-mutation/context-switch gates. Fake-socket
-network-removal tests cover the versioned exact-ID `DELETE`, absent force/prune
-parameters, invalid IDs before connection, and typed redacted rejections.
+`FERRUM_TEST_NETWORK` to name an existing local network and only inspects its
+matching listed ID. The separate ignored network create/remove test preflights
+a generated name, verifies the returned full ID against the exact inventory
+name before arming cleanup, removes only that ID, and confirms its absence.
+Ownership uncertainty never triggers name-based cleanup or prune.
+
+The opt-in network connect/disconnect smoke test requires the current local
+Unix Docker context and a preinstalled `FERRUM_TEST_IMAGE` containing
+`/bin/sleep`. It preflights a unique network name, creates that network and a
+container with `--network bridge --pull never`, no host mounts, and no published
+ports; it never pulls an image. The network cleanup guard is armed only after a
+fresh inventory matches the create response's full ID to the generated name.
+A create error, mismatched ID, or failed inventory read does not authorize
+cleanup; the network may remain for manual inspection. The container guard is
+armed only after its full ID matches the exact generated name in inventory.
+Once armed, both guards use the same pinned `EngineClient` socket and exact
+IDs without force or prune. If ownership cannot be confirmed, no unverified
+stop/remove request is sent and the resource may remain.
+After exact ID/name verification, it starts the container, connects and inspects
+membership, disconnects and re-inspects, then stops and removes only the owned
+IDs without force or prune. Run only against a disposable local engine; the
+default suite skips it.
+
+Fake-socket attachment tests verify exact versioned POST paths, the minimal
+`Container` body, omitted endpoint configuration/force, invalid IDs before
+connection, and typed redacted failures. Headless Networks tests cover complete
+membership and exact inventory-ID gates, the required `Running` target state,
+connect/disconnect confirmation and cancel, stale selections/results, and
+single-flight/context-switch gates. They do not contact a live engine; native
+UI click/visual validation remains unverified. Network usage is not implemented.
+Issues #17 and #10 remain open; Podman/rootless and remote behavior are not
+claimed.
 Fake-Unix-socket image protocol tests and headless Images UI tests cover tag
 and removal request/confirmation behavior without contacting a real engine or
 mutating images. There is no live image deletion or other live image-mutation

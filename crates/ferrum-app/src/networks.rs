@@ -1,6 +1,6 @@
 use crate::search::CaseInsensitiveQuery;
 use eframe::egui;
-use ferrum_core::{NetworkDetails, NetworkSummary};
+use ferrum_core::{ContainerState, ContainerSummary, NetworkDetails, NetworkSummary};
 
 const ROW_HEIGHT: f32 = 34.0;
 const MAX_NETWORK_NAME_BYTES: usize = 255;
@@ -18,6 +18,29 @@ pub(super) enum NetworksAction {
         id: String,
         name: String,
     },
+    Attach(NetworkAttachmentOperation),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct NetworkAttachmentOperation {
+    pub(super) generation: u64,
+    pub(super) inspection_generation: u64,
+    pub(super) mutation_generation: u64,
+    pub(super) connect: bool,
+    pub(super) network_id: String,
+    pub(super) container_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AttachmentConfirmation {
+    generation: u64,
+    inspection_generation: u64,
+    mutation_generation: u64,
+    connect: bool,
+    network_id: String,
+    container_id: String,
+    network_name: String,
+    container_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +69,10 @@ fn valid_network_removal_id(id: &str) -> bool {
     id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn valid_full_container_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[derive(Default)]
 pub(super) struct NetworksView {
     networks: Vec<NetworkSummary>,
@@ -67,6 +94,10 @@ pub(super) struct NetworksView {
     remove_result_name: Option<String>,
     remove_success: Option<String>,
     remove_error: Option<String>,
+    attachment_confirmation: Option<AttachmentConfirmation>,
+    attachment_generation: u64,
+    attaching: bool,
+    attachment_result: Option<(String, String, bool, Result<(), String>)>,
 
     pub(super) loading: bool,
     pub(super) loaded: bool,
@@ -94,6 +125,8 @@ impl NetworksView {
         self.creating = false;
         self.create_success = None;
         self.create_error = None;
+        self.attachment_confirmation = None;
+        self.attachment_result = None;
         self.remove_confirmation = None;
         self.removing = false;
         self.remove_result_id = None;
@@ -116,6 +149,8 @@ impl NetworksView {
         self.selected = None;
         self.inspecting = false;
         self.removing = false;
+        self.attachment_confirmation = None;
+        self.attachment_result = None;
         self.remove_confirmation = None;
         self.remove_result_id = None;
         self.remove_result_name = None;
@@ -152,6 +187,7 @@ impl NetworksView {
     fn begin_create(&mut self) -> Option<NetworksAction> {
         if self.has_mutation_in_flight()
             || self.remove_confirmation.is_some()
+            || self.attachment_confirmation.is_some()
             || !valid_network_name(&self.create_name)
         {
             return None;
@@ -160,10 +196,202 @@ impl NetworksView {
         self.creating = true;
         self.create_success = None;
         self.create_error = None;
+        self.attachment_result = None;
         Some(NetworksAction::Create {
             generation: self.create_generation,
             name: self.create_name.clone(),
         })
+    }
+
+    fn local_custom_network(&self) -> Option<(&NetworkSummary, &NetworkDetails)> {
+        let id = self.selected.as_deref()?;
+        let listed = self.networks.iter().find(|network| network.id == id)?;
+        let details = self.details.as_ref()?;
+        (details.id == listed.id
+            && details.name == listed.name
+            && listed.scope.as_deref() == Some("local")
+            && details.scope.as_deref() == Some("local")
+            && !predefined_network(&listed.name)
+            && valid_network_removal_id(&listed.id)
+            && !self.inspecting
+            && !self.loading)
+            .then_some((listed, details))
+    }
+
+    fn begin_attachment_confirmation(
+        &mut self,
+        connect: bool,
+        container_id: &str,
+        containers: &[ContainerSummary],
+    ) {
+        if self.has_mutation_in_flight()
+            || self.attachment_confirmation.is_some()
+            || self.remove_confirmation.is_some()
+        {
+            return;
+        }
+        let Some((network, details)) = self.local_custom_network() else {
+            return;
+        };
+        let Some(ids) = details.attached_container_ids.as_ref() else {
+            return;
+        };
+        if ids.iter().any(|id| !valid_full_container_id(id)) {
+            return;
+        }
+        let attached = ids.iter().any(|id| id == container_id);
+        if attached == connect {
+            return;
+        }
+        let Some(container) = containers.iter().find(|container| {
+            container.id == container_id
+                && valid_full_container_id(&container.id)
+                && container.state == Some(ContainerState::Running)
+        }) else {
+            return;
+        };
+        let network_id = network.id.clone();
+        let network_name = network.name.clone();
+        let attached_container_id = container.id.clone();
+        let container_name = container.name.clone();
+        self.attachment_generation = self.attachment_generation.wrapping_add(1);
+        self.attachment_result = None;
+        self.attachment_confirmation = Some(AttachmentConfirmation {
+            generation: self.generation,
+            inspection_generation: self.inspection_generation,
+            mutation_generation: self.attachment_generation,
+            connect,
+            network_id,
+            container_id: attached_container_id,
+            network_name,
+            container_name,
+        });
+    }
+
+    fn attachment_confirmation_is_current(
+        &self,
+        confirmation: &AttachmentConfirmation,
+        containers: &[ContainerSummary],
+    ) -> bool {
+        if self.remove_confirmation.is_some() {
+            return false;
+        }
+        let Some((network, details)) = self.local_custom_network() else {
+            return false;
+        };
+        let Some(ids) = details.attached_container_ids.as_ref() else {
+            return false;
+        };
+        self.generation == confirmation.generation
+            && self.inspection_generation == confirmation.inspection_generation
+            && network.id == confirmation.network_id
+            && details.id == confirmation.network_id
+            && network.name == confirmation.network_name
+            && valid_full_container_id(&confirmation.container_id)
+            && ids.iter().any(|id| id == &confirmation.container_id) != confirmation.connect
+            && containers.iter().any(|container| {
+                container.id == confirmation.container_id
+                    && container.name == confirmation.container_name
+                    && container.state == Some(ContainerState::Running)
+            })
+    }
+
+    fn confirm_attachment(&mut self, containers: &[ContainerSummary]) -> Option<NetworksAction> {
+        let confirmation = self.attachment_confirmation.take()?;
+        if self.remove_confirmation.is_some()
+            || !self.attachment_confirmation_is_current(&confirmation, containers)
+            || self.has_mutation_in_flight()
+        {
+            return None;
+        }
+        self.attaching = true;
+        self.attachment_result = None;
+        Some(NetworksAction::Attach(NetworkAttachmentOperation {
+            generation: confirmation.generation,
+            inspection_generation: confirmation.inspection_generation,
+            mutation_generation: confirmation.mutation_generation,
+            connect: confirmation.connect,
+            network_id: confirmation.network_id,
+            container_id: confirmation.container_id,
+        }))
+    }
+
+    pub(super) fn cancel_attachment_submission(&mut self, mutation_generation: u64) {
+        if self.attaching && self.attachment_generation == mutation_generation {
+            self.attaching = false;
+        }
+    }
+
+    pub(super) fn finish_attachment(
+        &mut self,
+        operation: &NetworkAttachmentOperation,
+        result: Result<(), String>,
+    ) -> bool {
+        if !self.attaching || self.attachment_generation != operation.mutation_generation {
+            return false;
+        }
+        self.attaching = false;
+        if self.generation != operation.generation
+            || self.inspection_generation != operation.inspection_generation
+            || self.selected.as_deref() != Some(operation.network_id.as_str())
+        {
+            return false;
+        }
+        self.details = None;
+        self.attached_container_count_display = None;
+        self.attachment_result = Some((
+            operation.network_id.clone(),
+            operation.container_id.clone(),
+            operation.connect,
+            result,
+        ));
+        true
+    }
+
+    pub(super) fn attachment_is_pending(
+        &self,
+        operation: &NetworkAttachmentOperation,
+        containers: &[ContainerSummary],
+    ) -> bool {
+        self.attaching
+            && self.generation == operation.generation
+            && self.inspection_generation == operation.inspection_generation
+            && self.attachment_generation == operation.mutation_generation
+            && self.selected.as_deref() == Some(operation.network_id.as_str())
+            && valid_full_container_id(&operation.container_id)
+            && containers.iter().any(|container| {
+                container.id == operation.container_id
+                    && container.state == Some(ContainerState::Running)
+            })
+            && self.remove_confirmation.is_none()
+            && self.local_custom_network().is_some()
+            && self.details.as_ref().is_some_and(|details| {
+                details.attached_container_ids.as_ref().is_some_and(|ids| {
+                    ids.iter().any(|id| id == &operation.container_id) != operation.connect
+                })
+            })
+    }
+
+    pub(super) fn refresh_after_attachment(
+        &mut self,
+        networks: Vec<NetworkSummary>,
+        details: NetworkDetails,
+        selected_id: &str,
+    ) {
+        let attachment_result = self.attachment_result.take();
+        let generation = self.begin_list();
+        self.finish_list(generation, Ok(networks));
+        if self
+            .networks
+            .iter()
+            .any(|network| network.id == selected_id)
+            && details.id == selected_id
+        {
+            let (generation, inspection_generation, id) =
+                self.begin_inspection(selected_id.to_owned());
+            self.finish_inspection(generation, inspection_generation, &id, Ok(details));
+            self.attachment_result = attachment_result;
+        }
     }
 
     pub(super) fn finish_create(
@@ -192,7 +420,7 @@ impl NetworksView {
         true
     }
     pub(super) fn has_mutation_in_flight(&self) -> bool {
-        self.creating || self.removing
+        self.creating || self.removing || self.attaching
     }
 
     pub(super) fn can_remove_selected_network(&self) -> bool {
@@ -221,6 +449,7 @@ impl NetworksView {
 
     fn begin_remove_confirmation(&mut self) {
         if !self.has_mutation_in_flight()
+            && self.attachment_confirmation.is_none()
             && self.can_remove_selected_network()
             && self.remove_confirmation.is_none()
             && let Some(details) = self.details.as_ref()
@@ -233,6 +462,7 @@ impl NetworksView {
             });
             self.remove_success = None;
             self.remove_error = None;
+            self.attachment_result = None;
         }
     }
 
@@ -242,6 +472,7 @@ impl NetworksView {
 
     fn confirmation_is_current(&self, confirmation: &NetworkRemovalConfirmation) -> bool {
         !self.has_mutation_in_flight()
+            && self.attachment_confirmation.is_none()
             && confirmation.generation == self.generation
             && confirmation.inspection_generation == self.inspection_generation
             && self.selected.as_deref() == Some(confirmation.id.as_str())
@@ -351,6 +582,7 @@ impl NetworksView {
         self.attached_container_count_display = None;
         self.inspecting = false;
         self.removing = false;
+        self.attachment_confirmation = None;
         self.remove_confirmation = None;
         self.remove_result_id = None;
         self.remove_result_name = None;
@@ -364,6 +596,8 @@ impl NetworksView {
         self.details = None;
         self.attached_container_count_display = None;
         self.detail_error = None;
+        self.attachment_confirmation = None;
+        self.attachment_result = None;
         self.remove_confirmation = None;
         self.remove_error = None;
         self.inspecting = true;
@@ -425,18 +659,24 @@ impl NetworksView {
         supported: bool,
         connection_message: &str,
         network_mutation_in_flight: bool,
+        container_inventory_fresh: bool,
+        containers: &[ContainerSummary],
     ) -> Option<NetworksAction> {
         ui.heading("Networks");
         ui.label(
-            "Inventory, default bridge creation, and confirmed removal of unused custom networks on the selected local Docker Unix socket on Linux.",
+            "Inventory, default bridge creation, confirmed custom-network removal, and confirmed container connect/disconnect on the selected local Docker Unix socket on Linux.",
         );
-        ui.label("Network connect and disconnect operations are not offered.");
         if !supported {
             ui.label("Networks require a connected local Docker Unix socket on Linux.");
             ui.label(connection_message);
             return None;
         }
+        if !container_inventory_fresh {
+            self.attachment_confirmation = None;
+        }
         let operation_in_flight = network_mutation_in_flight || self.has_mutation_in_flight();
+        let confirmation_open =
+            self.remove_confirmation.is_some() || self.attachment_confirmation.is_some();
         let mut action = None;
         ui.group(|ui| {
             ui.heading("Create default bridge network");
@@ -459,7 +699,7 @@ impl NetworksView {
             }
             let name_label = ui.label("Network name");
             ui.add_enabled(
-                !operation_in_flight && self.remove_confirmation.is_none(),
+                !operation_in_flight && !confirmation_open,
                 egui::TextEdit::singleline(&mut self.create_name),
             )
             .labelled_by(name_label.id);
@@ -471,9 +711,7 @@ impl NetworksView {
             }
             if ui
                 .add_enabled(
-                    name_is_valid
-                        && !operation_in_flight
-                        && self.remove_confirmation.is_none(),
+                    name_is_valid && !operation_in_flight && !confirmation_open,
                     egui::Button::new("Create network"),
                 )
                 .clicked()
@@ -510,14 +748,15 @@ impl NetworksView {
             .show_rows(ui, ROW_HEIGHT, self.visible.len(), |ui, rows| {
                 for row in rows {
                     let network = &self.networks[self.visible[row]];
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), ROW_HEIGHT],
-                            egui::Button::new(&network.name)
-                                .selected(self.selected.as_deref() == Some(&network.id)),
-                        )
-                        .clicked()
-                    {
+                    let response =
+                        ui.add_enabled_ui(!operation_in_flight && !confirmation_open, |ui| {
+                            ui.add_sized(
+                                [ui.available_width(), ROW_HEIGHT],
+                                egui::Button::new(&network.name)
+                                    .selected(self.selected.as_deref() == Some(&network.id)),
+                            )
+                        });
+                    if response.inner.clicked() {
                         selected = Some(network.id.clone());
                     }
                 }
@@ -547,6 +786,151 @@ impl NetworksView {
                 self.attached_container_count_display.as_deref(),
             );
         }
+        let mut requested_attachment = None;
+        {
+            let attachment_data = self.local_custom_network().and_then(|(network, details)| {
+                details
+                    .attached_container_ids
+                    .as_deref()
+                    .map(|ids| (network.name.as_str(), ids))
+            });
+            ui.group(|ui| {
+                if !container_inventory_fresh {
+                    ui.label(
+                        "Container inventory is stale. Use Refresh before changing network membership.",
+                    );
+                } else {
+                    ui.label("Only running containers can be connected or disconnected.");
+                    match attachment_data {
+                        None => {
+                            ui.label("A fresh local custom-network inspection with complete attached IDs is required.");
+                        }
+                        Some((_, _)) if containers.is_empty() => {
+                            ui.label("No current containers are available for this network.");
+                        }
+                        Some((network_name, attached_ids)) => {
+                            egui::ScrollArea::vertical()
+                                .max_height(ROW_HEIGHT * 8.0)
+                                .show_rows(ui, ROW_HEIGHT, containers.len(), |ui, rows| {
+                                    for row in rows {
+                                        let container = &containers[row];
+                                        if !valid_full_container_id(&container.id) {
+                                            continue;
+                                        }
+                                        let attached =
+                                            attached_ids.iter().any(|id| id == &container.id);
+                                        let id_prefix = &container.id[..12];
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("{} ({id_prefix})", container.name));
+                                            let label = if attached {
+                                                format!(
+                                                    "Disconnect '{}' ({id_prefix}) from '{network_name}'",
+                                                    container.name
+                                                )
+                                            } else {
+                                                format!(
+                                                    "Connect '{}' ({id_prefix}) to '{network_name}'",
+                                                    container.name
+                                                )
+                                            };
+                                            if ui
+                                                .add_enabled(
+                                                    container.state == Some(ContainerState::Running)
+                                                        && !operation_in_flight
+                                                        && !confirmation_open,
+                                                    egui::Button::new(label),
+                                                )
+                                                .clicked()
+                                            {
+                                                requested_attachment =
+                                                    Some((!attached, container.id.clone()));
+                                            }
+                                        });
+                                    }
+                                });
+                        }
+                    }
+                }
+            });
+        }
+        if let Some((connect, container_id)) = requested_attachment {
+            self.begin_attachment_confirmation(connect, &container_id, containers);
+        }
+        ui.group(|ui| {
+            if self.attaching {
+                ui.spinner();
+                ui.label("Updating network attachment…");
+            }
+            if let Some((result_network_id, _, connect, result)) = &self.attachment_result
+                && self
+                    .selected
+                    .as_deref()
+                    .is_none_or(|selected_id| selected_id == result_network_id)
+            {
+                match result {
+                    Ok(()) => {
+                        ui.label(if *connect {
+                            "Network connect request succeeded; inspect current membership before another change."
+                        } else {
+                            "Network disconnect request succeeded; inspect current membership before another change."
+                        });
+                    }
+                    Err(error) => {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            "Network attachment request failed; engine state may have changed.",
+                        );
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                        ui.label("Inspect current membership before retrying.");
+                    }
+                }
+            }
+            if let Some(confirmation) = self.attachment_confirmation.clone() {
+                if self.attachment_confirmation_is_current(&confirmation, containers) {
+                    ui.group(|ui| {
+                        ui.heading(if confirmation.connect {
+                            "Confirm container connection"
+                        } else {
+                            "Confirm container disconnection"
+                        });
+                        if confirmation.connect {
+                            ui.label(format!(
+                                "Connect '{}' ({}) to '{}' ({}). Confirm to submit.",
+                                confirmation.container_name,
+                                confirmation.container_id,
+                                confirmation.network_name,
+                                confirmation.network_id
+                            ));
+                        } else {
+                            ui.label(format!(
+                                "Disconnect '{}' ({}) from '{}' ({}). This can interrupt connectivity. Confirm to submit.",
+                                confirmation.container_name,
+                                confirmation.container_id,
+                                confirmation.network_name,
+                                confirmation.network_id
+                            ));
+                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(if confirmation.connect {
+                                    "Confirm connection"
+                                } else {
+                                    "Confirm disconnection"
+                                })
+                                .clicked()
+                            {
+                                action = self.confirm_attachment(containers);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.attachment_confirmation = None;
+                            }
+                        });
+                    });
+                } else {
+                    self.attachment_confirmation = None;
+                }
+            }
+        });
         ui.group(|ui| {
             ui.heading("Remove unused custom network");
             if self.selected.is_none() {
@@ -595,7 +979,8 @@ impl NetworksView {
                 .add_enabled(
                     self.can_remove_selected_network()
                         && !operation_in_flight
-                        && self.remove_confirmation.is_none(),
+                        && self.remove_confirmation.is_none()
+                        && self.attachment_confirmation.is_none(),
                     egui::Button::new("Remove network"),
                 )
                 .clicked()
@@ -662,6 +1047,7 @@ mod tests {
             enable_ipv4: Some(true),
             enable_ipv6: Some(false),
             attached_container_count: count,
+            attached_container_ids: None,
         }
     }
     fn removable_view(name: &str, count: Option<usize>) -> NetworksView {
@@ -683,13 +1069,327 @@ mod tests {
         Harness::new_ui_state(
             move |ui, view: &mut NetworksView| {
                 if let Some(NetworksAction::Inspect(id)) =
-                    view.show(ui, supported, "offline", false)
+                    view.show(ui, supported, "offline", false, true, &[])
                 {
                     view.begin_inspection(id);
                 }
             },
             view,
         )
+    }
+
+    fn container_summary(id: &str, name: &str) -> ContainerSummary {
+        ContainerSummary {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            image: None,
+            state: Some(ContainerState::Running),
+            status: None,
+        }
+    }
+
+    fn details_with_attachments(
+        id: &str,
+        name: &str,
+        attached_container_ids: Option<Vec<String>>,
+    ) -> NetworkDetails {
+        let mut details = details(id, name, attached_container_ids.as_ref().map(Vec::len));
+        details.attached_container_ids = attached_container_ids;
+        details
+    }
+
+    fn attachment_view(
+        network_name: &str,
+        attached_container_ids: Option<Vec<String>>,
+    ) -> NetworksView {
+        let network_id = "a".repeat(64);
+        let mut view = NetworksView::default();
+        let generation = view.begin_list();
+        view.finish_list(generation, Ok(vec![summary(&network_id, network_name)]));
+        let (generation, inspection_generation, selected_id) = view.begin_inspection(network_id);
+        view.finish_inspection(
+            generation,
+            inspection_generation,
+            &selected_id,
+            Ok(details_with_attachments(
+                &selected_id,
+                network_name,
+                attached_container_ids,
+            )),
+        );
+        view
+    }
+
+    fn attachment_harness(
+        view: NetworksView,
+        containers: Vec<ContainerSummary>,
+        container_inventory_fresh: bool,
+    ) -> (
+        Harness<'static, NetworksView>,
+        std::sync::mpsc::Receiver<NetworksAction>,
+    ) {
+        let (action_sender, action_receiver) = std::sync::mpsc::channel();
+        let harness = Harness::new_ui_state(
+            move |ui, view: &mut NetworksView| {
+                if let Some(action) =
+                    view.show(ui, true, "", false, container_inventory_fresh, &containers)
+                    && !matches!(&action, NetworksAction::Inspect(_))
+                {
+                    action_sender
+                        .send(action)
+                        .expect("action receiver should stay open");
+                }
+            },
+            view,
+        );
+        (harness, action_receiver)
+    }
+
+    #[test]
+    fn attachment_actions_require_complete_membership_and_exact_inventory_ids() {
+        let container_id = "b".repeat(64);
+        let container = container_summary(&container_id, "worker");
+
+        let mut missing = attachment_view("custom-net", None);
+        missing.begin_attachment_confirmation(
+            true,
+            &container_id,
+            std::slice::from_ref(&container),
+        );
+        assert!(missing.attachment_confirmation.is_none());
+
+        let mut already_attached = attachment_view("custom-net", Some(vec![container_id.clone()]));
+        already_attached.begin_attachment_confirmation(
+            true,
+            &container_id,
+            std::slice::from_ref(&container),
+        );
+        assert!(already_attached.attachment_confirmation.is_none());
+
+        already_attached.begin_attachment_confirmation(false, &container_id, &[]);
+        assert!(already_attached.attachment_confirmation.is_none());
+
+        let short_id = "b".repeat(12);
+        already_attached.begin_attachment_confirmation(
+            false,
+            &container_id,
+            &[container_summary(&short_id, "worker")],
+        );
+        assert!(already_attached.attachment_confirmation.is_none());
+
+        already_attached.begin_attachment_confirmation(
+            false,
+            &container_id,
+            std::slice::from_ref(&container),
+        );
+        assert!(already_attached.attachment_confirmation.is_some());
+        already_attached.begin_inspection("a".repeat(64));
+        assert!(already_attached.confirm_attachment(&[container]).is_none());
+    }
+
+    #[test]
+    fn attachment_controls_are_disabled_for_nonrunning_or_unknown_containers() {
+        let container_id = "b".repeat(64);
+        let mut container = container_summary(&container_id, "worker");
+        container.state = Some(ContainerState::Created);
+
+        let mut connect = attachment_view("custom-net", Some(Vec::new()));
+        connect.begin_attachment_confirmation(
+            true,
+            &container_id,
+            std::slice::from_ref(&container),
+        );
+        assert!(connect.attachment_confirmation.is_none());
+
+        let mut disconnect = attachment_view("custom-net", Some(vec![container_id.clone()]));
+        disconnect.begin_attachment_confirmation(
+            false,
+            &container_id,
+            std::slice::from_ref(&container),
+        );
+        assert!(disconnect.attachment_confirmation.is_none());
+
+        container.state = None;
+        let (mut harness, actions) = attachment_harness(
+            attachment_view("custom-net", Some(Vec::new())),
+            vec![container],
+            true,
+        );
+        harness.run();
+        let connect_label = format!("Connect 'worker' ({}) to 'custom-net'", &container_id[..12]);
+        let button = harness.get_by_role_and_label(Role::Button, &connect_label);
+        assert!(button.accesskit_node().is_disabled());
+        assert!(actions.try_recv().is_err());
+    }
+
+    #[test]
+    fn attachment_controls_require_fresh_container_inventory() {
+        let container_id = "b".repeat(64);
+        let container = container_summary(&container_id, "worker");
+        let mut view = attachment_view("custom-net", Some(Vec::new()));
+        view.begin_attachment_confirmation(true, &container_id, std::slice::from_ref(&container));
+        assert!(view.attachment_confirmation.is_some());
+        let (mut harness, actions) = attachment_harness(view, vec![container], false);
+
+        harness.run();
+        let _status = harness.get_by_role_and_label(
+            Role::Label,
+            "Container inventory is stale. Use Refresh before changing network membership.",
+        );
+        assert!(harness.state().attachment_confirmation.is_none());
+        assert!(actions.try_recv().is_err());
+    }
+
+    #[test]
+    fn attachment_success_refreshes_membership_before_another_operation() {
+        let network_id = "a".repeat(64);
+        let container_id = "b".repeat(64);
+        let containers = [container_summary(&container_id, "worker")];
+        let mut view = attachment_view("custom-net", Some(Vec::new()));
+        view.begin_attachment_confirmation(true, &container_id, &containers);
+        let operation = match view
+            .confirm_attachment(&containers)
+            .expect("explicit confirmation should submit")
+        {
+            NetworksAction::Attach(operation) => operation,
+            NetworksAction::Inspect(_)
+            | NetworksAction::Create { .. }
+            | NetworksAction::Remove { .. } => {
+                panic!("container connection should submit an attachment action")
+            }
+        };
+        assert!(view.attachment_is_pending(&operation, &containers));
+        assert!(view.finish_attachment(&operation, Ok(())));
+        assert!(view.details.is_none());
+
+        view.refresh_after_attachment(
+            vec![summary(&network_id, "custom-net")],
+            details_with_attachments(&network_id, "custom-net", Some(vec![container_id.clone()])),
+            &network_id,
+        );
+        assert_eq!(
+            view.details
+                .as_ref()
+                .and_then(|details| details.attached_container_ids.clone()),
+            Some(vec![container_id.clone()])
+        );
+        assert!(matches!(
+            view.attachment_result.as_ref().map(|result| &result.3),
+            Some(Ok(()))
+        ));
+        assert!(!view.attaching);
+    }
+
+    #[test]
+    fn stale_attachment_results_do_not_replace_current_inspection() {
+        let network_id = "a".repeat(64);
+        let container_id = "b".repeat(64);
+        let containers = [container_summary(&container_id, "worker")];
+        let mut view = attachment_view("custom-net", Some(Vec::new()));
+        view.begin_attachment_confirmation(true, &container_id, &containers);
+        let operation = match view
+            .confirm_attachment(&containers)
+            .expect("explicit confirmation should submit")
+        {
+            NetworksAction::Attach(operation) => operation,
+            NetworksAction::Inspect(_)
+            | NetworksAction::Create { .. }
+            | NetworksAction::Remove { .. } => {
+                panic!("container connection should submit an attachment action")
+            }
+        };
+
+        view.begin_inspection(network_id.clone());
+        assert!(!view.finish_attachment(&operation, Ok(())));
+        assert!(!view.attaching);
+        assert!(view.attachment_result.is_none());
+        assert!(view.inspecting);
+    }
+
+    #[test]
+    fn connection_confirmation_names_exact_targets_and_submits_only_on_confirm() {
+        let network_id = "a".repeat(64);
+        let container_id = "b".repeat(64);
+        let container = container_summary(&container_id, "worker");
+        let containers = vec![container.clone()];
+        let (mut connect_harness, connect_actions) = attachment_harness(
+            attachment_view("custom-net", Some(Vec::new())),
+            containers.clone(),
+            true,
+        );
+
+        connect_harness.run();
+        connect_harness
+            .get_by_role_and_label(
+                Role::Button,
+                &format!("Connect 'worker' ({}) to 'custom-net'", &container_id[..12]),
+            )
+            .click_accesskit();
+        connect_harness.run();
+        let connect_confirmation = format!(
+            "Connect 'worker' ({container_id}) to 'custom-net' ({network_id}). Confirm to submit."
+        );
+        let _warning = connect_harness.get_by_role_and_label(Role::Label, &connect_confirmation);
+        assert!(connect_actions.try_recv().is_err());
+        connect_harness
+            .get_by_role_and_label(Role::Button, "Cancel")
+            .click_accesskit();
+        connect_harness.run();
+        assert!(connect_actions.try_recv().is_err());
+
+        connect_harness
+            .get_by_role_and_label(
+                Role::Button,
+                &format!("Connect 'worker' ({}) to 'custom-net'", &container_id[..12]),
+            )
+            .click_accesskit();
+        connect_harness.run();
+        connect_harness
+            .get_by_role_and_label(Role::Button, "Confirm connection")
+            .click_accesskit();
+        connect_harness.step();
+        assert!(matches!(
+            connect_actions.try_recv().expect("confirmation should submit"),
+            NetworksAction::Attach(operation)
+                if operation.connect
+                    && operation.network_id == network_id
+                    && operation.container_id == container_id
+        ));
+
+        let (mut disconnect_harness, disconnect_actions) = attachment_harness(
+            attachment_view("custom-net", Some(vec![container_id.clone()])),
+            containers,
+            true,
+        );
+        disconnect_harness.run();
+        disconnect_harness
+            .get_by_role_and_label(
+                Role::Button,
+                &format!(
+                    "Disconnect 'worker' ({}) from 'custom-net'",
+                    &container_id[..12]
+                ),
+            )
+            .click_accesskit();
+        disconnect_harness.run();
+        let disconnect_confirmation = format!(
+            "Disconnect 'worker' ({container_id}) from 'custom-net' ({network_id}). This can interrupt connectivity. Confirm to submit."
+        );
+        let _warning =
+            disconnect_harness.get_by_role_and_label(Role::Label, &disconnect_confirmation);
+        disconnect_harness
+            .get_by_role_and_label(Role::Button, "Confirm disconnection")
+            .click_accesskit();
+        disconnect_harness.step();
+        assert!(matches!(
+            disconnect_actions
+                .try_recv()
+                .expect("confirmation should submit"),
+            NetworksAction::Attach(operation)
+                if !operation.connect
+                    && operation.network_id == network_id
+                    && operation.container_id == container_id
+        ));
     }
 
     #[test]
@@ -774,7 +1474,7 @@ mod tests {
 
         let mut harness = Harness::new_ui_state(
             |ui, view: &mut NetworksView| {
-                let _ = view.show(ui, true, "", true);
+                let _ = view.show(ui, true, "", true, true, &[]);
             },
             view,
         );
@@ -1009,7 +1709,7 @@ mod tests {
         let (action_sender, action_receiver) = std::sync::mpsc::channel();
         let mut harness = Harness::new_ui_state(
             move |ui, view: &mut NetworksView| {
-                if let Some(action) = view.show(ui, true, "", false)
+                if let Some(action) = view.show(ui, true, "", false, true, &[])
                     && !matches!(&action, NetworksAction::Inspect(_))
                 {
                     action_sender

@@ -224,11 +224,12 @@ pub struct NetworkSummary {
     pub enable_ipv6: Option<bool>,
 }
 
-/// Read-only details about one local Docker network.
+/// Details about one local Docker network and its point-in-time membership.
 ///
-/// Optional values remain absent when the engine does not report them. The
-/// attached-container count is a point-in-time count from inspect only; endpoint
-/// identifiers, names, addresses, and values are never retained.
+/// Optional values remain absent when the engine does not report them.
+/// Membership IDs are retained only when every inspect-map key is a
+/// full 64-character hexadecimal container ID. Endpoint names, IDs,
+/// addresses, and endpoint configuration values are not retained.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkDetails {
     /// Engine-assigned network identifier.
@@ -251,6 +252,8 @@ pub struct NetworkDetails {
     pub enable_ipv6: Option<bool>,
     /// Number of containers attached at the instant of inspection, if reported.
     pub attached_container_count: Option<usize>,
+    /// Validated full container IDs only when complete membership keys are available.
+    pub attached_container_ids: Option<Vec<String>>,
 }
 
 /// Read-only details reported for one local volume.

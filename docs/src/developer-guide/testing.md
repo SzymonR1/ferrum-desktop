@@ -159,29 +159,58 @@ cargo test -p ferrum-engine --test live_engine local_engine_creates_default_brid
 
 Run it only against a disposable local Docker Engine. Once ownership is
 verified, the test removes only that ID through `EngineClient::remove_network`
-and confirms the exact ID is absent from a refreshed inventory. If ownership
-cannot be confirmed, no removal or cleanup request is sent and the network may
-remain for manual inspection. The guard uses an argument-array
-`docker network rm` invocation with only the verified full ID as a `Drop`
-fallback if normal cleanup does not complete. It never removes by name or runs
-a broad prune. The default suite skips this ignored mutating test.
+and confirms it absent from refreshed inventory. The `Drop` guard retains the
+same `EngineClient` pinned to the selected local Unix socket and only attempts
+exact-ID removal if still armed; it uses no force or prune. If ownership cannot
+be confirmed, no removal is sent and the network may remain for manual
+inspection. The default suite skips this ignored mutating test.
 
-Fake-socket network API tests do not contact a live engine. They verify the
-negotiated exact-ID DELETE path, invalid IDs before connection, no force/prune
-parameters or request body, and safe typed rejection errors without daemon
-body or network-ID exposure. Headless Networks UI/state tests cover removal
-availability only after a fresh matching inspection reports `Some(0)`, disable
-positive/unreported counts and predefined `bridge`, `host`, and `none`, require
-an explicit name/full-ID confirmation, cancel without submitting, bind results
-to the selected ID and UI generations, force reinspection after a failed
-request, and keep mutations/context switching single-flight. They use fake
-state/events and never contact or mutate a live engine; native UI click/visual
-validation remains unverified. Network list results may omit attached-container
-information. Inspect may report an optional point-in-time attached-container
-count; no container identifiers, names, endpoint data, or other non-allowlisted
-network fields are retained or displayed. A zero count is not an atomic
-deletion guarantee; the Docker daemon may reject removal if dependencies change
-after inspection.
+The optional ignored live network connect/disconnect test requires the current
+local Docker context to use a Unix socket and `FERRUM_TEST_IMAGE` already
+installed with `/bin/sleep`. After EngineClient resolves and pins that socket,
+the test passes the same path as Docker CLI `--host` to create a uniquely named
+container with `--network bridge --pull never`, no host mounts, and no
+published ports; it never pulls an image. It verifies the network and
+container IDs against their exact generated names, starts the container,
+connects and inspects membership, disconnects and re-inspects, then stops and
+removes the container. Cleanup targets only those IDs without force or prune.
+
+The network cleanup guard is armed only after a successful create response's
+full ID matches the generated name in fresh inventory. A create error,
+mismatched ID, or failed inventory read does not authorize cleanup; the network
+may remain for manual inspection. The container guard is armed only after its
+full ID matches the exact generated name. Once armed, both guards use the same
+pinned `EngineClient` socket and exact IDs without force or prune. If identity
+cannot be verified, no stop/remove request is sent and the test-owned resource
+may remain.
+Run it only on a disposable local engine:
+
+```sh
+FERRUM_TEST_IMAGE=ghcr.io/catthehacker/ubuntu:rust-latest cargo test -p ferrum-engine --test live_engine local_engine_connects_and_disconnects_network_with_verified_owned_container -- --exact --ignored
+```
+
+Fake-socket network API tests cover versioned exact-ID delete/connect/disconnect
+paths, invalid IDs before connection, a minimal `Container` body with no
+endpoint configuration or `Force`, no removal force/prune parameters, and safe
+typed rejection errors without daemon-body or resource-ID exposure.
+
+Headless Networks UI/state tests cover removal only after a fresh matching
+inspection reports `Some(0)`, disable positive/unreported counts and predefined
+networks, and require an explicit confirmation/cancel. Attachment controls
+require a complete membership map of full IDs plus an exact current-inventory
+container entry in the `Running` state; stopped, paused, or unknown states are
+disabled. Connect/disconnect confirmations name both full IDs. Tests cover
+container-event invalidation, NetworkList refresh of both inventories, stale
+list results and read failures, stale selections/results, and single-flight/
+context-switch gates. Inspect retains the point-in-time count and only the
+membership keys when every key is a validated full ID; endpoint values are
+discarded. Network names and endpoint details are not retained from the map.
+
+Fake-socket/headless tests do not contact or mutate a live engine. The native
+Networks-page click/visual check remains unverified. Counts and membership are
+point-in-time snapshots; Docker can reject a mutation if network dependencies
+change after inspection, and timeout/transport errors do not prove that the
+engine state is unchanged.
 
 The lifecycle and logs tests below are separate opt-in ignored tests and mutate
 the engine by creating one disposable container.

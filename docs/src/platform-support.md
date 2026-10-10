@@ -12,7 +12,7 @@ exercised.
 | Linux local Docker Unix-socket image listing, inspection, anonymous public pull, tagging, and removal | Engine API/UI scope implemented; headless tests only; no live image mutation or native image-page visual validation | Listing, inspection, pull, tag, and removal use the validated local Docker Unix socket. Pull, tag, and removal send no registry authentication or stored credentials. Tagging requires confirmation on every request because Docker Engine v1.56 may reassign an existing `repository:tag`; the image data remains. Removal snapshots the selected ID and known tags, warns about last-reference data deletion and possible non-force rejection, and uses `noprune=true` without `force`. Fake-socket and headless UI tests do not contact a real engine or mutate images; no live pull/tag/removal operation is claimed; issues #16 and #10 remain open. |
 
 | Linux local Docker Unix-socket volume list/inspect/usage/name-only creation and guarded removal | Scoped API/UI slice; fake-socket and headless tests, opt-in owned-volume live test; native page not visually validated | List/inspect retains allowlisted metadata; usage reports `Size` and point-in-time `RefCount` only for exact inventory matches (`-1`, negative, or missing values are unavailable), with a 30-second/16 MiB usage bound. List, inspect, create, and removal use eight-second request bounds. Creation sends only `Name` and uses Docker's default local driver. Removal requires exact listed/inspected identity, `RefCount == 0`, and explicit confirmation; DELETE omits `force`, and a changing dependency may make Docker reject it. Optional driver/scope/time/mountpoint fields escape selected unsafe text; mountpoints are never accessed. Context switching is blocked and inventory refreshes after every mutation result. No pruning, modification, connection, disconnection, or filesystem browsing is offered. Podman/rootless is unvalidated; remote, Windows, and macOS support is not implemented. Issues #17 and #10 remain open. |
-| Linux local Docker Unix-socket network listing, inspection, default bridge creation, and unused custom-network removal | Scoped API/UI implementation; fake-socket contracts, headless state/UI coverage, and optional owned-resource live test; native UI not visually validated | Lists and inspects allowlisted metadata; creation sends only `Name`. Removal requires a fresh matching inspect with zero attached containers and an explicit full-ID confirmation; it uses negotiated DELETE without force/prune. Dependency snapshots are not atomic with deletion. The live test verifies its own full ID and generated name, removes via EngineClient, and confirms absence; CLI cleanup is only the Drop fallback. No usage, connect, disconnect, Podman/rootless, or remote support is claimed. |
+| Linux local Docker Unix-socket network list/inspect/create/remove/connect/disconnect | Scoped Linux API/UI slice; fake-socket/headless coverage; opt-in live attachment smoke passed 2026-10-10 on Docker Engine 29.9.0/API 1.56; native page not visually validated | Creation sends only `Name`; removal requires a fresh zero-reference inspection and exact-ID confirmation without force/prune. Attachment controls require complete validated membership IDs and an exact current-inventory container ID in `Running` state, plus confirmation. Requests send only `Container`, omit endpoint configuration/Force, use an eight-second deadline, and are not retried. The live smoke uses preinstalled `FERRUM_TEST_IMAGE`, `--pull never`, and exact-ID cleanup without force/prune. No usage, Podman/rootless, or remote support is claimed. |
 | Linux local lifecycle and container-event synchronization | Engine integration-tested; lifecycle audit events unit-tested; UI action clicks not visually verified | On 2026-10-08, the opt-in ignored lifecycle test passed against Docker Engine 29.8.2/API 1.56. It exercised Start/Stop/Restart/Pause/Unpause/Remove, observed an external CLI Start event, and verified state, inventory, and removal for one owned disposable container. Ferrum gates actions on known state; Remove is confirmed and does not force-remove or delete volumes. Lifecycle request results emit structured process-tracing events with action, `success` or `request_error`, and a validated full container ID when available; raw errors, names, endpoints, and daemon bodies are excluded. A request error does not prove the engine state remained unchanged. These events are not a persistent audit store. Event processing is bounded, reconnect retries are limited, and manual refresh remains available. |
 | Linux local historical/live container logs | Engine integration-tested; headless Logs controls tested; native surface not visually/screen-reader validated | On 2026-10-08, the opt-in ignored live test passed against the selected local Unix-socket Docker engine using the preinstalled `ghcr.io/catthehacker/ubuntu:rust-latest` image. It decoded timestamped historical and followed stdout/stderr markers, verified TTY mode, dropped the stream, and removed the owned container. A headless egui/accessibility test interacts with the real Logs dialog, exercising Pause/Resume, auto-scroll, Copy output, and Export availability. Native click/screenshot/screen-reader validation remains unavailable because the desktop provider cannot enumerate Ferrum or capture/accessibility state. |
 | Linux local embedded terminal | Experimental; local Docker-compatible Unix sockets only; visual and screen-reader validation not established | On 2026-10-09, the opt-in live terminal test passed against Docker Engine 29.8.2/API 1.56 using the preinstalled `ghcr.io/catthehacker/ubuntu:rust-latest` image. It verified TTY input/output, ANSI and Unicode bytes, resize to 37x101, Ctrl+C, and that dropping the exec session leaves the container running; the test then stopped and removed its own container, and no `ferrum-live-exec-*` container remained. The engine path is live-tested; the native terminal surface remains untested visually and with a screen reader. Terminal output is untrusted; OSC 52 clipboard and title requests are ignored; clipboard controls require explicit user action. Podman/rootless and remote compatibility remain open in issue #10. |
@@ -51,31 +51,49 @@ Private-registry authentication, Podman/rootless behavior, and remote endpoints
 remain unsupported or unvalidated. Issues
 [#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) and
 [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) remain open.
-Network listing, inspection, name-only default bridge creation, and constrained
-removal are limited to Linux local Docker Unix sockets. The optional ignored
-read-only test `local_engine_lists_and_inspects_existing_network_read_only`
-requires `FERRUM_TEST_NETWORK` to name an existing network, lists networks,
-then inspects the matching listed ID without mutation or cleanup. The optional
-ignored create-and-remove test preflights a generated name, then requires the
-returned full 64-character hexadecimal ID and a subsequent inventory entry to
-match the generated name before arming cleanup. It removes only that verified
-ID through `EngineClient::remove_network` and confirms the ID is absent. The
-Drop guard's argument-array Docker CLI cleanup is an exact-ID fallback only;
-neither path removes by name or runs prune. If ownership cannot be confirmed,
-no removal or cleanup request is sent and the network may remain.
+Network listing, inspection, name-only default-bridge creation, guarded unused
+custom-network removal, and confirmed connect/disconnect are limited to Linux
+local Docker Unix sockets. The optional ignored read-only
+`local_engine_lists_and_inspects_existing_network_read_only` test requires
+`FERRUM_TEST_NETWORK` to name an existing network, lists networks, then
+inspects the matching listed ID without mutation or cleanup. The optional
+create-and-remove test preflights a generated name, verifies a full returned
+ID and exact inventory name before cleanup. It removes only that ID through
+`EngineClient::remove_network` and confirms absence.
+The `Drop` fallback retains that `EngineClient`, pinned to the selected Unix
+socket, and attempts exact-ID removal only if still armed; it uses no force or
+prune. If ownership cannot be confirmed, no removal is sent and the network
+may remain for manual inspection.
 
-The UI rejects the predefined `bridge`, `host`, and `none` networks and enables
-removal only after a fresh inspection of the selected matching ID reports
-`Some(0)` attached containers. Positive or unavailable counts disable removal.
-Confirmation names the exact network and full ID. This count is only a
-point-in-time snapshot: Docker can reject a request if the network becomes
-attached after inspection, and a transport error or timeout does not prove the network remains.
-The bounded DELETE omits force and prune parameters; typed errors do not expose
-daemon bodies. Only one network mutation runs at a time, context switching is
-blocked while it is pending, and successful removal refreshes current inventory.
-Default tests and fake-socket/headless UI tests do not contact or mutate a live
-engine. Native UI click/visual validation remains unverified. Podman/rootless and
-remote endpoints remain unsupported or unvalidated. Issues
-[#17](https://github.com/SzymonR1/ferrum-desktop/issues/17) and
-[#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) remain open; this
-slice does not complete either issue or constitute a release claim.
+The UI permits network removal only for selected custom networks whose fresh
+matching inspection reports `Some(0)` attached containers. Connect/disconnect
+controls require a fresh complete `Containers` map containing only full
+hexadecimal IDs and a target full ID in current inventory whose state is
+`Running`; stopped, paused, and unknown states are disabled. Confirmation
+names both exact targets. The bounded attachment POST sends only `Container`,
+no endpoint configuration or `Force`, and is not retried; an uncertain result
+may follow a daemon-side change. Ferrum refreshes network/container inventory
+and inspects the selected network after either result. Mutations are
+single-flight and block context switching. Container-change events invalidate
+cached state; a Networks refresh reloads both inventories, and controls remain
+disabled when the container read is stale or fails.
+
+The opt-in live attachment test requires a current local Unix Docker context
+and a preinstalled `FERRUM_TEST_IMAGE` containing `/bin/sleep`. On 2026-10-10
+it passed against Docker Engine 29.9.0/API 1.56: the test created a uniquely
+named network and container with `--network bridge --pull never`, verified
+their exact generated names and full IDs, started the container, connected
+and inspected membership, disconnected and re-inspected, then stopped and
+removed only the owned resources without force or prune. It never pulled an
+image or published ports/host mounts.
+
+The network cleanup guard is armed only after a successful create response's
+full ID matches the generated name in fresh inventory. A create error,
+mismatched ID, or failed inventory read does not authorize cleanup; the network
+may remain for manual inspection. The container guard is armed only after its
+full ID matches the exact generated name. Once armed, both guards use the same
+pinned `EngineClient` socket and exact IDs without force or prune. If identity
+cannot be verified, no stop/remove request is sent and the resource may remain.
+The native Networks page remains unverified visually. Podman/rootless and
+remote endpoints remain unsupported or unvalidated. Issues #17 and #10 remain
+open; this slice does not complete either issue or constitute a release claim.

@@ -64,39 +64,56 @@ pending. Pruning, modification, connection, disconnection, and filesystem
 browsing are not offered. Podman/rootless behavior remains unvalidated; remote
 endpoints remain unsupported.
 
-The Networks page lists and inspects networks and creates networks by name
-through the selected local Docker Unix socket on Linux. Creation sends only the
-required `Name` field to the negotiated network-create endpoint and relies on
-Docker's default bridge driver; no driver, IPAM, or options controls are
-exposed. Names must be non-whitespace, at most 255 UTF-8 bytes, and contain no
-control characters. The create request body is bounded to 1 KiB and its
-successful response body to 64 KiB; daemon bodies are not displayed or logged.
+The Networks page lists and inspects networks, creates networks by name, and
+allows constrained removal and attachment operations through the selected local
+Docker Unix socket on Linux. Creation sends only the required `Name` field to
+the negotiated endpoint and relies on Docker's default bridge driver; no
+driver, IPAM, or options controls are exposed. Names must be non-whitespace,
+at most 255 UTF-8 bytes, and contain no control characters. Request/response
+bodies are bounded, and daemon bodies are not displayed or logged.
 
-The inventory allowlist is ID, name, driver, scope, creation time,
-internal/attachable, and EnableIPv4/EnableIPv6. Inspect may report only an
-optional point-in-time count from the `Containers` map; list responses may omit
-attached-container details. Ferrum does not retain or display container IDs,
-names, endpoint records, MAC/IP addresses, labels, options, IPAM, peers,
-services, status, or raw bodies.
+The network metadata allowlist is ID, name, driver, scope, creation time,
+internal/attachable, EnableIPv4, and EnableIPv6. Inspect may report an optional
+point-in-time count from the `Containers` map and separately retain its keys
+only when every key is a full 64-character hexadecimal container ID. Endpoint
+values are discarded. Container names are shown only from the current
+container inventory; endpoint names, endpoint IDs/configuration, MAC/IP
+addresses, labels, options, IPAM, peers, services, status, and raw bodies are
+not retained from network responses.
 
 Removal is offered only for selected custom networks, never Docker's predefined
-`bridge`, `host`, or `none` networks. The UI requires a fresh inspection of the
-selected exact ID with `attached_container_count == Some(0)` and explicit
-confirmation naming the network and full ID; positive or unreported counts
-cannot be submitted. The request is a bounded eight-second
-`DELETE /v{negotiated}/networks/{validated-full-id}` with no force or prune
-parameters. The count is a snapshot, not an atomic deletion guarantee, and
-Docker may reject removal if dependencies change before the request. User-facing
-errors contain only safe endpoint/status information where applicable; raw
-daemon bodies and network IDs are never included in errors. The process trace
-records the static create/remove action, request outcome, and a network ID only
-when it is exactly 64 hexadecimal characters; it omits names, endpoints, raw
-errors, and daemon bodies and is not persistent or tamper-proof. A transport
-error or timeout may occur after removal has taken effect.
-Only one network mutation is active at a time, and context switching is blocked
-until its result arrives. Successful removal refreshes the current inventory.
+`bridge`, `host`, or `none` networks. A fresh inspection of the selected exact
+ID must report `attached_container_count == Some(0)`, and the user must confirm
+the network name and full ID. The bounded eight-second
+`DELETE /v{negotiated}/networks/{id}` has no force or prune parameters. The
+count is not atomic with deletion, so Docker may reject removal if dependencies
+change before the request.
 
-Ferrum does not access credentials, provide network usage, or offer connect or
-disconnect operations. Podman/rootless and remote endpoints remain unsupported
-or unvalidated. Issues #17 and #10 remain open; no release is claimed.
+Connect/disconnect controls are limited to selected local custom networks with
+a fresh, complete membership map and a target container whose full ID matches
+the current inventory and whose reported state is `Running`. Stopped, paused,
+or unknown states are disabled. Confirmation names the network and container
+and shows both full IDs; disconnect warns that it may interrupt connectivity.
+
+Container-change events invalidate the cached state. A Networks-page refresh
+loads both inventories, and attachment controls remain disabled until the
+container inventory is current; read failures require a fresh refresh.
+Requests use the validated full network/container IDs and send only
+`Container`, with no endpoint configuration. Disconnect omits `Force` so
+Docker's default `false` applies. Requests have an eight-second bound and are
+not retried. A timeout or transport failure may follow an engine-side change;
+after either result Ferrum refreshes network/container inventories and
+re-inspects the selected network. If refresh fails, the network list is marked
+stale. Safe typed errors expose only endpoint kind and HTTP status where
+applicable; raw daemon bodies and IDs are excluded from errors.
+
+Network mutation traces record only the static create/remove/connect/disconnect
+action, `success` or `request_error`, and validated full IDs when available.
+Connect/disconnect events include both network and container IDs; names,
+endpoints, error text, and daemon bodies are excluded. These process traces are
+not persistent or tamper-proof. Only one network mutation may be active, and
+context switching is blocked until it returns. Network usage statistics and
+credential access are not provided. Podman/rootless and remote endpoints
+remain unsupported or unvalidated. Issues #17 and #10 remain open; no release
+is claimed.
 
