@@ -1,4 +1,4 @@
-use crate::search::CaseInsensitiveQuery;
+use crate::{display::escape_untrusted_display_text, search::CaseInsensitiveQuery};
 use eframe::egui;
 use ferrum_core::{ContainerState, ContainerSummary, NetworkDetails, NetworkSummary};
 
@@ -691,6 +691,7 @@ impl NetworksView {
                 }
             }
             if let Some(name) = &self.create_success {
+                let name = escape_untrusted_display_text(name);
                 ui.label(format!("Network '{name}' created."));
             }
             if let Some(error) = &self.create_error {
@@ -748,11 +749,12 @@ impl NetworksView {
             .show_rows(ui, ROW_HEIGHT, self.visible.len(), |ui, rows| {
                 for row in rows {
                     let network = &self.networks[self.visible[row]];
+                    let display_name = escape_untrusted_display_text(&network.name);
                     let response =
                         ui.add_enabled_ui(!operation_in_flight && !confirmation_open, |ui| {
                             ui.add_sized(
                                 [ui.available_width(), ROW_HEIGHT],
-                                egui::Button::new(&network.name)
+                                egui::Button::new(display_name.as_ref())
                                     .selected(self.selected.as_deref() == Some(&network.id)),
                             )
                         });
@@ -771,16 +773,17 @@ impl NetworksView {
         }
         if let Some(details) = &self.details {
             ui.separator();
-            ui.heading(&details.name);
-            crate::detail_row(ui, "ID", Some(&details.id));
-            crate::detail_row(ui, "Driver", details.driver.as_deref());
-            crate::detail_row(ui, "Scope", details.scope.as_deref());
-            crate::detail_row(ui, "Created", details.created_at.as_deref());
-            crate::detail_row(ui, "Internal", bool_label(details.internal));
-            crate::detail_row(ui, "Attachable", bool_label(details.attachable));
-            crate::detail_row(ui, "Enable IPv4", bool_label(details.enable_ipv4));
-            crate::detail_row(ui, "Enable IPv6", bool_label(details.enable_ipv6));
-            crate::detail_row(
+            let name = escape_untrusted_display_text(&details.name);
+            ui.heading(name.as_ref());
+            crate::untrusted_detail_row(ui, "ID", Some(&details.id));
+            crate::untrusted_detail_row(ui, "Driver", details.driver.as_deref());
+            crate::untrusted_detail_row(ui, "Scope", details.scope.as_deref());
+            crate::untrusted_detail_row(ui, "Created", details.created_at.as_deref());
+            crate::untrusted_detail_row(ui, "Internal", bool_label(details.internal));
+            crate::untrusted_detail_row(ui, "Attachable", bool_label(details.attachable));
+            crate::untrusted_detail_row(ui, "Enable IPv4", bool_label(details.enable_ipv4));
+            crate::untrusted_detail_row(ui, "Enable IPv6", bool_label(details.enable_ipv6));
+            crate::untrusted_detail_row(
                 ui,
                 "Attached containers",
                 self.attached_container_count_display.as_deref(),
@@ -809,6 +812,7 @@ impl NetworksView {
                             ui.label("No current containers are available for this network.");
                         }
                         Some((network_name, attached_ids)) => {
+                            let display_network_name = escape_untrusted_display_text(network_name);
                             egui::ScrollArea::vertical()
                                 .max_height(ROW_HEIGHT * 8.0)
                                 .show_rows(ui, ROW_HEIGHT, containers.len(), |ui, rows| {
@@ -820,17 +824,22 @@ impl NetworksView {
                                         let attached =
                                             attached_ids.iter().any(|id| id == &container.id);
                                         let id_prefix = &container.id[..12];
+                                        let display_container_name =
+                                            escape_untrusted_display_text(&container.name);
                                         ui.horizontal(|ui| {
-                                            ui.label(format!("{} ({id_prefix})", container.name));
+                                            ui.label(format!(
+                                                "{} ({id_prefix})",
+                                                display_container_name
+                                            ));
                                             let label = if attached {
                                                 format!(
-                                                    "Disconnect '{}' ({id_prefix}) from '{network_name}'",
-                                                    container.name
+                                                    "Disconnect '{}' ({id_prefix}) from '{display_network_name}'",
+                                                    display_container_name
                                                 )
                                             } else {
                                                 format!(
-                                                    "Connect '{}' ({id_prefix}) to '{network_name}'",
-                                                    container.name
+                                                    "Connect '{}' ({id_prefix}) to '{display_network_name}'",
+                                                    display_container_name
                                                 )
                                             };
                                             if ui
@@ -893,20 +902,24 @@ impl NetworksView {
                         } else {
                             "Confirm container disconnection"
                         });
+                        let container_name =
+                            escape_untrusted_display_text(&confirmation.container_name);
+                        let network_name =
+                            escape_untrusted_display_text(&confirmation.network_name);
                         if confirmation.connect {
                             ui.label(format!(
                                 "Connect '{}' ({}) to '{}' ({}). Confirm to submit.",
-                                confirmation.container_name,
+                                container_name,
                                 confirmation.container_id,
-                                confirmation.network_name,
+                                network_name,
                                 confirmation.network_id
                             ));
                         } else {
                             ui.label(format!(
                                 "Disconnect '{}' ({}) from '{}' ({}). This can interrupt connectivity. Confirm to submit.",
-                                confirmation.container_name,
+                                container_name,
                                 confirmation.container_id,
-                                confirmation.network_name,
+                                network_name,
                                 confirmation.network_id
                             ));
                         }
@@ -962,9 +975,11 @@ impl NetworksView {
                 && let Some(name) = &self.remove_result_name
             {
                 ui.spinner();
+                let name = escape_untrusted_display_text(name);
                 ui.label(format!("Removing network '{name}'…"));
             }
             if let Some(name) = &self.remove_success {
+                let name = escape_untrusted_display_text(name);
                 ui.label(format!("Network '{name}' was removed."));
             }
             if let Some(error) = &self.remove_error {
@@ -991,9 +1006,10 @@ impl NetworksView {
                 if self.confirmation_is_current(&confirmation) {
                     ui.group(|ui| {
                         ui.heading("Confirm network removal");
+                        let name = escape_untrusted_display_text(&confirmation.name);
                         ui.label(format!(
                             "Remove custom network '{}' (ID {})? The latest inspect reported zero attached containers; this is only a point-in-time check. Docker may reject removal if dependencies change. Force and prune are not used. Confirm to submit this exact-ID request.",
-                            confirmation.name, confirmation.id
+                            name, confirmation.id
                         ));
                         ui.horizontal(|ui| {
                             if ui.button("Confirm network removal").clicked() {
@@ -1387,6 +1403,79 @@ mod tests {
                 .expect("confirmation should submit"),
             NetworksAction::Attach(operation)
                 if !operation.connect
+                    && operation.network_id == network_id
+                    && operation.container_id == container_id
+        ));
+    }
+
+    #[test]
+    fn engine_network_and_container_text_is_escaped_before_accessible_display() {
+        let network_id = "a".repeat(64);
+        let container_id = "b".repeat(64);
+        let network_name = "custom\u{202e}net";
+        let container_name = "worker\u{e0001}proc";
+        let safe_network_name = "custom\\u{202e}net";
+        let safe_container_name = "worker\\u{e0001}proc";
+        let mut view = attachment_view(network_name, Some(Vec::new()));
+        view.details
+            .as_mut()
+            .expect("selected network details")
+            .driver = Some("bridge\u{200b}".to_owned());
+        let containers = vec![container_summary(&container_id, container_name)];
+        let (mut harness, action_receiver) = attachment_harness(view, containers, true);
+
+        harness.run();
+        let network_row = harness.get_by_role_and_label(Role::Button, safe_network_name);
+        assert_eq!(
+            network_row.accesskit_node().label().as_deref(),
+            Some(safe_network_name)
+        );
+        let network_heading = harness.get_by_role_and_label(Role::Label, safe_network_name);
+        assert_eq!(
+            network_heading.accesskit_node().value().as_deref(),
+            Some(safe_network_name)
+        );
+        let driver = harness.get_by_role_and_label(Role::Label, "bridge\\u{200b}");
+        assert_eq!(
+            driver.accesskit_node().value().as_deref(),
+            Some("bridge\\u{200b}")
+        );
+        let expected_container_row = format!("{safe_container_name} ({})", &container_id[..12]);
+        let container_row = harness.get_by_role_and_label(Role::Label, &expected_container_row);
+        assert_eq!(
+            container_row.accesskit_node().value().as_deref(),
+            Some(expected_container_row.as_str())
+        );
+        let connect_label = format!(
+            "Connect '{safe_container_name}' ({}) to '{safe_network_name}'",
+            &container_id[..12]
+        );
+        let connect_button = harness.get_by_role_and_label(Role::Button, &connect_label);
+        assert_eq!(
+            connect_button.accesskit_node().label().as_deref(),
+            Some(connect_label.as_str())
+        );
+        connect_button.click_accesskit();
+        harness.run();
+        let confirmation = format!(
+            "Connect '{safe_container_name}' ({container_id}) to '{safe_network_name}' ({network_id}). Confirm to submit."
+        );
+        let confirmation_label = harness.get_by_role_and_label(Role::Label, &confirmation);
+        assert_eq!(
+            confirmation_label.accesskit_node().value().as_deref(),
+            Some(confirmation.as_str())
+        );
+        harness
+            .get_by_role_and_label(Role::Button, "Confirm connection")
+            .click_accesskit();
+        harness.step();
+
+        assert!(matches!(
+            action_receiver
+                .try_recv()
+                .expect("confirmation should submit exact IDs"),
+            NetworksAction::Attach(operation)
+                if operation.connect
                     && operation.network_id == network_id
                     && operation.container_id == container_id
         ));

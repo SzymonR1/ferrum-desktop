@@ -6,3 +6,10 @@ fn unicode_tag_format_characters_are_untrusted_for_display() {
         assert!(is_untrusted_display_character(character));
     }
 }
+
+#[test]
+fn default_ignorable_hangul_fillers_are_untrusted_for_display() {
+    for character in ['\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}'] {
+        assert!(is_untrusted_display_character(character));
+    }
+}

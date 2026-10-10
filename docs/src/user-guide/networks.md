@@ -20,6 +20,15 @@ labels, options, IPAM, peers, services, status, or raw response bodies. The
 validated membership set is used only to compare exact container IDs against
 the current container inventory and to show network-attachment controls.
 
+Engine-provided network names/metadata and attached-container names are
+untrusted text. Ferrum visibly escapes selected controls, bidi/zero-width and
+invisible-format characters, Unicode tags, and Hangul fillers in network
+rows/details, membership actions, and confirmations. Engine-sourced fields
+whose raw or escaped text exceeds 4 KiB are shown as `[display text omitted]`.
+It retains original values for exact comparisons;
+connect/disconnect/remove requests remain bound to validated network/container
+IDs.
+
 This page supports network list/inspection, name-only default-bridge creation,
 explicit removal of selected unused custom networks, and connecting or
 disconnecting containers from selected local custom networks. Docker's

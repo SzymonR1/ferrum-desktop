@@ -10,6 +10,14 @@ Select a row to load its details, including tags, creation time, size,
 architecture, operating system, and author when reported by the engine. Missing
 engine fields are shown as **Not reported**.
 
+Image tags, identifiers, and inspection fields supplied by the engine are
+treated as untrusted text. Selected controls, bidi/zero-width and
+invisible-format characters, Unicode tags, and Hangul fillers appear as visible
+escapes in image rows, tooltips, details, and tag confirmations. Engine-sourced
+fields whose raw or escaped text exceeds 4 KiB are shown as
+`[display text omitted]`. Requests still use the original ID; ordinary tag and
+author text is not redacted.
+
 The list and inspection requests run asynchronously. Loading, empty, connection,
 and engine-error states are shown in the page. Search filters the most recently
 loaded inventory; use **Refresh** to request a new image list.
