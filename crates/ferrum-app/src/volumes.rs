@@ -1058,7 +1058,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn volume_create_form_enforces_name_boundaries_accessibly() {
-        for invalid_name in ["  ", ".", "..", "line\nbreak", "name\u{202e}"] {
+        for invalid_name in [
+            "  ",
+            ".",
+            "..",
+            "line\nbreak",
+            "name\u{202e}",
+            "name\u{e0001}",
+            "name\u{e007f}",
+        ] {
             let view = VolumesView {
                 create_name: invalid_name.to_owned(),
                 ..VolumesView::default()

@@ -42,9 +42,11 @@ into a raw stream, so stdout/stderr cannot be separated; Ferrum labels each
 such row `combined`. For non-TTY containers, Ferrum labels rows `stdout` or
 `stderr` according to the stream type. Copy and Export preserve these labels,
 formatting each row as `<source>: <text>` (for example, `stdout: ...`,
-`stderr: ...`, or for TTY, `combined: ...`). Copy and Export escape terminal
-control characters as literal `\xNN`; other text and row boundaries are
-preserved.
+`stderr: ...`, or for TTY, `combined: ...`).
+Container text is untrusted. Ferrum escapes C0/C1 controls as literal `\xNN`
+and selected bidi, zero-width, and invisible formatting characters as literal
+`\u{...}` before the Logs row, Copy, or Export. Other text and row boundaries
+are preserved; this is not secret detection or redaction.
 
 The view is bounded to 8 MiB or 10,000 lines and discards oldest lines when
 those limits are reached, with a visible discarded-line count. Individual

@@ -74,6 +74,13 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   engine state remained unchanged. These events are not persistent or
   tamper-proof.
 - Keep historical/live container logs restricted to the selected local Unix-socket engine. Use the negotiated API version and streaming response body; accept only json-file/journald drivers. TTY is read from allowlisted `Config.Tty`: TTY output is raw and combined, while non-TTY output is decoded from Docker's 8-byte multiplex frames. Render logs as plain text, never as a terminal. Bound frames to 1 MiB, lines to 64 KiB, retention to 8 MiB or 10,000 lines, and delivery to a dedicated 16-message channel; discard oldest retained lines with a visible count. Pause suspends UI draining, applying bounded backpressure to producer reads without unbounded memory or dropped lines; Resume continues delivery. Copy and Export include only currently visible, retained rows and escape terminal control characters as `\xNN`.
+- Escape untrusted container-log text once when adding rows to `LogBuffer`:
+  C0/C1 controls become visible `\xNN` text and selected bidi, zero-width, and
+  invisible formatting characters become `\u{...}` text. The stored safe string
+  is the one rendered in Logs rows and used by search, Copy, and Export. Count
+  the escaped size against the existing 8 MiB retention bound and drop a line
+  if its escaped form would exceed it. This is display sanitization, not secret
+  detection or redaction.
 - For visible log export, write the complete selected text to a unique sibling
   temporary file and atomically replace only the selected directory entry. New
   files are `0600`; existing writable regular targets retain ordinary rwx mode
