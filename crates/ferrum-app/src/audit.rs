@@ -1,18 +1,155 @@
+use serde::Serialize;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct AuditRecord {
+    schema_version: u32,
+    timestamp_unix_ms: u64,
+    event: &'static str,
+    action: &'static str,
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_id: Option<String>,
+}
+
+impl AuditRecord {
+    fn new(
+        event: &'static str,
+        action: &'static str,
+        outcome: &'static str,
+        container_id: Option<&str>,
+        network_id: Option<&str>,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            timestamp_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            event,
+            action,
+            outcome,
+            container_id: container_id.map(str::to_owned),
+            network_id: network_id.map(str::to_owned),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+use crate::settings::SettingsStore;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
+
+pub(super) const MAX_AUDIT_LOG_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Clone)]
+pub(super) struct AuditStore {
+    #[cfg(target_os = "linux")]
+    settings: Option<Arc<SettingsStore>>,
+}
+
+#[derive(Debug)]
+pub(super) enum AuditStoreError {
+    Full,
+    Unavailable,
+    Write,
+    Serialization,
+    Worker,
+}
+
+impl AuditStore {
+    #[cfg(target_os = "linux")]
+    pub(super) fn new(settings: Arc<SettingsStore>) -> Self {
+        Self {
+            settings: Some(settings),
+        }
+    }
+
+    #[cfg(any(test, not(target_os = "linux")))]
+    pub(super) fn disabled() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            settings: None,
+        }
+    }
+
+    pub(super) async fn persist(&self, record: AuditRecord) -> Result<(), AuditStoreError> {
+        #[cfg(target_os = "linux")]
+        {
+            let Some(settings) = self.settings.clone() else {
+                return Ok(());
+            };
+            tokio::task::spawn_blocking(move || persist_record(settings, record))
+                .await
+                .map_err(|_| AuditStoreError::Worker)?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = record;
+            Err(AuditStoreError::Unavailable)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn persist_record(
+    settings: Arc<SettingsStore>,
+    record: AuditRecord,
+) -> Result<(), AuditStoreError> {
+    use std::io::Write;
+    let mut line = serde_json::to_vec(&record).map_err(|_| AuditStoreError::Serialization)?;
+    line.push(b'\n');
+    if line.len() as u64 > MAX_AUDIT_LOG_BYTES {
+        return Err(AuditStoreError::Full);
+    }
+    let mut file = settings
+        .open_audit_file()
+        .map_err(|_| AuditStoreError::Unavailable)?;
+    // SAFETY: `file` owns a valid descriptor for the opened audit file.
+    let lock_result = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
+    if lock_result != 0 {
+        return Err(AuditStoreError::Write);
+    }
+    struct Unlock(std::os::fd::RawFd);
+    impl Drop for Unlock {
+        fn drop(&mut self) {
+            // SAFETY: the audit file remains open until this guard is dropped.
+            let _ = unsafe { libc::flock(self.0, libc::LOCK_UN) };
+        }
+    }
+    let _unlock = Unlock(std::os::fd::AsRawFd::as_raw_fd(&file));
+    let current = file.metadata().map_err(|_| AuditStoreError::Write)?.len();
+    if current.saturating_add(line.len() as u64) > MAX_AUDIT_LOG_BYTES {
+        return Err(AuditStoreError::Full);
+    }
+    if file.write_all(&line).is_err() {
+        let _ = file.set_len(current);
+        let _ = file.sync_data();
+        return Err(AuditStoreError::Write);
+    }
+    if file.sync_data().is_err() {
+        let _ = file.set_len(current);
+        let _ = file.sync_data();
+        return Err(AuditStoreError::Write);
+    }
+    Ok(())
+}
 use ferrum_core::ContainerAction;
 #[cfg(target_os = "linux")]
 use ferrum_core::VolumeDetails;
 #[cfg(target_os = "linux")]
 use ferrum_engine::EngineError;
 
-/// Emits a minimal local trace event when an engine lifecycle request returns.
-///
-/// Only 64-character hexadecimal container IDs are attached. Engine errors,
-/// endpoint details, names, and daemon response data are never logged here.
+/// Emits an ephemeral trace event and returns the redacted lifecycle outcome
+/// record for durable local persistence.
 pub(super) fn record_container_action_result(
     container_id: &str,
     action: ContainerAction,
     engine_confirmed: bool,
-) {
+) -> AuditRecord {
     let container_id = valid_resource_id(container_id);
     if engine_confirmed {
         tracing::info!(
@@ -33,6 +170,17 @@ pub(super) fn record_container_action_result(
             "Container lifecycle request returned an error"
         );
     }
+    AuditRecord::new(
+        "container_action",
+        action.label(),
+        if engine_confirmed {
+            "success"
+        } else {
+            "request_error"
+        },
+        container_id,
+        None,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -54,24 +202,21 @@ impl NetworkMutation {
     }
 }
 
-/// Emits a minimal local trace event when a network mutation request returns.
-///
-/// Only validated full network IDs are attached. Names, engine endpoints,
-/// errors, and daemon response data are never logged.
+/// Emits an ephemeral trace event and returns the redacted network outcome
+/// record for durable local persistence.
 pub(super) fn record_network_mutation_result(
     network_id: Option<&str>,
     action: NetworkMutation,
     request_succeeded: bool,
-) {
-    let network_id = network_id
-        .and_then(valid_resource_id)
-        .unwrap_or("unavailable");
+) -> AuditRecord {
+    let validated_network_id = network_id.and_then(valid_resource_id);
+    let logged_network_id = validated_network_id.unwrap_or("unavailable");
     if request_succeeded {
         tracing::info!(
             target: "ferrum::audit",
             audit_event = "network_mutation",
             action = action.label(),
-            network_id,
+            network_id = logged_network_id,
             outcome = "success",
             "Network mutation request succeeded"
         );
@@ -80,11 +225,22 @@ pub(super) fn record_network_mutation_result(
             target: "ferrum::audit",
             audit_event = "network_mutation",
             action = action.label(),
-            network_id,
+            network_id = logged_network_id,
             outcome = "request_error",
             "Network mutation request returned an error"
         );
     }
+    AuditRecord::new(
+        "network_mutation",
+        action.label(),
+        if request_succeeded {
+            "success"
+        } else {
+            "request_error"
+        },
+        None,
+        validated_network_id,
+    )
 }
 
 pub(super) fn record_network_attachment_result(
@@ -92,12 +248,12 @@ pub(super) fn record_network_attachment_result(
     container_id: &str,
     action: NetworkMutation,
     request_succeeded: bool,
-) {
+) -> Option<AuditRecord> {
     let (Some(network_id), Some(container_id)) = (
         valid_resource_id(network_id),
         valid_resource_id(container_id),
     ) else {
-        return;
+        return None;
     };
     let outcome = if request_succeeded {
         "success"
@@ -125,6 +281,13 @@ pub(super) fn record_network_attachment_result(
             "Network attachment request returned"
         );
     }
+    Some(AuditRecord::new(
+        "network_mutation",
+        action.label(),
+        outcome,
+        Some(container_id),
+        Some(network_id),
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -146,17 +309,15 @@ impl ImageMutation {
     }
 }
 
-/// Emits a local trace event when an image mutation request returns.
-///
-/// Local ID, reference, or tag validation failures are distinguished from
-/// errors after the request path begins. Image identifiers, references, and
+/// Emits an ephemeral trace event and returns the redacted image outcome
+/// record for durable local persistence. Image identifiers, references, and
 /// repository tags are never logged.
 #[cfg(target_os = "linux")]
 pub(super) fn record_image_mutation_result(
     action: ImageMutation,
     result: &Result<(), EngineError>,
-) {
-    match result {
+) -> AuditRecord {
+    let outcome = match result {
         Ok(()) => {
             tracing::info!(
                 target: "ferrum::audit",
@@ -165,6 +326,7 @@ pub(super) fn record_image_mutation_result(
                 outcome = "success",
                 "Image mutation request succeeded"
             );
+            "success"
         }
         Err(
             EngineError::InvalidImageId
@@ -178,6 +340,7 @@ pub(super) fn record_image_mutation_result(
                 outcome = "not_submitted",
                 "Image mutation input was rejected before request submission"
             );
+            "not_submitted"
         }
         Err(_) => {
             tracing::warn!(
@@ -187,24 +350,31 @@ pub(super) fn record_image_mutation_result(
                 outcome = "request_error",
                 "Image mutation request returned an error"
             );
+            "request_error"
         }
-    }
+    };
+    AuditRecord::new("image_mutation", action.label(), outcome, None, None)
 }
 #[cfg(target_os = "linux")]
-/// Emits an ephemeral volume-create outcome without resource or endpoint metadata.
-pub(super) fn record_volume_create_result(result: &Result<VolumeDetails, EngineError>) {
-    record_volume_mutation_result("create", result);
-}
-
-#[cfg(target_os = "linux")]
-/// Emits an ephemeral volume-removal outcome without resource or endpoint metadata.
-pub(super) fn record_volume_remove_result(result: &Result<(), EngineError>) {
-    record_volume_mutation_result("remove", result);
+/// Returns the redacted volume-create outcome after emitting its trace event.
+pub(super) fn record_volume_create_result(
+    result: &Result<VolumeDetails, EngineError>,
+) -> AuditRecord {
+    record_volume_mutation_result("create", result)
 }
 
 #[cfg(target_os = "linux")]
-fn record_volume_mutation_result<T>(action: &'static str, result: &Result<T, EngineError>) {
-    match result {
+/// Returns the redacted volume-removal outcome after emitting its trace event.
+pub(super) fn record_volume_remove_result(result: &Result<(), EngineError>) -> AuditRecord {
+    record_volume_mutation_result("remove", result)
+}
+
+#[cfg(target_os = "linux")]
+fn record_volume_mutation_result<T>(
+    action: &'static str,
+    result: &Result<T, EngineError>,
+) -> AuditRecord {
+    let outcome = match result {
         Ok(_) => {
             tracing::info!(
                 target: "ferrum::audit",
@@ -213,6 +383,7 @@ fn record_volume_mutation_result<T>(action: &'static str, result: &Result<T, Eng
                 outcome = "success",
                 "Volume mutation request succeeded"
             );
+            "success"
         }
         Err(EngineError::InvalidVolumeName) => {
             tracing::warn!(
@@ -222,6 +393,7 @@ fn record_volume_mutation_result<T>(action: &'static str, result: &Result<T, Eng
                 outcome = "not_submitted",
                 "Volume mutation input was rejected before request submission"
             );
+            "not_submitted"
         }
         Err(_) => {
             tracing::warn!(
@@ -231,8 +403,10 @@ fn record_volume_mutation_result<T>(action: &'static str, result: &Result<T, Eng
                 outcome = "request_error",
                 "Volume mutation request returned an error"
             );
+            "request_error"
         }
-    }
+    };
+    AuditRecord::new("volume_mutation", action, outcome, None, None)
 }
 
 fn valid_resource_id(resource_id: &str) -> Option<&str> {
@@ -542,5 +716,213 @@ mod tests {
         ] {
             assert!(!output.contains(sensitive_value));
         }
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn persists_redacted_audit_records_for_mutation_outcomes() {
+        use super::{
+            AuditStore, ImageMutation, record_image_mutation_result,
+            record_network_mutation_result, record_volume_create_result,
+        };
+        use crate::settings::SettingsStore;
+        use ferrum_core::VolumeDetails;
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ferrum-audit-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let store = AuditStore::new(Arc::new(SettingsStore::at(root.join("settings.toml"))));
+        let container_id = "a".repeat(64);
+        let network_id = "b".repeat(64);
+        let invalid_id = "invalid-container-ID-SECRET";
+
+        store
+            .persist(record_container_action_result(
+                &container_id,
+                ContainerAction::Remove,
+                true,
+            ))
+            .await
+            .unwrap();
+        store
+            .persist(record_container_action_result(
+                invalid_id,
+                ContainerAction::Stop,
+                false,
+            ))
+            .await
+            .unwrap();
+        store
+            .persist(record_image_mutation_result(
+                ImageMutation::Pull,
+                &Err(EngineError::ImagePullRejected {
+                    endpoint_label: "endpoint-SENTINEL",
+                    status: 500,
+                }),
+            ))
+            .await
+            .unwrap();
+        store
+            .persist(record_volume_create_result(&Ok(VolumeDetails {
+                name: "volume-name-SENTINEL".to_owned(),
+                driver: Some("volume-driver-SENTINEL".to_owned()),
+                scope: Some("volume-scope-SENTINEL".to_owned()),
+                created_at: Some("volume-time-SENTINEL".to_owned()),
+                mountpoint: Some("/volume/path-SENTINEL".to_owned()),
+            })))
+            .await
+            .unwrap();
+        store
+            .persist(record_network_mutation_result(
+                Some(&network_id),
+                NetworkMutation::Create,
+                true,
+            ))
+            .await
+            .unwrap();
+        store
+            .persist(
+                record_network_attachment_result(
+                    &network_id,
+                    &container_id,
+                    NetworkMutation::Disconnect,
+                    false,
+                )
+                .expect("validated network attachment IDs should produce a record"),
+            )
+            .await
+            .unwrap();
+
+        let log_path = root.join("audit.jsonl");
+        let contents = fs::read_to_string(&log_path).unwrap();
+        let records = contents
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let directory_mode = fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&log_path).unwrap().permissions().mode() & 0o777;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(records.len(), 6);
+        assert!(contents.ends_with('\n'));
+        assert_eq!(directory_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        for record in &records {
+            assert_eq!(record["schema_version"], 1);
+            assert!(record["timestamp_unix_ms"].as_u64().unwrap() > 0);
+            assert!(record["event"].as_str().is_some());
+            assert!(record["action"].as_str().is_some());
+            assert!(matches!(
+                record["outcome"].as_str(),
+                Some("success" | "not_submitted" | "request_error")
+            ));
+            let object = record.as_object().unwrap();
+            assert!(object.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "schema_version"
+                        | "timestamp_unix_ms"
+                        | "event"
+                        | "action"
+                        | "outcome"
+                        | "container_id"
+                        | "network_id"
+                )
+            }));
+            if let Some(id) = record["container_id"].as_str() {
+                assert!(id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            }
+            if let Some(id) = record["network_id"].as_str() {
+                assert!(id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            }
+        }
+        assert_eq!(records[0]["event"], "container_action");
+        assert_eq!(records[0]["container_id"], container_id);
+        assert_eq!(records[0]["action"], "Remove");
+        assert_eq!(records[0]["outcome"], "success");
+        assert_eq!(records[1]["event"], "container_action");
+        assert!(records[1].get("container_id").is_none());
+        assert_eq!(records[1]["action"], "Stop");
+        assert_eq!(records[1]["outcome"], "request_error");
+        assert_eq!(records[2]["event"], "image_mutation");
+        assert_eq!(records[2]["action"], "pull");
+        assert_eq!(records[2]["outcome"], "request_error");
+        assert_eq!(records[3]["event"], "volume_mutation");
+        assert_eq!(records[3]["action"], "create");
+        assert_eq!(records[3]["outcome"], "success");
+        assert!(records[3].get("container_id").is_none());
+        assert!(records[3].get("network_id").is_none());
+        assert_eq!(records[4]["event"], "network_mutation");
+        assert_eq!(records[4]["network_id"], network_id);
+        assert_eq!(records[4]["action"], "create");
+        assert_eq!(records[4]["outcome"], "success");
+        assert_eq!(records[5]["event"], "network_mutation");
+        assert_eq!(records[5]["container_id"], container_id);
+        assert_eq!(records[5]["network_id"], network_id);
+        assert_eq!(records[5]["action"], "disconnect");
+        assert_eq!(records[5]["outcome"], "request_error");
+        for sentinel in [
+            invalid_id,
+            "endpoint-SENTINEL",
+            "volume-name-SENTINEL",
+            "volume-driver-SENTINEL",
+            "volume-scope-SENTINEL",
+            "volume-time-SENTINEL",
+            "/volume/path-SENTINEL",
+            "SECRET",
+        ] {
+            assert!(
+                !contents.contains(sentinel),
+                "persisted sentinel: {sentinel}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_audit_log_stops_at_the_configured_size_limit() {
+        use super::{AuditStore, AuditStoreError, MAX_AUDIT_LOG_BYTES};
+        use crate::settings::SettingsStore;
+        use std::fs;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ferrum-audit-full-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let store = AuditStore::new(Arc::new(SettingsStore::at(root.join("settings.toml"))));
+        store
+            .persist(record_container_action_result(
+                &"c".repeat(64),
+                ContainerAction::Start,
+                true,
+            ))
+            .await
+            .unwrap();
+        let path = root.join("audit.jsonl");
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(MAX_AUDIT_LOG_BYTES).unwrap();
+        drop(file);
+        let previous = fs::read(&path).unwrap();
+
+        let result = store
+            .persist(record_container_action_result(
+                &"d".repeat(64),
+                ContainerAction::Stop,
+                true,
+            ))
+            .await;
+        let after = fs::read(&path).unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(matches!(result, Err(AuditStoreError::Full)));
+        assert_eq!(after.len() as u64, MAX_AUDIT_LOG_BYTES);
+        assert_eq!(after, previous);
     }
 }

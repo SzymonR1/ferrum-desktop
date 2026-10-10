@@ -291,16 +291,29 @@ The engine integration targets Linux local Unix sockets. Podman/rootless
 behavior remains unvalidated, remote transports remain unsupported, and Windows
 named pipes and macOS remain deferred to issue #21/M8.
 
-The `audit::tests` module captures lifecycle trace events in memory and checks
-action/outcome fields, full-ID validation, and omission of untrusted identifiers.
-Run those behavior tests directly with:
+The mutation audit tests verify redacted JSONL records for lifecycle, image,
+volume, and network outcomes; they also check the 16 MiB hard cap and that
+audit files are created privately and reject symlink, hard-link, and non-regular
+targets.
+
+The records are a local Ferrum-request history, not tamper-proof and not proof
+of final engine state; they do not capture external engine actions. Run the
+focused tests directly:
 
 ```sh
-cargo test -p ferrum-app audit::tests
+cargo test -p ferrum-app --bin ferrum audit::tests
+cargo test -p ferrum-app --bin ferrum settings::tests::audit_file_
 ```
 
-Audit events are process tracing output only; the app does not persist a
-tamper-proof audit history.
+The named regression tests are
+`persists_redacted_audit_records_for_mutation_outcomes`,
+`durable_audit_log_stops_at_the_configured_size_limit`,
+`audit_file_is_created_with_private_permissions`,
+`audit_file_rejects_symlink_and_hardlink_targets`, and
+`audit_file_rejects_non_regular_targets`. This work does not complete
+Issue #19: issues #17 and #19 remain open/ready, and issue #10 remains
+open/blocked for Podman/rootless and broader endpoint validation. No platform
+or endpoint support or release is claimed.
 
 ## Accessibility and performance samples
 

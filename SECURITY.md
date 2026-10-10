@@ -32,9 +32,25 @@ Image pull, tag, and removal requests emit local structured process traces with
 only the static action and a `success`, `not_submitted`, or `request_error`
 outcome. `not_submitted` identifies local image ID, reference, or tag validation
 that occurs before HTTP submission. Image IDs, references, repository tags,
-endpoints, error text, and daemon response bodies are not logged. These events
-are not persistent or tamper-proof; `request_error` does not establish that
-engine state remained unchanged.
+endpoints, error text, and daemon response bodies are not included in those
+traces.
+
+Ferrum also maintains a Linux-local, bounded JSONL copy of mutation outcomes
+for container lifecycle, image pull/tag/removal, volume create/removal, and
+network create/removal/connect/disconnect requests. `audit.jsonl` is created
+lazily in Ferrum's descriptor-anchored config directory with directory mode
+`0700` and file mode `0600`. Schema version 1 records a timestamp, static
+event/action/outcome, and validated full resource IDs only where existing
+traces permit. It excludes names, image references/tags, endpoints,
+credentials, raw errors, daemon bodies, and terminal/log contents. Each record
+is synced; the file has a 16 MiB hard cap and is not automatically truncated
+or rotated. When full or persistence fails, Ferrum emits a static process
+warning and does not claim that event was persisted; the engine request outcome
+is unchanged. This is local Ferrum-request history only, is mutable by the
+same-UID user, is not tamper-proof, and does not prove final engine state or
+record external engine actions. Issues #17 and #19 remain open/ready; issue #10
+remains open/blocked for Podman/rootless and broader endpoint validation. No
+release or platform/endpoint support is claimed.
 
 The Volumes page is available only for the selected local Docker Unix socket
 on Linux. Creation sends only `Name` to the negotiated volume-create endpoint
@@ -51,7 +67,7 @@ invalidation does not abort a submitted request.
 Volume create and removal results emit local structured traces with only the
 static action (`create` or `remove`) and `success`, `not_submitted`, or
 `request_error` outcome. Volume names, mountpoints, endpoints, error text, and
-daemon bodies are excluded; the process trace is not persistent or tamper-proof.
+daemon bodies are excluded. A durable redacted copy is described above.
 
 Ferrum lists and inspects volumes, then makes a separate filtered read-only
 usage request; only `Size` in bytes and the point-in-time `RefCount` for an
@@ -124,10 +140,10 @@ applicable; raw daemon bodies and IDs are excluded from errors.
 Network mutation traces record only the static create/remove/connect/disconnect
 action, `success` or `request_error`, and validated full IDs when available.
 Connect/disconnect events include both network and container IDs; names,
-endpoints, error text, and daemon bodies are excluded. These process traces are
-not persistent or tamper-proof. Only one network mutation may be active, and
-context switching is blocked until it returns. Network usage statistics and
-credential access are not provided. Podman/rootless and remote endpoints
-remain unsupported or unvalidated. Issues #17 and #10 remain open; no release
-is claimed.
+endpoints, error text, and daemon bodies are excluded. A durable redacted copy
+is described above. Only one network mutation may be active, and context
+switching is blocked until it returns. Network usage statistics and credential
+access are not provided. Podman/rootless and remote endpoints remain
+unsupported or unvalidated. Issues #17 and #10 remain open; no release is
+claimed.
 
