@@ -35,6 +35,10 @@ volume. The request has a 30-second bound and a 16 MiB response limit. Ferrum
 issues it asynchronously and does not retry it. Other JSON requests keep their
 eight-second deadlines. If usage retrieval fails, Ferrum keeps the inspected
 details visible and shows a separate usage error.
+Ambiguous usage data—including duplicate/conflicting `VolumeUsage`, `Items`,
+`Name`, or `UsageData` keys and repeated exact-name items—is unavailable. The
+zero-reference removal gate remains disabled unless one unambiguous snapshot
+reports `RefCount == 0`.
 
 The usage request does not retain or display labels or options. A reference count
 is a point-in-time snapshot and does not guarantee that a volume is safe to
