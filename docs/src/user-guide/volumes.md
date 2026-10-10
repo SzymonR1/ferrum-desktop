@@ -14,7 +14,8 @@ The create form sends only `Name` to the negotiated
 `POST /v{api}/volumes/create` endpoint. Docker selects its default local volume
 driver; driver, labels, and options are not configurable. Names must be
 nonblank, at most 4096 UTF-8 bytes, contain no control or selected invisible
-formatting characters, and not be `.` or `..`. The request body is limited to 16 KiB and the response to 64 KiB.
+formatting characters, and not be `.` or `..`. The request body is limited to
+16 KiB and the response to 64 KiB.
 A successful response must identify the requested name. Requests have an
 eight-second bound; a timeout or transport error can occur after Docker has
 created the volume. Ferrum refreshes the inventory after every create result

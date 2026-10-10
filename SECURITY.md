@@ -27,7 +27,8 @@ on Linux. Creation sends only `Name` to the negotiated volume-create endpoint
 and uses Docker's default local driver; no driver, labels, or options are
 configurable. Names must be nonblank, at most 4096 UTF-8 bytes, contain no
 control or selected invisible formatting characters, and not be `.` or `..`.
-The request body is limited to 16 KiB, the response to 64 KiB, and the request to eight seconds. A create
+The request body is limited to 16 KiB, the response to 64 KiB, and the request
+to eight seconds. A create
 response must identify the exact requested name. Transport errors or timeouts
 may follow a successful create, so Ferrum refreshes inventory after every
 result and blocks context switching while the request is pending. Page

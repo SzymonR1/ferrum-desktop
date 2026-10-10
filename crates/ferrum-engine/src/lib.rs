@@ -1707,7 +1707,7 @@ impl EngineClient {
     pub async fn create_volume(&self, name: &str) -> Result<VolumeDetails, EngineError> {
         #[cfg(target_os = "linux")]
         {
-            if !volume_create_name_safe(name) {
+            if !volume_name_path_safe(name) {
                 return Err(EngineError::InvalidVolumeName);
             }
             let endpoint_label = self.info.endpoint_label;
@@ -2425,14 +2425,10 @@ fn encode_query_component(value: &str) -> String {
 
 #[cfg(target_os = "linux")]
 fn volume_name_path_safe(name: &str) -> bool {
-    !name.is_empty()
+    !name.trim().is_empty()
         && name.len() <= 4096
         && !matches!(name, "." | "..")
         && !name.chars().any(is_untrusted_display_character)
-}
-#[cfg(target_os = "linux")]
-fn volume_create_name_safe(name: &str) -> bool {
-    !name.trim().is_empty() && volume_name_path_safe(name)
 }
 #[cfg(target_os = "linux")]
 fn escape_volume_display_text(value: String) -> String {
@@ -3663,6 +3659,7 @@ mod volume_api_tests {
             br#"{"Volumes":[{"Driver":"local","Scope":"local"}]}"#.as_slice(),
             br#"{"Volumes":[{"Name":"","Driver":"local","Scope":"local"}]}"#.as_slice(),
             br#"{"Volumes":[{"Name":"..","Driver":"local","Scope":"local"}]}"#.as_slice(),
+            br#"{"Volumes":[{"Name":"   ","Driver":"local","Scope":"local"}]}"#.as_slice(),
             br#"{"Volumes":[{"Name":"unsafe\u202ename","Driver":"local","Scope":"local"}]}"#
                 .as_slice(),
         ] {
@@ -3728,6 +3725,24 @@ mod volume_api_tests {
             EngineError::VolumeInspectionUnavailable { .. }
         ));
         assert!(!error.to_string().contains("other-volume"));
+        cleanup(&socket, &directory);
+    }
+    #[tokio::test]
+    async fn rejects_whitespace_only_inspection_names_before_connecting() {
+        let directory = temporary_directory();
+        let socket = directory.join("engine.sock");
+        let listener = UnixListener::bind(&socket).expect("Unix socket should bind");
+        for name in [" ", "\t"] {
+            assert!(matches!(
+                client(socket.clone()).inspect_volume(name).await,
+                Err(EngineError::InvalidVolumeName)
+            ));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
         cleanup(&socket, &directory);
     }
 
