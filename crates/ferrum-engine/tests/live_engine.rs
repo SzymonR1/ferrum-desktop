@@ -43,6 +43,14 @@ async fn local_engine_lists_and_inspects_existing_volume_read_only() {
         .await
         .expect("configured existing volume should be inspectable");
     assert_eq!(details.name, name);
+    let usage = engine
+        .volume_usage(&name)
+        .await
+        .expect("configured existing volume usage should be readable");
+    assert!(
+        usage.is_some(),
+        "configured existing volume should appear in the verbose usage snapshot"
+    );
 }
 
 /// Read-only opt-in check: inspects only a caller-specified existing network.

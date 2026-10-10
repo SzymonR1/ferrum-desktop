@@ -257,23 +257,50 @@ fn is_display_control(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, time::SystemTime};
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+        time::SystemTime,
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::UnixListener,
     };
 
+    static NEXT_TEMP_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
+
     fn temporary_socket() -> (std::path::PathBuf, std::path::PathBuf) {
-        let directory = std::env::temp_dir().join(format!(
-            "ferrum-image-pull-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&directory).unwrap();
-        (directory.join("engine.sock"), directory)
+        let timestamp_nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        temporary_socket_at(timestamp_nanos)
+    }
+
+    fn temporary_socket_at(timestamp_nanos: u128) -> (std::path::PathBuf, std::path::PathBuf) {
+        loop {
+            let id = NEXT_TEMP_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "ferrum-image-pull-{}-{timestamp_nanos}-{id}",
+                std::process::id(),
+            ));
+            match fs::create_dir(&directory) {
+                Ok(()) => return (directory.join("engine.sock"), directory),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("failed to create image-pull test directory: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn temporary_socket_directories_are_unique_for_equal_clock_values() {
+        let timestamp_nanos = 42;
+        let (_, first_directory) = temporary_socket_at(timestamp_nanos);
+        let (_, second_directory) = temporary_socket_at(timestamp_nanos);
+
+        assert_ne!(first_directory, second_directory);
+        fs::remove_dir(first_directory).unwrap();
+        fs::remove_dir(second_directory).unwrap();
     }
 
     fn engine(socket_path: std::path::PathBuf) -> EngineClient {
