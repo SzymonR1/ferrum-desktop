@@ -246,6 +246,15 @@ pub struct VolumeDetails {
     pub mountpoint: Option<String>,
 }
 
+/// Read-only point-in-time usage reported for one local volume.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeUsage {
+    /// Volume size in bytes, when reported as a non-negative integer.
+    pub size_bytes: Option<u64>,
+    /// Number of references to the volume, when reported as a non-negative integer.
+    pub reference_count: Option<u64>,
+}
+
 /// Read-only details reported for one image by a Docker-compatible engine.
 ///
 /// Optional values remain absent when the engine does not report them.

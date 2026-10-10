@@ -111,9 +111,11 @@ The ignored local image list/inspect smoke test is read-only and requires
 `FERRUM_TEST_IMAGE` to name an image already installed locally; it does not pull
 or modify images. Pull, tag, and removal behavior is covered only by fake-socket
 contract tests and headless UI tests; no live image mutation is performed. The
-ignored read-only volume list/inspect test requires `FERRUM_TEST_VOLUME` to name
-an existing local volume and only lists/inspects it; it does not mutate or clean
-up resources. The ignored read-only network list/inspect test requires
+ignored opt-in volume list/inspect/usage test requires `FERRUM_TEST_VOLUME` to
+name an existing volume on the selected local Docker Unix socket on Linux. It
+lists and inspects the volume, then reads its matching usage data; it remains
+read-only and never mutates or cleans up resources. The ignored read-only
+network list/inspect test requires
 `FERRUM_TEST_NETWORK` to name an existing local network. It lists networks and
 inspects the matching listed ID; it performs no mutation or cleanup. Default and
 fake-socket tests do not contact a live engine. See the testing guide for exact

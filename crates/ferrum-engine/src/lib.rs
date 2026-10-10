@@ -44,11 +44,11 @@ use contexts::{
 use ferrum_core::{
     ContainerAction, ContainerChange, ContainerDetails, ContainerMount, ContainerState,
     ContainerSummary, ImageDetails, ImageSummary, NetworkDetails, NetworkSummary, VolumeDetails,
-    VolumeSummary,
+    VolumeSummary, VolumeUsage,
 };
 use serde::{
     Deserialize,
-    de::{DeserializeOwned, IgnoredAny},
+    de::{DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 use thiserror::Error;
 
@@ -65,6 +65,8 @@ enum RequestJsonError {
 }
 #[cfg(target_os = "linux")]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(target_os = "linux")]
+const VOLUME_USAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
 const LIFECYCLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
@@ -130,6 +132,263 @@ struct VolumeResponse {
     scope: Option<String>,
     created_at: Option<String>,
     mountpoint: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct VolumeUsageData {
+    size: Option<i64>,
+    ref_count: Option<i64>,
+}
+
+#[cfg(target_os = "linux")]
+// Walk the SystemDataUsageResponse envelope and retain only the requested
+// item's size and reference count; every item name is dropped after matching.
+struct VolumeUsageResponseSeed<'a> {
+    requested_name: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+impl<'de, 'a> DeserializeSeed<'de> for VolumeUsageResponseSeed<'a> {
+    type Value = Option<VolumeUsage>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(VolumeUsageResponseVisitor {
+            requested_name: self.requested_name,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct VolumeUsageResponseVisitor<'a> {
+    requested_name: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+impl<'de, 'a> Visitor<'de> for VolumeUsageResponseVisitor<'a> {
+    type Value = Option<VolumeUsage>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a Docker system data usage response")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut usage = None;
+        while let Some(field) = map.next_key::<String>()? {
+            if field == "VolumeUsage" {
+                usage = map.next_value_seed(VolumeUsageInventorySeed {
+                    requested_name: self.requested_name,
+                })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(usage)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct VolumeUsageInventorySeed<'a> {
+    requested_name: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+impl<'de, 'a> DeserializeSeed<'de> for VolumeUsageInventorySeed<'a> {
+    type Value = Option<VolumeUsage>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(VolumeUsageInventoryVisitor {
+            requested_name: self.requested_name,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct VolumeUsageInventoryVisitor<'a> {
+    requested_name: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+impl<'de, 'a> Visitor<'de> for VolumeUsageInventoryVisitor<'a> {
+    type Value = Option<VolumeUsage>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a volume usage object or null")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut usage = None;
+        while let Some(field) = map.next_key::<String>()? {
+            if field == "Items" {
+                usage = map.next_value_seed(VolumeUsageItemsSeed {
+                    requested_name: self.requested_name,
+                })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(usage)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct VolumeUsageItemsSeed<'a> {
+    requested_name: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+impl<'de, 'a> DeserializeSeed<'de> for VolumeUsageItemsSeed<'a> {
+    type Value = Option<VolumeUsage>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(VolumeUsageItemsVisitor {
+            requested_name: self.requested_name,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct VolumeUsageItemsVisitor<'a> {
+    requested_name: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+impl<'de, 'a> Visitor<'de> for VolumeUsageItemsVisitor<'a> {
+    type Value = Option<VolumeUsage>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an array of volume usage items or null")
+    }
+
+    fn visit_seq<A>(self, mut items: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut usage = None;
+        while let Some(item_usage) = items.next_element_seed(VolumeUsageItemSeed {
+            requested_name: self.requested_name,
+        })? {
+            if usage.is_none() {
+                usage = item_usage;
+            }
+        }
+        Ok(usage)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct VolumeUsageItemSeed<'a> {
+    requested_name: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+impl<'de, 'a> DeserializeSeed<'de> for VolumeUsageItemSeed<'a> {
+    type Value = Option<VolumeUsage>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(VolumeUsageItemVisitor {
+            requested_name: self.requested_name,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct VolumeUsageItemVisitor<'a> {
+    requested_name: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+impl<'de, 'a> Visitor<'de> for VolumeUsageItemVisitor<'a> {
+    type Value = Option<VolumeUsage>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a volume usage item")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut matches_requested_name = None;
+        let mut usage_data = None;
+        while let Some(field) = map.next_key::<String>()? {
+            match field.as_str() {
+                "Name" => {
+                    let name = map.next_value::<Option<String>>()?;
+                    matches_requested_name = Some(name.as_deref() == Some(self.requested_name));
+                }
+                "UsageData" if matches_requested_name == Some(false) => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+                "UsageData" => usage_data = map.next_value::<Option<VolumeUsageData>>()?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        let usage = if matches_requested_name == Some(true) {
+            Some(VolumeUsage {
+                size_bytes: usage_data
+                    .as_ref()
+                    .and_then(|usage| usage.size)
+                    .and_then(|size| u64::try_from(size).ok()),
+                reference_count: usage_data
+                    .and_then(|usage| usage.ref_count)
+                    .and_then(|count| u64::try_from(count).ok()),
+            })
+        } else {
+            None
+        };
+        Ok(usage)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -375,6 +634,13 @@ pub enum EngineError {
     #[cfg(target_os = "linux")]
     #[error("The volume name for the engine request is invalid.")]
     InvalidVolumeName,
+    /// The engine could not return valid, bounded volume usage information.
+    #[cfg(target_os = "linux")]
+    #[error("The engine at the {endpoint_label} could not return safe volume usage information.")]
+    VolumeUsageUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
     /// The engine could not return a valid, bounded network inventory.
     #[cfg(target_os = "linux")]
     #[error("The engine at the {endpoint_label} could not return safe network information.")]
@@ -1187,6 +1453,57 @@ impl EngineClient {
         }
     }
 
+    /// Returns read-only point-in-time usage for a named local volume.
+    ///
+    /// Only the matching volume name and its size and reference count are
+    /// retained from Docker's verbose volume usage report. The request is
+    /// restricted to the volume type and never requests all disk usage data.
+    /// This filtered read has a bounded 30-second total request wait because
+    /// system usage calculation can be slower than ordinary engine reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidVolumeName` before connecting for an invalid name, or
+    /// `VolumeUsageUnavailable` if the request exceeds its 30-second bound or
+    /// the engine response is unavailable, invalid, or oversized. Unsupported
+    /// platforms return `UnsupportedPlatform`.
+    pub async fn volume_usage(&self, name: &str) -> Result<Option<VolumeUsage>, EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            if !volume_name_path_safe(name) {
+                return Err(EngineError::InvalidVolumeName);
+            }
+            let endpoint_label = self.info.endpoint_label;
+            let path = format!("/v{}/system/df?verbose=true&type=volume", self.api_version);
+            let usage = request_json_with_decoder(
+                &self.socket_path,
+                &path,
+                MAX_LIST_RESPONSE_BYTES,
+                VOLUME_USAGE_REQUEST_TIMEOUT,
+                |body| {
+                    let mut deserializer = serde_json::Deserializer::from_slice(body);
+                    let usage = VolumeUsageResponseSeed {
+                        requested_name: name,
+                    }
+                    .deserialize(&mut deserializer)
+                    .map_err(|_| RequestJsonError::JsonDecode)?;
+                    deserializer
+                        .end()
+                        .map_err(|_| RequestJsonError::JsonDecode)?;
+                    Ok(usage)
+                },
+            )
+            .await
+            .map_err(|_| EngineError::VolumeUsageUnavailable { endpoint_label })?;
+            Ok(usage)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = name;
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
+
     /// Returns read-only details for an image identified by its engine ID.
     ///
     /// The engine response is reduced to the documented image fields; labels,
@@ -1693,6 +2010,27 @@ async fn request_json<T: DeserializeOwned>(
     max_response_bytes: usize,
     request_timeout: Duration,
 ) -> Result<T, RequestJsonError> {
+    request_json_with_decoder(
+        socket_path,
+        request_path,
+        max_response_bytes,
+        request_timeout,
+        |body| serde_json::from_slice(body).map_err(|_| RequestJsonError::JsonDecode),
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn request_json_with_decoder<T, F>(
+    socket_path: &std::path::Path,
+    request_path: &str,
+    max_response_bytes: usize,
+    request_timeout: Duration,
+    decode: F,
+) -> Result<T, RequestJsonError>
+where
+    F: FnOnce(&[u8]) -> Result<T, RequestJsonError>,
+{
     match timeout(request_timeout, async {
         let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
         let request = Request::builder()
@@ -1718,7 +2056,7 @@ async fn request_json<T: DeserializeOwned>(
                 }
             })?
             .to_bytes();
-        serde_json::from_slice(&body).map_err(|_| RequestJsonError::JsonDecode)
+        decode(&body)
     })
     .await
     {
@@ -2826,6 +3164,152 @@ mod volume_api_tests {
             }
         );
         assert!(!format!("{details:?}").contains("secret"));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn reports_usage_only_for_an_exact_volume_name_and_keeps_allowlisted_fields() {
+        let body = br#"{"VolumeUsage":{"Items":[{"Name":"data-copy","UsageData":{"Size":900,"RefCount":8},"Labels":{"secret":"label"}},{"Name":"data","UsageData":{"Size":7,"RefCount":2},"Options":{"secret":"option"},"Status":{"secret":"status"},"extra":"secret"}]}}"#;
+        let (socket, directory, server) = fixture(response("200 OK", body)).await;
+        let usage = client(socket.clone())
+            .volume_usage("data")
+            .await
+            .expect("volume usage");
+        let request = server.await.expect("server");
+        assert!(request.starts_with("GET /v1.45/system/df?verbose=true&type=volume HTTP/1.1\r\n"));
+        assert_eq!(
+            usage,
+            Some(VolumeUsage {
+                size_bytes: Some(7),
+                reference_count: Some(2),
+            })
+        );
+        assert!(!format!("{usage:?}").contains("secret"));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn maps_missing_negative_and_zero_usage_values() {
+        for (name, body, expected) in [
+            (
+                "missing-data",
+                br#"{"VolumeUsage":{"Items":[{"Name":"missing-data"}]}}"#.as_slice(),
+                VolumeUsage {
+                    size_bytes: None,
+                    reference_count: None,
+                },
+            ),
+            (
+                "missing-fields",
+                br#"{"VolumeUsage":{"Items":[{"Name":"missing-fields","UsageData":{"Size":12}}]}}"#.as_slice(),
+                VolumeUsage {
+                    size_bytes: Some(12),
+                    reference_count: None,
+                },
+            ),
+            (
+                "negative",
+                br#"{"VolumeUsage":{"Items":[{"Name":"negative","UsageData":{"Size":-1,"RefCount":-2}}]}}"#.as_slice(),
+                VolumeUsage {
+                    size_bytes: None,
+                    reference_count: None,
+                },
+            ),
+            (
+                "zero",
+                br#"{"VolumeUsage":{"Items":[{"Name":"zero","UsageData":{"Size":0,"RefCount":0}}]}}"#.as_slice(),
+                VolumeUsage {
+                    size_bytes: Some(0),
+                    reference_count: Some(0),
+                },
+            ),
+        ] {
+            let (socket, directory, server) = fixture(response("200 OK", body)).await;
+            assert_eq!(
+                client(socket.clone())
+                    .volume_usage(name)
+                    .await
+                    .expect("volume usage"),
+                Some(expected),
+                "usage for {name}"
+            );
+            server.await.expect("server");
+            cleanup(&socket, &directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_none_when_the_requested_volume_is_absent_from_the_snapshot() {
+        let body = br#"{"VolumeUsage":{"Items":[{"Name":"data-copy","UsageData":{"Size":4,"RefCount":1}},{"Name":"database","UsageData":{"Size":5,"RefCount":2}}]}}"#;
+        let (socket, directory, server) = fixture(response("200 OK", body)).await;
+        assert_eq!(
+            client(socket.clone())
+                .volume_usage("data")
+                .await
+                .expect("volume usage"),
+            None
+        );
+        server.await.expect("server");
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn maps_volume_usage_request_decode_size_and_status_failures_safely() {
+        for (status, body) in [
+            (
+                "500 Internal Server Error",
+                br#"{"message":"private daemon body"}"#.as_slice(),
+            ),
+            ("200 OK", b"{".as_slice()),
+        ] {
+            let (socket, directory, server) = fixture(response(status, body)).await;
+            let error = client(socket.clone())
+                .volume_usage("data")
+                .await
+                .expect_err("invalid response should fail");
+            server.await.expect("server");
+            assert!(matches!(error, EngineError::VolumeUsageUnavailable { .. }));
+            assert!(!error.to_string().contains("private"));
+            assert!(!format!("{error:?}").contains("private"));
+            cleanup(&socket, &directory);
+        }
+
+        let body = vec![b' '; MAX_LIST_RESPONSE_BYTES + 1];
+        let (socket, directory, server) = fixture(response("200 OK", &body)).await;
+        assert!(matches!(
+            client(socket.clone()).volume_usage("data").await,
+            Err(EngineError::VolumeUsageUnavailable { .. })
+        ));
+        server.await.expect("server");
+        cleanup(&socket, &directory);
+
+        let error = client(std::path::PathBuf::from(
+            "/path/that/does/not/exist/engine.sock",
+        ))
+        .volume_usage("data")
+        .await
+        .expect_err("unavailable socket should fail");
+        assert!(matches!(error, EngineError::VolumeUsageUnavailable { .. }));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_usage_names_without_connecting_to_the_socket() {
+        let directory = temporary_directory();
+        let socket = directory.join("engine.sock");
+        let listener = UnixListener::bind(&socket).expect("Unix socket should bind");
+        let engine = client(socket.clone());
+        let too_long = "x".repeat(4097);
+        for name in ["", ".", "..", too_long.as_str()] {
+            assert!(matches!(
+                engine.volume_usage(name).await,
+                Err(EngineError::InvalidVolumeName)
+            ));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
         cleanup(&socket, &directory);
     }
 
