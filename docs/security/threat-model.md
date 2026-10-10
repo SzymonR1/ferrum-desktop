@@ -14,9 +14,9 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 - Do not log or display raw `DOCKER_HOST` values, which may contain sensitive endpoint data.
 - Keep Docker CLI context selection session-only; do not log or display raw context endpoints.
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
-- Use a private bounded request path for version, inventory, inspect, and lifecycle operations. Version/inventory/inspection and event-subscription setup use an 8-second timeout; lifecycle requests use a bounded 30-second timeout for graceful Stop/Restart. Timed-out actions may still be changing state, so errors advise refresh before retry. Remove requires confirmation and sends neither force nor volume-removal parameters. Never log or expose raw response bodies.
-- Restrict volume listing/inspection to the selected local Docker Unix socket on Linux, using the bounded read-only API path. Retain/display only volume name, driver, scope, creation time, and mountpoint; show the mountpoint only as untrusted plain text and never access it. A separate filtered read-only `GET /v{api}/system/df?verbose=true&type=volume` provides usage only for an exact inventory-matched volume; retain/display only `Size` in bytes and the point-in-time `RefCount` when reported. Missing, negative, or unknown metric values remain unavailable, and usage failures appear separately while successful inspect metadata remains visible. Discard unknown daemon fields, labels, options, status, and raw response bodies. The reference count is not a deletion-safety guarantee; the UI offers no volume/network mutations or filesystem browsing. Podman/rootless behavior remains unvalidated, remote endpoints remain unsupported, and issues #17 and #10 remain open.
-- Keep network listing and inspection read-only on the selected local Docker Unix socket on Linux. Retain/display only ID, name, driver, scope, creation time, internal, attachable, EnableIPv4, and EnableIPv6. Inspect may retain only an optional point-in-time count of the `Containers` map; list responses may omit attached-container details. Discard container IDs, names, endpoint records, MAC/IP addresses, labels, options, IPAM, peers, services, status, and raw bodies. Do not access credentials, offer usage statistics or network create/remove/connect/disconnect, or claim Podman/rootless and remote support.
+- Use private bounded request paths for version, API negotiation, inventory, inspection, lifecycle, volume usage, and network creation. Version/inventory/inspection and event-subscription setup use an 8-second timeout; lifecycle requests use a bounded 30-second timeout for graceful Stop/Restart; only the filtered volume-usage request uses a 30-second timeout with a 16 MiB response limit. Network creation uses a bounded JSON `POST /v{negotiated}/networks/create` with only the required `Name` field, a 1 KiB request-body limit, a 64 KiB success-response limit, and a safe typed response/error path. Timed-out mutations may still change state; never log or expose raw response bodies. Container Remove requires confirmation and sends neither force nor volume-removal parameters.
+- Restrict volume listing, inspection, and usage to the selected local Docker Unix socket on Linux. Retain/display only volume name, driver, scope, creation time, and mountpoint as untrusted plain text; never access the mountpoint. The separate filtered read-only `GET /v{api}/system/df?verbose=true&type=volume` provides usage only for an exact inventory-matched volume; retain/display only `Size` in bytes and point-in-time `RefCount` when reported. Missing, negative, or unknown metric values remain unavailable, and usage failures appear separately while successful inspect metadata remains visible. Discard unknown daemon fields, labels, options, status, and raw response bodies. A reference count is not a deletion-safety guarantee. No volume mutations or filesystem browsing are offered. Podman/rootless behavior remains unvalidated, remote endpoints remain unsupported, and issues #17 and #10 remain open.
+- Keep network listing and inspection allowlisted on the selected Linux local Docker Unix socket, and offer name-only default bridge creation with the bounded `POST /v{negotiated}/networks/create` containing only `Name`. Names are non-whitespace, at most 255 UTF-8 bytes, and contain no control characters; no driver, IPAM, or options controls are sent. Retain/display only ID, name, driver, scope, creation time, internal, attachable, EnableIPv4, and EnableIPv6. Inspect may retain only an optional point-in-time count of the `Containers` map; list responses may omit attached-container details. Discard container IDs, names, endpoint records, MAC/IP addresses, labels, options, IPAM, peers, services, status, and raw bodies. Do not access credentials or offer network usage, remove, connect, or disconnect. Podman/rootless and remote support are not claimed.
 - Anonymous image pulls are restricted to the selected local Unix-socket Docker
   engine and send no `X-Registry-Auth` header or stored credentials. Progress
   responses are bounded to 1 MiB per HTTP frame and 64 KiB per JSON record;
@@ -124,12 +124,17 @@ These surfaces must receive explicit design and tests before their implementatio
 Read-only live-engine tests cover version, inventory, and inspection without
 image mutation. The optional ignored network list/inspect test requires
 `FERRUM_TEST_NETWORK` to name an existing local network; it lists networks and
-inspects the matching listed ID without mutation or cleanup. Default tests and
-fake-socket/headless UI tests do not contact a live engine. Fake-Unix-socket
-image protocol tests and headless Images UI tests cover tag and removal
-request/confirmation behavior without contacting a real engine or mutating
-images. There is no live image deletion or other live image-mutation test.
-Separate opt-in ignored lifecycle, logs, and terminal tests mutate engine state
-using one uniquely named disposable container and only its validated full ID as
-cleanup authority. Logs and terminal tests require locally installed images and
-never pull, tag, or delete images. See [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
+inspects the matching listed ID without mutation or cleanup. A separate ignored
+network-create test preflights its generated name, then requires a full
+64-character hexadecimal ID and an inventory entry matching that exact ID and
+name before arming cleanup. If ownership cannot be confirmed, it sends no
+cleanup request and the created network may remain; once verified, the guard
+removes only that ID and never prunes. Default tests and fake-socket/headless UI
+tests do not contact or mutate a live engine. Fake-Unix-socket image protocol
+tests and headless Images UI tests cover tag and removal request/confirmation
+behavior without contacting a real engine or mutating images. There is no live
+image deletion or other live image-mutation test. Separate opt-in ignored
+lifecycle, logs, and terminal tests mutate engine state using one uniquely
+named disposable container and only its validated full ID as cleanup authority.
+Logs and terminal tests require locally installed images and never pull, tag, or
+delete images. See [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).

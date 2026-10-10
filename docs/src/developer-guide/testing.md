@@ -128,13 +128,29 @@ context. It lists networks, then inspects the matching listed network ID:
 FERRUM_TEST_NETWORK=my-existing-network cargo test -p ferrum-engine --test live_engine local_engine_lists_and_inspects_existing_network_read_only -- --exact --ignored
 ```
 
-It does not create, remove, connect, disconnect, modify, or clean up resources.
-This live test is distinct from the default suite, which skips ignored tests,
-and from headless UI/fake-socket protocol tests, which do not contact a live
-engine. Network list results may omit attached-container information. Inspect
-may report an optional point-in-time attached-container count; no container
-identifiers, names, endpoint data, or other non-allowlisted network fields are
-retained or displayed. There are no live mutation tests for networks.
+A separate optional ignored live test creates a uniquely named default bridge
+network through the current local Docker Unix context. It preflights that the
+generated name is absent, then requires the returned ID to be a full 64-character
+hex ID and an inventory entry with exactly that ID and generated name before
+arming the cleanup guard. Cleanup uses an argument-array `docker network rm`
+invocation with only that verified ID:
+
+```sh
+cargo test -p ferrum-engine --test live_engine local_engine_creates_default_bridge_network_and_cleans_up_exact_id -- --exact --ignored
+```
+
+Run it only against a disposable local Docker Engine. If the ID or inventory
+ownership cannot be confirmed, the test stops without issuing a cleanup
+request; a network may remain for manual inspection and cleanup. Once armed,
+the drop guard retries only the verified ID after cleanup failure, never
+removes by name, and never runs a broad prune. The test verifies the owned ID
+is absent after successful cleanup. The default suite skips both ignored
+network tests. Fake-socket protocol tests and headless Networks UI tests do not
+contact or mutate a live engine; native UI click/visual validation remains
+unverified. Network list results may omit attached-container information.
+Inspect may report an optional point-in-time attached-container count; no
+container identifiers, names, endpoint data, or other non-allowlisted network
+fields are retained or displayed.
 
 The lifecycle and logs tests below are separate opt-in ignored tests and mutate
 the engine by creating one disposable container.
