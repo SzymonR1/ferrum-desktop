@@ -1,4 +1,4 @@
-use crate::search::CaseInsensitiveQuery;
+use crate::{display::escape_untrusted_display_text, search::CaseInsensitiveQuery};
 
 use eframe::egui;
 use ferrum_core::{ImageDetails, ImagePullProgress, ImageSummary};
@@ -612,30 +612,33 @@ impl ImagesView {
                         .first()
                         .map(String::as_str)
                         .unwrap_or("Untagged image");
+                    let safe_tag = escape_untrusted_display_text(tag);
+                    let safe_image_id = escape_untrusted_display_text(&image.id);
                     ui.horizontal(|ui| {
                         let response = ui.add_sized(
                             [tag_width, IMAGE_CELL_HEIGHT],
-                            egui::Button::new(egui::RichText::new(tag).strong())
+                            egui::Button::new(egui::RichText::new(safe_tag.as_ref()).strong())
                                 .selected(self.selected_id.as_deref() == Some(image.id.as_str())),
                         );
                         let clicked = response.clicked();
                         response.on_hover_ui(|ui| {
+                            ui.strong("Repository tags");
                             if image.repo_tags.is_empty() {
                                 ui.label("Untagged image");
                             } else {
-                                ui.label("Repository tags");
                                 for tag in &image.repo_tags {
-                                    ui.label(tag);
+                                    let safe_tag = escape_untrusted_display_text(tag);
+                                    ui.label(safe_tag.as_ref());
                                 }
                             }
-                            ui.label(&image.id);
+                            ui.label(safe_image_id.as_ref());
                         });
                         if clicked {
                             selected = Some(image.id.clone());
                         }
                         ui.add_sized(
                             [id_width, IMAGE_CELL_HEIGHT],
-                            egui::Label::new(image.id.as_str())
+                            egui::Label::new(safe_image_id.as_ref())
                                 .truncate()
                                 .show_tooltip_when_elided(true),
                         );
@@ -765,10 +768,11 @@ impl ImagesView {
                 && let Some(image_id) = self.tag_confirmation_image_id.clone()
             {
                 let target = self.tag_target();
+                let safe_image_id = escape_untrusted_display_text(&image_id);
                 ui.group(|ui| {
                     ui.heading("Confirm image tag");
                     ui.label(format!(
-                        "Tag image {image_id} as {target}? Docker may reassign an existing repository:tag; the image data remains. Confirm to send this request to the connected local Docker engine."
+                        "Tag image {safe_image_id} as {target}? Docker may reassign an existing repository:tag; the image data remains. Confirm to send this request to the connected local Docker engine."
                     ));
                     ui.horizontal(|ui| {
                         if ui.button("Confirm tag").clicked() {
@@ -837,10 +841,12 @@ impl ImagesView {
                         image.repo_tags.join(", ")
                     })
                     .unwrap_or_else(|| "Tags unavailable".to_owned());
+                let safe_image_id = escape_untrusted_display_text(&image_id);
+                let safe_tags = escape_untrusted_display_text(&tags);
                 ui.group(|ui| {
                     ui.heading("Confirm image removal");
                     ui.label(format!(
-                        "Remove image ID {image_id} (known tags: {tags})? Force is not used. Untagged parent images are preserved. The engine may refuse images in use by containers or with other tags. If this removes the last reference, image data may be deleted. Confirm to send this request to the connected local Docker engine."
+                        "Remove image ID {safe_image_id} (known tags: {safe_tags})? Force is not used. Untagged parent images are preserved. The engine may refuse images in use by containers or with other tags. If this removes the last reference, image data may be deleted. Confirm to send this request to the connected local Docker engine."
                     ));
                     ui.horizontal(|ui| {
                         if ui.button("Confirm removal").clicked() {
@@ -856,12 +862,14 @@ impl ImagesView {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     if let Some(image_id) = self.remove_result_image_id.as_deref() {
-                        ui.label(format!("Removing image {image_id}…"));
+                        let safe_image_id = escape_untrusted_display_text(image_id);
+                        ui.label(format!("Removing image {safe_image_id}…"));
                     }
                 });
             } else if self.remove_complete {
                 if let Some(image_id) = &self.remove_result_image_id {
-                    ui.label(format!("Image removal succeeded for {image_id}."));
+                    let safe_image_id = escape_untrusted_display_text(image_id);
+                    ui.label(format!("Image removal succeeded for {safe_image_id}."));
                 }
             } else if let Some(error) = &self.remove_error {
                 ui.label("Image removal failed; the engine state may have changed.");
@@ -884,16 +892,18 @@ fn valid_docker_tag(tag: &str) -> bool {
 }
 
 fn image_cell(ui: &mut egui::Ui, text: &str, width: f32) {
+    let text = escape_untrusted_display_text(text);
     ui.add_sized(
         [width, IMAGE_CELL_HEIGHT],
-        egui::Label::new(egui::RichText::new(text).small().strong().weak()).truncate(),
+        egui::Label::new(egui::RichText::new(text.as_ref()).small().strong().weak()).truncate(),
     );
 }
 
 fn image_detail(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
+    let value = value.map(escape_untrusted_display_text);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).weak());
-        ui.label(value.unwrap_or("Not reported"));
+        ui.label(value.as_deref().unwrap_or("Not reported"));
     });
 }
 
@@ -1122,6 +1132,40 @@ mod tests {
         assert!(!view.has_mutation_in_flight());
     }
 
+    #[test]
+    fn engine_image_id_is_escaped_in_tag_confirmation_and_request_preserves_exact_id() {
+        let original_id = "sha256:image\u{202e}";
+        let mut view = taggable_view();
+        view.selected_id = Some(original_id.to_owned());
+        let mut harness = harness_for(view);
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Tag image")
+            .click_accesskit();
+        harness.run();
+
+        let safe_id = "sha256:image\\u{202e}";
+        let expected_confirmation = format!(
+            "Tag image {safe_id} as example/image:release-1? Docker may reassign an existing repository:tag; the image data remains. Confirm to send this request to the connected local Docker engine."
+        );
+        let confirmation = harness.get_by_role_and_label(Role::Label, &expected_confirmation);
+        assert_eq!(
+            confirmation.accesskit_node().value().as_deref(),
+            Some(expected_confirmation.as_str())
+        );
+
+        harness
+            .get_by_role_and_label(Role::Button, "Confirm tag")
+            .click_accesskit();
+        harness.run();
+        assert!(harness.state_mut().view.take_tag_requested());
+        let request = harness
+            .state_mut()
+            .view
+            .begin_tag()
+            .expect("confirmed tag request");
+        assert_eq!(request.image_id, original_id);
+    }
     #[test]
     fn tagging_requires_confirmation_and_cancel_sends_no_request() {
         let mut harness = harness_for(taggable_view());
@@ -1365,6 +1409,45 @@ mod tests {
         harness.run();
         let _os = harness.get_by_role_and_label(Role::Label, "linux");
         let _architecture = harness.get_by_role_and_label(Role::Label, "arm64");
+    }
+
+    #[test]
+    fn untrusted_image_tags_and_author_are_escaped_before_accessible_display() {
+        let image_id = "sha256:untrusted";
+        let tag = "repository\u{202e}tag";
+        let safe_tag = "repository\\u{202e}tag";
+        let mut harness = harness_for(loaded_view(vec![image(image_id, tag, 1024)]));
+
+        harness.run();
+        let image_row = harness.get_by_role_and_label(Role::Button, safe_tag);
+        assert_eq!(
+            image_row.accesskit_node().label().as_deref(),
+            Some(safe_tag)
+        );
+        image_row.click_accesskit();
+        harness.run();
+        let request = harness.state_mut().inspection.take().unwrap();
+        let mut details = details(&request.id, tag);
+        details.author = Some("author\u{e0001}text\u{200b}".to_owned());
+        assert!(harness.state_mut().view.complete_inspection(
+            request.list_generation,
+            request.inspection_generation,
+            &request.id,
+            Ok::<_, &str>(details),
+        ));
+        harness.run();
+
+        let tag_label = harness.get_by_role_and_label(Role::Label, safe_tag);
+        assert_eq!(
+            tag_label.accesskit_node().value().as_deref(),
+            Some(safe_tag)
+        );
+        let safe_author = "author\\u{e0001}text\\u{200b}";
+        let author_label = harness.get_by_role_and_label(Role::Label, safe_author);
+        assert_eq!(
+            author_label.accesskit_node().value().as_deref(),
+            Some(safe_author)
+        );
     }
 
     #[test]

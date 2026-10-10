@@ -6,6 +6,15 @@ Container log text is untrusted. Ferrum escapes C0/C1 controls and selected
 bidirectional, zero-width, and invisible formatting characters before rendering,
 clipboard copy, and file export. This reduces display spoofing but does not
 detect or redact arbitrary data printed by a container.
+Engine-provided container names, image identifiers/tags/inspection fields,
+network names/metadata, and attached-container names are untrusted. Ferrum
+escapes selected control, bidirectional, zero-width, invisible-format, Unicode
+tag, and Hangul filler characters in resource rows, details, and
+membership/confirmation labels. Each engine-sourced display field is limited
+to 4 KiB of raw or escaped text; values beyond that are shown as `[display
+text omitted]`. Escaping is presentation-only; original values remain for
+comparisons and requests. It does not detect or redact secrets or arbitrary
+log content.
 
 ## Reporting a vulnerability
 

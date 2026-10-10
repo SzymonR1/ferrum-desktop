@@ -5,7 +5,8 @@
 /// Returns whether a character can disrupt the visible identity or layout of plain text.
 ///
 /// This includes control characters and selected bidirectional, zero-width,
-/// invisible formatting, and Unicode tag characters in untrusted engine text.
+/// invisible formatting, Hangul filler, and Unicode tag characters in
+/// untrusted engine text.
 #[must_use]
 pub fn is_untrusted_display_character(character: char) -> bool {
     character.is_control()
@@ -20,6 +21,10 @@ pub fn is_untrusted_display_character(character: char) -> bool {
                 | '\u{200e}'
                 | '\u{200f}'
                 | '\u{180e}'
+                | '\u{115f}'
+                | '\u{1160}'
+                | '\u{3164}'
+                | '\u{ffa0}'
                 | '\u{2028}'
                 | '\u{2029}'
                 | '\u{feff}'

@@ -7,6 +7,12 @@ engine, including stopped containers. The inspection dialog also offers
 state-gated lifecycle actions (Start, Stop, Restart, Pause, Unpause, Remove)
 only when the container is in a known state where that action is safe. Remove
 requires explicit confirmation. Engine response bodies are not exposed.
+Engine-provided container names, image references, statuses, and inspection
+fields are rendered as plain text. Selected controls, bidi/zero-width and
+invisible-format characters, Unicode tags, and Hangul fillers appear as visible
+escapes in inventory and inspection labels. Engine-sourced fields whose raw or
+escaped text exceeds 4 KiB are shown as `[display text omitted]`; actions
+continue to use the original IDs. This does not redact arbitrary values.
 
 Lifecycle request results emit a structured local tracing event containing the
 action, outcome (`success` or `request_error`), and a full container ID only

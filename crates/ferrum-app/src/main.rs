@@ -26,6 +26,7 @@ fn action_requires_confirmation(action: ContainerAction) -> bool {
     action.is_destructive()
 }
 mod audit;
+mod display;
 mod images;
 mod inventory;
 mod logs;
@@ -3130,44 +3131,51 @@ impl FerrumApp {
                     let index = visible[row];
                     let container = &self.containers[index];
                     ui.horizontal(|ui| {
+                        let display_name = display::escape_untrusted_display_text(&container.name);
                         let name_button = ui
                             .add_enabled_ui(!self.loading && !self.action_busy(), |ui| {
                                 ui.add_sized(
                                     [name_width, CELL_HEIGHT],
-                                    egui::Button::new(RichText::new(&container.name).strong())
-                                        .frame(false),
+                                    egui::Button::new(
+                                        RichText::new(display_name.as_ref()).strong(),
+                                    )
+                                    .frame(false),
                                 )
                             })
                             .inner;
                         if name_button.clicked() {
                             selected = Some(index);
                         }
-                        name_button.on_hover_text(&container.id);
+                        let display_id = display::escape_untrusted_display_text(&container.id);
+                        name_button.on_hover_text(display_id.as_ref());
                         let image = container.image.as_deref().unwrap_or("Not reported");
+                        let display_image = display::escape_untrusted_display_text(image);
                         let image_response = ui.add_sized(
                             [image_width, CELL_HEIGHT],
-                            egui::Label::new(image)
+                            egui::Label::new(display_image.as_ref())
                                 .truncate()
                                 .show_tooltip_when_elided(true),
                         );
-                        image_response.on_hover_text(image);
+                        image_response.on_hover_text(display_image.as_ref());
                         let state_text = container
                             .state
                             .as_ref()
                             .map_or("Not reported", container_state_display);
+                        let display_state = display::escape_untrusted_display_text(state_text);
                         ui.add_sized(
                             [state_width, CELL_HEIGHT],
                             egui::Label::new(
-                                RichText::new(state_text)
+                                RichText::new(display_state.as_ref())
                                     .color(state_color(container.state.as_ref())),
                             )
                             .truncate()
                             .show_tooltip_when_elided(true),
                         );
                         let status = container.status.as_deref().unwrap_or("Not reported");
+                        let display_status = display::escape_untrusted_display_text(status);
                         ui.add_sized(
                             [status_width, CELL_HEIGHT],
-                            egui::Label::new(status)
+                            egui::Label::new(display_status.as_ref())
                                 .truncate()
                                 .show_tooltip_when_elided(true),
                         );
@@ -3199,8 +3207,10 @@ impl FerrumApp {
             .open(&mut open)
             .resizable(true)
             .show(&context, |ui| {
-                ui.heading(&inspection.container_name);
-                detail_row(ui, "ID", Some(&inspection.container_id));
+                let container_name =
+                    display::escape_untrusted_display_text(&inspection.container_name);
+                ui.heading(container_name.as_ref());
+                untrusted_detail_row(ui, "ID", Some(&inspection.container_id));
                 #[cfg(target_os = "linux")]
                 if ui
                     .add_enabled(
@@ -3326,22 +3336,22 @@ impl FerrumApp {
                     ui.label("The engine could not provide container details.");
                 }
                 if let Some(details) = &inspection.details {
-                    detail_row(ui, "Name", details.name.as_deref());
-                    detail_row(ui, "Image", details.image.as_deref());
-                    detail_row(ui, "Created", details.created.as_deref());
-                    detail_row(
+                    untrusted_detail_row(ui, "Name", details.name.as_deref());
+                    untrusted_detail_row(ui, "Image", details.image.as_deref());
+                    untrusted_detail_row(ui, "Created", details.created.as_deref());
+                    untrusted_detail_row(
                         ui,
                         "State",
                         details.state.as_ref().map(container_state_display),
                     );
-                    detail_row(
+                    untrusted_detail_row(
                         ui,
                         "Restart count",
                         inspection.restart_count_display.as_deref(),
                     );
-                    detail_row(ui, "Exit code", inspection.exit_code_display.as_deref());
-                    detail_row(ui, "Started at", details.started_at.as_deref());
-                    detail_row(ui, "Finished at", details.finished_at.as_deref());
+                    untrusted_detail_row(ui, "Exit code", inspection.exit_code_display.as_deref());
+                    untrusted_detail_row(ui, "Started at", details.started_at.as_deref());
+                    untrusted_detail_row(ui, "Finished at", details.finished_at.as_deref());
                     ui.separator();
                     ui.strong("Mounts");
                     match &details.mounts {
@@ -3355,11 +3365,15 @@ impl FerrumApp {
                             for mount in mounts {
                                 ui.group(|ui| {
                                     ui.strong("Mount");
-                                    detail_row(ui, "Type", mount.kind.as_deref());
-                                    detail_row(ui, "Source", mount.source.as_deref());
-                                    detail_row(ui, "Destination", mount.destination.as_deref());
-                                    detail_row(ui, "Mode", mount.mode.as_deref());
-                                    detail_row(
+                                    untrusted_detail_row(ui, "Type", mount.kind.as_deref());
+                                    untrusted_detail_row(ui, "Source", mount.source.as_deref());
+                                    untrusted_detail_row(
+                                        ui,
+                                        "Destination",
+                                        mount.destination.as_deref(),
+                                    );
+                                    untrusted_detail_row(ui, "Mode", mount.mode.as_deref());
+                                    untrusted_detail_row(
                                         ui,
                                         "Read/write",
                                         mount
@@ -3706,6 +3720,11 @@ fn detail_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
         ui.strong(label);
         ui.label(value.unwrap_or("Not reported"));
     });
+}
+
+fn untrusted_detail_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
+    let value = value.map(display::escape_untrusted_display_text);
+    detail_row(ui, label, value.as_deref());
 }
 
 impl Drop for FerrumApp {
@@ -5776,6 +5795,75 @@ mod event_reconciliation_tests {
         assert_eq!(harness.state().app.inventory_view.visible().len(), 1);
         let last = harness.get_by_role_and_label(Role::Button, "container-0999");
         assert!(!last.accesskit_node().is_disabled());
+    }
+
+    #[test]
+    fn untrusted_container_text_is_escaped_in_inventory_and_inspection_accessibility() {
+        use egui::accesskit::Role;
+        use egui_kittest::{
+            Harness,
+            kittest::{NodeT, Queryable},
+        };
+
+        let (mut app, _) = app_with_open_inspection();
+        let inspection = app.inspection.as_mut().expect("open inspection");
+        inspection.container_name = "inspected\u{e0001}container".to_owned();
+        let details = inspection.details.as_mut().expect("inspection details");
+        details.name = Some("detail\u{200b}container".to_owned());
+        details.image = Some("inspect-image\u{202e}:tag".to_owned());
+        app.containers = vec![ContainerSummary {
+            id: "a".repeat(64),
+            name: "worker\u{202e}proc".to_owned(),
+            image: Some("image\u{200b}:latest".to_owned()),
+            state: Some(ContainerState::Unknown("mystery\u{e0001}".to_owned())),
+            status: Some("Up\u{2060}".to_owned()),
+        }];
+        app.inventory_view.inventory_changed(&app.containers);
+        let mut harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| {
+                let _ = app.draw_inventory(ui);
+                app.draw_inspection(ui.ctx().clone());
+            },
+            app,
+        );
+        harness.run();
+
+        let name = "worker\\u{202e}proc";
+        let name_button = harness.get_by_role_and_label(Role::Button, name);
+        assert_eq!(name_button.accesskit_node().label().as_deref(), Some(name));
+        let image = harness.get_by_role_and_label(Role::Label, "image\\u{200b}:latest");
+        assert_eq!(
+            image.accesskit_node().value().as_deref(),
+            Some("image\\u{200b}:latest")
+        );
+        let state = harness.get_by_role_and_label(Role::Label, "mystery\\u{e0001}");
+        assert_eq!(
+            state.accesskit_node().value().as_deref(),
+            Some("mystery\\u{e0001}")
+        );
+        let status = harness.get_by_role_and_label(Role::Label, "Up\\u{2060}");
+        assert_eq!(
+            status.accesskit_node().value().as_deref(),
+            Some("Up\\u{2060}")
+        );
+        let inspection_name = "inspected\\u{e0001}container";
+        let heading = harness.get_by_role_and_label(Role::Label, inspection_name);
+        assert_eq!(
+            heading.accesskit_node().value().as_deref(),
+            Some(inspection_name)
+        );
+        let detail_name = "detail\\u{200b}container";
+        let name_detail = harness.get_by_role_and_label(Role::Label, detail_name);
+        assert_eq!(
+            name_detail.accesskit_node().value().as_deref(),
+            Some(detail_name)
+        );
+        let detail_image = "inspect-image\\u{202e}:tag";
+        let image_detail = harness.get_by_role_and_label(Role::Label, detail_image);
+        assert_eq!(
+            image_detail.accesskit_node().value().as_deref(),
+            Some(detail_image)
+        );
     }
 
     #[test]

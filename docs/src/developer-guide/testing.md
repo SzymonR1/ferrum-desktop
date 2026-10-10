@@ -261,6 +261,22 @@ secret detection. Run the focused tests with:
 cargo test -p ferrum-app --bin ferrum log_buffer_tests
 ```
 
+Headless AccessKit tests verify visible escaping for engine-controlled container
+inventory and inspection fields, image tags/inspection author/tag-confirmation
+IDs, network names/metadata, and attached-container names in
+membership/confirmation labels. They also verify network actions submit exact
+IDs and image tagging submits the original image ID. Engine-sourced fields
+whose raw or escaped text exceeds the 4 KiB limit are omitted. These tests use
+in-memory view state and do not contact an engine. Run them with:
+
+```sh
+cargo test -p ferrum-core --test display_safety
+cargo test -p ferrum-app --bin ferrum display::tests
+cargo test -p ferrum-app --bin ferrum untrusted
+cargo test -p ferrum-app --bin ferrum engine_image_id_is_escaped_in_tag_confirmation_and_request_preserves_exact_id
+cargo test -p ferrum-app --bin ferrum engine_network_and_container_text_is_escaped_before_accessible_display
+```
+
 The engine integration targets Linux local Unix sockets. Podman/rootless
 behavior remains unvalidated, remote transports remain unsupported, and Windows
 named pipes and macOS remain deferred to issue #21/M8.
