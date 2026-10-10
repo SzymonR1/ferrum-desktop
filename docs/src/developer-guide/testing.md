@@ -15,12 +15,77 @@ The default suite does not require a host engine. Ignored live-engine tests for
 version, inventory, and Docker CLI contexts are read-only. The general
 local-engine inventory test may inspect an existing container; these tests do
 not mutate resources.
-Settings tests cover missing/corrupt settings, file symlink rejection without
-changing target permissions, non-regular file rejection, and refusal to chmod
-or write through a symlinked settings directory. A deterministic path-replacement
-test verifies temp creation, replacement, and failure cleanup stay on the
-opened directory descriptor while a symlink target remains untouched. These
-tests run in the default suite and use only temporary paths.
+Settings tests cover missing/corrupt settings, file-symlink rejection without
+changing target permissions, non-regular and hard-linked file rejection, and
+refusal to chmod or write through symlinked settings directories. The hard-link
+regression links a `0644` sibling sentinel as `settings.toml` and verifies that
+load rejects it without changing the sentinel's contents or mode; load also
+normalizes the opened final settings directory to `0700`. Single-link
+versionless legacy settings continue to migrate in memory.
+
+Temporary-directory path regressions verify the anchored-path contract. Create
+a store, then replace the selected parent path and confirm that loads and saves
+cannot reach the replacement target. Include an XDG/HOME symlink alias that
+exists when the store is initialized and confirm that Ferrum honors that
+selected location.
+
+Use temporary directory trees to check that loads with missing directories use
+defaults without creating directories, while saves create remaining components
+relative to the retained descriptor. Insert symlinks in the remaining directory
+components and at the final app directory; load and save must reject them
+without changing or writing through their targets. Loads reject symlinked,
+non-regular, and multiply linked settings files. Saves reject a pre-existing
+symlink or non-regular entry before writing; if the destination changes
+concurrently into a symlink, `renameat` replaces the link entry without
+following its target. Verify that every directory Ferrum creates in the
+remaining path ends at exactly `0700`, settings and temporary files stay `0600`,
+and pre-existing ancestors keep their modes. The existing final app settings
+directory is set to `0700` on load and save.
+
+The subprocess regression
+`settings::tests::saving_under_restrictive_umask_normalizes_only_new_directories`
+uses a missing `XDG_CONFIG_HOME` below a parent-controlled temporary tree and
+umask `0200`. The parent sets both `XDG_CONFIG_HOME` and `HOME` to that same
+temporary path, so the child cannot read or modify ambient user settings. The
+test verifies that settings are written at
+`$XDG_CONFIG_HOME/ferrum/settings.toml` and that the fallback
+`$HOME/.config/ferrum/settings.toml` path is not created. It also checks save
+success, exact modes for both created directories and the settings file, and
+unchanged modes on pre-existing ancestors. Run it directly with:
+
+```sh
+cargo test -p ferrum-app settings::tests::saving_under_restrictive_umask_normalizes_only_new_directories -- --exact
+```
+
+The default suite must use temporary paths and must not change the user's real
+XDG or HOME settings tree. [ADR 0010](../architecture/decisions.md#adr-0010-linux-settings-directory-permissions) supersedes ADR 0009 only for newly created
+remaining-path directory modes; [ADR 0011](../architecture/decisions.md#adr-0011-linux-settings-load-permissions-and-hard-link-rejection) records load-time directory permissions and hard-link rejection. If a
+umask removes owner-read permission required to open a new directory, save
+fails before temporary-file creation or settings writes. There is no
+interprocess serialization between `mkdirat` and `openat`: an actor with
+write/search access to the parent (subject to sticky-directory rules) may
+replace a just-created entry with a real directory during that interval.
+`O_NOFOLLOW` rejects symlinks, not real-directory replacements. If an ordinary
+unprivileged process opens a replacement owned by another user, descriptor-
+based mode normalization fails with `EPERM` and save stops before writing; a
+process that owns the replacement or has `CAP_FOWNER` can change its mode.
+Later filesystem operations remain anchored to the opened descriptor. Keep the
+migration, default, corrupt-file, and unknown-secret-field checks.
+
+The inherited-marker regression
+`settings::tests::inherited_valid_marker_cannot_write_through_symlinked_test_roots`
+passes a matching parent PID/nonce while the test root or `existing-xdg-parent`
+is a symlink. It verifies that Ferrum writes no settings through either link
+and that the helper process umask remains `027` (a `0750` directory probe).
+Marker validation also rejects a pre-existing derived XDG root.
+
+Run the focused load and marker checks directly:
+
+```sh
+cargo test -p ferrum-app settings::tests::loading_rejects_hardlinked_settings_without_changing_sibling_permissions -- --exact
+cargo test -p ferrum-app settings::tests::inherited_valid_marker_cannot_write_through_symlinked_test_roots -- --exact
+cargo test -p ferrum-app settings::tests::inherited_umask_child_marker_cannot_touch_ambient_settings_or_umask -- --exact
+```
 
 The opt-in image list/inspect test is read-only and requires
 `FERRUM_TEST_IMAGE` to name an image already present on the current local Docker
