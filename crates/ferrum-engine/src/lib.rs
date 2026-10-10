@@ -685,8 +685,31 @@ pub enum EngineError {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
     },
+    /// Volume removal failed or the engine returned an invalid response.
+    #[cfg(target_os = "linux")]
+    #[error("The engine at the {endpoint_label} could not confirm volume removal.")]
+    VolumeRemovalUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// Volume removal timed out and may already have taken effect.
+    #[cfg(target_os = "linux")]
+    #[error("Volume removal at the {endpoint_label} timed out; the volume may have been removed.")]
+    VolumeRemovalTimedOut {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The local engine rejected volume removal.
+    #[cfg(target_os = "linux")]
+    #[error("Volume removal was rejected at the {endpoint_label} (HTTP {status}).")]
+    VolumeRemovalRejected {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+        /// HTTP response status.
+        status: u16,
+    },
 
-    /// The volume name supplied to an inspection or creation request is invalid.
+    /// The volume name supplied to an inspection, creation, or removal request is invalid.
     #[cfg(target_os = "linux")]
     #[error("The volume name for the engine request is invalid.")]
     InvalidVolumeName,
@@ -1758,6 +1781,56 @@ impl EngineClient {
             })
             .await
             .map_err(|_| EngineError::VolumeCreationTimedOut { endpoint_label })?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = name;
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
+    /// Removes a named local volume on the connected Linux local Docker Unix socket.
+    ///
+    /// The caller must check current dependencies and obtain explicit confirmation.
+    /// Ferrum never sets Docker's `force` parameter. The dependency snapshot is not
+    /// atomic with this request, so Docker may reject removal if the volume becomes
+    /// in use before the request is processed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidVolumeName` before connecting for an unsafe name, or a safe
+    /// typed availability, timeout, or HTTP rejection error. A timeout or transport
+    /// error does not establish whether the volume remains. Unsupported platforms
+    /// return `UnsupportedPlatform`.
+    pub async fn remove_volume(&self, name: &str) -> Result<(), EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            if !volume_name_path_safe(name) {
+                return Err(EngineError::InvalidVolumeName);
+            }
+            let path = resource_request_path(&self.api_version, "volumes", name, "")
+                .map_err(|_| EngineError::InvalidVolumeName)?;
+            let endpoint_label = self.info.endpoint_label;
+            timeout(REQUEST_TIMEOUT, async {
+                let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
+                let request = Request::builder()
+                    .method(Method::DELETE)
+                    .uri(Uri::new(&self.socket_path, &path))
+                    .body(Empty::<Bytes>::new())
+                    .map_err(|_| EngineError::VolumeRemovalUnavailable { endpoint_label })?;
+                let response = client
+                    .request(request)
+                    .await
+                    .map_err(|_| EngineError::VolumeRemovalUnavailable { endpoint_label })?;
+                if !response.status().is_success() {
+                    return Err(EngineError::VolumeRemovalRejected {
+                        endpoint_label,
+                        status: response.status().as_u16(),
+                    });
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| EngineError::VolumeRemovalTimedOut { endpoint_label })?
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -3635,6 +3708,59 @@ mod volume_api_tests {
         server.await.expect("server should finish");
         cleanup(&socket, &directory);
     }
+    #[tokio::test]
+    async fn removes_volume_through_versioned_name_path_without_force() {
+        let (socket, directory, server) = fixture(response("204 No Content", b"")).await;
+        client(socket.clone())
+            .remove_volume("data")
+            .await
+            .expect("an unused volume should be removed");
+        let request = server.await.expect("server should finish");
+        assert!(request.starts_with("DELETE /v1.45/volumes/data HTTP/1.1\r\n"));
+        let request_line = request.lines().next().expect("HTTP request line");
+        assert!(!request_line.contains('?'));
+        assert!(!request.to_ascii_lowercase().contains("force"));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn volume_removal_rejection_is_typed_and_redacted() {
+        let private_body = b"private daemon body volume-secret";
+        let (socket, directory, server) = fixture(response("409 Conflict", private_body)).await;
+        let error = client(socket.clone())
+            .remove_volume("volume-secret")
+            .await
+            .expect_err("an in-use volume should be rejected");
+        server.await.expect("server should finish");
+        assert!(matches!(
+            error,
+            EngineError::VolumeRemovalRejected { status: 409, .. }
+        ));
+        assert!(!format!("{error:?}").contains("private daemon body"));
+        assert!(!error.to_string().contains("volume-secret"));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_volume_removal_names_before_connecting() {
+        let directory = temporary_directory();
+        let socket = directory.join("engine.sock");
+        let listener = UnixListener::bind(&socket).expect("Unix socket should bind");
+        let engine = client(socket.clone());
+        let too_long = "x".repeat(4097);
+        for name in ["", "  ", ".", "..", too_long.as_str(), "volume\nname"] {
+            assert!(matches!(
+                engine.remove_volume(name).await,
+                Err(EngineError::InvalidVolumeName)
+            ));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+        cleanup(&socket, &directory);
+    }
 
     #[tokio::test]
     async fn accepts_missing_or_null_volume_lists_as_empty() {
@@ -5493,20 +5619,21 @@ mod live_volume_create_tests {
         let verified_name = verify_created_volume(&created, &name, &created_volumes)
             .expect("the response and inventory must identify the exact generated volume name");
         let mut volume = DisposableVolume::new(verified_name, socket_uri);
-
-        let cleanup = Command::new("docker")
-            .args(["--host", volume.socket_uri(), "volume", "rm", volume.name()])
-            .env_remove("DOCKER_CONTEXT")
-            .env_remove("DOCKER_HOST")
-            .env_remove("DOCKER_TLS_VERIFY")
-            .env_remove("DOCKER_CERT_PATH")
-            .output()
-            .expect("Docker CLI should run cleanup against the pinned local socket");
-        volume.disarm();
-        assert!(
-            cleanup.status.success(),
-            "Docker CLI should remove only the verified test-owned volume"
+        let usage = engine
+            .volume_usage(volume.name())
+            .await
+            .expect("the generated volume usage should be readable");
+        assert_eq!(
+            usage.and_then(|usage| usage.reference_count),
+            Some(0),
+            "the owned test volume should have no container references before removal"
         );
+
+        volume.disarm();
+        engine
+            .remove_volume(volume.name())
+            .await
+            .expect("EngineClient should remove the verified test-owned volume");
 
         let remaining = engine
             .list_volumes()
@@ -5543,10 +5670,6 @@ mod live_volume_create_tests {
 
         fn name(&self) -> &str {
             self.name.as_str()
-        }
-
-        fn socket_uri(&self) -> &str {
-            &self.socket_uri
         }
 
         fn disarm(&mut self) {

@@ -120,22 +120,24 @@ perform no mutations. UI coverage checks reported zero versus unavailable
 values, separate usage errors, and stale responses. The native Volumes page has
 not been visually validated.
 
-The optional ignored live volume-create test is mutating and requires the
-current local Docker CLI context to use a Unix socket:
+The optional ignored live volume create/remove test is mutating and requires
+the current local Docker CLI context to use a Unix socket:
 
 ```sh
 cargo test -p ferrum-engine live_volume_create_tests::local_engine_creates_and_removes_unique_volume -- --exact --ignored
 ```
 
-EngineClient connects using the local Unix socket path stored in the discovered
-current context. The test uses that same pinned `unix://` path for an
-argument-array Docker CLI cleanup request, without force. It preflights its
-generated name and arms cleanup only after both the response and inventory
-confirm that exact name. If ownership cannot be confirmed, it sends no cleanup
-request; after a cleanup command returns, the guard is disarmed and a failure
-is not retried by name, so the volume may remain. The read-only
-`FERRUM_TEST_VOLUME` test is separate. Fake-socket and headless UI tests do not
-contact a live engine.
+EngineClient uses the socket path stored in the discovered current context. The
+test preflights its generated name, verifies the create response and inventory,
+and requires the exact-name usage snapshot to report `RefCount == 0`. It
+disarms the cleanup guard immediately before calling
+`EngineClient::remove_volume`, then confirms inventory absence. The Drop
+fallback uses argument-array Docker CLI `--host unix://...` pinned to the same
+socket without force, only if the test unwinds before the removal request is
+submitted. There is no name-based retry after submission; a failed or uncertain
+removal may leave the volume. If ownership cannot be confirmed, no removal
+request is sent. The read-only `FERRUM_TEST_VOLUME` test is separate.
+Fake-socket and headless UI tests do not contact a live engine.
 
 The optional ignored network list/inspect test is read-only and requires
 `FERRUM_TEST_NETWORK` to name an existing network on the selected local Docker
