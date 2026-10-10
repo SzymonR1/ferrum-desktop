@@ -128,14 +128,16 @@ matching that ID and name before arming cleanup. If ownership cannot be
 confirmed, it sends no cleanup request and the created network may remain; once
 verified, cleanup uses only that ID in the current local Docker context.
 
-The opt-in ignored volume-create live test is mutating and requires the current
-local Docker context to use a Unix socket. EngineClient connects through the
-discovered socket path, and cleanup uses that same `unix://` endpoint through
-an argument-array Docker CLI request with no force. The test preflights a
-generated name and arms cleanup only after both the response and inventory
-confirm that exact name. If ownership cannot be confirmed, no cleanup is sent;
-if an attempted cleanup reports failure, the test does not retry by name and
-the volume may remain:
+The opt-in ignored volume create/remove live test is mutating and requires the
+current local Docker context to use a Unix socket. EngineClient uses the
+discovered socket path, preflights a generated name, verifies the create
+response and inventory, then requires exact-name usage `RefCount == 0`.
+The guard is disarmed immediately before the test removes the owned volume
+through EngineClient and confirms absence. A Drop fallback invokes Docker CLI
+with an argument-array `--host unix://...` on that pinned socket without force
+only if the test unwinds before submitting removal. There is no name-based
+retry after submission, so a failed removal may leave the volume. If ownership
+cannot be verified, no remove request is sent:
 
 ```sh
 cargo test -p ferrum-engine live_volume_create_tests::local_engine_creates_and_removes_unique_volume -- --exact --ignored

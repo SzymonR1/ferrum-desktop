@@ -34,10 +34,10 @@ may follow a successful create, so Ferrum refreshes inventory after every
 result and blocks context switching while the request is pending. Page
 invalidation does not abort a submitted request.
 
-Volume-create results emit local structured traces with only the static
-`create` action and `success`, `not_submitted`, or `request_error` outcome.
-Volume names, mountpoints, endpoints, error text, and daemon bodies are
-excluded; the process trace is not persistent or tamper-proof.
+Volume create and removal results emit local structured traces with only the
+static action (`create` or `remove`) and `success`, `not_submitted`, or
+`request_error` outcome. Volume names, mountpoints, endpoints, error text, and
+daemon bodies are excluded; the process trace is not persistent or tamper-proof.
 
 Ferrum lists and inspects volumes, then makes a separate filtered read-only
 usage request; only `Size` in bytes and the point-in-time `RefCount` for an
@@ -45,12 +45,24 @@ exact inventory-matched volume are displayed when reported. Missing, negative,
 or unknown metric values remain unavailable. A usage failure is shown
 separately while successful inspect metadata stays visible. Only volume name,
 driver, scope, creation time, and mountpoint are retained; selected control,
-bidirectional, and invisible formatting characters in driver, scope, creation
-time, and mountpoint are escaped as visible `\u{...}` text. The mountpoint is
-never accessed. Labels, options, status, raw response bodies, and filesystem
-browsing are not exposed. Volume removal, pruning, modification, connection,
-and disconnection are not offered. Podman/rootless behavior remains
-unvalidated; remote endpoints remain unsupported.
+bidirectional, and invisible formatting characters in optional display fields
+are escaped as visible `\u{...}` text. The mountpoint is never accessed.
+Labels, options, status, raw response bodies, and filesystem browsing are not
+exposed.
+
+Removal is offered only for a listed volume with a matching inspection and an
+exact-name usage snapshot reporting `RefCount == 0`; positive, missing, or
+unknown counts disable it. Confirmation names the volume and warns that the
+snapshot can change before deletion. Ferrum sends the negotiated
+`DELETE /v{api}/volumes/{name}` without `force`, with an eight-second bound.
+Docker may reject removal if the volume becomes in use. A timeout or transport
+error can follow a successful deletion. Ferrum marks inventory stale after every
+result and refreshes immediately if Volumes remains open, or when that page is
+opened again; a fresh inspection/usage snapshot is required before retrying.
+Only one volume mutation may be active and context switching is blocked while it is
+pending. Pruning, modification, connection, disconnection, and filesystem
+browsing are not offered. Podman/rootless behavior remains unvalidated; remote
+endpoints remain unsupported.
 
 The Networks page lists and inspects networks and creates networks by name
 through the selected local Docker Unix socket on Linux. Creation sends only the

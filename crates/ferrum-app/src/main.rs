@@ -137,6 +137,13 @@ enum EngineEvent {
         name: String,
         result: Result<VolumeDetails, EngineError>,
     },
+    VolumeRemoved {
+        generation: u64,
+        inspection_generation: u64,
+        removal_generation: u64,
+        name: String,
+        result: Result<(), EngineError>,
+    },
     NetworksListed {
         generation: u64,
         result: Result<Vec<NetworkSummary>, EngineError>,
@@ -765,6 +772,7 @@ struct FerrumApp {
     network_create_task: Option<JoinHandle<()>>,
     network_remove_task: Option<JoinHandle<()>>,
     volume_create_task: Option<JoinHandle<()>>,
+    volume_remove_task: Option<JoinHandle<()>>,
     resource_read_task: Option<JoinHandle<()>>,
     pending_resource_read: Option<PendingResourceRead>,
     image_list_task: Option<JoinHandle<()>>,
@@ -950,6 +958,7 @@ impl FerrumApp {
             network_create_task: None,
             network_remove_task: None,
             volume_create_task: None,
+            volume_remove_task: None,
             resource_read_task: None,
             pending_resource_read: None,
             image_list_task: None,
@@ -1133,6 +1142,7 @@ impl FerrumApp {
     }
     fn load_volumes(&mut self, context: egui::Context) {
         if self.loading
+            || self.volume_mutation_busy()
             || !cfg!(target_os = "linux")
             || !matches!(&self.connection, ConnectionState::Connected)
         {
@@ -1145,6 +1155,7 @@ impl FerrumApp {
     fn inspect_volume(&mut self, name: String, context: egui::Context) {
         if !cfg!(target_os = "linux")
             || self.loading
+            || self.volume_mutation_busy()
             || !matches!(&self.connection, ConnectionState::Connected)
         {
             return;
@@ -1162,6 +1173,7 @@ impl FerrumApp {
             return;
         }
         if self.volume_create_task.is_some()
+            || self.volume_remove_task.is_some()
             || self.loading
             || !cfg!(target_os = "linux")
             || !matches!(&self.connection, ConnectionState::Connected)
@@ -1196,6 +1208,60 @@ impl FerrumApp {
             }
         }));
     }
+    fn start_volume_remove(
+        &mut self,
+        generation: u64,
+        inspection_generation: u64,
+        removal_generation: u64,
+        name: String,
+        context: egui::Context,
+    ) {
+        if self.volume_create_task.is_some()
+            || self.volume_remove_task.is_some()
+            || self.loading
+            || !cfg!(target_os = "linux")
+            || !matches!(&self.connection, ConnectionState::Connected)
+            || self.page != images::AppPage::Volumes
+            || !self.volumes.removal_is_pending(
+                generation,
+                inspection_generation,
+                removal_generation,
+                &name,
+            )
+        {
+            self.volumes.cancel_remove_submission(removal_generation);
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            self.volumes.finish_remove(
+                generation,
+                inspection_generation,
+                removal_generation,
+                &name,
+                Err("The selected engine connection is unavailable.".to_owned()),
+            );
+            return;
+        };
+        let sender = self.sender.clone();
+        self.volume_remove_task = Some(self.runtime.spawn(async move {
+            let result = engine.remove_volume(&name).await;
+            #[cfg(target_os = "linux")]
+            audit::record_volume_remove_result(&result);
+            if sender
+                .send(EngineEvent::VolumeRemoved {
+                    generation,
+                    inspection_generation,
+                    removal_generation,
+                    name,
+                    result,
+                })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
     fn load_networks(&mut self, context: egui::Context) {
         if self.loading
             || !cfg!(target_os = "linux")
@@ -1215,7 +1281,9 @@ impl FerrumApp {
         self.network_task_in_flight() || self.networks.has_mutation_in_flight()
     }
     fn volume_mutation_busy(&self) -> bool {
-        self.volume_create_task.is_some() || self.volumes.has_mutation_in_flight()
+        self.volume_create_task.is_some()
+            || self.volume_remove_task.is_some()
+            || self.volumes.has_mutation_in_flight()
     }
 
     fn start_network_create(&mut self, generation: u64, name: String, context: egui::Context) {
@@ -1890,6 +1958,26 @@ impl FerrumApp {
                         self.load_volumes(context.clone());
                     }
                 }
+                EngineEvent::VolumeRemoved {
+                    generation,
+                    inspection_generation,
+                    removal_generation,
+                    name,
+                    result,
+                } => {
+                    self.volumes.finish_remove(
+                        generation,
+                        inspection_generation,
+                        removal_generation,
+                        &name,
+                        result.map_err(|error| error.to_string()),
+                    );
+                    self.volume_remove_task = None;
+                    self.volumes.mark_list_stale();
+                    if self.page == images::AppPage::Volumes {
+                        self.load_volumes(context.clone());
+                    }
+                }
                 EngineEvent::NetworksListed { generation, result } => {
                     self.networks
                         .finish_list(generation, result.map_err(|error| error.to_string()));
@@ -2483,6 +2571,7 @@ impl FerrumApp {
             && cfg!(target_os = "linux")
             && !self.volumes.loading
             && !self.volumes.loaded
+            && !self.volume_mutation_busy()
         {
             self.load_volumes(ui.ctx().clone());
         }
@@ -3513,6 +3602,18 @@ impl eframe::App for FerrumApp {
                 volumes::VolumesAction::Create { generation, name } => {
                     self.start_volume_create(generation, name, context.clone());
                 }
+                volumes::VolumesAction::Remove {
+                    generation,
+                    inspection_generation,
+                    removal_generation,
+                    name,
+                } => self.start_volume_remove(
+                    generation,
+                    inspection_generation,
+                    removal_generation,
+                    name,
+                    context.clone(),
+                ),
             }
         }
         if let Some(action) = network_action {
@@ -3946,6 +4047,7 @@ mod event_reconciliation_tests {
             volumes: volumes::VolumesView::default(),
             networks: networks::NetworksView::default(),
             volume_create_task: None,
+            volume_remove_task: None,
             resource_read_task: None,
             pending_resource_read: None,
             image_list_task: None,
@@ -4140,7 +4242,7 @@ mod event_reconciliation_tests {
             .expect("the Volumes UI should request creation")
         {
             volumes::VolumesAction::Create { generation, name } => (generation, name),
-            volumes::VolumesAction::Inspect(_) => {
+            volumes::VolumesAction::Inspect(_) | volumes::VolumesAction::Remove { .. } => {
                 panic!("the create button should return a create action")
             }
         };
@@ -4168,6 +4270,143 @@ mod event_reconciliation_tests {
         assert!(!harness.state().volumes.loaded);
         assert!(harness.state().volume_create_task.is_none());
         let _success = harness.get_by_role_and_label(Role::Label, "Volume 'app-data' created.");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_volume_removal_refreshes_current_inventory_in_headless_app() {
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let (mut app, sender) = app_with_open_inspection();
+        app.page = images::AppPage::Volumes;
+        let previous_generation = app.volumes.begin_list();
+        app.volumes.finish_list(
+            previous_generation,
+            Ok(vec![VolumeSummary {
+                name: "owned-data".to_owned(),
+                driver: Some("local".to_owned()),
+                scope: Some("local".to_owned()),
+            }]),
+        );
+        let (generation, inspection_generation, name) =
+            app.volumes.begin_inspection("owned-data".to_owned());
+        app.volumes.finish_inspection(
+            generation,
+            inspection_generation,
+            &name,
+            volumes::VolumeInspectionResult::Inspected {
+                details: VolumeDetails {
+                    name: name.clone(),
+                    driver: Some("local".to_owned()),
+                    scope: Some("local".to_owned()),
+                    created_at: None,
+                    mountpoint: None,
+                },
+                usage_result: Ok(Some(ferrum_core::VolumeUsage {
+                    size_bytes: Some(0),
+                    reference_count: Some(0),
+                })),
+            },
+        );
+        let (action_sender, action_receiver) = std::sync::mpsc::channel();
+        let mut harness = Harness::new_ui_state(
+            move |ui, app: &mut FerrumApp| {
+                let context = ui.ctx().clone();
+                app.receive_events(context);
+                if let Some(action) = app.volumes.show(ui, true, "")
+                    && matches!(&action, volumes::VolumesAction::Remove { .. })
+                {
+                    action_sender
+                        .send(action)
+                        .expect("action receiver should stay open");
+                }
+            },
+            app,
+        );
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Remove volume")
+            .click_accesskit();
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Confirm volume removal")
+            .click_accesskit();
+        harness.step();
+        let (generation, inspection_generation, removal_generation, name) = match action_receiver
+            .try_recv()
+            .expect("confirmed removal should return an action")
+        {
+            volumes::VolumesAction::Remove {
+                generation,
+                inspection_generation,
+                removal_generation,
+                name,
+            } => (generation, inspection_generation, removal_generation, name),
+            volumes::VolumesAction::Inspect(_) | volumes::VolumesAction::Create { .. } => {
+                panic!("confirmation should return a remove action")
+            }
+        };
+        let pending_task = harness.state().runtime.spawn(std::future::pending());
+        harness.state_mut().volume_remove_task = Some(pending_task);
+        harness
+            .state()
+            .runtime
+            .block_on(sender.send(EngineEvent::VolumeRemoved {
+                generation,
+                inspection_generation,
+                removal_generation,
+                name,
+                result: Ok(()),
+            }))
+            .expect("removal result should be queued");
+        harness.step();
+
+        assert!(harness.state().volumes.generation > previous_generation);
+        assert!(harness.state().volumes.loading);
+        assert!(!harness.state().volumes.loaded);
+        assert!(harness.state().volume_remove_task.is_none());
+        let _success =
+            harness.get_by_role_and_label(Role::Label, "Volume 'owned-data' was removed.");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_volume_removal_disables_context_switching_accessibly() {
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let (mut app, _) = app_with_open_inspection();
+        app.volume_remove_task = Some(app.runtime.spawn(std::future::pending()));
+
+        app.switch_context(Some("other-context".to_owned()), egui::Context::default());
+        assert!(!app.loading);
+        assert_eq!(app.selected_context, None);
+        assert!(app.volume_remove_task.is_some());
+
+        let mut harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| {
+                let mut refresh_requested = false;
+                let mut settings_requested = false;
+                let mut context_requested = None;
+                app.draw_header(
+                    ui,
+                    &mut refresh_requested,
+                    &mut settings_requested,
+                    &mut context_requested,
+                );
+            },
+            app,
+        );
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(Role::ComboBox, "Docker context")
+                .accesskit_node()
+                .is_disabled()
+        );
+        let _status = harness.get_by_role_and_label(
+            Role::Label,
+            "A volume mutation is in progress; context switching is disabled.",
+        );
     }
     #[cfg(target_os = "linux")]
     #[test]

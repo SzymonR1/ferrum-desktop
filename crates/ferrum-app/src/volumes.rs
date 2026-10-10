@@ -22,7 +22,23 @@ pub(super) enum VolumeInspectionResult {
 
 pub(super) enum VolumesAction {
     Inspect(String),
-    Create { generation: u64, name: String },
+    Create {
+        generation: u64,
+        name: String,
+    },
+    Remove {
+        generation: u64,
+        inspection_generation: u64,
+        removal_generation: u64,
+        name: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VolumeRemovalConfirmation {
+    generation: u64,
+    inspection_generation: u64,
+    name: String,
 }
 
 #[derive(Default)]
@@ -39,6 +55,12 @@ pub(super) struct VolumesView {
     creating: bool,
     create_success: Option<String>,
     create_error: Option<String>,
+    removal_generation: u64,
+    remove_confirmation: Option<VolumeRemovalConfirmation>,
+    removing: bool,
+    remove_result_name: Option<String>,
+    remove_success: Option<String>,
+    remove_error: Option<String>,
     pub(super) loading: bool,
     pub(super) loaded: bool,
     inspecting: bool,
@@ -58,6 +80,13 @@ impl VolumesView {
             self.create_success = None;
             self.create_error = None;
         }
+        if !self.removing {
+            self.removal_generation = self.removal_generation.wrapping_add(1);
+            self.remove_result_name = None;
+            self.remove_success = None;
+            self.remove_error = None;
+        }
+        self.remove_confirmation = None;
         self.volumes.clear();
         self.visible.clear();
         self.selected = None;
@@ -73,6 +102,9 @@ impl VolumesView {
     pub(super) fn begin_list(&mut self) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.inspection_generation = self.inspection_generation.wrapping_add(1);
+        self.removal_generation = self.removal_generation.wrapping_add(1);
+        self.remove_confirmation = None;
+        self.remove_result_name = None;
         self.loading = true;
         self.loaded = false;
         self.error = None;
@@ -150,7 +182,10 @@ impl VolumesView {
         }
     }
     fn begin_create(&mut self) -> Option<VolumesAction> {
-        if self.creating || !valid_volume_name(&self.create_name) {
+        if self.has_mutation_in_flight()
+            || self.remove_confirmation.is_some()
+            || !valid_volume_name(&self.create_name)
+        {
             return None;
         }
         self.create_generation = self.create_generation.wrapping_add(1);
@@ -199,8 +234,134 @@ impl VolumesView {
         true
     }
 
+    fn selected_volume_has_zero_references(&self) -> bool {
+        if self.loading || self.inspecting || !self.loaded || self.error.is_some() {
+            return false;
+        }
+        let Some(name) = self.selected.as_deref() else {
+            return false;
+        };
+        self.volumes.iter().any(|volume| volume.name == name)
+            && self
+                .details
+                .as_ref()
+                .is_some_and(|details| details.name == name)
+            && self.usage.as_ref().and_then(|usage| usage.reference_count) == Some(0)
+    }
+
+    pub(super) fn can_remove_selected_volume(&self) -> bool {
+        !self.has_mutation_in_flight()
+            && self.remove_confirmation.is_none()
+            && self.selected_volume_has_zero_references()
+    }
+
+    fn begin_remove_confirmation(&mut self) {
+        if self.can_remove_selected_volume()
+            && let Some(name) = self.selected.as_ref()
+        {
+            self.remove_confirmation = Some(VolumeRemovalConfirmation {
+                generation: self.generation,
+                inspection_generation: self.inspection_generation,
+                name: name.clone(),
+            });
+            self.remove_success = None;
+            self.remove_error = None;
+        }
+    }
+
+    fn cancel_remove_confirmation(&mut self) {
+        self.remove_confirmation = None;
+    }
+
+    fn confirmation_is_current(&self, confirmation: &VolumeRemovalConfirmation) -> bool {
+        !self.has_mutation_in_flight()
+            && confirmation.generation == self.generation
+            && confirmation.inspection_generation == self.inspection_generation
+            && self.selected.as_deref() == Some(confirmation.name.as_str())
+            && self.selected_volume_has_zero_references()
+    }
+
+    fn confirm_remove(&mut self) -> Option<VolumesAction> {
+        let confirmation = self.remove_confirmation.take()?;
+        if !self.confirmation_is_current(&confirmation) {
+            return None;
+        }
+        self.removal_generation = self.removal_generation.wrapping_add(1);
+        self.removing = true;
+        self.remove_result_name = Some(confirmation.name.clone());
+        self.remove_success = None;
+        self.remove_error = None;
+        Some(VolumesAction::Remove {
+            generation: confirmation.generation,
+            inspection_generation: confirmation.inspection_generation,
+            removal_generation: self.removal_generation,
+            name: confirmation.name,
+        })
+    }
+
+    pub(super) fn removal_is_pending(
+        &self,
+        generation: u64,
+        inspection_generation: u64,
+        removal_generation: u64,
+        name: &str,
+    ) -> bool {
+        self.removing
+            && self.generation == generation
+            && self.inspection_generation == inspection_generation
+            && self.removal_generation == removal_generation
+            && self.selected.as_deref() == Some(name)
+            && self.remove_result_name.as_deref() == Some(name)
+            && self.selected_volume_has_zero_references()
+    }
+
+    pub(super) fn cancel_remove_submission(&mut self, removal_generation: u64) {
+        if self.removing && self.removal_generation == removal_generation {
+            self.removing = false;
+            self.remove_result_name = None;
+        }
+    }
+
+    pub(super) fn finish_remove(
+        &mut self,
+        generation: u64,
+        inspection_generation: u64,
+        removal_generation: u64,
+        name: &str,
+        result: Result<(), String>,
+    ) -> bool {
+        if !self.removing
+            || self.removal_generation != removal_generation
+            || self.remove_result_name.as_deref() != Some(name)
+        {
+            return false;
+        }
+        self.removing = false;
+        self.remove_result_name = None;
+        if self.generation != generation
+            || self.inspection_generation != inspection_generation
+            || self.selected.as_deref() != Some(name)
+        {
+            return false;
+        }
+        self.details = None;
+        self.usage = None;
+        self.inspecting = false;
+        self.remove_confirmation = None;
+        match result {
+            Ok(()) => {
+                self.remove_success = Some(name.to_owned());
+                self.remove_error = None;
+            }
+            Err(error) => {
+                self.remove_success = None;
+                self.remove_error = Some(error);
+            }
+        }
+        true
+    }
     pub(super) fn has_mutation_in_flight(&self) -> bool {
-        self.creating
+        self.creating || self.removing
     }
 
     pub(super) fn mark_list_stale(&mut self) {
@@ -220,7 +381,7 @@ impl VolumesView {
     }
 
     pub(super) fn is_loading(&self) -> bool {
-        self.loading || self.inspecting || self.creating
+        self.loading || self.inspecting || self.creating || self.removing
     }
 
     fn rebuild_visible(&mut self) {
@@ -241,9 +402,9 @@ impl VolumesView {
     ) -> Option<VolumesAction> {
         ui.heading("Volumes");
         ui.label(
-            "Inventory and name-only creation for the selected local Docker Unix socket on Linux.",
+            "Inventory, name-only creation, and dependency-gated removal for the selected local Docker Unix socket on Linux.",
         );
-        ui.label("Creation uses Docker's default local driver. Removal, pruning, modification, connection, and disconnection are not offered.");
+        ui.label("Creation uses Docker's default local driver. Removal requires a zero-reference usage snapshot and explicit confirmation; Ferrum never uses force. Pruning, modification, connection, and disconnection are not offered.");
         if !supported {
             ui.label(format!(
                 "Volumes require a connected local Docker Unix socket on Linux. {connection_message}"
@@ -269,7 +430,7 @@ impl VolumesView {
             }
             let name_label = ui.label("Volume name");
             ui.add_enabled(
-                !self.creating,
+                !self.has_mutation_in_flight(),
                 egui::TextEdit::singleline(&mut self.create_name),
             )
             .labelled_by(name_label.id);
@@ -279,7 +440,9 @@ impl VolumesView {
             }
             if ui
                 .add_enabled(
-                    !self.creating && name_is_valid,
+                    !self.has_mutation_in_flight()
+                        && self.remove_confirmation.is_none()
+                        && name_is_valid,
                     egui::Button::new("Create volume"),
                 )
                 .clicked()
@@ -373,6 +536,79 @@ impl VolumesView {
                 );
             }
         }
+        ui.group(|ui| {
+            ui.heading("Remove a volume");
+            if self.selected.is_none() {
+                ui.label("Select and inspect a volume before removal.");
+            } else if self.loading || self.inspecting {
+                ui.label("Wait for the selected volume inspection to finish.");
+            } else if self.details.is_some() {
+                match self
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.reference_count)
+                {
+                    Some(0) => ui.label(
+                        "The latest usage snapshot reports zero container references; this is only a point-in-time check.",
+                    ),
+                    Some(count) => ui.label(format!(
+                        "Removal is disabled while {count} container reference(s) are reported."
+                    )),
+                    None => ui.label(
+                        "Removal is disabled because the container reference count is unavailable.",
+                    ),
+                };
+            } else {
+                ui.label("Inspect the selected volume before removal.");
+            }
+            if self.removing
+                && let Some(name) = &self.remove_result_name
+            {
+                ui.spinner();
+                ui.label(format!("Removing volume '{name}'…"));
+            }
+            if let Some(name) = &self.remove_success {
+                ui.label(format!("Volume '{name}' was removed."));
+            }
+            if let Some(error) = &self.remove_error {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    "Volume removal failed; the engine state may have changed.",
+                );
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+                ui.label("Inspect the volume again before another removal attempt.");
+            }
+            if ui
+                .add_enabled(
+                    self.can_remove_selected_volume(),
+                    egui::Button::new("Remove volume"),
+                )
+                .clicked()
+            {
+                self.begin_remove_confirmation();
+            }
+            if let Some(confirmation) = self.remove_confirmation.clone() {
+                if self.confirmation_is_current(&confirmation) {
+                    ui.group(|ui| {
+                        ui.heading("Confirm volume removal");
+                        ui.label(format!(
+                            "Remove volume '{}' and its data? The latest usage snapshot reports zero container references, but it can change before deletion. Docker may reject removal if the volume becomes in use. Force is not used.",
+                            confirmation.name
+                        ));
+                        ui.horizontal(|ui| {
+                            if ui.button("Confirm volume removal").clicked() {
+                                action = self.confirm_remove();
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.cancel_remove_confirmation();
+                            }
+                        });
+                    });
+                } else {
+                    self.cancel_remove_confirmation();
+                }
+            }
+        });
         if action.is_none()
             && let Some(name) = selected
         {
@@ -432,6 +668,18 @@ mod tests {
         view.finish_list(
             generation,
             Ok(names.iter().map(|name| summary(name)).collect()),
+        );
+        view
+    }
+    fn removable_view(name: &str, reference_count: Option<u64>) -> VolumesView {
+        let mut view = loaded_view(&[name]);
+        let (generation, inspection_generation, requested_name) =
+            view.begin_inspection(name.to_owned());
+        view.finish_inspection(
+            generation,
+            inspection_generation,
+            &requested_name,
+            inspection_result(details(name), Ok(Some(usage(Some(128), reference_count)))),
         );
         view
     }
@@ -795,7 +1043,9 @@ mod tests {
             .expect("the Volumes UI should request creation")
         {
             VolumesAction::Create { generation, name } => (generation, name),
-            VolumesAction::Inspect(_) => panic!("Create volume should return a create action"),
+            VolumesAction::Inspect(_) | VolumesAction::Remove { .. } => {
+                panic!("Create volume should return a create action")
+            }
         };
         assert_eq!(name, "ferrum-data");
         assert!(harness.state().creating);
@@ -902,5 +1152,150 @@ mod tests {
         let _error_heading = harness.get_by_role_and_label(Role::Label, "Could not create volume:");
         let _error =
             harness.get_by_role_and_label(Role::Label, "The engine rejected volume creation.");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn volume_removal_button_requires_reported_zero_container_references() {
+        for reference_count in [Some(1), None] {
+            let mut harness = harness_for(removable_view("project-data", reference_count), true);
+            harness.run();
+            assert!(
+                harness
+                    .get_by_role_and_label(Role::Button, "Remove volume")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+        }
+
+        let mut harness = harness_for(removable_view("project-data", Some(0)), true);
+        harness.run();
+        assert!(
+            !harness
+                .get_by_role_and_label(Role::Button, "Remove volume")
+                .accesskit_node()
+                .is_disabled()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accessible_volume_removal_requires_named_confirmation_and_cancel_is_safe() {
+        let (action_sender, action_receiver) = std::sync::mpsc::channel();
+        let mut harness = Harness::new_ui_state(
+            move |ui, view: &mut VolumesView| {
+                if let Some(action) = view.show(ui, true, "")
+                    && matches!(&action, VolumesAction::Remove { .. })
+                {
+                    action_sender
+                        .send(action)
+                        .expect("action receiver should stay open");
+                }
+            },
+            removable_view("project-data", Some(0)),
+        );
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Remove volume")
+            .click_accesskit();
+        harness.run();
+        let _heading = harness.get_by_role_and_label(Role::Label, "Confirm volume removal");
+        let warning = "Remove volume 'project-data' and its data? The latest usage snapshot reports zero container references, but it can change before deletion. Docker may reject removal if the volume becomes in use. Force is not used.";
+        let _warning = harness.get_by_role_and_label(Role::Label, warning);
+        assert!(action_receiver.try_recv().is_err());
+
+        harness
+            .get_by_role_and_label(Role::Button, "Cancel")
+            .click_accesskit();
+        harness.run();
+        assert!(action_receiver.try_recv().is_err());
+        assert!(!harness.state().removing);
+
+        harness
+            .get_by_role_and_label(Role::Button, "Remove volume")
+            .click_accesskit();
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Confirm volume removal")
+            .click_accesskit();
+        harness.step();
+        assert!(matches!(
+            action_receiver
+                .try_recv()
+                .expect("explicit confirmation should submit"),
+            VolumesAction::Remove {
+                name,
+                ..
+            } if name == "project-data"
+        ));
+        assert!(harness.state().removing);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_volume_removal_confirmation_and_results_are_rejected() {
+        let mut view = removable_view("project-data", Some(0));
+        view.begin_remove_confirmation();
+        view.begin_inspection("other-volume".to_owned());
+        assert!(view.confirm_remove().is_none());
+
+        let mut view = removable_view("project-data", Some(0));
+        view.begin_remove_confirmation();
+        let action = view
+            .confirm_remove()
+            .expect("fresh confirmation should submit");
+        let VolumesAction::Remove {
+            generation,
+            inspection_generation,
+            removal_generation,
+            name,
+        } = action
+        else {
+            panic!("confirmation should submit a removal");
+        };
+        view.invalidate();
+        assert!(view.has_mutation_in_flight());
+        assert!(!view.finish_remove(
+            generation,
+            inspection_generation,
+            removal_generation,
+            &name,
+            Ok(())
+        ));
+        assert!(!view.has_mutation_in_flight());
+        assert!(view.remove_success.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_volume_removal_discards_usage_snapshot_and_requires_reinspection() {
+        let mut view = removable_view("project-data", Some(0));
+        view.begin_remove_confirmation();
+        let action = view
+            .confirm_remove()
+            .expect("zero-reference volume should be removable");
+        let VolumesAction::Remove {
+            generation,
+            inspection_generation,
+            removal_generation,
+            name,
+        } = action
+        else {
+            panic!("confirmation should submit a removal");
+        };
+
+        assert!(view.finish_remove(
+            generation,
+            inspection_generation,
+            removal_generation,
+            &name,
+            Err("Volume removal was rejected (HTTP 409).".to_owned())
+        ));
+        assert!(view.details.is_none());
+        assert!(view.usage.is_none());
+        assert_eq!(
+            view.remove_error.as_deref(),
+            Some("Volume removal was rejected (HTTP 409).")
+        );
+        assert!(!view.can_remove_selected_volume());
     }
 }

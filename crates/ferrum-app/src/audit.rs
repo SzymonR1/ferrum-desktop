@@ -149,32 +149,43 @@ pub(super) fn record_image_mutation_result(
 #[cfg(target_os = "linux")]
 /// Emits an ephemeral volume-create outcome without resource or endpoint metadata.
 pub(super) fn record_volume_create_result(result: &Result<VolumeDetails, EngineError>) {
+    record_volume_mutation_result("create", result);
+}
+
+#[cfg(target_os = "linux")]
+/// Emits an ephemeral volume-removal outcome without resource or endpoint metadata.
+pub(super) fn record_volume_remove_result(result: &Result<(), EngineError>) {
+    record_volume_mutation_result("remove", result);
+}
+
+#[cfg(target_os = "linux")]
+fn record_volume_mutation_result<T>(action: &'static str, result: &Result<T, EngineError>) {
     match result {
         Ok(_) => {
             tracing::info!(
                 target: "ferrum::audit",
                 audit_event = "volume_mutation",
-                action = "create",
+                action,
                 outcome = "success",
-                "Volume creation request succeeded"
+                "Volume mutation request succeeded"
             );
         }
         Err(EngineError::InvalidVolumeName) => {
             tracing::warn!(
                 target: "ferrum::audit",
                 audit_event = "volume_mutation",
-                action = "create",
+                action,
                 outcome = "not_submitted",
-                "Volume creation input was rejected before request submission"
+                "Volume mutation input was rejected before request submission"
             );
         }
         Err(_) => {
             tracing::warn!(
                 target: "ferrum::audit",
                 audit_event = "volume_mutation",
-                action = "create",
+                action,
                 outcome = "request_error",
-                "Volume creation request returned an error"
+                "Volume mutation request returned an error"
             );
         }
     }
@@ -189,6 +200,8 @@ fn valid_resource_id(resource_id: &str) -> Option<&str> {
 mod tests {
     #[cfg(target_os = "linux")]
     use super::record_volume_create_result;
+    #[cfg(target_os = "linux")]
+    use super::record_volume_remove_result;
     #[cfg(target_os = "linux")]
     use super::{ImageMutation, record_image_mutation_result};
     use super::{NetworkMutation, record_container_action_result, record_network_mutation_result};
@@ -426,6 +439,50 @@ mod tests {
             "local Docker Unix socket",
             "endpoint_label",
             "mountpoint",
+        ] {
+            assert!(!output.contains(sensitive_value));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn records_volume_removal_outcomes_without_resource_metadata() {
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(writer.clone())
+            .finish();
+        let dispatcher = tracing::Dispatch::new(subscriber);
+        let success = Ok::<(), EngineError>(());
+        let invalid = Err(EngineError::InvalidVolumeName);
+        let rejected = Err(EngineError::VolumeRemovalRejected {
+            endpoint_label: "local Docker Unix socket",
+            status: 409,
+        });
+
+        tracing::dispatcher::with_default(&dispatcher, || {
+            record_volume_remove_result(&success);
+            record_volume_remove_result(&invalid);
+            record_volume_remove_result(&rejected);
+        });
+
+        let captured = match writer.0.lock() {
+            Ok(output) => output.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let output = String::from_utf8(captured).expect("audit events should be UTF-8");
+        let events = output.lines().collect::<Vec<_>>();
+        let expected = ["success", "not_submitted", "request_error"];
+        assert_eq!(events.len(), expected.len());
+        for (line, outcome) in events.iter().zip(expected) {
+            assert!(line.contains("audit_event=\"volume_mutation\""));
+            assert!(line.contains("action=\"remove\""));
+            assert!(line.contains(&format!("outcome=\"{outcome}\"")));
+        }
+        for sensitive_value in [
+            "local Docker Unix socket",
+            "endpoint_label",
+            "volume-secret",
         ] {
             assert!(!output.contains(sensitive_value));
         }
