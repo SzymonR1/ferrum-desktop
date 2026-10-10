@@ -3,6 +3,10 @@
 - **Status:** Accepted for Linux local-Unix sockets only
 - **Date:** 2026-10-08
 
+Export target handling in this ADR was superseded by
+[ADR 0012](0012-atomic-log-export.md); the bounded log-stream and UI
+decisions remain active.
+
 ## Context
 
 Container inspection needs access to both historical output and an optional live stream without introducing terminal behavior or allowing an unbounded response, queue, or UI buffer. Docker's logs endpoint streams response bodies and has different wire formats for TTY and non-TTY containers. A reconnect must not duplicate the tail already displayed.

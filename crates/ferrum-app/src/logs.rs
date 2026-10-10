@@ -8,16 +8,113 @@ const MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RETAINED_LINES: usize = 10_000;
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 #[cfg(target_os = "linux")]
-/// Writes UTF-8 log output without following the selected final path component.
+/// Writes visible log output to the selected regular file by atomic replacement.
+///
+/// New files are private (`0600`). Existing regular files must be writable, and
+/// their ordinary permission bits are preserved. Symlinks and non-regular
+/// targets are rejected. Replacement affects only the selected directory entry,
+/// so other hard links retain the previous contents.
 pub(super) fn export_visible_logs(path: &Path, text: &str) -> io::Result<()> {
-    use std::{fs::OpenOptions, io::Write as _, os::unix::fs::OpenOptionsExt as _};
+    export_visible_logs_using(path, text, rename_log_export_temp_at)
+}
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+#[cfg(target_os = "linux")]
+fn export_visible_logs_using(
+    path: &Path,
+    text: &str,
+    replace: impl FnOnce(&std::fs::File, &std::ffi::CStr, &std::ffi::CStr) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::{
+        ffi::CString,
+        io::Write as _,
+        os::{fd::FromRawFd as _, unix::ffi::OsStrExt as _},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "export target has no file name",
+        )
+    })?;
+    if file_name.as_bytes() == b"." || file_name.as_bytes() == b".." {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "export target has an invalid file name",
+        ));
+    }
+    let target_name = CString::new(file_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid export target"))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_name = CString::new(parent.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid export directory"))?;
+    // O_PATH avoids requiring directory read permission; entry changes still
+    // require write and search access through the directory descriptor.
+    // SAFETY: `parent_name` is a valid NUL-terminated path used only for this call.
+    let descriptor = unsafe {
+        libc::open(
+            parent_name.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful `open` returned a newly owned descriptor.
+    let directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    let mode = open_existing_log_target_mode(&directory, &target_name)?;
+
+    let (temp_name, mut temp_file) = create_log_export_temp(&directory, &target_name, || {
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    })?;
+    let result = (|| {
+        temp_file.write_all(text.as_bytes())?;
+        temp_file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        temp_file.sync_all()?;
+        replace(&directory, &temp_name, &target_name)
+    })();
+    drop(temp_file);
+    if result.is_err() {
+        let _ = unlink_log_export_temp(&directory, &temp_name);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn open_existing_log_target_mode(
+    directory: &std::fs::File,
+    target_name: &std::ffi::CStr,
+) -> io::Result<u32> {
+    use std::os::{
+        fd::{AsRawFd as _, FromRawFd as _},
+        unix::fs::PermissionsExt as _,
+    };
+
+    // SAFETY: `directory` is an open directory and `target_name` is one
+    // NUL-terminated filename interpreted relative to that descriptor.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            target_name.as_ptr(),
+            libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(0o600);
+        }
+        return Err(error);
+    }
+
+    // SAFETY: a successful `openat` call returned a newly owned descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -25,8 +122,104 @@ pub(super) fn export_visible_logs(path: &Path, text: &str) -> io::Result<()> {
             "export target is not a regular file",
         ));
     }
-    file.set_len(0)?;
-    file.write_all(text.as_bytes())
+    Ok(metadata.permissions().mode() & 0o777)
+}
+
+#[cfg(target_os = "linux")]
+fn create_log_export_temp(
+    directory: &std::fs::File,
+    target_name: &std::ffi::CStr,
+    mut next_sequence: impl FnMut() -> u64,
+) -> io::Result<(std::ffi::CString, std::fs::File)> {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::{
+        ffi::CString,
+        fs::File,
+        os::fd::{AsRawFd as _, FromRawFd as _},
+    };
+
+    for _ in 0..32 {
+        let sequence = next_sequence();
+        let name = CString::new(format!(
+            ".ferrum-log-export-{}-{sequence}.tmp",
+            std::process::id()
+        ))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid temporary name"))?;
+        if name.as_c_str() == target_name {
+            continue;
+        }
+
+        // SAFETY: `directory` is an open directory and `name` is one
+        // NUL-terminated filename interpreted relative to that descriptor.
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::mode_t,
+            )
+        };
+        if descriptor < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(error);
+        }
+
+        // SAFETY: a successful `openat` call returned a newly owned descriptor.
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            drop(file);
+            let _ = unlink_log_export_temp(directory, &name);
+            return Err(error);
+        }
+        return Ok((name, file));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique log-export file",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn rename_log_export_temp_at(
+    directory: &std::fs::File,
+    temp_name: &std::ffi::CStr,
+    target_name: &std::ffi::CStr,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: `directory` is open and both C strings are single filename
+    // components interpreted relative to that descriptor.
+    let result = unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            temp_name.as_ptr(),
+            directory.as_raw_fd(),
+            target_name.as_ptr(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unlink_log_export_temp(directory: &std::fs::File, temp_name: &std::ffi::CStr) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: `directory` is open and `temp_name` is one NUL-terminated
+    // filename interpreted relative to that descriptor.
+    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), temp_name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 #[derive(Default)]
@@ -206,7 +399,7 @@ pub(super) fn source_label(source: &ContainerLogSource) -> &'static str {
 }
 #[cfg(all(test, target_os = "linux"))]
 mod export_tests {
-    use super::export_visible_logs;
+    use super::{create_log_export_temp, export_visible_logs, export_visible_logs_using};
     use std::{
         fs,
         os::unix::fs::{MetadataExt as _, PermissionsExt as _},
@@ -268,6 +461,92 @@ mod export_tests {
         assert_eq!(metadata.mode() & 0o777, 0o640);
         assert_eq!(fs::read(path).unwrap(), b"replacement");
     }
+
+    #[test]
+    fn exports_when_parent_is_write_and_search_only() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("logs.txt");
+        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o300)).unwrap();
+
+        let result = export_visible_logs(&path, "visible logs\n");
+        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o700)).unwrap();
+
+        result.expect("write and search access should be enough for atomic replacement");
+        assert_eq!(fs::read(path).unwrap(), b"visible logs\n");
+    }
+
+    #[test]
+    fn temporary_name_never_matches_selected_target() {
+        let directory = TestDirectory::new();
+        let directory_file = fs::File::open(&directory.0).unwrap();
+        let sequence = [17, 18];
+        let mut next_sequence = sequence.into_iter();
+        let target_name =
+            std::ffi::CString::new(format!(".ferrum-log-export-{}-17.tmp", std::process::id()))
+                .unwrap();
+        let target_path = directory
+            .0
+            .join(target_name.to_str().expect("generated name is UTF-8"));
+
+        let (temp_name, temp_file) = create_log_export_temp(&directory_file, &target_name, || {
+            next_sequence.next().expect("two names should be enough")
+        })
+        .expect("a distinct temporary name should be allocated");
+
+        assert_ne!(temp_name, target_name);
+        assert!(!target_path.exists());
+        let temp_path = directory
+            .0
+            .join(temp_name.to_str().expect("generated name is UTF-8"));
+        assert!(temp_path.exists());
+        drop(temp_file);
+        fs::remove_file(temp_path).unwrap();
+    }
+
+    #[test]
+    fn exporting_hard_linked_path_does_not_modify_other_link() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("logs.txt");
+        let alias = directory.0.join("other-name.txt");
+        fs::write(&path, "original contents").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+
+        export_visible_logs(&path, "replacement").expect("export should succeed");
+
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(fs::read(&alias).unwrap(), b"original contents");
+        assert_eq!(
+            fs::metadata(path).unwrap().mode() & 0o777,
+            0o640,
+            "replacement should preserve the selected file's ordinary mode bits"
+        );
+    }
+
+    #[test]
+    fn keeps_previous_export_and_cleans_temp_when_replacement_fails() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("logs.txt");
+        fs::write(&path, "previous export").unwrap();
+
+        let error = export_visible_logs_using(&path, "new export", |_, _, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "test replacement failure",
+            ))
+        })
+        .expect_err("a failed replacement should be reported");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&path).unwrap(), b"previous export");
+        let entries = fs::read_dir(&directory.0)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1, "the temporary export should be removed");
+        assert_eq!(entries[0].file_name(), "logs.txt");
+    }
+
     #[test]
     fn refuses_to_replace_file_without_owner_write_permission() {
         let directory = TestDirectory::new();
