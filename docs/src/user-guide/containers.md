@@ -50,13 +50,22 @@ The view is bounded to 8 MiB or 10,000 lines and discards oldest lines when
 those limits are reached, with a visible discarded-line count. Individual
 Docker frames are limited to 1 MiB and lines to 64 KiB. Copy and Export include
 only rows currently visible after filtering and still retained in the buffer.
-Export writes the visible rows as plain text to the path you select in the
-native save dialog. The dialog starts at `container-logs.txt` and offers a
-text-file filter, but the selected extension is not enforced. New regular files
-are created with owner-only Unix permissions (`0600`); for existing regular
-files, ordinary rwx permission bits are preserved, though the OS may clear
-setuid/setgid bits. Final-component symlinks and non-regular targets are
-rejected before truncation or writing.
+Export writes only the currently visible retained rows as plain text to the
+path selected in the native save dialog. The dialog starts at
+`container-logs.txt` and offers a text-file filter, but does not enforce the
+extension. New regular files are created with owner-only Unix permissions
+(`0600`). Existing regular targets must be writable; Ferrum writes the complete
+export to a unique sibling temporary file and atomically replaces only the
+selected entry. If a write or rename fails before commit, the previous
+contents remain unchanged; Ferrum attempts to remove the temporary file.
+Hard-link aliases retain the previous contents. Ordinary rwx permission bits
+are preserved, though setuid/setgid bits are not. Replacing an existing target
+requires write and search (execute) permission on its containing directory.
+The replacement is a new inode owned by Ferrum's user; its group follows
+directory creation policy. Extended ACLs and other xattrs are not preserved.
+Final-component symlinks and non-regular targets are rejected before writing
+or replacement.
+
 Logs are not automatically exported or persisted. Refresh reloads the selected
 tail and reapplies the current Follow setting.
 Copy copies the visible rows to the clipboard. Clipboard contents may be
