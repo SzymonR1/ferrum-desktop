@@ -676,7 +676,8 @@ pub enum EngineError {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
     },
-    /// The network identifier supplied to an inspection request is invalid.
+    /// The network identifier supplied to an inspection or removal request
+    /// is invalid.
     #[cfg(target_os = "linux")]
     #[error("The network identifier for the engine request is invalid.")]
     InvalidNetworkId,
@@ -711,6 +712,34 @@ pub enum EngineError {
         /// HTTP response status.
         status: u16,
     },
+    /// The engine's result for a network removal request could not be confirmed.
+    #[cfg(target_os = "linux")]
+    #[error(
+        "The engine at the {endpoint_label} could not confirm whether the network was removed."
+    )]
+    NetworkRemovalUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// Network removal exceeded its bounded wait; the daemon may have applied it.
+    #[cfg(target_os = "linux")]
+    #[error(
+        "Network removal at the {endpoint_label} timed out; the network may have been removed."
+    )]
+    NetworkRemovalTimedOut {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The daemon rejected network removal, for example because the network is now in use.
+    #[cfg(target_os = "linux")]
+    #[error("Network removal was rejected at the {endpoint_label} (HTTP {status}).")]
+    NetworkRemovalRejected {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+        /// HTTP response status.
+        status: u16,
+    },
+
     /// Image inspection failed or returned an invalid, oversized response.
     #[cfg(target_os = "linux")]
     #[error("The engine at the {endpoint_label} could not return safe image details.")]
@@ -1474,6 +1503,59 @@ impl EngineClient {
                 enable_ipv6: summary.enable_ipv6,
                 attached_container_count: response.containers.map(|count| count.0),
             })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = id;
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
+
+    /// Removes one network by its exact full Docker ID on the connected Linux
+    /// local Docker Unix socket.
+    ///
+    /// The request is bounded to the standard engine request deadline and sends
+    /// no force or prune parameters. The inspected attached-container count is
+    /// only a point-in-time observation; Docker may reject removal if network
+    /// dependencies change before this request.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidNetworkId` before connecting unless the ID is exactly
+    /// 64 hexadecimal characters. Other failures return safe typed availability,
+    /// timeout, or HTTP rejection errors. A timeout or transport error does not
+    /// prove the network remains.
+    /// Unsupported platforms return `UnsupportedPlatform`.
+    pub async fn remove_network(&self, id: &str) -> Result<(), EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            if !is_full_network_id(id) {
+                return Err(EngineError::InvalidNetworkId);
+            }
+            let path = resource_request_path(&self.api_version, "networks", id, "")
+                .map_err(|_| EngineError::InvalidNetworkId)?;
+            let endpoint_label = self.info.endpoint_label;
+            timeout(REQUEST_TIMEOUT, async {
+                let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
+                let request = Request::builder()
+                    .method(Method::DELETE)
+                    .uri(Uri::new(&self.socket_path, &path))
+                    .body(Empty::<Bytes>::new())
+                    .map_err(|_| EngineError::NetworkRemovalUnavailable { endpoint_label })?;
+                let response = client
+                    .request(request)
+                    .await
+                    .map_err(|_| EngineError::NetworkRemovalUnavailable { endpoint_label })?;
+                if !response.status().is_success() {
+                    return Err(EngineError::NetworkRemovalRejected {
+                        endpoint_label,
+                        status: response.status().as_u16(),
+                    });
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| EngineError::NetworkRemovalTimedOut { endpoint_label })?
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -2290,6 +2372,10 @@ fn negotiate_api_version(client: &str, server: &str) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn network_id_path_safe(id: &str) -> bool {
     !id.is_empty() && id.len() <= 4096 && !matches!(id, "." | "..")
+}
+#[cfg(target_os = "linux")]
+fn is_full_network_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(target_os = "linux")]
@@ -4699,6 +4785,65 @@ mod network_api_tests {
             Err(EngineError::NetworkCreationUnavailable { .. })
         ));
         server.await.expect("server should finish");
+        cleanup(&socket, &directory);
+    }
+    #[tokio::test]
+    async fn removes_network_by_exact_id_without_force_prune_or_query() {
+        let (socket, directory, server) = fixture(response("204 No Content", b"")).await;
+        let id = "a".repeat(64);
+
+        client(socket.clone())
+            .remove_network(&id)
+            .await
+            .expect("an exact-ID network removal should succeed");
+        let request = server.await.expect("server should finish");
+        let (headers, body) = request
+            .split_once("\r\n\r\n")
+            .expect("HTTP request should contain headers");
+        assert!(
+            headers.starts_with(&format!("DELETE /v1.45/networks/{id} HTTP/1.1\r\n")),
+            "unexpected network removal request: {headers}"
+        );
+        assert!(
+            !headers.lines().next().unwrap_or_default().contains('?'),
+            "network removal must not include query parameters"
+        );
+        assert!(body.is_empty(), "network removal must not send a body");
+        assert!(!headers.to_ascii_lowercase().contains("force"));
+        assert!(!headers.to_ascii_lowercase().contains("prune"));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn network_removal_rejects_non_full_or_non_hex_ids_before_connecting() {
+        let engine = client(std::path::PathBuf::from("/path/that/does/not/exist"));
+        let non_hex = "g".repeat(64);
+        for id in ["", "network-name", "..", "a/../b", non_hex.as_str()] {
+            assert!(matches!(
+                engine.remove_network(id).await,
+                Err(EngineError::InvalidNetworkId)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_network_removal_is_typed_and_redacts_id_and_daemon_body() {
+        let id = "b".repeat(64);
+        let (socket, directory, server) =
+            fixture(response("409 Conflict", b"private daemon response")).await;
+        let error = client(socket.clone())
+            .remove_network(&id)
+            .await
+            .expect_err("the daemon rejection should be surfaced");
+        server.await.expect("server should finish");
+        assert!(matches!(
+            error,
+            EngineError::NetworkRemovalRejected { status: 409, .. }
+        ));
+        assert!(!format!("{error:?}").contains(&id));
+        assert!(!format!("{error:?}").contains("private daemon response"));
+        assert!(!error.to_string().contains(&id));
+        assert!(!error.to_string().contains("private daemon response"));
         cleanup(&socket, &directory);
     }
 
