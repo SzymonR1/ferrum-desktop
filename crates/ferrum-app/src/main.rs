@@ -1457,7 +1457,7 @@ impl FerrumApp {
                 Ok::<(), EngineError>(())
             }
             .await;
-            audit::record_image_mutation_result(audit::ImageMutation::Pull, result.is_ok());
+            audit::record_image_mutation_result(audit::ImageMutation::Pull, &result);
             if sender
                 .send(EngineEvent::ImagePullFinished { generation, result })
                 .await
@@ -1490,7 +1490,7 @@ impl FerrumApp {
             let result = engine
                 .tag_image(&request.image_id, &request.repository, &request.tag)
                 .await;
-            audit::record_image_mutation_result(audit::ImageMutation::Tag, result.is_ok());
+            audit::record_image_mutation_result(audit::ImageMutation::Tag, &result);
             if sender
                 .send(EngineEvent::ImageTagged {
                     generation: request.generation,
@@ -1523,7 +1523,7 @@ impl FerrumApp {
         let sender = self.sender.clone();
         self.image_remove_task = Some(self.runtime.spawn(async move {
             let result = engine.remove_image(&request.image_id).await;
-            audit::record_image_mutation_result(audit::ImageMutation::Remove, result.is_ok());
+            audit::record_image_mutation_result(audit::ImageMutation::Remove, &result);
             if sender
                 .send(EngineEvent::ImageRemoved {
                     generation: request.generation,

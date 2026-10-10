@@ -1,4 +1,6 @@
 use ferrum_core::ContainerAction;
+#[cfg(target_os = "linux")]
+use ferrum_engine::EngineError;
 
 /// Emits a minimal local trace event when an engine lifecycle request returns.
 ///
@@ -79,6 +81,7 @@ pub(super) fn record_network_mutation_result(
     }
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 pub(super) enum ImageMutation {
     Pull,
@@ -86,6 +89,7 @@ pub(super) enum ImageMutation {
     Remove,
 }
 
+#[cfg(target_os = "linux")]
 impl ImageMutation {
     fn label(self) -> &'static str {
         match self {
@@ -98,25 +102,46 @@ impl ImageMutation {
 
 /// Emits a local trace event when an image mutation request returns.
 ///
-/// Only the static action and request outcome are logged; image identifiers,
-/// references, and repository tags are never included.
-pub(super) fn record_image_mutation_result(action: ImageMutation, request_succeeded: bool) {
-    if request_succeeded {
-        tracing::info!(
-            target: "ferrum::audit",
-            audit_event = "image_mutation",
-            action = action.label(),
-            outcome = "success",
-            "Image mutation request succeeded"
-        );
-    } else {
-        tracing::warn!(
-            target: "ferrum::audit",
-            audit_event = "image_mutation",
-            action = action.label(),
-            outcome = "request_error",
-            "Image mutation request returned an error"
-        );
+/// Local ID, reference, or tag validation failures are distinguished from
+/// errors after the request path begins. Image identifiers, references, and
+/// repository tags are never logged.
+#[cfg(target_os = "linux")]
+pub(super) fn record_image_mutation_result(
+    action: ImageMutation,
+    result: &Result<(), EngineError>,
+) {
+    match result {
+        Ok(()) => {
+            tracing::info!(
+                target: "ferrum::audit",
+                audit_event = "image_mutation",
+                action = action.label(),
+                outcome = "success",
+                "Image mutation request succeeded"
+            );
+        }
+        Err(
+            EngineError::InvalidImageId
+            | EngineError::InvalidImageReference
+            | EngineError::InvalidImageTagTarget,
+        ) => {
+            tracing::warn!(
+                target: "ferrum::audit",
+                audit_event = "image_mutation",
+                action = action.label(),
+                outcome = "not_submitted",
+                "Image mutation input was rejected before request submission"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "ferrum::audit",
+                audit_event = "image_mutation",
+                action = action.label(),
+                outcome = "request_error",
+                "Image mutation request returned an error"
+            );
+        }
     }
 }
 
@@ -127,11 +152,12 @@ fn valid_resource_id(resource_id: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ImageMutation, NetworkMutation, record_container_action_result,
-        record_image_mutation_result, record_network_mutation_result,
-    };
+    #[cfg(target_os = "linux")]
+    use super::{ImageMutation, record_image_mutation_result};
+    use super::{NetworkMutation, record_container_action_result, record_network_mutation_result};
     use ferrum_core::ContainerAction;
+    #[cfg(target_os = "linux")]
+    use ferrum_engine::EngineError;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -242,6 +268,7 @@ mod tests {
         }
         assert!(!output.contains("TOKEN=sentinel"));
     }
+    #[cfg(target_os = "linux")]
     #[test]
     fn records_image_mutation_action_outcomes_without_resource_metadata() {
         let writer = SharedWriter::default();
@@ -252,13 +279,33 @@ mod tests {
             .finish();
         let dispatcher = tracing::Dispatch::new(subscriber);
 
+        let succeeded = Ok::<(), EngineError>(());
+        let invalid_pull = Err(EngineError::InvalidImageReference);
+        let rejected_pull = Err(EngineError::ImagePullRejected {
+            endpoint_label: "local Docker Unix socket",
+            status: 500,
+        });
+        let invalid_tag = Err(EngineError::InvalidImageTagTarget);
+        let rejected_tag = Err(EngineError::ImageTagRejected {
+            endpoint_label: "local Docker Unix socket",
+            status: 409,
+        });
+        let invalid_remove = Err(EngineError::InvalidImageId);
+        let rejected_remove = Err(EngineError::ImageRemovalRejected {
+            endpoint_label: "local Docker Unix socket",
+            status: 409,
+        });
+
         tracing::dispatcher::with_default(&dispatcher, || {
-            record_image_mutation_result(ImageMutation::Pull, true);
-            record_image_mutation_result(ImageMutation::Pull, false);
-            record_image_mutation_result(ImageMutation::Tag, true);
-            record_image_mutation_result(ImageMutation::Tag, false);
-            record_image_mutation_result(ImageMutation::Remove, true);
-            record_image_mutation_result(ImageMutation::Remove, false);
+            record_image_mutation_result(ImageMutation::Pull, &succeeded);
+            record_image_mutation_result(ImageMutation::Pull, &invalid_pull);
+            record_image_mutation_result(ImageMutation::Pull, &rejected_pull);
+            record_image_mutation_result(ImageMutation::Tag, &succeeded);
+            record_image_mutation_result(ImageMutation::Tag, &invalid_tag);
+            record_image_mutation_result(ImageMutation::Tag, &rejected_tag);
+            record_image_mutation_result(ImageMutation::Remove, &succeeded);
+            record_image_mutation_result(ImageMutation::Remove, &invalid_remove);
+            record_image_mutation_result(ImageMutation::Remove, &rejected_remove);
         });
 
         let captured = match writer.0.lock() {
@@ -269,10 +316,13 @@ mod tests {
         let events = output.lines().collect::<Vec<_>>();
         let expected = [
             ("pull", "success"),
+            ("pull", "not_submitted"),
             ("pull", "request_error"),
             ("tag", "success"),
+            ("tag", "not_submitted"),
             ("tag", "request_error"),
             ("remove", "success"),
+            ("remove", "not_submitted"),
             ("remove", "request_error"),
         ];
         assert_eq!(events.len(), expected.len());
@@ -284,6 +334,8 @@ mod tests {
             assert!(!line.contains("reference="));
             assert!(!line.contains("repository="));
             assert!(!line.contains("tag="));
+            assert!(!line.contains("endpoint_label="));
+            assert!(!line.contains("local Docker Unix socket"));
         }
     }
 }
