@@ -1,10 +1,25 @@
 # Volumes
 
-The Volumes page is a read-only inventory for the selected local Docker Unix
+The Volumes page lists and inspects volumes for the selected local Docker Unix
 socket on Linux. Select a volume to inspect its name, optional driver, scope,
 creation time, and host mountpoint. Missing optional fields are shown as not
 reported. Ferrum displays the mountpoint as untrusted text and does not open,
 read, or browse that path.
+
+## Create a volume
+
+The create form sends only `Name` to the negotiated
+`POST /v{api}/volumes/create` endpoint. Docker selects its default local volume
+driver; driver, labels, and options are not configurable. Names must be
+nonblank, at most 4096 UTF-8 bytes, contain no control characters, and not be
+`.` or `..`. The request body is limited to 16 KiB and the response to 64 KiB.
+A successful response must identify the requested name. Requests have an
+eight-second bound; a timeout or transport error can occur after Docker has
+created the volume. Ferrum refreshes the inventory after every create result
+and blocks context switching while the request is pending. Navigating away
+does not abort a submitted request.
+
+## Usage reporting
 
 Ferrum reads per-volume usage with the negotiated Engine API request
 `GET /v{api}/system/df?verbose=true&type=volume`. It keeps usage data only when
@@ -18,11 +33,11 @@ issues it asynchronously and does not retry it. Other JSON requests keep their
 eight-second deadlines. If usage retrieval fails, Ferrum keeps the inspected
 details visible and shows a separate usage error.
 
-This request does not retain or display labels or options, and it does not
+The usage request does not retain or display labels or options, and it does not
 access volume mountpoints. A reference count is only a snapshot. Even a count
 of zero does not guarantee that a volume is safe to delete because container
-state can change after the response. Ferrum does not offer volume creation,
-removal, pruning, modification, connection, or disconnection.
+state can change after the response. Ferrum offers no volume removal, pruning,
+modification, connection, disconnection, or filesystem browsing.
 
 Only Linux with the selected local Docker Unix socket is covered. Podman and
 rootless behavior are unvalidated, remote endpoints are unsupported, and
@@ -33,19 +48,24 @@ visually validated. This slice does not complete issues
 [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10), and it is not a
 release claim.
 
-The optional ignored live test requires `FERRUM_TEST_VOLUME` to name a volume
-that already exists on the selected local Docker socket. It lists volumes,
-inspects that exact name, and reads its usage from the Engine API. It does not
-create, remove, modify, or clean up any resource. Headless UI and fake-socket
-tests do not contact a live engine. See the [testing guide](../developer-guide/testing.md)
-for the exact command.
-
-For the optional ignored live check, set `FERRUM_TEST_VOLUME` to an existing
-volume name and run:
+The optional ignored live list/inspect/usage test requires `FERRUM_TEST_VOLUME`
+to name an existing volume on the current local Docker context. It is
+read-only and does not clean up resources:
 
 ```sh
 FERRUM_TEST_VOLUME=my-existing-volume cargo test -p ferrum-engine --test live_engine local_engine_lists_and_inspects_existing_volume_read_only -- --exact --ignored
 ```
 
-It lists volumes, inspects the named volume, and reads per-volume usage. It
-performs no create, remove, modify, or cleanup operation.
+The optional ignored create test creates a uniquely named volume on the
+current local Docker context. It preflights the generated name and arms cleanup
+only after both the create response and inventory confirm that exact name. It
+removes only that generated name through an argument-array Docker CLI request
+without force; if ownership cannot be confirmed, the test sends no cleanup
+request and the volume may remain:
+
+```sh
+cargo test -p ferrum-engine --test live_engine local_engine_creates_and_removes_unique_volume -- --exact --ignored
+```
+
+Default fake-socket and headless UI tests do not contact a live engine. See the
+[testing guide](../developer-guide/testing.md) for prerequisites and details.

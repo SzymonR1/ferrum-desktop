@@ -33,7 +33,7 @@ mod networks;
 mod retry;
 mod search;
 mod volumes;
-use ferrum_core::{NetworkSummary, VolumeSummary};
+use ferrum_core::{NetworkSummary, VolumeDetails, VolumeSummary};
 #[cfg(target_os = "linux")]
 mod terminal;
 #[cfg(target_os = "linux")]
@@ -131,6 +131,11 @@ enum EngineEvent {
         inspection_generation: u64,
         name: String,
         result: volumes::VolumeInspectionResult,
+    },
+    VolumeCreated {
+        generation: u64,
+        name: String,
+        result: Result<VolumeDetails, EngineError>,
     },
     NetworksListed {
         generation: u64,
@@ -759,6 +764,7 @@ struct FerrumApp {
     // engine may already have accepted them and success should refresh inventory.
     network_create_task: Option<JoinHandle<()>>,
     network_remove_task: Option<JoinHandle<()>>,
+    volume_create_task: Option<JoinHandle<()>>,
     resource_read_task: Option<JoinHandle<()>>,
     pending_resource_read: Option<PendingResourceRead>,
     image_list_task: Option<JoinHandle<()>>,
@@ -943,6 +949,7 @@ impl FerrumApp {
             networks: networks::NetworksView::default(),
             network_create_task: None,
             network_remove_task: None,
+            volume_create_task: None,
             resource_read_task: None,
             pending_resource_read: None,
             image_list_task: None,
@@ -1150,6 +1157,45 @@ impl FerrumApp {
         });
         self.start_pending_resource_read(context);
     }
+    fn start_volume_create(&mut self, generation: u64, name: String, context: egui::Context) {
+        if !self.volumes.creation_is_pending(generation, &name) {
+            return;
+        }
+        if self.volume_create_task.is_some()
+            || self.loading
+            || !cfg!(target_os = "linux")
+            || !matches!(&self.connection, ConnectionState::Connected)
+            || self.page != images::AppPage::Volumes
+        {
+            self.volumes.cancel_create_submission(generation);
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            self.volumes.finish_create(
+                generation,
+                &name,
+                Err("The selected engine connection is unavailable.".to_owned()),
+            );
+            return;
+        };
+        let sender = self.sender.clone();
+        self.volume_create_task = Some(self.runtime.spawn(async move {
+            let result = engine.create_volume(&name).await;
+            #[cfg(target_os = "linux")]
+            audit::record_volume_create_result(&result);
+            if sender
+                .send(EngineEvent::VolumeCreated {
+                    generation,
+                    name,
+                    result,
+                })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
     fn load_networks(&mut self, context: egui::Context) {
         if self.loading
             || !cfg!(target_os = "linux")
@@ -1167,6 +1213,9 @@ impl FerrumApp {
 
     fn network_mutation_busy(&self) -> bool {
         self.network_task_in_flight() || self.networks.has_mutation_in_flight()
+    }
+    fn volume_mutation_busy(&self) -> bool {
+        self.volume_create_task.is_some() || self.volumes.has_mutation_in_flight()
     }
 
     fn start_network_create(&mut self, generation: u64, name: String, context: egui::Context) {
@@ -1644,7 +1693,11 @@ impl FerrumApp {
         });
     }
     fn switch_context(&mut self, selected: Option<String>, context: egui::Context) {
-        if self.loading || self.action_busy() || self.network_mutation_busy() {
+        if self.loading
+            || self.action_busy()
+            || self.network_mutation_busy()
+            || self.volume_mutation_busy()
+        {
             return;
         }
         #[cfg(target_os = "linux")]
@@ -1820,6 +1873,22 @@ impl FerrumApp {
                     );
                     self.resource_read_task = None;
                     self.start_pending_resource_read(context.clone());
+                }
+                EngineEvent::VolumeCreated {
+                    generation,
+                    name,
+                    result,
+                } => {
+                    self.volumes.finish_create(
+                        generation,
+                        &name,
+                        result.map(|_| ()).map_err(|error| error.to_string()),
+                    );
+                    self.volume_create_task = None;
+                    self.volumes.mark_list_stale();
+                    if self.page == images::AppPage::Volumes {
+                        self.load_volumes(context.clone());
+                    }
                 }
                 EngineEvent::NetworksListed { generation, result } => {
                     self.networks
@@ -2396,7 +2465,7 @@ impl FerrumApp {
         page_requested
     }
 
-    fn draw_volumes(&mut self, ui: &mut egui::Ui) -> Option<String> {
+    fn draw_volumes(&mut self, ui: &mut egui::Ui) -> Option<volumes::VolumesAction> {
         if let Some(error) = &self.context_error {
             ui.colored_label(Color32::from_rgb(224, 174, 109), "Context switch failed");
             ui.label("The previous engine connection remains active.");
@@ -2549,8 +2618,10 @@ impl FerrumApp {
                     || self.images.is_tagging()
                     || self.images.is_removing()
                     || self.image_tag_task.is_some()
-                    || self.image_remove_task.is_some()));
+                    || self.image_remove_task.is_some()))
+            || (self.page == images::AppPage::Volumes && self.volumes.is_loading());
         let network_mutation_in_flight = self.network_mutation_busy();
+        let volume_mutation_in_flight = self.volume_mutation_busy();
 
         egui::Panel::top("header")
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 14)))
@@ -2570,7 +2641,10 @@ impl FerrumApp {
                         }
                     }
                     ui.add_enabled_ui(
-                        !page_loading && !self.action_busy() && !network_mutation_in_flight,
+                        !page_loading
+                            && !self.action_busy()
+                            && !network_mutation_in_flight
+                            && !volume_mutation_in_flight,
                         |ui| {
                             let selected_name = match self.selected_context.as_deref() {
                                 Some(name) => self
@@ -2629,6 +2703,11 @@ impl FerrumApp {
                     if network_mutation_in_flight {
                         ui.label(
                             "A network mutation is in progress; context switching is disabled.",
+                        );
+                    }
+                    if volume_mutation_in_flight {
+                        ui.label(
+                            "A volume mutation is in progress; context switching is disabled.",
                         );
                     }
                     if let Some(info) = &self.engine_info {
@@ -3407,14 +3486,14 @@ impl eframe::App for FerrumApp {
         }
         let mut inspect_index = None;
         let mut image_inspection = None;
-        let mut volume_selection = None;
+        let mut volume_action = None;
         let mut network_action = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 18)))
             .show(ui, |ui| match self.page {
                 images::AppPage::Containers => inspect_index = self.draw_inventory(ui),
                 images::AppPage::Images => image_inspection = self.draw_images(ui),
-                images::AppPage::Volumes => volume_selection = self.draw_volumes(ui),
+                images::AppPage::Volumes => volume_action = self.draw_volumes(ui),
                 images::AppPage::Networks => network_action = self.draw_networks(ui),
             });
         if let Some(index) = inspect_index {
@@ -3426,8 +3505,15 @@ impl eframe::App for FerrumApp {
         if let Some(request) = image_inspection {
             self.inspect_image(request, context.clone());
         }
-        if let Some(name) = volume_selection {
-            self.inspect_volume(name, context.clone());
+        if let Some(action) = volume_action {
+            match action {
+                volumes::VolumesAction::Inspect(name) => {
+                    self.inspect_volume(name, context.clone());
+                }
+                volumes::VolumesAction::Create { generation, name } => {
+                    self.start_volume_create(generation, name, context.clone());
+                }
+            }
         }
         if let Some(action) = network_action {
             match action {
@@ -3859,6 +3945,7 @@ mod event_reconciliation_tests {
             images: images::ImagesView::default(),
             volumes: volumes::VolumesView::default(),
             networks: networks::NetworksView::default(),
+            volume_create_task: None,
             resource_read_task: None,
             pending_resource_read: None,
             image_list_task: None,
@@ -4012,6 +4099,115 @@ mod event_reconciliation_tests {
         assert!(!harness.state().networks.loaded);
         assert!(harness.state().network_create_task.is_none());
         let _success = harness.get_by_role_and_label(Role::Label, "Network 'work-net' created.");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_volume_creation_refreshes_inventory_after_page_invalidation() {
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let (mut app, sender) = app_with_open_inspection();
+        app.page = images::AppPage::Volumes;
+        let previous_generation = app.volumes.begin_list();
+        app.volumes.finish_list(previous_generation, Ok(Vec::new()));
+        app.volume_create_task = Some(app.runtime.spawn(std::future::pending()));
+        let (action_sender, action_receiver) = std::sync::mpsc::channel();
+        let mut harness = Harness::new_ui_state(
+            move |ui, app: &mut FerrumApp| {
+                let context = ui.ctx().clone();
+                app.receive_events(context);
+                if let Some(action) = app.volumes.show(ui, true, "") {
+                    let _ = action_sender.send(action);
+                }
+            },
+            app,
+        );
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::TextInput, "Volume name")
+            .focus();
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::TextInput, "Volume name")
+            .type_text("app-data");
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Create volume")
+            .click();
+        harness.step();
+        let (generation, name) = match action_receiver
+            .try_recv()
+            .expect("the Volumes UI should request creation")
+        {
+            volumes::VolumesAction::Create { generation, name } => (generation, name),
+            volumes::VolumesAction::Inspect(_) => {
+                panic!("the create button should return a create action")
+            }
+        };
+
+        harness.state_mut().volumes.invalidate();
+        harness
+            .state()
+            .runtime
+            .block_on(sender.send(EngineEvent::VolumeCreated {
+                generation,
+                name: name.clone(),
+                result: Ok(VolumeDetails {
+                    name: name.clone(),
+                    driver: None,
+                    scope: None,
+                    created_at: None,
+                    mountpoint: None,
+                }),
+            }))
+            .expect("create result should be queued");
+        harness.step();
+
+        assert!(harness.state().volumes.generation > previous_generation);
+        assert!(harness.state().volumes.loading);
+        assert!(!harness.state().volumes.loaded);
+        assert!(harness.state().volume_create_task.is_none());
+        let _success = harness.get_by_role_and_label(Role::Label, "Volume 'app-data' created.");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_volume_creation_disables_context_switching_accessibly() {
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let (mut app, _) = app_with_open_inspection();
+        app.volume_create_task = Some(app.runtime.spawn(std::future::pending()));
+
+        app.switch_context(Some("other-context".to_owned()), egui::Context::default());
+        assert!(!app.loading);
+        assert_eq!(app.selected_context, None);
+        assert!(app.volume_create_task.is_some());
+
+        let mut harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| {
+                let mut refresh_requested = false;
+                let mut settings_requested = false;
+                let mut context_requested = None;
+                app.draw_header(
+                    ui,
+                    &mut refresh_requested,
+                    &mut settings_requested,
+                    &mut context_requested,
+                );
+            },
+            app,
+        );
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(Role::ComboBox, "Docker context")
+                .accesskit_node()
+                .is_disabled()
+        );
+        let _status = harness.get_by_role_and_label(
+            Role::Label,
+            "A volume mutation is in progress; context switching is disabled.",
+        );
     }
     #[cfg(target_os = "linux")]
     #[test]

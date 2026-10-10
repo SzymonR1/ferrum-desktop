@@ -120,6 +120,20 @@ perform no mutations. UI coverage checks reported zero versus unavailable
 values, separate usage errors, and stale responses. The native Volumes page has
 not been visually validated.
 
+The optional ignored live volume-create test is mutating and requires the
+current local Docker CLI context to use a Unix socket:
+
+```sh
+cargo test -p ferrum-engine --test live_engine local_engine_creates_and_removes_unique_volume -- --exact --ignored
+```
+
+The test preflights its generated volume name and only arms cleanup after both
+the create response and a subsequent inventory confirm that exact name. It
+removes only that generated name through an argument-array Docker CLI request
+without force. If ownership cannot be confirmed, the test sends no cleanup
+request and the volume may remain. The read-only `FERRUM_TEST_VOLUME` test is
+separate. Fake-socket and headless UI tests do not contact a live engine.
+
 The optional ignored network list/inspect test is read-only and requires
 `FERRUM_TEST_NETWORK` to name an existing network on the selected local Docker
 context. It lists networks, then inspects the matching listed network ID:

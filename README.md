@@ -127,6 +127,17 @@ name is absent, then requires a full 64-character hex ID and inventory entry
 matching that ID and name before arming cleanup. If ownership cannot be
 confirmed, it sends no cleanup request and the created network may remain; once
 verified, cleanup uses only that ID in the current local Docker context.
+
+The opt-in ignored volume-create live test is mutating and requires the current
+local Docker context. It preflights its generated name and arms cleanup only
+after both the response and inventory confirm that exact name; cleanup removes
+only that generated name without force. If ownership cannot be confirmed, no
+cleanup request is sent and the volume may remain:
+
+```sh
+cargo test -p ferrum-engine --test live_engine local_engine_creates_and_removes_unique_volume -- --exact --ignored
+```
+
 Default and fake-socket tests do not contact a live engine. Native UI
 click/visual validation remains unverified; see the testing guide for exact
 commands.
@@ -143,6 +154,7 @@ An ignored lifecycle integration test is mutating; see the testing guide for its
 - [Architecture decisions](docs/decisions/)
 - [Embedded terminal guide](docs/src/user-guide/terminal.md)
 - [Networks guide](docs/src/user-guide/networks.md)
+- [Volumes guide](docs/src/user-guide/volumes.md)
 - [Performance and accessibility evidence](docs/src/performance.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 

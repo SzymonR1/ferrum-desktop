@@ -1,5 +1,7 @@
 use ferrum_core::ContainerAction;
 #[cfg(target_os = "linux")]
+use ferrum_core::VolumeDetails;
+#[cfg(target_os = "linux")]
 use ferrum_engine::EngineError;
 
 /// Emits a minimal local trace event when an engine lifecycle request returns.
@@ -144,6 +146,39 @@ pub(super) fn record_image_mutation_result(
         }
     }
 }
+#[cfg(target_os = "linux")]
+/// Emits an ephemeral volume-create outcome without resource or endpoint metadata.
+pub(super) fn record_volume_create_result(result: &Result<VolumeDetails, EngineError>) {
+    match result {
+        Ok(_) => {
+            tracing::info!(
+                target: "ferrum::audit",
+                audit_event = "volume_mutation",
+                action = "create",
+                outcome = "success",
+                "Volume creation request succeeded"
+            );
+        }
+        Err(EngineError::InvalidVolumeName) => {
+            tracing::warn!(
+                target: "ferrum::audit",
+                audit_event = "volume_mutation",
+                action = "create",
+                outcome = "not_submitted",
+                "Volume creation input was rejected before request submission"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "ferrum::audit",
+                audit_event = "volume_mutation",
+                action = "create",
+                outcome = "request_error",
+                "Volume creation request returned an error"
+            );
+        }
+    }
+}
 
 fn valid_resource_id(resource_id: &str) -> Option<&str> {
     (resource_id.len() == 64 && resource_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -152,6 +187,8 @@ fn valid_resource_id(resource_id: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::record_volume_create_result;
     #[cfg(target_os = "linux")]
     use super::{ImageMutation, record_image_mutation_result};
     use super::{NetworkMutation, record_container_action_result, record_network_mutation_result};
@@ -336,6 +373,61 @@ mod tests {
             assert!(!line.contains("tag="));
             assert!(!line.contains("endpoint_label="));
             assert!(!line.contains("local Docker Unix socket"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn records_volume_create_outcomes_without_resource_metadata() {
+        use ferrum_core::VolumeDetails;
+
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(writer.clone())
+            .finish();
+        let dispatcher = tracing::Dispatch::new(subscriber);
+        let success = Ok(VolumeDetails {
+            name: "private-volume-name".to_owned(),
+            driver: Some("local".to_owned()),
+            scope: Some("local".to_owned()),
+            created_at: Some("private-timestamp".to_owned()),
+            mountpoint: Some("/host/private/path".to_owned()),
+        });
+        let invalid = Err(EngineError::InvalidVolumeName);
+        let rejected = Err(EngineError::VolumeCreationRejected {
+            endpoint_label: "local Docker Unix socket",
+            status: 409,
+        });
+
+        tracing::dispatcher::with_default(&dispatcher, || {
+            record_volume_create_result(&success);
+            record_volume_create_result(&invalid);
+            record_volume_create_result(&rejected);
+        });
+
+        let captured = match writer.0.lock() {
+            Ok(output) => output.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let output = String::from_utf8(captured).expect("audit events should be UTF-8");
+        let events = output.lines().collect::<Vec<_>>();
+        let expected = ["success", "not_submitted", "request_error"];
+        assert_eq!(events.len(), expected.len());
+        for (line, outcome) in events.iter().zip(expected) {
+            assert!(line.contains("audit_event=\"volume_mutation\""));
+            assert!(line.contains("action=\"create\""));
+            assert!(line.contains(&format!("outcome=\"{outcome}\"")));
+        }
+        for sensitive_value in [
+            "private-volume-name",
+            "private-timestamp",
+            "/host/private/path",
+            "local Docker Unix socket",
+            "endpoint_label",
+            "mountpoint",
+        ] {
+            assert!(!output.contains(sensitive_value));
         }
     }
 }
