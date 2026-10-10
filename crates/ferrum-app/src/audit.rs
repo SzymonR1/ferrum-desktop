@@ -79,6 +79,47 @@ pub(super) fn record_network_mutation_result(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ImageMutation {
+    Pull,
+    Tag,
+    Remove,
+}
+
+impl ImageMutation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pull => "pull",
+            Self::Tag => "tag",
+            Self::Remove => "remove",
+        }
+    }
+}
+
+/// Emits a local trace event when an image mutation request returns.
+///
+/// Only the static action and request outcome are logged; image identifiers,
+/// references, and repository tags are never included.
+pub(super) fn record_image_mutation_result(action: ImageMutation, request_succeeded: bool) {
+    if request_succeeded {
+        tracing::info!(
+            target: "ferrum::audit",
+            audit_event = "image_mutation",
+            action = action.label(),
+            outcome = "success",
+            "Image mutation request succeeded"
+        );
+    } else {
+        tracing::warn!(
+            target: "ferrum::audit",
+            audit_event = "image_mutation",
+            action = action.label(),
+            outcome = "request_error",
+            "Image mutation request returned an error"
+        );
+    }
+}
+
 fn valid_resource_id(resource_id: &str) -> Option<&str> {
     (resource_id.len() == 64 && resource_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .then_some(resource_id)
@@ -86,7 +127,10 @@ fn valid_resource_id(resource_id: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NetworkMutation, record_container_action_result, record_network_mutation_result};
+    use super::{
+        ImageMutation, NetworkMutation, record_container_action_result,
+        record_image_mutation_result, record_network_mutation_result,
+    };
     use ferrum_core::ContainerAction;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;
@@ -197,5 +241,49 @@ mod tests {
             assert!(line.contains(&format!("outcome=\"{outcome}\"")));
         }
         assert!(!output.contains("TOKEN=sentinel"));
+    }
+    #[test]
+    fn records_image_mutation_action_outcomes_without_resource_metadata() {
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(writer.clone())
+            .finish();
+        let dispatcher = tracing::Dispatch::new(subscriber);
+
+        tracing::dispatcher::with_default(&dispatcher, || {
+            record_image_mutation_result(ImageMutation::Pull, true);
+            record_image_mutation_result(ImageMutation::Pull, false);
+            record_image_mutation_result(ImageMutation::Tag, true);
+            record_image_mutation_result(ImageMutation::Tag, false);
+            record_image_mutation_result(ImageMutation::Remove, true);
+            record_image_mutation_result(ImageMutation::Remove, false);
+        });
+
+        let captured = match writer.0.lock() {
+            Ok(output) => output.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let output = String::from_utf8(captured).expect("audit events should be UTF-8");
+        let events = output.lines().collect::<Vec<_>>();
+        let expected = [
+            ("pull", "success"),
+            ("pull", "request_error"),
+            ("tag", "success"),
+            ("tag", "request_error"),
+            ("remove", "success"),
+            ("remove", "request_error"),
+        ];
+        assert_eq!(events.len(), expected.len());
+        for (line, (action, outcome)) in events.iter().zip(expected) {
+            assert!(line.contains("audit_event=\"image_mutation\""));
+            assert!(line.contains(&format!("action=\"{action}\"")));
+            assert!(line.contains(&format!("outcome=\"{outcome}\"")));
+            assert!(!line.contains("image_id="));
+            assert!(!line.contains("reference="));
+            assert!(!line.contains("repository="));
+            assert!(!line.contains("tag="));
+        }
     }
 }

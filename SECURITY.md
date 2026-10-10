@@ -14,6 +14,12 @@ an active pull reader: Ferrum drains the response and keeps the mutation gate
 closed until a terminal event. Closing Ferrum does not guarantee that the
 daemon-side pull stops.
 
+Image pull, tag, and removal requests emit local structured process traces with
+only the static action and `success` or `request_error` outcome. Image IDs,
+references, repository tags, endpoints, errors, and daemon response bodies are
+not logged. These events are not persistent or tamper-proof; a request error
+does not establish that engine state remained unchanged.
+
 The Volumes page is read-only and limited to the selected local Docker Unix
 socket on Linux. It lists and inspects volumes, then makes a separate filtered
 read-only usage request; only `Size` in bytes and the point-in-time `RefCount`
