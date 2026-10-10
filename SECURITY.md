@@ -47,10 +47,13 @@ confirmation naming the network and full ID; positive or unreported counts
 cannot be submitted. The request is a bounded eight-second
 `DELETE /v{negotiated}/networks/{validated-full-id}` with no force or prune
 parameters. The count is a snapshot, not an atomic deletion guarantee, and
-Docker may reject removal if dependencies change before the request. Errors
-contain only safe endpoint/status information where applicable; raw daemon
-bodies and network IDs are not exposed. A transport error or timeout may occur
-after removal has taken effect.
+Docker may reject removal if dependencies change before the request. User-facing
+errors contain only safe endpoint/status information where applicable; raw
+daemon bodies and network IDs are never included in errors. The process trace
+records the static create/remove action, request outcome, and a network ID only
+when it is exactly 64 hexadecimal characters; it omits names, endpoints, raw
+errors, and daemon bodies and is not persistent or tamper-proof. A transport
+error or timeout may occur after removal has taken effect.
 Only one network mutation is active at a time, and context switching is blocked
 until its result arrives. Successful removal refreshes the current inventory.
 

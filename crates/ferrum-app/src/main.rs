@@ -1183,6 +1183,11 @@ impl FerrumApp {
         let sender = self.sender.clone();
         self.network_create_task = Some(self.runtime.spawn(async move {
             let result = engine.create_network(&name).await;
+            audit::record_network_mutation_result(
+                result.as_deref().ok(),
+                audit::NetworkMutation::Create,
+                result.is_ok(),
+            );
             if sender
                 .send(EngineEvent::NetworkCreated {
                     generation,
@@ -1228,6 +1233,11 @@ impl FerrumApp {
         let sender = self.sender.clone();
         self.network_remove_task = Some(self.runtime.spawn(async move {
             let result = engine.remove_network(&id).await;
+            audit::record_network_mutation_result(
+                Some(&id),
+                audit::NetworkMutation::Remove,
+                result.is_ok(),
+            );
             if sender
                 .send(EngineEvent::NetworkRemoved {
                     generation,
