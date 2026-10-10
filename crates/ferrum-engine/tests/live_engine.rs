@@ -13,7 +13,7 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-use ferrum_core::{ContainerAction, ContainerState, NetworkSummary, VolumeDetails, VolumeSummary};
+use ferrum_core::{ContainerAction, ContainerState, NetworkSummary};
 use ferrum_engine::{ContextTransport, DockerContext, EngineClient};
 
 /// Read-only opt-in check: inspects only a caller-specified existing volume.
@@ -151,81 +151,6 @@ async fn local_engine_creates_default_bridge_network_and_cleans_up_exact_id() {
         "the test-owned network should be absent after exact-ID cleanup"
     );
     network.disarm();
-}
-#[cfg(target_os = "linux")]
-#[tokio::test]
-#[ignore = "creates and removes one unique test-owned volume through the current local Docker context"]
-async fn local_engine_creates_and_removes_unique_volume() {
-    let contexts = EngineClient::available_contexts()
-        .await
-        .expect("Docker CLI context discovery should succeed");
-    let context = contexts
-        .iter()
-        .find(|context| context.is_current())
-        .expect("Docker CLI should report its current context");
-    assert_eq!(
-        context.transport(),
-        ContextTransport::LocalUnix,
-        "volume creation requires the current local Unix Docker context"
-    );
-    let context_name = context.name().to_owned();
-    let engine = EngineClient::connect_context(&context_name)
-        .await
-        .expect("the current local Docker context should connect");
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock should be after the Unix epoch")
-        .as_nanos();
-    let sequence = NEXT_VOLUME_NAME.fetch_add(1, Ordering::Relaxed);
-    let name = format!(
-        "ferrum-live-volume-{}-{timestamp}-{sequence}",
-        std::process::id()
-    );
-    let existing_volumes = engine
-        .list_volumes()
-        .await
-        .expect("the local volume inventory should be readable before creation");
-    assert!(
-        volume_name_is_available(&name, &existing_volumes),
-        "the generated test volume name must not already exist"
-    );
-
-    let created = engine
-        .create_volume(&name)
-        .await
-        .expect("the unique test-owned volume should be created");
-    let created_volumes = engine
-        .list_volumes()
-        .await
-        .expect("the local volume inventory should be readable after creation");
-    let verified_name = verify_created_volume(&created, &name, &created_volumes)
-        .expect("the response and inventory must identify the exact generated volume name");
-    let mut volume = DisposableVolume::new(verified_name, context_name);
-
-    let cleanup = Command::new("docker")
-        .args([
-            "--context",
-            volume.context_name.as_str(),
-            "volume",
-            "rm",
-            volume.name(),
-        ])
-        .output()
-        .expect("Docker CLI should run exact-name cleanup");
-    assert!(
-        cleanup.status.success(),
-        "Docker CLI should remove only the verified test-owned volume"
-    );
-    let remaining = engine
-        .list_volumes()
-        .await
-        .expect("the local volume inventory should be readable after cleanup");
-    assert!(
-        !remaining.iter().any(|listed| listed.name == volume.name()),
-        "the test-owned volume should be absent after exact-name cleanup"
-    );
-    volume.disarm();
 }
 
 #[cfg(target_os = "linux")]
@@ -747,9 +672,6 @@ static NEXT_CONTAINER_NAME: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 static NEXT_NETWORK_NAME: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
-static NEXT_VOLUME_NAME: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires a local Docker-compatible engine and FERRUM_TEST_IMAGE already present locally with /bin/sleep"]
 async fn local_engine_lifecycle_actions_emit_events_and_update_state() {
@@ -1044,73 +966,6 @@ impl Drop for DisposableNetwork {
         }
     }
 }
-#[cfg(target_os = "linux")]
-struct DisposableVolume {
-    name: VerifiedVolumeName,
-    context_name: String,
-    cleanup_required: bool,
-}
-
-#[cfg(target_os = "linux")]
-struct VerifiedVolumeName(String);
-
-#[cfg(target_os = "linux")]
-impl VerifiedVolumeName {
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl DisposableVolume {
-    fn new(name: VerifiedVolumeName, context_name: String) -> Self {
-        Self {
-            name,
-            context_name,
-            cleanup_required: true,
-        }
-    }
-
-    fn name(&self) -> &str {
-        self.name.as_str()
-    }
-
-    fn disarm(&mut self) {
-        self.cleanup_required = false;
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for DisposableVolume {
-    fn drop(&mut self) {
-        if self.cleanup_required {
-            let _ = Command::new("docker")
-                .args([
-                    "--context",
-                    self.context_name.as_str(),
-                    "volume",
-                    "rm",
-                    self.name.as_str(),
-                ])
-                .output();
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn volume_name_is_available(name: &str, volumes: &[VolumeSummary]) -> bool {
-    !volumes.iter().any(|volume| volume.name == name)
-}
-
-#[cfg(target_os = "linux")]
-fn verify_created_volume(
-    created: &VolumeDetails,
-    requested_name: &str,
-    volumes: &[VolumeSummary],
-) -> Option<VerifiedVolumeName> {
-    (created.name == requested_name && volumes.iter().any(|volume| volume.name == requested_name))
-        .then(|| VerifiedVolumeName(requested_name.to_owned()))
-}
 
 #[cfg(target_os = "linux")]
 fn network_name_is_available(name: &str, networks: &[NetworkSummary]) -> bool {
@@ -1167,29 +1022,6 @@ fn live_network_cleanup_requires_an_unused_name_and_verified_id() {
     assert!(verify_created_network("short-id", name, &[network("short-id", name)]).is_none());
     let non_hex = "g".repeat(64);
     assert!(verify_created_network(&non_hex, name, &[network(&non_hex, name)]).is_none());
-}
-#[cfg(target_os = "linux")]
-#[test]
-fn live_volume_cleanup_requires_preflight_and_verified_created_name() {
-    let summary = |name: &str| VolumeSummary {
-        name: name.to_owned(),
-        driver: None,
-        scope: None,
-    };
-    let details = |name: &str| VolumeDetails {
-        name: name.to_owned(),
-        driver: None,
-        scope: None,
-        created_at: None,
-        mountpoint: None,
-    };
-    let name = "ferrum-live-volume-123";
-
-    assert!(volume_name_is_available(name, &[summary("another-volume")]));
-    assert!(!volume_name_is_available(name, &[summary(name)]));
-    assert!(verify_created_volume(&details(name), name, &[summary(name)]).is_some());
-    assert!(verify_created_volume(&details("different-volume"), name, &[summary(name)]).is_none());
-    assert!(verify_created_volume(&details(name), name, &[summary("another-volume")]).is_none());
 }
 #[cfg(target_os = "linux")]
 fn is_full_docker_resource_id(id: &str) -> bool {

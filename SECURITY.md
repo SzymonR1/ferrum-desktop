@@ -26,8 +26,8 @@ The Volumes page is available only for the selected local Docker Unix socket
 on Linux. Creation sends only `Name` to the negotiated volume-create endpoint
 and uses Docker's default local driver; no driver, labels, or options are
 configurable. Names must be nonblank, at most 4096 UTF-8 bytes, contain no
-control characters, and not be `.` or `..`. The request body is limited to
-16 KiB, the response to 64 KiB, and the request to eight seconds. A create
+control or selected invisible formatting characters, and not be `.` or `..`.
+The request body is limited to 16 KiB, the response to 64 KiB, and the request to eight seconds. A create
 response must identify the exact requested name. Transport errors or timeouts
 may follow a successful create, so Ferrum refreshes inventory after every
 result and blocks context switching while the request is pending. Page
@@ -43,12 +43,13 @@ usage request; only `Size` in bytes and the point-in-time `RefCount` for an
 exact inventory-matched volume are displayed when reported. Missing, negative,
 or unknown metric values remain unavailable. A usage failure is shown
 separately while successful inspect metadata stays visible. Only volume name,
-driver, scope, creation time, and mountpoint are retained; the mountpoint is
-untrusted plain text and is never accessed. Labels, options, status, raw
-response bodies, and filesystem browsing are not exposed. Volume removal,
-pruning, modification, connection, and disconnection are not offered.
-Podman/rootless behavior remains unvalidated; remote endpoints remain
-unsupported.
+driver, scope, creation time, and mountpoint are retained; selected control,
+bidirectional, and invisible formatting characters in driver, scope, creation
+time, and mountpoint are escaped as visible `\u{...}` text. The mountpoint is
+never accessed. Labels, options, status, raw response bodies, and filesystem
+browsing are not exposed. Volume removal, pruning, modification, connection,
+and disconnection are not offered. Podman/rootless behavior remains
+unvalidated; remote endpoints remain unsupported.
 
 The Networks page lists and inspects networks and creates networks by name
 through the selected local Docker Unix socket on Linux. Creation sends only the

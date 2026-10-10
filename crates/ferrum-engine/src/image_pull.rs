@@ -2,7 +2,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use ferrum_core::ImagePullProgress;
+use ferrum_core::{ImagePullProgress, is_untrusted_display_character};
 use http_body_util::{BodyExt, Empty};
 use hyper::{Method, Request, body::Bytes};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -220,7 +220,7 @@ enum PullParseError {
 fn sanitize_status(status: String) -> String {
     let mut safe = String::with_capacity(status.len().min(MAX_STATUS_BYTES));
     for character in status.chars() {
-        let replacement = if is_display_control(character) {
+        let replacement = if is_untrusted_display_character(character) {
             ' '
         } else {
             character
@@ -231,27 +231,6 @@ fn sanitize_status(status: String) -> String {
         safe.push(replacement);
     }
     safe
-}
-
-fn is_display_control(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{00ad}'
-                | '\u{061c}'
-                | '\u{200b}'
-                | '\u{034f}'
-                | '\u{200c}'
-                | '\u{200d}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{180e}'
-                | '\u{2028}'
-                | '\u{2029}'
-                | '\u{feff}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2060}'..='\u{206f}'
-        )
 }
 
 #[cfg(test)]

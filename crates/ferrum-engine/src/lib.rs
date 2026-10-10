@@ -44,7 +44,7 @@ use contexts::{
 use ferrum_core::{
     ContainerAction, ContainerChange, ContainerDetails, ContainerMount, ContainerState,
     ContainerSummary, ImageDetails, ImageSummary, NetworkDetails, NetworkSummary, VolumeDetails,
-    VolumeSummary, VolumeUsage,
+    VolumeSummary, VolumeUsage, is_untrusted_display_character,
 };
 #[cfg(target_os = "linux")]
 use serde::Serialize;
@@ -1634,8 +1634,8 @@ impl EngineClient {
                         .ok_or(EngineError::VolumeInventoryUnavailable { endpoint_label })?;
                     Ok(VolumeSummary {
                         name,
-                        driver: volume.driver,
-                        scope: volume.scope,
+                        driver: volume.driver.map(escape_volume_display_text),
+                        scope: volume.scope.map(escape_volume_display_text),
                     })
                 })
                 .collect()
@@ -1674,14 +1674,16 @@ impl EngineClient {
             .map_err(|_| EngineError::VolumeInspectionUnavailable { endpoint_label })?;
             let name = response
                 .name
-                .filter(|name| !name.is_empty())
+                .filter(|returned_name| {
+                    returned_name == name && volume_name_path_safe(returned_name)
+                })
                 .ok_or(EngineError::VolumeInspectionUnavailable { endpoint_label })?;
             Ok(VolumeDetails {
                 name,
-                driver: response.driver,
-                scope: response.scope,
-                created_at: response.created_at,
-                mountpoint: response.mountpoint,
+                driver: response.driver.map(escape_volume_display_text),
+                scope: response.scope.map(escape_volume_display_text),
+                created_at: response.created_at.map(escape_volume_display_text),
+                mountpoint: response.mountpoint.map(escape_volume_display_text),
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -1748,10 +1750,10 @@ impl EngineClient {
                     .ok_or(EngineError::VolumeCreationUnavailable { endpoint_label })?;
                 Ok(VolumeDetails {
                     name,
-                    driver: response.driver,
-                    scope: response.scope,
-                    created_at: response.created_at,
-                    mountpoint: response.mountpoint,
+                    driver: response.driver.map(escape_volume_display_text),
+                    scope: response.scope.map(escape_volume_display_text),
+                    created_at: response.created_at.map(escape_volume_display_text),
+                    mountpoint: response.mountpoint.map(escape_volume_display_text),
                 })
             })
             .await
@@ -2423,11 +2425,49 @@ fn encode_query_component(value: &str) -> String {
 
 #[cfg(target_os = "linux")]
 fn volume_name_path_safe(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 4096 && !matches!(name, "." | "..")
+    !name.is_empty()
+        && name.len() <= 4096
+        && !matches!(name, "." | "..")
+        && !name.chars().any(is_untrusted_display_character)
 }
 #[cfg(target_os = "linux")]
 fn volume_create_name_safe(name: &str) -> bool {
-    !name.trim().is_empty() && volume_name_path_safe(name) && !name.chars().any(char::is_control)
+    !name.trim().is_empty() && volume_name_path_safe(name)
+}
+#[cfg(target_os = "linux")]
+fn escape_volume_display_text(value: String) -> String {
+    let escape_count = value
+        .chars()
+        .filter(|character| is_untrusted_display_character(*character))
+        .count();
+    if escape_count == 0 {
+        return value;
+    }
+    let capacity = value.len().saturating_add(escape_count.saturating_mul(7));
+    let mut escaped = String::with_capacity(capacity);
+    for character in value.chars() {
+        if is_untrusted_display_character(character) {
+            let mut code = character as u32;
+            let mut digits = [0_u8; 6];
+            let mut start = digits.len();
+            loop {
+                start -= 1;
+                digits[start] = b"0123456789abcdef"[(code & 0xf) as usize];
+                code >>= 4;
+                if code == 0 {
+                    break;
+                }
+            }
+            escaped.push_str("\\u{");
+            for digit in &digits[start..] {
+                escaped.push(char::from(*digit));
+            }
+            escaped.push('}');
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 #[cfg(target_os = "linux")]
@@ -3496,6 +3536,24 @@ mod volume_api_tests {
         assert!(!format!("{details:?}").contains("secret"));
         cleanup(&socket, &directory);
     }
+    #[tokio::test]
+    async fn volume_creation_escapes_untrusted_display_metadata() {
+        let body = br#"{"Name":"ferrum-data","Driver":"local\u202e-driver","Scope":"local\nscope","CreatedAt":"date\u200b","Mountpoint":"/host\u202e/path"}"#;
+        let (socket, directory, server) = fixture(response("201 Created", body)).await;
+        let details = client(socket.clone())
+            .create_volume("ferrum-data")
+            .await
+            .expect("the matching volume should be created");
+        server.await.expect("server should finish");
+
+        assert_eq!(details.driver.as_deref(), Some("local\\u{202e}-driver"));
+        assert_eq!(details.scope.as_deref(), Some("local\\u{a}scope"));
+        assert_eq!(details.created_at.as_deref(), Some("date\\u{200b}"));
+        assert_eq!(details.mountpoint.as_deref(), Some("/host\\u{202e}/path"));
+        assert!(!format!("{details:?}").contains('\u{202e}'));
+        assert!(!format!("{details:?}").contains('\u{200b}'));
+        cleanup(&socket, &directory);
+    }
 
     #[tokio::test]
     async fn rejects_invalid_volume_create_names_before_connecting() {
@@ -3605,6 +3663,8 @@ mod volume_api_tests {
             br#"{"Volumes":[{"Driver":"local","Scope":"local"}]}"#.as_slice(),
             br#"{"Volumes":[{"Name":"","Driver":"local","Scope":"local"}]}"#.as_slice(),
             br#"{"Volumes":[{"Name":"..","Driver":"local","Scope":"local"}]}"#.as_slice(),
+            br#"{"Volumes":[{"Name":"unsafe\u202ename","Driver":"local","Scope":"local"}]}"#
+                .as_slice(),
         ] {
             let (socket, directory, server) = fixture(response("200 OK", body)).await;
             assert!(matches!(
@@ -3637,6 +3697,37 @@ mod volume_api_tests {
             }
         );
         assert!(!format!("{details:?}").contains("secret"));
+        cleanup(&socket, &directory);
+    }
+    #[tokio::test]
+    async fn volume_inspection_escapes_metadata_and_requires_exact_name() {
+        let body = br#"{"Name":"data","Driver":"local\u202e-driver","Scope":"local\nscope","CreatedAt":"date\u200b","Mountpoint":"/host\u202e/path"}"#;
+        let (socket, directory, server) = fixture(response("200 OK", body)).await;
+        let details = client(socket.clone())
+            .inspect_volume("data")
+            .await
+            .expect("matching volume details should be safe to display");
+        server.await.expect("server should finish");
+
+        assert_eq!(details.driver.as_deref(), Some("local\\u{202e}-driver"));
+        assert_eq!(details.scope.as_deref(), Some("local\\u{a}scope"));
+        assert_eq!(details.created_at.as_deref(), Some("date\\u{200b}"));
+        assert_eq!(details.mountpoint.as_deref(), Some("/host\\u{202e}/path"));
+        assert!(!format!("{details:?}").contains('\u{202e}'));
+        cleanup(&socket, &directory);
+
+        let (socket, directory, server) =
+            fixture(response("200 OK", br#"{"Name":"other-volume"}"#)).await;
+        let error = client(socket.clone())
+            .inspect_volume("data")
+            .await
+            .expect_err("inspect response must identify the requested name");
+        server.await.expect("server should finish");
+        assert!(matches!(
+            error,
+            EngineError::VolumeInspectionUnavailable { .. }
+        ));
+        assert!(!error.to_string().contains("other-volume"));
         cleanup(&socket, &directory);
     }
 
@@ -5314,5 +5405,198 @@ mod network_api_tests {
             server.await.expect("server");
             cleanup(&socket, &directory);
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod live_volume_create_tests {
+    use super::*;
+    use std::{
+        process::Command,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static NEXT_VOLUME_NAME: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test]
+    #[ignore = "creates and removes one unique volume through the exact local Unix socket used by EngineClient"]
+    async fn local_engine_creates_and_removes_unique_volume() {
+        let contexts = EngineClient::available_contexts()
+            .await
+            .expect("Docker CLI context discovery should succeed");
+        let context = contexts
+            .iter()
+            .find(|context| context.is_current())
+            .expect("Docker CLI should report its current context");
+        assert_eq!(
+            context.transport(),
+            ContextTransport::LocalUnix,
+            "volume creation requires the current local Unix Docker context"
+        );
+        let socket_path = context
+            .socket_path()
+            .expect("a local Unix context should expose its socket path internally")
+            .to_path_buf();
+        let socket_uri = format!(
+            "unix://{}",
+            socket_path
+                .to_str()
+                .expect("the local socket path should be valid UTF-8")
+        );
+        let engine =
+            EngineClient::connect_unix_socket(&socket_path, "selected local Docker Unix socket")
+                .await
+                .expect("the exact current local Docker socket should connect");
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let sequence = NEXT_VOLUME_NAME.fetch_add(1, Ordering::Relaxed);
+        let name = format!(
+            "ferrum-live-volume-{}-{timestamp}-{sequence}",
+            std::process::id()
+        );
+        let existing_volumes = engine
+            .list_volumes()
+            .await
+            .expect("the local volume inventory should be readable before creation");
+        assert!(
+            volume_name_is_available(&name, &existing_volumes),
+            "the generated test volume name must not already exist"
+        );
+
+        let created = engine
+            .create_volume(&name)
+            .await
+            .expect("the unique test-owned volume should be created");
+        let created_volumes = engine
+            .list_volumes()
+            .await
+            .expect("the local volume inventory should be readable after creation");
+        let verified_name = verify_created_volume(&created, &name, &created_volumes)
+            .expect("the response and inventory must identify the exact generated volume name");
+        let mut volume = DisposableVolume::new(verified_name, socket_uri);
+
+        let cleanup = Command::new("docker")
+            .args(["--host", volume.socket_uri(), "volume", "rm", volume.name()])
+            .env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_HOST")
+            .env_remove("DOCKER_TLS_VERIFY")
+            .env_remove("DOCKER_CERT_PATH")
+            .output()
+            .expect("Docker CLI should run cleanup against the pinned local socket");
+        volume.disarm();
+        assert!(
+            cleanup.status.success(),
+            "Docker CLI should remove only the verified test-owned volume"
+        );
+
+        let remaining = engine
+            .list_volumes()
+            .await
+            .expect("the local volume inventory should be readable after cleanup");
+        assert!(
+            !remaining.iter().any(|listed| listed.name == volume.name()),
+            "the test-owned volume should be absent after exact-name cleanup"
+        );
+    }
+
+    struct DisposableVolume {
+        name: VerifiedVolumeName,
+        socket_uri: String,
+        cleanup_required: bool,
+    }
+
+    struct VerifiedVolumeName(String);
+
+    impl VerifiedVolumeName {
+        fn as_str(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl DisposableVolume {
+        fn new(name: VerifiedVolumeName, socket_uri: String) -> Self {
+            Self {
+                name,
+                socket_uri,
+                cleanup_required: true,
+            }
+        }
+
+        fn name(&self) -> &str {
+            self.name.as_str()
+        }
+
+        fn socket_uri(&self) -> &str {
+            &self.socket_uri
+        }
+
+        fn disarm(&mut self) {
+            self.cleanup_required = false;
+        }
+    }
+
+    impl Drop for DisposableVolume {
+        fn drop(&mut self) {
+            if self.cleanup_required {
+                let _ = Command::new("docker")
+                    .args([
+                        "--host",
+                        self.socket_uri.as_str(),
+                        "volume",
+                        "rm",
+                        self.name.as_str(),
+                    ])
+                    .env_remove("DOCKER_CONTEXT")
+                    .env_remove("DOCKER_HOST")
+                    .env_remove("DOCKER_TLS_VERIFY")
+                    .env_remove("DOCKER_CERT_PATH")
+                    .output();
+            }
+        }
+    }
+
+    fn volume_name_is_available(name: &str, volumes: &[VolumeSummary]) -> bool {
+        !volumes.iter().any(|volume| volume.name == name)
+    }
+
+    fn verify_created_volume(
+        created: &VolumeDetails,
+        requested_name: &str,
+        volumes: &[VolumeSummary],
+    ) -> Option<VerifiedVolumeName> {
+        (created.name == requested_name
+            && volumes.iter().any(|volume| volume.name == requested_name))
+        .then(|| VerifiedVolumeName(requested_name.to_owned()))
+    }
+
+    #[test]
+    fn live_volume_cleanup_requires_preflight_and_verified_created_name() {
+        let summary = |name: &str| VolumeSummary {
+            name: name.to_owned(),
+            driver: None,
+            scope: None,
+        };
+        let details = |name: &str| VolumeDetails {
+            name: name.to_owned(),
+            driver: None,
+            scope: None,
+            created_at: None,
+            mountpoint: None,
+        };
+        let name = "ferrum-live-volume-123";
+
+        assert!(volume_name_is_available(name, &[summary("another-volume")]));
+        assert!(!volume_name_is_available(name, &[summary(name)]));
+        assert!(verify_created_volume(&details(name), name, &[summary(name)]).is_some());
+        assert!(
+            verify_created_volume(&details("different-volume"), name, &[summary(name)]).is_none()
+        );
+        assert!(
+            verify_created_volume(&details(name), name, &[summary("another-volume")]).is_none()
+        );
     }
 }

@@ -3,16 +3,18 @@
 The Volumes page lists and inspects volumes for the selected local Docker Unix
 socket on Linux. Select a volume to inspect its name, optional driver, scope,
 creation time, and host mountpoint. Missing optional fields are shown as not
-reported. Ferrum displays the mountpoint as untrusted text and does not open,
-read, or browse that path.
+reported. Selected controls and invisible formatting characters in driver,
+scope, creation time, and mountpoint are shown as visible `\u{...}` escapes;
+unsafe volume names are rejected. Ferrum displays the mountpoint as untrusted
+text and does not open, read, or browse that path.
 
 ## Create a volume
 
 The create form sends only `Name` to the negotiated
 `POST /v{api}/volumes/create` endpoint. Docker selects its default local volume
 driver; driver, labels, and options are not configurable. Names must be
-nonblank, at most 4096 UTF-8 bytes, contain no control characters, and not be
-`.` or `..`. The request body is limited to 16 KiB and the response to 64 KiB.
+nonblank, at most 4096 UTF-8 bytes, contain no control or selected invisible
+formatting characters, and not be `.` or `..`. The request body is limited to 16 KiB and the response to 64 KiB.
 A successful response must identify the requested name. Requests have an
 eight-second bound; a timeout or transport error can occur after Docker has
 created the volume. Ferrum refreshes the inventory after every create result
@@ -56,15 +58,17 @@ read-only and does not clean up resources:
 FERRUM_TEST_VOLUME=my-existing-volume cargo test -p ferrum-engine --test live_engine local_engine_lists_and_inspects_existing_volume_read_only -- --exact --ignored
 ```
 
-The optional ignored create test creates a uniquely named volume on the
-current local Docker context. It preflights the generated name and arms cleanup
-only after both the create response and inventory confirm that exact name. It
-removes only that generated name through an argument-array Docker CLI request
-without force; if ownership cannot be confirmed, the test sends no cleanup
-request and the volume may remain:
+The optional ignored create test creates a uniquely named volume through the
+current local Docker context. EngineClient and cleanup use the exact same local
+Unix socket path; cleanup passes it to Docker CLI as an argument-array
+`--host unix://...` option and never uses force. The test preflights the
+generated name and arms cleanup only after both the create response and
+inventory confirm that exact name. If ownership cannot be confirmed, no cleanup
+is sent. Once a cleanup command has returned, the guard is disarmed; a failed
+command is not retried by name and the volume may remain:
 
 ```sh
-cargo test -p ferrum-engine --test live_engine local_engine_creates_and_removes_unique_volume -- --exact --ignored
+cargo test -p ferrum-engine live_volume_create_tests::local_engine_creates_and_removes_unique_volume -- --exact --ignored
 ```
 
 Default fake-socket and headless UI tests do not contact a live engine. See the

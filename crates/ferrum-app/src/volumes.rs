@@ -1,6 +1,6 @@
 use crate::search::CaseInsensitiveQuery;
 use eframe::egui;
-use ferrum_core::{VolumeDetails, VolumeSummary, VolumeUsage};
+use ferrum_core::{VolumeDetails, VolumeSummary, VolumeUsage, is_untrusted_display_character};
 
 const ROW_HEIGHT: f32 = 34.0;
 const MAX_VOLUME_NAME_BYTES: usize = 4096;
@@ -9,7 +9,7 @@ fn valid_volume_name(name: &str) -> bool {
     !name.trim().is_empty()
         && name.len() <= MAX_VOLUME_NAME_BYTES
         && !matches!(name, "." | "..")
-        && !name.chars().any(char::is_control)
+        && !name.chars().any(is_untrusted_display_character)
 }
 
 pub(super) enum VolumeInspectionResult {
@@ -275,7 +275,7 @@ impl VolumesView {
             .labelled_by(name_label.id);
             let name_is_valid = valid_volume_name(&self.create_name);
             if !self.create_name.is_empty() && !name_is_valid {
-                ui.label("Enter a non-whitespace volume name up to 4096 UTF-8 bytes without control characters; '.' and '..' are not allowed.");
+                ui.label("Enter a non-whitespace volume name up to 4096 UTF-8 bytes without control or invisible formatting characters; '.' and '..' are not allowed.");
             }
             if ui
                 .add_enabled(
@@ -808,7 +808,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn volume_create_form_enforces_name_boundaries_accessibly() {
-        for invalid_name in ["  ", ".", "..", "line\nbreak"] {
+        for invalid_name in ["  ", ".", "..", "line\nbreak", "name\u{202e}"] {
             let view = VolumesView {
                 create_name: invalid_name.to_owned(),
                 ..VolumesView::default()

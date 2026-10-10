@@ -2,6 +2,32 @@
 
 //! Ferrum's engine-independent domain model.
 
+/// Returns whether a character can disrupt the visible identity or layout of plain text.
+///
+/// This includes control characters and selected bidirectional, zero-width, and
+/// invisible formatting characters used in untrusted engine text.
+#[must_use]
+pub fn is_untrusted_display_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{200b}'
+                | '\u{034f}'
+                | '\u{200c}'
+                | '\u{200d}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{180e}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{feff}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+        )
+}
+
 /// A container lifecycle state reported by a Docker-compatible engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContainerState {
