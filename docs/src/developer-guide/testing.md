@@ -127,8 +127,15 @@ cargo test -p ferrum-engine volume_api_tests
 
 Headless Volumes UI and fake-socket protocol tests need no live engine and
 perform no mutations. UI coverage checks reported zero versus unavailable
-values, separate usage errors, and stale responses. The native Volumes page has
-not been visually validated.
+values, separate usage errors, and stale responses. Headless AccessKit volume
+cases verify names and optional driver, scope, creation-time, and host-
+mountpoint details are escaped and bounded to 4 KiB of raw or escaped text;
+over-limit text is omitted. Raw names stay exact for identity and requests, and
+the mountpoint is never accessed. The volume display cases include
+`engine_supplied_volume_names_are_escaped_before_accessible_rendering`,
+`oversized_engine_volume_names_are_omitted_from_accessible_rendering`, and
+`oversized_engine_volume_details_are_omitted_from_accessible_rendering`.
+The native Volumes page has not been visually validated.
 
 The optional ignored live volume create/remove test is mutating and requires
 the current local Docker CLI context to use a Unix socket:
@@ -273,11 +280,23 @@ cargo test -p ferrum-app --bin ferrum log_buffer_tests
 
 Headless AccessKit tests verify visible escaping for engine-controlled container
 inventory and inspection fields, image tags/inspection author/tag-confirmation
-IDs, network names/metadata, and attached-container names in
-membership/confirmation labels. They also verify network actions submit exact
-IDs and image tagging submits the original image ID. Engine-sourced fields
-whose raw or escaped text exceeds the 4 KiB limit are omitted. These tests use
-in-memory view state and do not contact an engine. Run them with:
+IDs, network names/metadata, attached-container names in membership/confirmation
+labels, and engine-supplied volume names and optional details in their
+accessible display surfaces. They also verify network actions submit exact IDs,
+image tagging submits the original image ID, and volume names remain raw for
+identity and request values. Engine-sourced fields whose raw or escaped text
+exceeds the 4 KiB limit are omitted. The volume-specific cases are
+`engine_supplied_volume_names_are_escaped_before_accessible_rendering`,
+`oversized_engine_volume_names_are_omitted_from_accessible_rendering`, and
+`oversized_engine_volume_details_are_omitted_from_accessible_rendering`. These
+tests use in-memory view state, do not access mountpoints, and do not contact an
+engine. Run the volume display regressions with:
+
+```sh
+cargo test -p ferrum-app --bin ferrum volume_details
+```
+
+Run the other display-safety checks with:
 
 ```sh
 cargo test -p ferrum-core --test display_safety
@@ -285,6 +304,7 @@ cargo test -p ferrum-app --bin ferrum display::tests
 cargo test -p ferrum-app --bin ferrum untrusted
 cargo test -p ferrum-app --bin ferrum engine_image_id_is_escaped_in_tag_confirmation_and_request_preserves_exact_id
 cargo test -p ferrum-app --bin ferrum engine_network_and_container_text_is_escaped_before_accessible_display
+cargo test -p ferrum-app --bin ferrum volume_names
 ```
 
 The engine integration targets Linux local Unix sockets. Podman/rootless

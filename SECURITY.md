@@ -7,14 +7,18 @@ bidirectional, zero-width, and invisible formatting characters before rendering,
 clipboard copy, and file export. This reduces display spoofing but does not
 detect or redact arbitrary data printed by a container.
 Engine-provided container names, image identifiers/tags/inspection fields,
-network names/metadata, and attached-container names are untrusted. Ferrum
-escapes selected control, bidirectional, zero-width, invisible-format, Unicode
-tag, and Hangul filler characters in resource rows, details, and
-membership/confirmation labels. Each engine-sourced display field is limited
-to 4 KiB of raw or escaped text; values beyond that are shown as `[display
-text omitted]`. Escaping is presentation-only; original values remain for
-comparisons and requests. It does not detect or redact secrets or arbitrary
-log content.
+network names/metadata, attached-container names, and volume names and optional
+volume detail values are untrusted. Ferrum escapes selected control,
+bidirectional, zero-width, invisible-format, Unicode-tag, and Hangul-filler
+characters in resource rows, details, and membership/confirmation labels. Each
+engine-sourced display field is limited to 4 KiB of raw or escaped text; values
+beyond that are shown as `[display text omitted]`. Volume names receive this
+protection in the virtualized list button/accessibility label, details heading,
+removal confirmation, in-progress label, and success label. Optional volume
+detail values (driver, scope, creation time, and host mountpoint) use the same
+bounded UI display helper. Escaping is presentation-only; raw names remain
+unchanged for identity comparisons and requests. The mountpoint is never
+accessed. This does not detect or redact secrets or arbitrary log content.
 
 ## Reporting a vulnerability
 
@@ -59,10 +63,14 @@ exact inventory-matched volume are displayed when reported. Missing, negative,
 or unknown metric values remain unavailable. A usage failure is shown
 separately while successful inspect metadata stays visible. Only volume name,
 driver, scope, creation time, and mountpoint are retained; selected control,
-bidirectional, and invisible formatting characters in optional display fields
-are escaped as visible `\u{...}` text. The mountpoint is never accessed.
-Labels, options, status, raw response bodies, and filesystem browsing are not
-exposed.
+bidirectional, invisible-format, Unicode-tag, and Hangul-filler characters in
+volume names are escaped at UI display boundaries, with raw-or-escaped text
+capped at 4 KiB and longer text shown as `[display text omitted]`. Raw names
+remain unchanged for identity comparisons and API request values. Selected
+control, bidirectional, and invisible formatting characters in optional
+display fields are escaped as visible `\u{...}` text. The mountpoint is never
+accessed. Labels, options, status, raw response bodies, and filesystem browsing
+are not exposed.
 
 Removal is offered only for a listed volume with a matching inspection and an
 exact-name usage snapshot reporting `RefCount == 0`; positive, missing, or
@@ -128,6 +136,6 @@ endpoints, error text, and daemon bodies are excluded. These process traces are
 not persistent or tamper-proof. Only one network mutation may be active, and
 context switching is blocked until it returns. Network usage statistics and
 credential access are not provided. Podman/rootless and remote endpoints
-remain unsupported or unvalidated. Issues #17 and #10 remain open; no release
-is claimed.
+remain unsupported or unvalidated. Issues #17, #19, and #10 remain open; no
+release is claimed.
 
