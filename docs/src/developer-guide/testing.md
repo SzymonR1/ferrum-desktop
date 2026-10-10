@@ -122,7 +122,7 @@ items produce unavailable usage, never a false zero-reference result. Run the
 focused regression with:
 
 ```sh
-cargo test -p ferrum-engine volume_api_tests::leaves_ambiguous_duplicate_volume_usage_unavailable -- --exact
+cargo test -p ferrum-engine volume_api_tests
 ```
 
 Headless Volumes UI and fake-socket protocol tests need no live engine and
