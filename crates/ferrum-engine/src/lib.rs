@@ -200,16 +200,23 @@ impl<'de, 'a> Visitor<'de> for VolumeUsageResponseVisitor<'a> {
         A: MapAccess<'de>,
     {
         let mut usage = None;
+        let mut volume_usage_seen = false;
+        let mut ambiguous = false;
         while let Some(field) = map.next_key::<String>()? {
             if field == "VolumeUsage" {
-                usage = map.next_value_seed(VolumeUsageInventorySeed {
+                let value = map.next_value_seed(VolumeUsageInventorySeed {
                     requested_name: self.requested_name,
                 })?;
+                ambiguous |= volume_usage_seen;
+                volume_usage_seen = true;
+                if !ambiguous {
+                    usage = value;
+                }
             } else {
                 map.next_value::<IgnoredAny>()?;
             }
         }
-        Ok(usage)
+        Ok(if ambiguous { None } else { usage })
     }
 }
 
@@ -250,16 +257,23 @@ impl<'de, 'a> Visitor<'de> for VolumeUsageInventoryVisitor<'a> {
         A: MapAccess<'de>,
     {
         let mut usage = None;
+        let mut items_seen = false;
+        let mut ambiguous = false;
         while let Some(field) = map.next_key::<String>()? {
             if field == "Items" {
-                usage = map.next_value_seed(VolumeUsageItemsSeed {
+                let value = map.next_value_seed(VolumeUsageItemsSeed {
                     requested_name: self.requested_name,
                 })?;
+                ambiguous |= items_seen;
+                items_seen = true;
+                if !ambiguous {
+                    usage = value;
+                }
             } else {
                 map.next_value::<IgnoredAny>()?;
             }
         }
-        Ok(usage)
+        Ok(if ambiguous { None } else { usage })
     }
 
     fn visit_none<E>(self) -> Result<Self::Value, E>
@@ -314,14 +328,26 @@ impl<'de, 'a> Visitor<'de> for VolumeUsageItemsVisitor<'a> {
         A: SeqAccess<'de>,
     {
         let mut usage = None;
+        let mut ambiguous_match = false;
         while let Some(item_usage) = items.next_element_seed(VolumeUsageItemSeed {
             requested_name: self.requested_name,
         })? {
-            if usage.is_none() {
-                usage = item_usage;
+            if let Some(item_usage) = item_usage {
+                if usage.is_some() {
+                    ambiguous_match = true;
+                } else {
+                    usage = Some(item_usage);
+                }
             }
         }
-        Ok(usage)
+        if ambiguous_match {
+            Ok(Some(VolumeUsage {
+                size_bytes: None,
+                reference_count: None,
+            }))
+        } else {
+            Ok(usage)
+        }
     }
 
     fn visit_none<E>(self) -> Result<Self::Value, E>
@@ -376,24 +402,47 @@ impl<'de, 'a> Visitor<'de> for VolumeUsageItemVisitor<'a> {
         A: MapAccess<'de>,
     {
         let mut matches_requested_name = None;
+        let mut name_seen = false;
+        let mut requested_name_seen = false;
+        let mut usage_data_seen = false;
+        let mut ambiguous = false;
         let mut usage_data = None;
         while let Some(field) = map.next_key::<String>()? {
             match field.as_str() {
                 "Name" => {
                     let name = map.next_value::<Option<String>>()?;
-                    matches_requested_name = Some(name.as_deref() == Some(self.requested_name));
+                    let matches = name.as_deref() == Some(self.requested_name);
+                    ambiguous |= name_seen;
+                    name_seen = true;
+                    requested_name_seen |= matches;
+                    matches_requested_name = Some(matches);
+                    if !matches {
+                        usage_data = None;
+                    }
                 }
                 "UsageData" if matches_requested_name == Some(false) => {
                     map.next_value::<IgnoredAny>()?;
                 }
-                "UsageData" => usage_data = map.next_value::<Option<VolumeUsageData>>()?,
+                "UsageData" => {
+                    let value = map.next_value::<Option<VolumeUsageData>>()?;
+                    ambiguous |= usage_data_seen;
+                    usage_data_seen = true;
+                    if !ambiguous {
+                        usage_data = value;
+                    }
+                }
                 _ => {
                     map.next_value::<IgnoredAny>()?;
                 }
             }
         }
 
-        let usage = if matches_requested_name == Some(true) {
+        let usage = if requested_name_seen && ambiguous {
+            Some(VolumeUsage {
+                size_bytes: None,
+                reference_count: None,
+            })
+        } else if matches_requested_name == Some(true) {
             Some(VolumeUsage {
                 size_bytes: usage_data
                     .as_ref()
@@ -4078,6 +4127,48 @@ mod volume_api_tests {
         );
         assert!(!format!("{usage:?}").contains("secret"));
         cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn leaves_ambiguous_duplicate_volume_usage_unavailable() {
+        for body in [
+            br#"{"VolumeUsage":{"Items":[{"Name":"data","UsageData":{"Size":7,"RefCount":0},"Name":"other","Name":"data"}]}}"#.as_slice(),
+            br#"{"VolumeUsage":{"Items":[{"Name":"data","UsageData":{"Size":7,"RefCount":0},"UsageData":{"Size":9,"RefCount":2}}]}}"#.as_slice(),
+            br#"{"VolumeUsage":{"Items":[{"Name":"data","UsageData":{"Size":7,"RefCount":0}},{"Name":"data","UsageData":{"Size":9,"RefCount":2}}]}}"#.as_slice(),
+        ] {
+            let (socket, directory, server) = fixture(response("200 OK", body)).await;
+            assert_eq!(
+                client(socket.clone())
+                    .volume_usage("data")
+                    .await
+                    .expect("valid HTTP response with ambiguous usage"),
+                Some(VolumeUsage {
+                    size_bytes: None,
+                    reference_count: None,
+                })
+            );
+            server.await.expect("server should finish");
+            cleanup(&socket, &directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_volume_usage_envelopes() {
+        for body in [
+            br#"{"VolumeUsage":{"Items":[{"Name":"data","UsageData":{"Size":7,"RefCount":3}}]},"VolumeUsage":{"Items":[{"Name":"data","UsageData":{"Size":7,"RefCount":0}}]}}"#.as_slice(),
+            br#"{"VolumeUsage":{"Items":[{"Name":"data","UsageData":{"Size":7,"RefCount":3}}],"Items":[{"Name":"data","UsageData":{"Size":7,"RefCount":0}}]}}"#.as_slice(),
+        ] {
+            let (socket, directory, server) = fixture(response("200 OK", body)).await;
+            assert_eq!(
+                client(socket.clone())
+                    .volume_usage("data")
+                    .await
+                    .expect("valid HTTP response with duplicate wrapper"),
+                None
+            );
+            server.await.expect("server should finish");
+            cleanup(&socket, &directory);
+        }
     }
 
     #[tokio::test]

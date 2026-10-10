@@ -115,6 +115,16 @@ response limit. Only volume-usage calls receive this longer bound; volume list
 and inspect requests retain their existing eight-second timeout. This opt-in
 test remains read-only: it does not create, remove, modify, or clean up any
 resource.
+
+Fake-socket regressions verify that duplicate/conflicting volume-usage
+`VolumeUsage`, `Items`, `Name`, and `UsageData` keys plus repeated exact-name
+items produce unavailable usage, never a false zero-reference result. Run the
+focused regression with:
+
+```sh
+cargo test -p ferrum-engine volume_api_tests
+```
+
 Headless Volumes UI and fake-socket protocol tests need no live engine and
 perform no mutations. UI coverage checks reported zero versus unavailable
 values, separate usage errors, and stale responses. The native Volumes page has
