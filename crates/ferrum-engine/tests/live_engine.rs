@@ -671,7 +671,6 @@ async fn assert_context_connects_and_returns_a_valid_inventory(context: &DockerC
 static NEXT_CONTAINER_NAME: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 static NEXT_NETWORK_NAME: AtomicU64 = AtomicU64::new(0);
-
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires a local Docker-compatible engine and FERRUM_TEST_IMAGE already present locally with /bin/sleep"]

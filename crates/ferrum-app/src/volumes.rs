@@ -1,14 +1,28 @@
 use crate::search::CaseInsensitiveQuery;
 use eframe::egui;
-use ferrum_core::{VolumeDetails, VolumeSummary, VolumeUsage};
+use ferrum_core::{VolumeDetails, VolumeSummary, VolumeUsage, is_untrusted_display_character};
 
 const ROW_HEIGHT: f32 = 34.0;
+const MAX_VOLUME_NAME_BYTES: usize = 4096;
+
+fn valid_volume_name(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name.len() <= MAX_VOLUME_NAME_BYTES
+        && !matches!(name, "." | "..")
+        && !name.chars().any(is_untrusted_display_character)
+}
+
 pub(super) enum VolumeInspectionResult {
     InspectionFailed(String),
     Inspected {
         details: VolumeDetails,
         usage_result: Result<Option<VolumeUsage>, String>,
     },
+}
+
+pub(super) enum VolumesAction {
+    Inspect(String),
+    Create { generation: u64, name: String },
 }
 
 #[derive(Default)]
@@ -20,6 +34,11 @@ pub(super) struct VolumesView {
     selected: Option<String>,
     details: Option<VolumeDetails>,
     usage: Option<VolumeUsage>,
+    create_name: String,
+    create_generation: u64,
+    creating: bool,
+    create_success: Option<String>,
+    create_error: Option<String>,
     pub(super) loading: bool,
     pub(super) loaded: bool,
     inspecting: bool,
@@ -34,6 +53,11 @@ impl VolumesView {
     pub(super) fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.inspection_generation = self.inspection_generation.wrapping_add(1);
+        if !self.creating {
+            self.create_generation = self.create_generation.wrapping_add(1);
+            self.create_success = None;
+            self.create_error = None;
+        }
         self.volumes.clear();
         self.visible.clear();
         self.selected = None;
@@ -125,8 +149,78 @@ impl VolumesView {
             }
         }
     }
+    fn begin_create(&mut self) -> Option<VolumesAction> {
+        if self.creating || !valid_volume_name(&self.create_name) {
+            return None;
+        }
+        self.create_generation = self.create_generation.wrapping_add(1);
+        self.creating = true;
+        self.create_success = None;
+        self.create_error = None;
+        Some(VolumesAction::Create {
+            generation: self.create_generation,
+            name: self.create_name.clone(),
+        })
+    }
+
+    pub(super) fn creation_is_pending(&self, generation: u64, name: &str) -> bool {
+        self.creating && self.create_generation == generation && self.create_name == name
+    }
+
+    pub(super) fn cancel_create_submission(&mut self, generation: u64) {
+        if self.creating && self.create_generation == generation {
+            self.creating = false;
+        }
+    }
+
+    pub(super) fn finish_create(
+        &mut self,
+        generation: u64,
+        name: &str,
+        result: Result<(), String>,
+    ) -> bool {
+        if !self.creation_is_pending(generation, name) {
+            return false;
+        }
+        self.creating = false;
+        match result {
+            Ok(()) => {
+                self.create_success = Some(name.to_owned());
+                self.create_error = None;
+                if self.create_name == name {
+                    self.create_name.clear();
+                }
+            }
+            Err(error) => {
+                self.create_success = None;
+                self.create_error = Some(error);
+            }
+        }
+        true
+    }
+
+    pub(super) fn has_mutation_in_flight(&self) -> bool {
+        self.creating
+    }
+
+    pub(super) fn mark_list_stale(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.inspection_generation = self.inspection_generation.wrapping_add(1);
+        self.loading = false;
+        self.loaded = false;
+        self.volumes.clear();
+        self.visible.clear();
+        self.selected = None;
+        self.details = None;
+        self.usage = None;
+        self.inspecting = false;
+        self.error = None;
+        self.detail_error = None;
+        self.usage_error = None;
+    }
+
     pub(super) fn is_loading(&self) -> bool {
-        self.loading || self.inspecting
+        self.loading || self.inspecting || self.creating
     }
 
     fn rebuild_visible(&mut self) {
@@ -144,16 +238,59 @@ impl VolumesView {
         ui: &mut egui::Ui,
         supported: bool,
         connection_message: &str,
-    ) -> Option<String> {
+    ) -> Option<VolumesAction> {
         ui.heading("Volumes");
-        ui.label("Read-only inventory for the selected local Docker Unix socket on Linux.");
-        ui.label("Create, remove, connect, and disconnect operations are not offered.");
+        ui.label(
+            "Inventory and name-only creation for the selected local Docker Unix socket on Linux.",
+        );
+        ui.label("Creation uses Docker's default local driver. Removal, pruning, modification, connection, and disconnection are not offered.");
         if !supported {
             ui.label(format!(
                 "Volumes require a connected local Docker Unix socket on Linux. {connection_message}"
             ));
             return None;
         }
+
+        let mut action = None;
+        let mut create_requested = false;
+        ui.group(|ui| {
+            ui.heading("Create a volume");
+            ui.label("Ferrum sends only the name; driver, labels, and options are not configurable.");
+            if self.creating {
+                ui.spinner();
+                ui.label("Creating volume…");
+            }
+            if let Some(name) = &self.create_success {
+                ui.label(format!("Volume '{name}' created."));
+            }
+            if let Some(error) = &self.create_error {
+                ui.colored_label(egui::Color32::LIGHT_RED, "Could not create volume:");
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+            let name_label = ui.label("Volume name");
+            ui.add_enabled(
+                !self.creating,
+                egui::TextEdit::singleline(&mut self.create_name),
+            )
+            .labelled_by(name_label.id);
+            let name_is_valid = valid_volume_name(&self.create_name);
+            if !self.create_name.is_empty() && !name_is_valid {
+                ui.label("Enter a non-whitespace volume name up to 4096 UTF-8 bytes without control or invisible formatting characters; '.' and '..' are not allowed.");
+            }
+            if ui
+                .add_enabled(
+                    !self.creating && name_is_valid,
+                    egui::Button::new("Create volume"),
+                )
+                .clicked()
+            {
+                create_requested = true;
+            }
+        });
+        if create_requested {
+            action = self.begin_create();
+        }
+        ui.separator();
 
         let search_label = ui.label("Search volumes");
         let search = ui.text_edit_singleline(&mut self.query);
@@ -236,7 +373,12 @@ impl VolumesView {
                 );
             }
         }
-        selected
+        if action.is_none()
+            && let Some(name) = selected
+        {
+            action = Some(VolumesAction::Inspect(name));
+        }
+        action
     }
 }
 
@@ -244,7 +386,10 @@ impl VolumesView {
 mod tests {
     use super::*;
     use egui::accesskit::Role;
-    use egui_kittest::{Harness, kittest::Queryable};
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT, Queryable},
+    };
 
     fn summary(name: &str) -> VolumeSummary {
         VolumeSummary {
@@ -294,8 +439,7 @@ mod tests {
     fn harness_for(view: VolumesView, supported: bool) -> Harness<'static, VolumesView> {
         Harness::new_ui_state(
             move |ui, view: &mut VolumesView| {
-                let selection = view.show(ui, supported, "offline");
-                if let Some(name) = selection {
+                if let Some(VolumesAction::Inspect(name)) = view.show(ui, supported, "offline") {
                     view.begin_inspection(name);
                 }
             },
@@ -588,5 +732,175 @@ mod tests {
         harness.run();
         let _target = harness.get_by_role_and_label(Role::Button, "target-volume");
         assert_eq!(harness.state().visible.len(), 1);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_volume_creation_survives_page_invalidation() {
+        let mut view = VolumesView {
+            create_name: "ferrum-data".to_owned(),
+            ..VolumesView::default()
+        };
+        let VolumesAction::Create { generation, name } =
+            view.begin_create().expect("a valid name should submit")
+        else {
+            panic!("the valid volume name should return a create action");
+        };
+
+        view.invalidate();
+
+        assert!(view.creation_is_pending(generation, &name));
+        assert!(view.has_mutation_in_flight());
+        assert!(view.begin_create().is_none());
+        assert!(view.finish_create(generation, &name, Ok(())));
+        assert_eq!(view.create_success.as_deref(), Some("ferrum-data"));
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accessible_create_volume_form_submits_name_and_announces_success() {
+        let (action_sender, action_receiver) = std::sync::mpsc::channel();
+        let mut harness = Harness::new_ui_state(
+            move |ui, view: &mut VolumesView| {
+                if let Some(action) = view.show(ui, true, "offline") {
+                    action_sender
+                        .send(action)
+                        .expect("action receiver should stay open");
+                }
+            },
+            VolumesView::default(),
+        );
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, "Create volume")
+                .accesskit_node()
+                .is_disabled()
+        );
+
+        harness
+            .get_by_role_and_label(Role::TextInput, "Volume name")
+            .focus();
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::TextInput, "Volume name")
+            .type_text("ferrum-data");
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Create volume")
+            .click_accesskit();
+        harness.step();
+        harness.step();
+
+        let (generation, name) = match action_receiver
+            .try_recv()
+            .expect("the Volumes UI should request creation")
+        {
+            VolumesAction::Create { generation, name } => (generation, name),
+            VolumesAction::Inspect(_) => panic!("Create volume should return a create action"),
+        };
+        assert_eq!(name, "ferrum-data");
+        assert!(harness.state().creating);
+        let _progress = harness.get_by_role_and_label(Role::Label, "Creating volume…");
+        assert!(harness.state_mut().finish_create(generation, &name, Ok(())));
+        harness.run();
+        let _success = harness.get_by_role_and_label(Role::Label, "Volume 'ferrum-data' created.");
+        assert!(harness.state().create_name.is_empty());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn volume_create_form_enforces_name_boundaries_accessibly() {
+        for invalid_name in ["  ", ".", "..", "line\nbreak", "name\u{202e}"] {
+            let view = VolumesView {
+                create_name: invalid_name.to_owned(),
+                ..VolumesView::default()
+            };
+            let mut harness = Harness::new_ui_state(
+                |ui, view: &mut VolumesView| {
+                    let _ = view.show(ui, true, "");
+                },
+                view,
+            );
+            harness.run();
+            assert!(
+                harness
+                    .get_by_role_and_label(Role::Button, "Create volume")
+                    .accesskit_node()
+                    .is_disabled(),
+                "invalid volume name {invalid_name:?} must not be submittable"
+            );
+        }
+
+        let view = VolumesView {
+            create_name: "é".repeat(MAX_VOLUME_NAME_BYTES / "é".len()),
+            ..VolumesView::default()
+        };
+        let mut harness = Harness::new_ui_state(
+            |ui, view: &mut VolumesView| {
+                let _ = view.show(ui, true, "");
+            },
+            view,
+        );
+        harness.run();
+        assert!(
+            !harness
+                .get_by_role_and_label(Role::Button, "Create volume")
+                .accesskit_node()
+                .is_disabled(),
+            "a name at the UTF-8 byte limit should be submittable"
+        );
+
+        let view = VolumesView {
+            create_name: "é".repeat(MAX_VOLUME_NAME_BYTES / "é".len() + 1),
+            ..VolumesView::default()
+        };
+        let mut harness = Harness::new_ui_state(
+            |ui, view: &mut VolumesView| {
+                let _ = view.show(ui, true, "");
+            },
+            view,
+        );
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, "Create volume")
+                .accesskit_node()
+                .is_disabled(),
+            "a name exceeding the UTF-8 byte limit must not be submittable"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_volume_creation_preserves_the_name_for_retry() {
+        let mut view = VolumesView {
+            create_name: "ferrum-data".to_owned(),
+            ..VolumesView::default()
+        };
+        let VolumesAction::Create { generation, name } =
+            view.begin_create().expect("a valid name should submit")
+        else {
+            panic!("the valid volume name should return a create action");
+        };
+        assert!(view.finish_create(
+            generation,
+            &name,
+            Err("The engine rejected volume creation.".to_owned())
+        ));
+
+        let mut harness = Harness::new_ui_state(
+            |ui, view: &mut VolumesView| {
+                let _ = view.show(ui, true, "");
+            },
+            view,
+        );
+        harness.run();
+        assert_eq!(harness.state().create_name, "ferrum-data");
+        assert!(
+            !harness
+                .get_by_role_and_label(Role::Button, "Create volume")
+                .accesskit_node()
+                .is_disabled()
+        );
+        let _error_heading = harness.get_by_role_and_label(Role::Label, "Could not create volume:");
+        let _error =
+            harness.get_by_role_and_label(Role::Label, "The engine rejected volume creation.");
     }
 }
