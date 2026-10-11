@@ -59,9 +59,11 @@ while the confirmation or build remains active. Output is sanitized plain text,
 bounded in memory, and not persisted to logs or audit traces. Cancellation is
 best effort and terminates the Docker CLI process group; builder work may
 continue and image/tag state may be uncertain. Ferrum refreshes image inventory
-after every terminal result. Build traces contain only static
-`image_mutation` / `build` action and `success`, `not_submitted`, or
-`request_error` outcome; context path, tag, and output are excluded.
+after every terminal result.
+Build traces contain only static `image_mutation` / `build` action and
+`success`, `not_submitted`, or `request_error` outcome; context path, tag, and
+output are excluded. The build trace is ephemeral process logging, not durable
+audit history.
 
 Issues #16 and #19 remain open and ready. This partial slice is not a release
 or a support claim beyond local Linux Docker.

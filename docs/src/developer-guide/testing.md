@@ -105,7 +105,8 @@ process. They do not invoke Docker or Buildx against an engine, build an image,
 or mutate image resources. Tests cover local-context and target validation,
 private config permissions and cleanup, socket-pinned command construction,
 credential isolation, bounded and escaped output, process failure/cancellation,
-explicit confirmation, context-switch gating, and static build audit events.
+explicit confirmation, context-switch gating, and static non-persistent build
+outcome tracing.
 
 The named tests are:
 

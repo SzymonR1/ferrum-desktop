@@ -114,9 +114,10 @@ Build execution uses a private temporary empty Docker config and isolated
 settings, build arguments, secrets, or SSH access.
 
 Output is streamed as sanitized plain text with bounded in-memory retention and
-is not persisted to logs or audit traces. Cancellation is best effort: Ferrum
-terminates the Docker CLI process group, but cannot guarantee builder work
-stopped or determine whether the image/tag changed. Inventory refreshes after
-every terminal result, including cancellation, because the outcome may be
-uncertain.
+is not persisted to logs or audit traces. Build outcome tracing records only a
+static action and result, remains process-local, and is not durable audit
+history. Cancellation is best effort: Ferrum terminates the Docker CLI process
+group, but cannot guarantee builder work stopped or determine whether the
+image/tag changed. Inventory refreshes after every terminal result, including
+cancellation, because the outcome may be uncertain.
 

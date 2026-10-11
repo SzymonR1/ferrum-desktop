@@ -21,7 +21,8 @@ or build is active. Stream only sanitized bounded plain text in memory; do not
 persist output. Best-effort cancellation terminates the CLI process group;
 refresh inventory after every terminal/cancel result because state may be
 uncertain. Build traces contain only static action and outcome, excluding
-context path, tag, and output.
+context path, tag, and output; they are ephemeral process logs, not durable
+audit history.
 
 Compose support is not provided. Podman/rootless and broader endpoint/platform
 compatibility remain unvalidated under issue #10, which remains open and

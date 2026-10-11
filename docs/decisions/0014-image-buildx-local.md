@@ -20,9 +20,10 @@ execution and possible reassignment of an existing tag. Disable context
 switching while the confirmation is open and while a build is active. Stream
 output as plain text, sanitize controls and invisible formatting, cap lines and
 retained output in memory, and never persist build output to logs or audit
-storage. Cancellation is best effort: terminate the Docker CLI process group,
-then refresh image inventory after every terminal or cancellation result
-because builder execution and image/tag state may be uncertain.
+storage. Build outcome tracing is process-local and not durable audit history.
+Cancellation is best effort: terminate the Docker CLI process group, then
+refresh image inventory after every terminal or cancellation result because
+builder execution and image/tag state may be uncertain.
 
 This decision is Linux and local Docker/Buildx only. It does not claim Podman/rootless support or broader endpoint/platform compatibility; issue #10 remains open and blocked. Issues #16 and #19 remain open and ready. No release or broader support claim is made.
 
