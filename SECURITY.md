@@ -153,13 +153,19 @@ at most 255 UTF-8 bytes, and contain no control characters. Request/response
 bodies are bounded, and daemon bodies are not displayed or logged.
 
 The network metadata allowlist is ID, name, driver, scope, creation time,
-internal/attachable, EnableIPv4, and EnableIPv6. Inspect may report an optional
-point-in-time count from the `Containers` map and separately retain its keys
-only when every key is a full 64-character hexadecimal container ID. Endpoint
-values are discarded. Container names are shown only from the current
-container inventory; endpoint names, endpoint IDs/configuration, MAC/IP
-addresses, labels, options, IPAM, peers, services, status, and raw bodies are
-not retained from network responses.
+internal/attachable, `EnableIPv4`, `EnableIPv6`, and an optional point-in-time
+attached-container count. The `Containers` map keys are retained only as full
+64-character hexadecimal IDs when every key is valid; endpoint values are
+discarded. Container names are shown only from the current inventory. When
+verbose inspect reports IPAM status, Ferrum retains only aggregate
+`IPsInUse` and `DynamicIPsAvailable` allocation counts across subnets. Invalid
+CIDRs or duplicate normalized subnet keys make both metrics unavailable.
+Missing, malformed, negative, or overflowing count values and checked-sum
+overflow make only the corresponding metric unavailable; the other may remain
+available. Subnet/CIDR keys, addresses, endpoint names/IDs/configuration, labels,
+options, peers, services, raw status, and raw response bodies are not retained
+or displayed. These point-in-time values describe IP allocation, not network
+traffic; per-container/interface counters are not aggregated.
 
 Removal is offered only for selected custom networks, never Docker's predefined
 `bridge`, `host`, or `none` networks. A fresh inspection of the selected exact
@@ -193,9 +199,10 @@ Connect/disconnect events include both network and container IDs; names,
 endpoints, error text, and daemon bodies are excluded. These process traces are
 not persistent or tamper-proof; a separate durable redacted copy is described
 above. Only one network mutation may be active, and context switching is blocked
-until it returns. Network usage statistics and credential access are not
-provided. Podman/rootless and remote endpoints remain unsupported or
-unvalidated. Issues #17, #19, and #10 remain open; no release is claimed.
+until it returns. IPAM parsing and metric availability are as described above;
+credential access is not provided. Podman/rootless and remote endpoints remain
+unsupported or unvalidated. Issues #17, #19, and #10 remain open; no release is
+claimed.
 
 The Compose page keeps read-only project discovery for the selected Linux local
 Docker Unix socket. It detects the installed CLI version with
