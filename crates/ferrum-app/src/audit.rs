@@ -389,30 +389,40 @@ pub(super) enum ImageBuildOutcome {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn record_image_build_result(outcome: ImageBuildOutcome) {
-    match outcome {
-        ImageBuildOutcome::Success => tracing::info!(
-            target: "ferrum::audit",
-            audit_event = "image_mutation",
-            action = "build",
-            outcome = "success",
-            "Image build completed"
-        ),
-        ImageBuildOutcome::NotSubmitted => tracing::warn!(
-            target: "ferrum::audit",
-            audit_event = "image_mutation",
-            action = "build",
-            outcome = "not_submitted",
-            "Image build was not submitted"
-        ),
-        ImageBuildOutcome::RequestError => tracing::warn!(
-            target: "ferrum::audit",
-            audit_event = "image_mutation",
-            action = "build",
-            outcome = "request_error",
-            "Image build request failed"
-        ),
-    }
+pub(super) fn record_image_build_result(outcome: ImageBuildOutcome) -> AuditRecord {
+    let outcome = match outcome {
+        ImageBuildOutcome::Success => {
+            tracing::info!(
+                target: "ferrum::audit",
+                audit_event = "image_mutation",
+                action = "build",
+                outcome = "success",
+                "Image build completed"
+            );
+            "success"
+        }
+        ImageBuildOutcome::NotSubmitted => {
+            tracing::warn!(
+                target: "ferrum::audit",
+                audit_event = "image_mutation",
+                action = "build",
+                outcome = "not_submitted",
+                "Image build was not submitted"
+            );
+            "not_submitted"
+        }
+        ImageBuildOutcome::RequestError => {
+            tracing::warn!(
+                target: "ferrum::audit",
+                audit_event = "image_mutation",
+                action = "build",
+                outcome = "request_error",
+                "Image build request failed"
+            );
+            "request_error"
+        }
+    };
+    AuditRecord::new("image_mutation", "build", outcome, None, None)
 }
 #[cfg(target_os = "linux")]
 /// Returns the redacted volume-create outcome after emitting its trace event.
@@ -826,8 +836,9 @@ mod tests {
     #[tokio::test]
     async fn persists_redacted_audit_records_for_mutation_outcomes() {
         use super::{
-            AuditStore, ImageMutation, record_image_mutation_result,
-            record_network_mutation_result, record_volume_create_result,
+            AuditStore, ImageBuildOutcome, ImageMutation, record_image_build_result,
+            record_image_mutation_result, record_network_mutation_result,
+            record_volume_create_result,
         };
         use crate::settings::SettingsStore;
         use ferrum_core::VolumeDetails;
@@ -911,6 +922,16 @@ mod tests {
             ))
             .await
             .unwrap();
+        for outcome in [
+            ImageBuildOutcome::Success,
+            ImageBuildOutcome::NotSubmitted,
+            ImageBuildOutcome::RequestError,
+        ] {
+            store
+                .persist(record_image_build_result(outcome))
+                .await
+                .unwrap();
+        }
 
         let log_path = root.join("audit.jsonl");
         let contents = fs::read_to_string(&log_path).unwrap();
@@ -922,7 +943,7 @@ mod tests {
         let file_mode = fs::metadata(&log_path).unwrap().permissions().mode() & 0o777;
         let _ = fs::remove_dir_all(&root);
 
-        assert_eq!(records.len(), 7);
+        assert_eq!(records.len(), 10);
         assert!(contents.ends_with('\n'));
         assert_eq!(directory_mode, 0o700);
         assert_eq!(file_mode, 0o600);
@@ -983,6 +1004,45 @@ mod tests {
         assert_eq!(records[6]["event"], "image_mutation");
         assert_eq!(records[6]["action"], "push");
         assert_eq!(records[6]["outcome"], "request_error");
+        for (record, outcome) in
+            records[7..]
+                .iter()
+                .zip(["success", "not_submitted", "request_error"])
+        {
+            assert_eq!(record["schema_version"], 1);
+            assert!(record["timestamp_unix_ms"].as_u64().unwrap() > 0);
+            assert_eq!(record["event"], "image_mutation");
+            assert_eq!(record["action"], "build");
+            assert_eq!(record["outcome"], outcome);
+            assert_eq!(
+                record
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                [
+                    "action",
+                    "event",
+                    "outcome",
+                    "schema_version",
+                    "timestamp_unix_ms"
+                ]
+                .into_iter()
+                .collect()
+            );
+        }
+        for sensitive_value in [
+            "build-output-SENTINEL",
+            "/build/context-SENTINEL",
+            "image-tag-SENTINEL",
+            "docker.sock",
+            "build-context-SENTINEL",
+            "credential-SENTINEL",
+            "raw-error-SENTINEL",
+        ] {
+            assert!(!contents.contains(sensitive_value));
+        }
         for sentinel in [
             invalid_id,
             "endpoint-SENTINEL",

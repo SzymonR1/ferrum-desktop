@@ -15,17 +15,20 @@ unchanged.
 ## Decision
 
 Add a separate, bounded Linux-local JSONL sink for Ferrum-initiated outcomes
-from container lifecycle, image pull/tag/removal, volume create/removal, and
-network create/removal/connect/disconnect operations. Store it as `audit.jsonl`
+from container lifecycle, image pull/push/tag/removal and Buildx image builds,
+volume create/removal, and network create/removal/connect/disconnect operations.
+Store it as `audit.jsonl`
 in the same descriptor-anchored private Ferrum configuration directory used by
 settings, and open it lazily on the first supported outcome. Require a `0700`
 directory and a regular `0600` file. Do not follow symlink targets or accept
 non-regular or multiply linked audit files.
 
 Append one JSON object per line and sync record data. Each record contains only
-a schema version, timestamp in Unix milliseconds, a static event/action/outcome,
-and already-validated full resource IDs where available. Never persist names,
-image references or tags, endpoints, credentials, raw errors, daemon response
+a schema version, timestamp in Unix milliseconds, and a static event/action/outcome,
+with already-validated full resource IDs only where existing traces permit.
+Build records contain only `image_mutation` / `build` and the static outcome;
+build output and all build-specific metadata are never persisted. Never persist
+names, image references or tags, endpoints, credentials, raw errors, daemon
 bodies, or terminal/log contents.
 
 Cap the file at 16 MiB. Do not automatically delete, truncate, or rotate older

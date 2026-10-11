@@ -1913,6 +1913,7 @@ impl FerrumApp {
         let (cancel_sender, mut cancel_receiver) = oneshot::channel();
         self.image_build_cancel = Some(cancel_sender);
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         let repaint = context.clone();
         self.image_build_task = Some(self.runtime.spawn(async move {
             let preparation = tokio::task::spawn_blocking(move || {
@@ -1930,7 +1931,11 @@ impl FerrumApp {
             let (command, config) = match preparation {
                 Ok(Ok(prepared)) => prepared,
                 Ok(Err(error)) => {
-                    audit::record_image_build_result(audit::ImageBuildOutcome::NotSubmitted);
+                    persist_audit_record(
+                        &audit_store,
+                        audit::record_image_build_result(audit::ImageBuildOutcome::NotSubmitted),
+                    )
+                    .await;
                     if sender
                         .send(EngineEvent::ImageBuildFinished {
                             generation,
@@ -1945,7 +1950,11 @@ impl FerrumApp {
                 }
                 Err(_) => {
                     let error = image_build::ImageBuildError::DockerUnavailable;
-                    audit::record_image_build_result(audit::ImageBuildOutcome::NotSubmitted);
+                    persist_audit_record(
+                        &audit_store,
+                        audit::record_image_build_result(audit::ImageBuildOutcome::NotSubmitted),
+                    )
+                    .await;
                     if sender
                         .send(EngineEvent::ImageBuildFinished {
                             generation,
@@ -1966,7 +1975,11 @@ impl FerrumApp {
                 drop(command);
                 drop(config);
                 let error = image_build::ImageBuildError::Cancelled;
-                audit::record_image_build_result(audit::ImageBuildOutcome::NotSubmitted);
+                persist_audit_record(
+                    &audit_store,
+                    audit::record_image_build_result(audit::ImageBuildOutcome::NotSubmitted),
+                )
+                .await;
                 if sender
                     .send(EngineEvent::ImageBuildFinished {
                         generation,
@@ -2052,7 +2065,7 @@ impl FerrumApp {
                     Err(_) => audit::ImageBuildOutcome::RequestError,
                 }
             };
-            audit::record_image_build_result(outcome);
+            persist_audit_record(&audit_store, audit::record_image_build_result(outcome)).await;
             if sender
                 .send(EngineEvent::ImageBuildFinished { generation, result })
                 .await

@@ -21,8 +21,10 @@ or build is active. Stream only sanitized bounded plain text in memory; do not
 persist output. Best-effort cancellation terminates the CLI process group;
 refresh inventory after every terminal/cancel result because state may be
 uncertain. Build traces contain only static action and outcome, excluding
-context path, tag, and output; they are ephemeral process logs, not durable
-audit history.
+context path, tag, and output. Their redacted outcome is also written to the
+existing best-effort durable JSONL audit; only static event/action/outcome are
+persisted for builds. Build output remains bounded transient UI data and is
+never persisted.
 
 Compose support includes read-only Docker CLI version/project discovery and
 explicit structural validation of a user-selected local base file followed by
@@ -217,16 +219,18 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   durable copy is described below.
 
 - Maintain a Linux-local bounded JSONL copy of Ferrum-originated mutation
-  outcomes for container lifecycle, image pull/push/tag/removal, volume
-  create/removal, and network create/removal/connect/disconnect. Lazily create
-  `audit.jsonl` in the descriptor-anchored Ferrum config directory, with
-  directory mode `0700` and file mode `0600`. Schema v1 contains a timestamp,
-  static event/action/outcome, and validated full resource IDs only where
-  existing traces permit. Exclude names, image references/tags, endpoints,
-  credentials, raw errors, daemon bodies, and terminal/log contents. Sync each
-  record; enforce a 16 MiB hard cap without automatic truncation or rotation.
-  Use nonblocking interprocess-lock attempts with a 250 ms deadline; continued
-  contention counts as a persistence failure.
+  outcomes for container lifecycle, image pull/push/tag/removal and Buildx
+  image builds, volume create/removal, and network
+  create/removal/connect/disconnect. Lazily create `audit.jsonl` in the
+  descriptor-anchored Ferrum config directory, with directory mode `0700` and
+  file mode `0600`. Schema v1 contains a timestamp, static event/action/outcome,
+  and validated full resource IDs only where existing traces permit. A build
+  record contains only static `image_mutation` / `build` and outcome fields;
+  build output and build-specific metadata are never persisted. Exclude names,
+  image references/tags, endpoints, credentials, raw errors, daemon bodies, and
+  terminal/log contents. Sync each record; enforce a 16 MiB hard cap without
+  automatic truncation or rotation. Use nonblocking interprocess-lock attempts
+  with a 250 ms deadline; continued contention counts as a persistence failure.
   At capacity or on persistence failure, emit a static process warning and do
   not claim the event is durable; do not change the engine request outcome.
   This is local Ferrum-request history, mutable by the same-UID user, not

@@ -47,20 +47,23 @@ submission. Image IDs, references, repository tags, endpoints, error text, and
 daemon response bodies are not included in those traces.
 
 Ferrum also maintains a Linux-local, bounded JSONL copy of mutation outcomes
-for container lifecycle, image pull/push/tag/removal, volume create/removal, and
-network create/removal/connect/disconnect requests. `audit.jsonl` is created
-lazily in Ferrum's descriptor-anchored config directory with directory mode
-`0700` and file mode `0600`. Schema version 1 records a timestamp, static
-event/action/outcome, and validated full resource IDs only where existing
-traces permit. It excludes names, image references/tags, endpoints,
-credentials, raw errors, daemon bodies, and terminal/log contents. Each record
-is synced; the file has a 16 MiB hard cap and is not automatically truncated or
-rotated. Interprocess lock acquisition uses nonblocking retries with a 250 ms
-deadline; continued contention is a persistence failure. When full or when
-persistence fails, Ferrum emits a static process warning and does not claim the
-event was persisted; the engine request outcome is unchanged. This is local
-Ferrum-request history only, mutable by the same-UID user, not tamper-proof, and
-does not prove final engine state or record external engine actions.
+for container lifecycle, image pull/push/tag/removal and Buildx image builds,
+volume create/removal, and network create/removal/connect/disconnect requests.
+`audit.jsonl` is created lazily in Ferrum's descriptor-anchored config directory
+with directory mode `0700` and file mode `0600`. Schema version 1 records a
+timestamp, static event/action/outcome, and validated full resource IDs only
+where existing traces permit. A build entry contains only the static
+`image_mutation` event, `build` action, and outcome. It excludes build output
+and all build-specific metadata, as well as names, image references/tags,
+endpoints, credentials, raw errors, daemon bodies, and terminal/log contents.
+Each record is synced; the file has a 16 MiB hard cap and is not automatically
+truncated or rotated. Interprocess lock acquisition uses nonblocking retries
+with a 250 ms deadline; continued contention is a persistence failure. When
+full or when persistence fails, Ferrum emits a static process warning and does
+not claim the event was persisted; the engine request outcome is unchanged.
+This is local Ferrum-request history only, mutable by the same-UID user, not
+tamper-proof, and does not prove final engine state or record external engine
+actions.
 Issues #16, #17, and #19 remain open/ready; issue #10 remains open/blocked for
 Podman/rootless and broader endpoint validation. No release or platform/endpoint
 support is claimed.
@@ -85,14 +88,15 @@ commands and an existing tag may be reassigned. The confirmation names the
 selected Docker context or a safe endpoint-source label when no named context is
 selected, without displaying the socket path. Context switching is disabled
 while the confirmation or build remains active. Output is sanitized plain text,
-bounded in memory, and not persisted to logs or audit traces. Cancellation is
+bounded in memory, and not persisted to logs or audit storage. Cancellation is
 best effort and terminates the Docker CLI process group; builder work may
 continue and image/tag state may be uncertain. Ferrum refreshes image inventory
 after every terminal result.
 Build traces contain only static `image_mutation` / `build` action and
 `success`, `not_submitted`, or `request_error` outcome; context path, tag, and
-output are excluded. The build trace is ephemeral process logging, not durable
-audit history.
+output are excluded. These static outcomes are included in the existing
+best-effort durable redacted JSONL audit; build output remains transient and
+unpersisted.
 
 Issues #16 and #19 remain open and ready. This partial slice is not a release
 or a support claim beyond local Linux Docker.

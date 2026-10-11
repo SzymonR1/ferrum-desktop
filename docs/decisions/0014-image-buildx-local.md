@@ -20,7 +20,9 @@ execution and possible reassignment of an existing tag. Disable context
 switching while the confirmation is open and while a build is active. Stream
 output as plain text, sanitize controls and invisible formatting, cap lines and
 retained output in memory, and never persist build output to logs or audit
-storage. Build outcome tracing is process-local and not durable audit history.
+storage. Build outcomes have process traces and are also included in the
+existing best-effort durable redacted JSONL audit as only the static event,
+action, and outcome; no build output or build-specific metadata is persisted.
 Cancellation is best effort: terminate the Docker CLI process group, then
 refresh image inventory after every terminal or cancellation result because
 builder execution and image/tag state may be uncertain.
