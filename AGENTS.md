@@ -1185,7 +1185,7 @@ Remaining problems.
 - [ ] Documentation is accurate
 - [ ] Security considered
 - [ ] Acceptance criteria met
-- [ ] CI passes
+- [ ] Hosted CI passes, or while Actions are unavailable the documented exact-commit local fallback is recorded (see Section 16.3)
 
 Do not check items that are unverified.
 
