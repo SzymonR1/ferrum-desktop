@@ -44,6 +44,10 @@ use crate::settings::SettingsStore;
 use std::sync::Arc;
 
 pub(super) const MAX_AUDIT_LOG_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const AUDIT_FILE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+#[cfg(target_os = "linux")]
+const AUDIT_FILE_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Clone)]
 pub(super) struct AuditStore {
@@ -108,11 +112,7 @@ fn persist_record(
     let mut file = settings
         .open_audit_file()
         .map_err(|_| AuditStoreError::Unavailable)?;
-    // SAFETY: `file` owns a valid descriptor for the opened audit file.
-    let lock_result = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
-    if lock_result != 0 {
-        return Err(AuditStoreError::Write);
-    }
+    lock_audit_file(&file)?;
     struct Unlock(std::os::fd::RawFd);
     impl Drop for Unlock {
         fn drop(&mut self) {
@@ -136,6 +136,26 @@ fn persist_record(
         return Err(AuditStoreError::Write);
     }
     Ok(())
+}
+#[cfg(target_os = "linux")]
+fn lock_audit_file(file: &std::fs::File) -> Result<(), AuditStoreError> {
+    let descriptor = std::os::fd::AsRawFd::as_raw_fd(file);
+    let started = std::time::Instant::now();
+    loop {
+        // SAFETY: `file` owns an open descriptor; `flock` does not take ownership.
+        let result = unsafe { libc::flock(descriptor, libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(());
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
+            return Err(AuditStoreError::Write);
+        }
+        let remaining = AUDIT_FILE_LOCK_TIMEOUT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(AuditStoreError::Write);
+        }
+        std::thread::sleep(remaining.min(AUDIT_FILE_LOCK_RETRY_INTERVAL));
+    }
 }
 use ferrum_core::ContainerAction;
 #[cfg(target_os = "linux")]
@@ -880,6 +900,64 @@ mod tests {
                 "persisted sentinel: {sentinel}"
             );
         }
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn audit_persistence_returns_bounded_failure_under_lock_contention() {
+        use super::{AuditRecord, AuditStore, AuditStoreError};
+        use crate::settings::SettingsStore;
+        use std::{
+            fs,
+            os::fd::AsRawFd,
+            time::{Duration, SystemTime, UNIX_EPOCH},
+        };
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ferrum-audit-lock-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let settings = Arc::new(SettingsStore::at(root.join("settings.toml")));
+        let store = AuditStore::new(settings.clone());
+        let blocker = settings.open_audit_file().expect("audit file should open");
+        let descriptor = blocker.as_raw_fd();
+        assert_eq!(
+            unsafe { libc::flock(descriptor, libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        let persist_store = store.clone();
+        let mut persist_task = tokio::spawn(async move {
+            persist_store
+                .persist(AuditRecord::new(
+                    "container_action",
+                    "start",
+                    "success",
+                    None,
+                    None,
+                ))
+                .await
+        });
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut persist_task).await;
+        let completed_while_locked = result.is_ok();
+        // SAFETY: `blocker` owns this descriptor and this test acquired its lock.
+        assert_eq!(unsafe { libc::flock(descriptor, libc::LOCK_UN) }, 0);
+        drop(blocker);
+        let persistence_result = match result {
+            Ok(joined) => joined.expect("persistence task should finish"),
+            Err(_) => persist_task
+                .await
+                .expect("blocked task should finish after unlock"),
+        };
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(
+            completed_while_locked,
+            "audit persistence must not wait indefinitely while the file lock is contended"
+        );
+        assert!(matches!(persistence_result, Err(AuditStoreError::Write)));
     }
 
     #[cfg(target_os = "linux")]

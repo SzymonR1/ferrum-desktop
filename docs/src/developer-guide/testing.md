@@ -295,6 +295,9 @@ The mutation audit tests verify redacted JSONL records for lifecycle, image,
 volume, and network outcomes; they also check the 16 MiB hard cap and that
 audit files are created privately and reject symlink, hard-link, and non-regular
 targets.
+Lock-contention coverage holds the audit file lock through a separate open file
+descriptor and verifies persistence fails within the bounded wait. No real
+engine resource is used.
 
 The records are a local Ferrum-request history, not tamper-proof and not proof
 of final engine state; they do not capture external engine actions. Run the
@@ -305,15 +308,16 @@ cargo test -p ferrum-app --bin ferrum audit::tests
 cargo test -p ferrum-app --bin ferrum settings::tests::audit_file_
 ```
 
-The named regression tests are
+The named regression tests are:
 `persists_redacted_audit_records_for_mutation_outcomes`,
 `durable_audit_log_stops_at_the_configured_size_limit`,
+`audit_persistence_returns_bounded_failure_under_lock_contention`,
 `audit_file_is_created_with_private_permissions`,
 `audit_file_rejects_symlink_and_hardlink_targets`, and
-`audit_file_rejects_non_regular_targets`. This work does not complete
-Issue #19: issues #17 and #19 remain open/ready, and issue #10 remains
-open/blocked for Podman/rootless and broader endpoint validation. No platform
-or endpoint support or release is claimed.
+`audit_file_rejects_non_regular_targets`. This is partial Issue #19 work:
+issues #17 and #19 remain open/ready; #10 remains open/blocked for
+Podman/rootless and broader endpoint validation. No endpoint/platform support
+or release is claimed.
 
 ## Accessibility and performance samples
 

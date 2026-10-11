@@ -100,6 +100,8 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   existing traces permit. Exclude names, image references/tags, endpoints,
   credentials, raw errors, daemon bodies, and terminal/log contents. Sync each
   record; enforce a 16 MiB hard cap without automatic truncation or rotation.
+  Use nonblocking interprocess-lock attempts with a 250 ms deadline; continued
+  contention counts as a persistence failure.
   At capacity or on persistence failure, emit a static process warning and do
   not claim the event is durable; do not change the engine request outcome.
   This is local Ferrum-request history, mutable by the same-UID user, not

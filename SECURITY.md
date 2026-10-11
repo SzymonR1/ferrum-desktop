@@ -43,14 +43,16 @@ lazily in Ferrum's descriptor-anchored config directory with directory mode
 event/action/outcome, and validated full resource IDs only where existing
 traces permit. It excludes names, image references/tags, endpoints,
 credentials, raw errors, daemon bodies, and terminal/log contents. Each record
-is synced; the file has a 16 MiB hard cap and is not automatically truncated
-or rotated. When full or persistence fails, Ferrum emits a static process
-warning and does not claim that event was persisted; the engine request outcome
-is unchanged. This is local Ferrum-request history only, is mutable by the
-same-UID user, is not tamper-proof, and does not prove final engine state or
-record external engine actions. Issues #17 and #19 remain open/ready; issue #10
-remains open/blocked for Podman/rootless and broader endpoint validation. No
-release or platform/endpoint support is claimed.
+is synced; the file has a 16 MiB hard cap and is not automatically truncated or
+rotated. Interprocess lock acquisition uses nonblocking retries with a 250 ms
+deadline; continued contention is a persistence failure. When full or when
+persistence fails, Ferrum emits a static process warning and does not claim the
+event was persisted; the engine request outcome is unchanged. This is local
+Ferrum-request history only, mutable by the same-UID user, not tamper-proof, and
+does not prove final engine state or record external engine actions.
+Issues #17 and #19 remain open/ready; issue #10 remains open/blocked for
+Podman/rootless and broader endpoint validation. No release or platform/endpoint
+support is claimed.
 
 The Volumes page is available only for the selected local Docker Unix socket
 on Linux. Creation sends only `Name` to the negotiated volume-create endpoint

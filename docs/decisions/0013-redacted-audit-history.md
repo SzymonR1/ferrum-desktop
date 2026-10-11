@@ -33,6 +33,10 @@ records. When the cap is reached or persistence fails, claim no durable record,
 emit only a static process warning, and leave the already-returned engine
 result unchanged. Existing process trace events remain separate from this file.
 
+Serialize appends with nonblocking file-lock attempts bounded to 250 ms. If the
+lock remains contended, treat persistence as failed, emit the static warning,
+and leave the already-returned engine result unchanged.
+
 ## Alternatives
 
 - **Rely only on process tracing:** rejected because events disappear with the
