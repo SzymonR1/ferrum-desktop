@@ -43,8 +43,8 @@ use contexts::{
 
 use ferrum_core::{
     ContainerAction, ContainerChange, ContainerDetails, ContainerMount, ContainerState,
-    ContainerSummary, ImageDetails, ImageSummary, NetworkDetails, NetworkSummary, VolumeDetails,
-    VolumeSummary, VolumeUsage, is_untrusted_display_character,
+    ContainerSummary, ImageDetails, ImageHistoryEntry, ImageSummary, NetworkDetails,
+    NetworkSummary, VolumeDetails, VolumeSummary, VolumeUsage, is_untrusted_display_character,
 };
 #[cfg(target_os = "linux")]
 use serde::Serialize;
@@ -75,6 +75,8 @@ const LIFECYCLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_INSPECT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_LIST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_IMAGE_HISTORY_ROWS: usize = 65_536;
 #[cfg(target_os = "linux")]
 const MAX_VERSION_RESPONSE_BYTES: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
@@ -127,6 +129,58 @@ struct ImageInspectResponse {
     architecture: Option<String>,
     os: Option<String>,
     author: Option<String>,
+}
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ImageHistoryResponse {
+    id: Option<String>,
+    created: Option<i64>,
+    size: Option<i64>,
+}
+
+#[cfg(target_os = "linux")]
+struct ImageHistoryResponseList(Vec<ImageHistoryEntry>);
+
+#[cfg(target_os = "linux")]
+impl<'de> Deserialize<'de> for ImageHistoryResponseList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ImageHistoryResponseListVisitor;
+
+        impl<'de> Visitor<'de> for ImageHistoryResponseListVisitor {
+            type Value = ImageHistoryResponseList;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a bounded array of image history rows")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                for _ in 0..MAX_IMAGE_HISTORY_ROWS {
+                    let Some(response) = sequence.next_element::<ImageHistoryResponse>()? else {
+                        return Ok(ImageHistoryResponseList(entries));
+                    };
+                    if let Some(entry) = map_image_history(response) {
+                        entries.push(entry);
+                    }
+                }
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(<A::Error as serde::de::Error>::custom(
+                        "too many image history rows",
+                    ));
+                }
+                Ok(ImageHistoryResponseList(entries))
+            }
+        }
+
+        deserializer.deserialize_seq(ImageHistoryResponseListVisitor)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -902,6 +956,13 @@ pub enum EngineError {
     #[cfg(target_os = "linux")]
     #[error("The engine at the {endpoint_label} could not return safe image details.")]
     ImageInspectionUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// Image history failed or returned an invalid, oversized response.
+    #[cfg(target_os = "linux")]
+    #[error("The engine at the {endpoint_label} could not return safe image history.")]
+    ImageHistoryUnavailable {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
     },
@@ -1888,8 +1949,8 @@ impl EngineClient {
                         .ok_or(EngineError::VolumeInventoryUnavailable { endpoint_label })?;
                     Ok(VolumeSummary {
                         name,
-                        driver: volume.driver.map(escape_volume_display_text),
-                        scope: volume.scope.map(escape_volume_display_text),
+                        driver: volume.driver.and_then(escape_volume_display_text),
+                        scope: volume.scope.and_then(escape_volume_display_text),
                     })
                 })
                 .collect()
@@ -1934,10 +1995,10 @@ impl EngineClient {
                 .ok_or(EngineError::VolumeInspectionUnavailable { endpoint_label })?;
             Ok(VolumeDetails {
                 name,
-                driver: response.driver.map(escape_volume_display_text),
-                scope: response.scope.map(escape_volume_display_text),
-                created_at: response.created_at.map(escape_volume_display_text),
-                mountpoint: response.mountpoint.map(escape_volume_display_text),
+                driver: response.driver.and_then(escape_volume_display_text),
+                scope: response.scope.and_then(escape_volume_display_text),
+                created_at: response.created_at.and_then(escape_volume_display_text),
+                mountpoint: response.mountpoint.and_then(escape_volume_display_text),
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -2004,10 +2065,10 @@ impl EngineClient {
                     .ok_or(EngineError::VolumeCreationUnavailable { endpoint_label })?;
                 Ok(VolumeDetails {
                     name,
-                    driver: response.driver.map(escape_volume_display_text),
-                    scope: response.scope.map(escape_volume_display_text),
-                    created_at: response.created_at.map(escape_volume_display_text),
-                    mountpoint: response.mountpoint.map(escape_volume_display_text),
+                    driver: response.driver.and_then(escape_volume_display_text),
+                    scope: response.scope.and_then(escape_volume_display_text),
+                    created_at: response.created_at.and_then(escape_volume_display_text),
+                    mountpoint: response.mountpoint.and_then(escape_volume_display_text),
                 })
             })
             .await
@@ -2146,6 +2207,43 @@ impl EngineClient {
             .await
             .map_err(|_| EngineError::ImageInspectionUnavailable { endpoint_label })?;
             map_image_details(response, endpoint_label)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = id;
+            Err(EngineError::UnsupportedPlatform)
+        }
+    }
+    /// Returns read-only layer history for one image identifier.
+    ///
+    /// The read-only request uses the negotiated API version and the selected
+    /// local Docker Unix socket, with an eight-second timeout, 16 MiB response
+    /// limit, and a 65,536-row limit. It sends no registry credentials. Only
+    /// validated full SHA-256 layer IDs, nonnegative creation timestamps, and
+    /// nonnegative sizes are retained. `CreatedBy` command text, tags, comments,
+    /// and all other daemon fields are discarded.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidImageId` for an empty or oversized identifier, a safe
+    /// `ImageHistoryUnavailable` error if the request fails, response is
+    /// invalid/oversized, or row limit is exceeded, or `UnsupportedPlatform`
+    /// outside Linux.
+    pub async fn image_history(&self, id: &str) -> Result<Vec<ImageHistoryEntry>, EngineError> {
+        #[cfg(target_os = "linux")]
+        {
+            let endpoint_label = self.info.endpoint_label;
+            let path = image_history_request_path(&self.api_version, id)
+                .map_err(|_| EngineError::InvalidImageId)?;
+            let history: ImageHistoryResponseList = request_json(
+                &self.socket_path,
+                &path,
+                MAX_LIST_RESPONSE_BYTES,
+                REQUEST_TIMEOUT,
+            )
+            .await
+            .map_err(|_| EngineError::ImageHistoryUnavailable { endpoint_label })?;
+            Ok(history.0)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -2700,6 +2798,10 @@ fn container_request_path(
 fn image_inspect_request_path(api_version: &str, id: &str) -> Result<String, RequestJsonError> {
     resource_request_path(api_version, "images", id, "/json")
 }
+#[cfg(target_os = "linux")]
+fn image_history_request_path(api_version: &str, id: &str) -> Result<String, RequestJsonError> {
+    resource_request_path(api_version, "images", id, "/history")
+}
 
 #[cfg(target_os = "linux")]
 fn image_remove_request_path(
@@ -2735,16 +2837,39 @@ fn volume_name_path_safe(name: &str) -> bool {
         && !name.chars().any(is_untrusted_display_character)
 }
 #[cfg(target_os = "linux")]
-fn escape_volume_display_text(value: String) -> String {
-    let escape_count = value
-        .chars()
-        .filter(|character| is_untrusted_display_character(*character))
-        .count();
-    if escape_count == 0 {
-        return value;
+const MAX_VOLUME_DISPLAY_TEXT_BYTES: usize = 4 * 1024;
+
+#[cfg(target_os = "linux")]
+fn escape_volume_display_text(value: String) -> Option<String> {
+    if value.len() > MAX_VOLUME_DISPLAY_TEXT_BYTES {
+        return None;
     }
-    let capacity = value.len().saturating_add(escape_count.saturating_mul(7));
-    let mut escaped = String::with_capacity(capacity);
+
+    let mut escaped_len = 0usize;
+    let mut needs_escape = false;
+    for character in value.chars() {
+        let character_len = if is_untrusted_display_character(character) {
+            needs_escape = true;
+            let mut code = character as u32;
+            let mut digits = 1usize;
+            while code >= 0x10 {
+                code >>= 4;
+                digits += 1;
+            }
+            4 + digits
+        } else {
+            character.len_utf8()
+        };
+        escaped_len = escaped_len.checked_add(character_len)?;
+        if escaped_len > MAX_VOLUME_DISPLAY_TEXT_BYTES {
+            return None;
+        }
+    }
+    if !needs_escape {
+        return Some(value);
+    }
+
+    let mut escaped = String::with_capacity(escaped_len);
     for character in value.chars() {
         if is_untrusted_display_character(character) {
             let mut code = character as u32;
@@ -2767,7 +2892,7 @@ fn escape_volume_display_text(value: String) -> String {
             escaped.push(character);
         }
     }
-    escaped
+    Some(escaped)
 }
 
 #[cfg(target_os = "linux")]
@@ -2878,6 +3003,26 @@ fn map_image_summary(
         created_unix_seconds: image.created,
         size_bytes: image.size,
     })
+}
+#[cfg(target_os = "linux")]
+fn is_full_image_layer_id(id: &str) -> bool {
+    id.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn map_image_history(response: ImageHistoryResponse) -> Option<ImageHistoryEntry> {
+    let layer_id = response.id.filter(|id| is_full_image_layer_id(id));
+    let created_unix_seconds = response.created.filter(|created| *created >= 0);
+    let size_bytes = response.size.and_then(|size| u64::try_from(size).ok());
+    (layer_id.is_some() || created_unix_seconds.is_some() || size_bytes.is_some()).then_some(
+        ImageHistoryEntry {
+            layer_id,
+            created_unix_seconds,
+            size_bytes,
+        },
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -3675,6 +3820,169 @@ mod image_api_tests {
         assert!(!error.to_string().contains("private engine response body"));
         cleanup(&socket, &directory);
     }
+    #[tokio::test]
+    async fn reads_only_allowlisted_image_history_fields_from_exact_image_id() {
+        let layer_id = format!("sha256:{}", "a".repeat(64));
+        let body = format!(
+            r#"[{{"Id":"{layer_id}","Created":1720000000,"Size":9876,"CreatedBy":"RUN echo COMMAND_SECRET","Tags":["private:tag"],"Comment":"COMMENT_SECRET"}},{{"Id":"<missing>","Created":1720000001,"Size":0,"CreatedBy":"another command"}},{{"Id":"unvalidated daemon value","Created":-1,"Size":-5,"CreatedBy":"UNRETAINED_COMMAND"}}]"#
+        );
+        let (socket, directory, server) = fixture(http_response("200 OK", body.as_bytes())).await;
+
+        let history = client(socket.clone())
+            .image_history("sha256:inventory-image")
+            .await
+            .expect("history should be returned for the selected image");
+        let request = server.await.expect("fixture server should finish");
+        assert!(
+            request.starts_with("GET /v1.45/images/sha256%3Ainventory-image/history HTTP/1.1\r\n"),
+            "unexpected image history request: {request}"
+        );
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
+        assert_eq!(
+            history,
+            vec![
+                ferrum_core::ImageHistoryEntry {
+                    layer_id: Some(layer_id),
+                    created_unix_seconds: Some(1_720_000_000),
+                    size_bytes: Some(9_876),
+                },
+                ferrum_core::ImageHistoryEntry {
+                    layer_id: None,
+                    created_unix_seconds: Some(1_720_000_001),
+                    size_bytes: Some(0),
+                },
+            ]
+        );
+        let retained = format!("{history:?}");
+        for sensitive in [
+            "COMMAND_SECRET",
+            "private:tag",
+            "COMMENT_SECRET",
+            "another command",
+            "UNRETAINED_COMMAND",
+            "unvalidated daemon value",
+        ] {
+            assert!(!retained.contains(sensitive));
+        }
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn image_history_accepts_an_empty_response() {
+        let (socket, directory, server) = fixture(http_response("200 OK", b"[]")).await;
+        let history = client(socket.clone())
+            .image_history("sha256:inventory-image")
+            .await
+            .expect("an empty history response should succeed");
+        let request = server.await.expect("fixture server should finish");
+        assert!(
+            request.starts_with("GET /v1.45/images/sha256%3Ainventory-image/history HTTP/1.1\r\n")
+        );
+        assert!(history.is_empty());
+        cleanup(&socket, &directory);
+    }
+    #[tokio::test]
+    async fn image_history_rejects_excessive_row_count_without_materializing_rows() {
+        let rows = std::iter::repeat_n("{}", 65_537)
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = format!("[{rows}]");
+        let (socket, directory, server) = fixture(http_response("200 OK", body.as_bytes())).await;
+
+        let error = client(socket.clone())
+            .image_history("sha256:inventory-image")
+            .await
+            .expect_err("excessive history rows should fail safely");
+        let request = server.await.expect("fixture server should finish");
+        assert!(
+            request.starts_with("GET /v1.45/images/sha256%3Ainventory-image/history HTTP/1.1\r\n")
+        );
+        assert!(matches!(
+            error,
+            EngineError::ImageHistoryUnavailable {
+                endpoint_label: "test endpoint"
+            }
+        ));
+        cleanup(&socket, &directory);
+    }
+    #[tokio::test]
+    async fn image_history_accepts_the_row_limit() {
+        let rows = std::iter::repeat_n("{}", MAX_IMAGE_HISTORY_ROWS)
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = format!("[{rows}]");
+        let (socket, directory, server) = fixture(http_response("200 OK", body.as_bytes())).await;
+
+        let history = client(socket.clone())
+            .image_history("sha256:inventory-image")
+            .await
+            .expect("the maximum supported history row count should succeed");
+        let request = server.await.expect("fixture server should finish");
+        assert!(
+            request.starts_with("GET /v1.45/images/sha256%3Ainventory-image/history HTTP/1.1\r\n")
+        );
+        assert!(history.is_empty());
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn image_history_maps_malformed_and_api_error_responses_to_safe_errors() {
+        let (socket, directory, server) = fixture(http_response("200 OK", b"{malformed")).await;
+        let error = client(socket.clone())
+            .image_history("sha256:inventory-image")
+            .await
+            .expect_err("malformed history JSON should fail safely");
+        let request = server.await.expect("fixture server should finish");
+        assert!(
+            request.starts_with("GET /v1.45/images/sha256%3Ainventory-image/history HTTP/1.1\r\n")
+        );
+        assert!(matches!(
+            error,
+            EngineError::ImageHistoryUnavailable {
+                endpoint_label: "test endpoint"
+            }
+        ));
+        cleanup(&socket, &directory);
+
+        let (socket, directory, server) = fixture(http_response(
+            "500 Internal Server Error",
+            b"PRIVATE_DAEMON_RESPONSE",
+        ))
+        .await;
+        let error = client(socket.clone())
+            .image_history("sha256:inventory-image")
+            .await
+            .expect_err("HTTP errors should not be treated as image history");
+        let request = server.await.expect("fixture server should finish");
+        assert!(
+            request.starts_with("GET /v1.45/images/sha256%3Ainventory-image/history HTTP/1.1\r\n")
+        );
+        assert!(matches!(
+            error,
+            EngineError::ImageHistoryUnavailable {
+                endpoint_label: "test endpoint"
+            }
+        ));
+        assert!(!format!("{error:?}").contains("PRIVATE_DAEMON_RESPONSE"));
+        assert!(!error.to_string().contains("PRIVATE_DAEMON_RESPONSE"));
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn image_history_rejects_invalid_id_without_connecting() {
+        let directory = temporary_directory();
+        let missing_socket = directory.join("missing.sock");
+        let engine = client(missing_socket);
+        assert!(matches!(
+            engine.image_history("").await,
+            Err(EngineError::InvalidImageId)
+        ));
+        assert!(matches!(
+            engine.image_history(&"x".repeat(4097)).await,
+            Err(EngineError::InvalidImageId)
+        ));
+        std::fs::remove_dir(directory).expect("temporary directory should be removed");
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -3802,6 +4110,29 @@ mod volume_api_tests {
             }]
         );
         assert!(!format!("{volumes:?}").contains("secret"));
+        cleanup(&socket, &directory);
+    }
+    #[tokio::test]
+    async fn volume_list_omits_control_expanded_metadata_over_display_limit() {
+        let control_heavy = "\n".repeat(1_000);
+        let encoded_driver =
+            serde_json::to_string(&control_heavy).expect("metadata should be valid JSON");
+        let body = format!(
+            r#"{{"Volumes":[{{"Name":"data","Driver":{encoded_driver},"Scope":"local"}}]}}"#
+        );
+        let (socket, directory, server) = fixture(response("200 OK", body.as_bytes())).await;
+
+        let volumes = client(socket.clone())
+            .list_volumes()
+            .await
+            .expect("volume listing should remain available");
+        server.await.expect("server should finish");
+        assert_eq!(volumes.len(), 1);
+        assert!(
+            volumes[0].driver.is_none(),
+            "control-heavy metadata beyond the display bound must be omitted"
+        );
+        assert_eq!(volumes[0].scope.as_deref(), Some("local"));
         cleanup(&socket, &directory);
     }
 
@@ -4089,6 +4420,30 @@ mod volume_api_tests {
         assert!(!error.to_string().contains("other-volume"));
         cleanup(&socket, &directory);
     }
+    #[tokio::test]
+    async fn volume_inspection_omits_raw_and_escaped_metadata_over_display_limit() {
+        let control_heavy = "\n".repeat(1_000);
+        let encoded_mountpoint =
+            serde_json::to_string(&control_heavy).expect("metadata should be valid JSON");
+        let oversized_created =
+            serde_json::to_string(&"x".repeat(4097)).expect("metadata should be valid JSON");
+        let body = format!(
+            r#"{{"Name":"data","Driver":"local","Scope":"local","CreatedAt":{oversized_created},"Mountpoint":{encoded_mountpoint}}}"#
+        );
+        let (socket, directory, server) = fixture(response("200 OK", body.as_bytes())).await;
+
+        let details = client(socket.clone())
+            .inspect_volume("data")
+            .await
+            .expect("volume inspection should remain available");
+        server.await.expect("server should finish");
+        assert_eq!(details.driver.as_deref(), Some("local"));
+        assert_eq!(details.scope.as_deref(), Some("local"));
+        assert!(details.created_at.is_none());
+        assert!(details.mountpoint.is_none());
+        cleanup(&socket, &directory);
+    }
+
     #[tokio::test]
     async fn rejects_whitespace_only_inspection_names_before_connecting() {
         let directory = temporary_directory();
