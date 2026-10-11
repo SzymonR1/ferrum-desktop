@@ -114,13 +114,13 @@ Do not require Docker Desktop to run the application when an alternative compati
 
 Use this workflow:
 
-Research → Architecture → GitHub Issue → Branch → Implementation → Tests → Documentation → Pull Request → CI → Review → Merge → Update Tracking → Next Issue.
+Research → Architecture → GitHub Issue → Branch → Implementation → Tests → Documentation → Pull Request → CI (hosted, or the documented local fallback in Section 16.3 when Actions are unavailable) → Review → Merge → Update Tracking → Next Issue.
 
-If merge permission or approval is unavailable, leave the PR ready for review and continue independent authorized work.
+If required approval, repository permission, or merge eligibility is unavailable, leave the PR ready for review and continue independent authorized work. Routine PR merges and Issue management described in Section 16.3 do not require repeated user permission.
 
 ## 1.3 Authorization boundaries
 
-Ordinary authorized development may include creating issues, branches, commits, PRs, documentation, tests, and CI workflows.
+Routine authorized development includes creating, updating, prioritizing, and closing Issues whose acceptance criteria are satisfied, and autonomously merging routine PRs after successful validation and appropriate review when GitHub permits. These actions do not require repeated user permission; all authorization boundaries below still apply.
 
 Request approval before:
 
@@ -1137,11 +1137,11 @@ For each issue:
 12. Push.
 13. Open PR.
 14. Link issue.
-15. Run CI.
+15. Run hosted CI, or while Actions are unavailable run and document the exact-commit local checks required by Section 16.3.
 16. Review findings.
 17. Fix problems.
 18. Obtain required approvals.
-19. Merge when authorized.
+19. Merge after successful validation and appropriate review when GitHub permits; routine merges are explicitly authorized, but do not bypass enforced protections or required approvals.
 20. Update issue and milestone.
 
 ## 14.3 PR template
@@ -1185,7 +1185,7 @@ Remaining problems.
 - [ ] Documentation is accurate
 - [ ] Security considered
 - [ ] Acceptance criteria met
-- [ ] CI passes
+- [ ] Hosted CI passes, or while Actions are unavailable the documented exact-commit local fallback is recorded (see Section 16.3)
 
 Do not check items that are unverified.
 
@@ -1208,7 +1208,7 @@ Automated self-review does not replace required independent approval.
 
 ## 14.5 Merge policy
 
-Merge only when required checks pass, approvals exist, and branch protection permits it.
+Merge only after required validation and appropriate review. When hosted Actions are unavailable, their infrastructure failure is not a failed Rust test; use and document the relevant local checks on the exact PR commit as specified in Section 16.3. Autonomously merge routine PRs once validation and review are satisfactory, provided GitHub permits the merge and any enforced branch protection and required approvals are satisfied.
 
 Prefer small, reviewable PRs.
 
@@ -1293,13 +1293,36 @@ Adapt commands for platform-specific targets and justified feature flags.
 ## 16.2 CI failure protocol
 
 1. Read logs.
-2. Identify failure.
+2. Determine whether the job started; distinguish billing, runner, or other infrastructure restrictions from failures in executed checks. Infrastructure-caused failed or unstarted jobs are not Rust test failures.
 3. Reproduce where possible.
 4. Fix root cause.
 5. Add regression coverage.
 6. Rerun checks.
 7. Update PR.
 8. Record persistent blockers.
+
+## 16.3 Temporary CI Unavailability and Autonomous GitHub Management
+
+**Temporary status (2026-10-11): GitHub Actions are currently unavailable for this repository because of an account billing/spending-limit restriction.** The annotation for Actions run `38154563168` says the job was not started because recent account payments failed or the spending limit needs to be increased. Recent jobs failed before any workflow step ran (`runner_id: 0`, no runner name, empty steps, and no logs). If the underlying cause or status changes, confirm it from GitHub's current run annotations and billing/runner information where accessible, then update this temporary status. Do not change billing or repository security settings to work around the restriction.
+
+An Actions job that was not started, or failed before any step because of billing, runner allocation, or other GitHub infrastructure restrictions, is not evidence that Rust tests failed or passed. Read its annotations and execution state. Failures from commands that actually ran—including Rust tests—remain real blockers and must be fixed; never reclassify a code or test failure as infrastructure trouble.
+
+While hosted Actions are unavailable, validate the relevant checks locally against the exact PR head commit. Use a clean checkout pinned to its full SHA, confirm `git rev-parse HEAD` matches that SHA, and repeat validation after any source change or base synchronization that creates a new commit. Run the workflow-equivalent checks required by the change, including:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace
+cargo test --workspace
+cargo doc --workspace --no-deps
+mdbook build docs
+```
+
+Also run applicable MSRV, dependency security/license, packaging, platform, integration, and focused checks from the preserved workflows when the required tools and environment are available. Record unavailable platform-specific checks rather than claiming they passed. In the PR description or a comment, record the exact commit SHA, environment (OS, architecture, Rust/Cargo versions, and relevant targets), every command executed, and its observed result. Local checks do not override a required GitHub status check or authorize bypassing branch protection.
+
+Preserve all GitHub Actions workflows and their normal triggers and checks. Once Actions are available again, restore the normal hosted-CI requirements, rerun checks on current PR commits, and do not treat an outage-era local result as a permanent replacement for required hosted CI.
+
+Routine GitHub administration is explicitly authorized: create, update, and prioritize Issues, and close an Issue when its acceptance criteria are actually satisfied. Never close a parent Issue for a partially implemented feature; leave it open and accurately record the completed slice and outstanding acceptance criteria. Routine PR merges are explicitly authorized after successful validation and appropriate review, provided GitHub permits the merge. Do not bypass enforced branch protection, required approvals, security restrictions, or permissions, and do not repeatedly ask for permission for these already-authorized routine actions. If a merge is genuinely blocked, record the exact blocker, leave the PR and Issue state accurate, and continue independent authorized work.
 
 ---
 
@@ -1679,7 +1702,7 @@ An issue is complete only when:
 7. Security is considered.
 8. Performance is considered.
 9. PR is reviewed.
-10. Required CI passes.
+10. Required CI passes, or while hosted Actions are unavailable the relevant exact-commit local equivalents are executed and documented under Section 16.3; actual Rust test failures remain blockers.
 11. PR is merged when authorized.
 12. GitHub status is updated.
 
@@ -1820,9 +1843,9 @@ Each cycle must:
 6. Test.
 7. Update documentation.
 8. Open or update PR.
-9. Process CI and reviews.
-10. Merge when authorized.
-11. Update GitHub.
+9. Process CI and reviews; distinguish infrastructure failures from executed-check failures and use the exact-commit local fallback in Section 16.3 while hosted Actions are unavailable.
+10. Merge after successful validation and appropriate review when GitHub permits; do not bypass enforced protections or required approvals. Update, prioritize, or close Issues only as authorized in Section 16.3 and only when their acceptance criteria are met; keep parent Issues open for partial features.
+11. If a merge is genuinely blocked, document the blocker and continue independent authorized work. Restore normal hosted CI requirements once Actions are available.
 12. Persist progress.
 
 Maintain a durable execution ledger recording:

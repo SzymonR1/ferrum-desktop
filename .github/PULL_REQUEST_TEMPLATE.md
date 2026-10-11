@@ -16,7 +16,7 @@ Important technical details.
 
 ## Testing
 
-Commands and observed results.
+Commands and observed results. If hosted Actions are unavailable, include the exact commit SHA, OS/architecture, Rust/Cargo versions, and each local command/result required by AGENTS.md Section 16.3.
 
 ## Documentation impact
 
@@ -51,4 +51,4 @@ Remaining problems and unsupported environments.
 - [ ] Security considered
 - [ ] Performance considered
 - [ ] Acceptance criteria met
-- [ ] CI passes
+- [ ] Hosted CI passes, or while Actions are unavailable the documented exact-commit local fallback is recorded in Testing (AGENTS.md Section 16.3)
