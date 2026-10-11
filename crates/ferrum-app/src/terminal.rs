@@ -72,10 +72,7 @@ impl OscStringLimiter {
                         continue;
                     }
 
-                    let data_length = bytes
-                        .iter()
-                        .position(|byte| is_osc_terminator(*byte))
-                        .unwrap_or(bytes.len());
+                    let data_length = first_osc_terminator(bytes).unwrap_or(bytes.len());
                     let remaining = MAX_OSC_SEQUENCE_BYTES - seen;
                     if data_length > remaining {
                         if remaining > 0 {
@@ -107,9 +104,7 @@ impl OscStringLimiter {
                     };
                 }
                 OscState::DiscardOsc => {
-                    let Some(terminator_index) =
-                        bytes.iter().position(|byte| is_osc_terminator(*byte))
-                    else {
+                    let Some(terminator_index) = first_osc_terminator(bytes) else {
                         return;
                     };
                     let terminator = bytes[terminator_index];
@@ -128,6 +123,10 @@ impl OscStringLimiter {
 
 fn is_osc_terminator(byte: u8) -> bool {
     matches!(byte, 0x07 | 0x18 | 0x1a | 0x1b)
+}
+
+fn first_osc_terminator(bytes: &[u8]) -> Option<usize> {
+    bytes.iter().position(|byte| is_osc_terminator(*byte))
 }
 
 fn escape_keeps_pending(byte: u8) -> bool {
