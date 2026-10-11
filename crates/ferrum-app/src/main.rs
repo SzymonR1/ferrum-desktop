@@ -1744,10 +1744,6 @@ impl FerrumApp {
             self.images.cancel_push_confirmation();
             return;
         }
-        if self.image_push_task.is_some() {
-            self.images.cancel_push_confirmation();
-            return;
-        }
         let Some(engine) = self.engine.clone() else {
             self.images.cancel_push_confirmation();
             return;
