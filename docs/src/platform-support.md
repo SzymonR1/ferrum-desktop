@@ -13,7 +13,7 @@ exercised.
 
 | Linux local Docker Unix-socket volume list/inspect/usage/name-only creation and guarded removal | Scoped API/UI slice; fake-socket and headless tests, opt-in owned-volume live test; native page not visually validated | List/inspect retains allowlisted metadata; usage reports `Size` and point-in-time `RefCount` only for exact inventory matches (`-1`, negative, or missing values are unavailable), with a 30-second/16 MiB usage bound. List, inspect, create, and removal use eight-second request bounds. Creation sends only `Name` and uses Docker's default local driver. Removal requires exact listed/inspected identity, `RefCount == 0`, and explicit confirmation; DELETE omits `force`, and a changing dependency may make Docker reject it. Optional driver/scope/time/mountpoint fields escape selected unsafe text; mountpoints are never accessed. Context switching is blocked and inventory refreshes after every mutation result. No pruning, modification, connection, disconnection, or filesystem browsing is offered. Podman/rootless is unvalidated; remote, Windows, and macOS support is not implemented. Issues #17 and #10 remain open. |
 | Linux local Docker Unix-socket network list/inspect/create/remove/connect/disconnect | Scoped Linux API/UI slice; fake-socket/headless coverage; opt-in live attachment smoke passed 2026-10-10 on Docker Engine 29.9.0/API 1.56; native page not visually validated | Creation sends only `Name`; removal requires a fresh zero-reference inspection and exact-ID confirmation without force/prune. Attachment controls require complete validated membership IDs and an exact current-inventory container ID in `Running` state, plus confirmation. Requests send only `Container`, omit endpoint configuration/Force, use an eight-second deadline, and are not retried. Verbose inspection adds aggregate IP allocation counts; details and unavailable-value semantics are below. The live smoke uses preinstalled `FERRUM_TEST_IMAGE`, `--pull never`, and exact-ID cleanup without force/prune. No usage, Podman/rootless, or remote support is claimed. |
-| Linux local Docker Unix-socket Compose discovery and single-file validation | Read-only CLI/UI; optional live discovery listing, temporary-file validation, and loopback remote-loader smokes passed with Compose v5.6.0 and Docker Engine 29.9.0/API 1.56; native page visual check unavailable | Discovery uses `docker compose version --short` and `docker compose ls --all --format json`, pinning only the listing to the selected `EngineClient::local_socket_path()`. Validation uses `rfd::AsyncFileDialog` to accept one local YAML file, then runs `docker compose --project-directory <parent> --file <selected-file> config --quiet --no-interpolate --no-env-resolution`; the parent is the selected file's directory. The private child environment sets `COMPOSE_DISABLE_ENV_FILE=1`, `COMPOSE_EXPERIMENTAL_GIT_REMOTE=false`, and `COMPOSE_EXPERIMENTAL_OCI_REMOTE=false`, so selected-project interpolation and service `env_file` resolution are skipped and remote Git/OCI `include`/`extends.file` fetches are disabled. The loopback-only safety smoke verified remote Git/OCI `include` references do not open a local connection; it contacts no external host or engine. Multiple files and profiles remain unsupported. Compose may recursively read local files referenced by `include` or service `extends.file`, and included projects may also read their default `.env` or explicit `include.env_file` paths, including outside the selected directory under the logged-in user's permissions. These reads are not confined by the selected path; validate only trusted files. Both commands use private Docker config/HOME, an allowlisted environment, an eight-second deadline, and a 1 MiB stdout cap. Validation contacts no engine or external host and Ferrum itself writes no project files; selected paths and raw diagnostics are not displayed. See Docker's [Compose config](https://docs.docker.com/reference/cli/docker/compose/config), [Compose CLI](https://docs.docker.com/reference/cli/docker/compose), [Compose include reference](https://docs.docker.com/reference/compose-file/include/), [Compose trust model](https://docs.docker.com/compose/trust-model), and [environment-variable guide](https://docs.docker.com/compose/how-tos/environment-variables/envvars/). Only Linux local Docker discovery was validated. Issue #18 remains open; issue #10 remains blocked. |
+| Linux local Docker Compose discovery and ordered multi-file structural validation | Read-only CLI/UI; discovery and single-file, loopback-loader, and ordered temporary base/override smokes passed with Compose v5.6.0; the ordered smoke used no engine; native page visual check unavailable | Uses one base file plus up to 15 local overrides in explicit order (max 16), separate `--file` arguments, and `--project-directory` pinned to the base parent. Validation uses a private CLI config/HOME, cleared environment, and no engine or project mutation. It is structural only. Local includes/extends/environment sources can read files outside the base under user permissions; remote Git/OCI is disabled and rejected; validate only trusted files. Profiles/import/lifecycle/logs remain unsupported. #18 partial/open; #10 blocked/open. |
 | Linux local lifecycle and container-event synchronization | Engine integration-tested; lifecycle audit events unit-tested; UI action clicks not visually verified | On 2026-10-08, the opt-in ignored lifecycle test passed against Docker Engine 29.8.2/API 1.56. It exercised Start/Stop/Restart/Pause/Unpause/Remove, observed an external CLI Start event, and verified state, inventory, and removal for one owned disposable container. Ferrum gates actions on known state; Remove is confirmed and does not force-remove or delete volumes. Lifecycle request results emit structured process-tracing events with action, `success` or `request_error`, and a validated full container ID when available; raw errors, names, endpoints, and daemon bodies are excluded. A request error does not prove the engine state remained unchanged. These events are not a persistent audit store. Event processing is bounded, reconnect retries are limited, and manual refresh remains available. |
 | Linux local historical/live container logs | Engine integration-tested; headless Logs controls tested; native surface not visually/screen-reader validated | On 2026-10-08, the opt-in ignored live test passed against the selected local Unix-socket Docker engine using the preinstalled `ghcr.io/catthehacker/ubuntu:rust-latest` image. It decoded timestamped historical and followed stdout/stderr markers, verified TTY mode, dropped the stream, and removed the owned container. A headless egui/accessibility test interacts with the real Logs dialog, exercising Pause/Resume, auto-scroll, Copy output, and Export availability. Native click/screenshot/screen-reader validation remains unavailable because the desktop provider cannot enumerate Ferrum or capture/accessibility state. |
 | Linux local embedded terminal | Experimental; local Docker-compatible Unix sockets only; visual and screen-reader validation not established | On 2026-10-09, the opt-in live terminal test passed against Docker Engine 29.8.2/API 1.56 using the preinstalled `ghcr.io/catthehacker/ubuntu:rust-latest` image. It verified TTY input/output, ANSI and Unicode bytes, resize to 37x101, Ctrl+C, and that dropping the exec session leaves the container running; the test then stopped and removed its own container, and no `ferrum-live-exec-*` container remained. The engine path is live-tested; the native terminal surface remains untested visually and with a screen reader. Terminal output is untrusted; OSC 52 clipboard and title requests are ignored; clipboard controls require explicit user action. Podman/rootless and remote compatibility remain open in issue #10. |
@@ -139,21 +139,37 @@ The native Networks page remains unverified visually. Podman/rootless and
 remote endpoints remain unsupported or unvalidated. Issues #17 and #10 remain
 open; this slice does not complete either issue or constitute a release claim.
 
-Compose discovery and single-file validation are limited to Linux local Docker.
+Compose discovery and ordered multi-file structural validation are limited to
+Linux local Docker Compose CLI. Validation selects one base `.yaml`/`.yml` file
+then up to 15 local override files in user-chosen sequence (one-based order,
+base first; 16 files maximum). Docker merges files in supplied `-f` order.
+Ferrum sets `--project-directory` to the base file's parent; see Docker's
+[Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
+for ordered merge and relative path resolution from the first config or
+`--project-directory`, and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
+for `config --quiet --no-interpolate --no-env-resolution`.
+
 Validation preflights `docker compose version --short` through the private
-isolated Docker config; a failed preflight is distinct from a config-validation
-failure. Validation uses no engine. Success means structural validation only;
-the selected project's interpolation and service `env_file` resolution are
-skipped. Remote Git/OCI loaders are disabled and rejected without a fetch.
-Compose may recursively read local Compose files referenced by `include` or
-service `extends.file`, plus each included project's default `.env` and
-explicit `include.env_file` paths. These may be outside the selected file's
-directory under the logged-in user's permissions; the selected path is not a
-containment boundary. Validate only trusted Compose files; the CLI/plugin is
-trusted local code and is not sandboxed.
-Multi-file merge, profiles, `.env`/service `env_file` resolution, remote
-OCI/Git, import, lifecycle/build/pull/logs, and mutations remain unsupported.
-Ferrum itself performs no project writes or engine operations during
-validation; selected paths and raw diagnostics are not displayed. Issue #18
-remains open and issue #10 remains blocked; no release/support expansion is
+isolated Docker config; preflight failure is distinct from config-validation
+failure. It does not use an engine or mutate project files. Success means
+structural validation only; interpolation and service `env_file` resolution
+are skipped. Remote Git/OCI loaders are disabled and rejected without a fetch.
+Compose may recursively read local files referenced by `include` or service
+`extends.file`, plus each included project's default `.env` and explicit
+`include.env_file` paths. These may be outside the base directory and are read
+under the logged-in user's permissions. `COMPOSE_DISABLE_ENV_FILE=1` disables
+only the selected project's default `.env`; the `config` flags do not confine
+included-project reads. The selected files are not a containment boundary;
+validate only trusted files. The CLI/plugin is trusted local code and is not
+sandboxed. Ferrum clears inherited environment, does not pass user environment
+files, uses private Docker config/HOME, and bounds each command to eight
+seconds and 1 MiB stdout.
+
+Prior optional discovery, single-file validation, and remote-loader smokes
+passed. The ordered base/override smoke also passed with Compose v5.6.0 using
+temporary files and no engine; it does not validate arbitrary projects or
+lifecycle operations. Native visual validation is unavailable. Profiles,
+remote references, import, lifecycle/build/pull/logs, and project mutations
+remain unsupported. Issue #18 remains partial/open and issue #10 remains
+blocked/open; no full issue completion, release, or support expansion is
 claimed.

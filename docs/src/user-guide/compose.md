@@ -1,8 +1,8 @@
 # Compose
 
-The Compose page keeps its read-only project discovery and adds an explicit
-action to validate one local Compose YAML file. Project discovery uses Docker's
-Compose CLI:
+The Compose page keeps its read-only project discovery and provides structural
+validation of a local base Compose file with ordered local overrides. Project
+discovery uses Docker's Compose CLI:
 
 - `docker compose version --short`
 - `docker compose ls --all --format json`
@@ -14,81 +14,85 @@ Ferrum's current `EngineClient::local_socket_path()` using Docker's global
 sockets; it is not a claim of support for Podman/rootless, remote Docker,
 Windows, or macOS.
 
-## Validate one local Compose file
+## Validate local Compose files
 
-Choose **Validate Compose file** and select one local `.yaml` or `.yml` file.
+Click **Choose base file** and select one local `.yaml` or `.yml` file, then
+use **Add override file** to append up to 15 local overrides in your chosen
+order. The base is order 1; overrides are numbered from 2, and later files
+override earlier definitions. At most 16 files total are accepted.
+
+Use **Remove override N** to remove an override. **Change base file** replaces
+the current base and clears its overrides; add any needed overrides again in
+the intended order.
+
 Ferrum first preflights the installed Compose CLI with
 `docker compose version --short` through its private isolated Docker config.
-Ferrum displays the detected version even when no engine is selected or connected;
-project listing still requires the selected local Docker socket.
 A preflight failure (for example, unavailable CLI/plugin) is distinct from a
-Compose config-validation failure. On successful preflight, Ferrum passes the
-selected path as a separate argument:
+Compose config-validation failure. On successful preflight Ferrum passes each
+selected path as a separate argument, with the base first and each override
+following in the chosen order:
 
 ```text
-docker compose --project-directory <parent> --file <selected-file> config --quiet --no-interpolate --no-env-resolution
+docker compose --project-directory <base-parent> --file <base-file> --file <override-2> ... config --quiet --no-interpolate --no-env-resolution
 ```
 
-The project directory is the selected file's parent, so Compose resolves
-relative paths from that directory. Validation does not contact or require a
-Docker Engine socket, and Ferrum does not write, modify, delete, or extract
-project files. A successful result means structural validation only:
-interpolation and service `env_file` resolution are skipped. The selected path
-is held only for the current validation session; Ferrum displays only a
-bounded, escaped basename and a static result, never the full path or raw CLI
-diagnostics.
+Docker Compose merges files in the order supplied with `-f`/`--file`, with
+later files overriding or extending earlier configuration. Compose resolves
+relative paths against the first/base configuration file; Ferrum explicitly
+sets `--project-directory` to that base file's parent, which determines path
+resolution for the merged project. See Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
+for ordered file merging and path resolution, and the [`config` reference](https://docs.docker.com/reference/cli/docker/compose/config)
+for the validation flags.
+
+Validation is Linux local Docker Compose CLI only. It does not contact or
+require a Docker Engine socket, and Ferrum does not write, modify, delete, or
+extract project files. A successful result means structural validation only:
+`--no-interpolate` skips interpolation and `--no-env-resolution` skips service
+`env_file` resolution. The selected paths are held only for the current
+validation session; Ferrum displays only bounded, escaped basenames and a static
+result, never full paths or raw CLI diagnostics.
 
 Compose can recursively read local Compose files referenced by `include` or
-service `extends.file`, plus each included project's default `.env` and
-explicit `include.env_file` paths. These may be outside the selected Compose
-file's directory and are opened with the logged-in user's permissions.
-`COMPOSE_DISABLE_ENV_FILE=1` disables only the selected project's default
-`.env`; `--no-interpolate` and `--no-env-resolution` do not confine these
-included-project reads. Remote Git/OCI loaders are disabled, so remote
-`include`/`extends.file` references fail without a fetch. The selected file is
-not a path-containment boundary. Private config/HOME and environment isolation
-are not a sandbox; the CLI/plugin is trusted local code. Validate only trusted
-Compose files.
+service `extends.file`, plus each included project's default `.env` and explicit
+`include.env_file` paths. These may be outside the base file's directory and
+are opened with the logged-in user's permissions. `COMPOSE_DISABLE_ENV_FILE=1`
+disables only the selected project's default `.env`; the validation flags do
+not confine included-project reads. Remote Git/OCI loaders are disabled, so
+remote `include`/`extends.file` references fail without a fetch. The selected
+files are not a path-containment boundary: users should validate only trusted
+files. Private config/HOME and environment isolation are not a sandbox, and the
+CLI/plugin is trusted local code.
 
 Ferrum clears inherited environment values, sets `COMPOSE_DISABLE_ENV_FILE=1`,
 and sets `COMPOSE_EXPERIMENTAL_GIT_REMOTE=false` and
 `COMPOSE_EXPERIMENTAL_OCI_REMOTE=false`. No user environment files are passed
-by Ferrum itself; however, included projects may still read their default
-`.env` and explicit `include.env_file` under the logged-in user's permissions.
-`--no-interpolate` and `--no-env-resolution` skip substitution and service
-`env_file` resolution but do not confine those include-env reads. The
-eight-second command deadline and 1 MiB stdout cap apply to each CLI command;
-raw stderr/diagnostics are discarded.
+by Ferrum itself; included projects may still read their default `.env` and
+explicit `include.env_file` under the logged-in user's permissions. Each CLI
+command has an eight-second deadline and a 1 MiB stdout cap; raw stderr and
+diagnostics are discarded.
 
-Discovery and validation CLI processes use a private isolated Docker config
-and `HOME` with a cleared allowlisted environment. If Compose is installed in
-the standard per-user CLI plugin directory, only the `docker-compose`
-executable is linked into the private config; custom `cliPluginsExtraDirs`
-from saved Docker configuration are not loaded. Saved Docker `config.json`
-credentials and proxy settings are not read or passed to the CLI. This does
-not prevent Compose from reading local environment files declared by included
-projects as described above.
+CLI processes use a private isolated Docker config and `HOME` with a cleared
+allowlisted environment. If Compose is installed in the standard per-user CLI
+plugin directory, only the `docker-compose` executable is linked into the
+private config; custom `cliPluginsExtraDirs` from saved Docker configuration
+are not loaded. Saved Docker `config.json` credentials and proxy settings are
+not read or passed to the CLI. This does not prevent Compose from reading local
+environment files declared by included projects.
 
-This remains a read-only page. Multi-file merge, profiles, `.env`/service
-`env_file` resolution, remote Git/OCI `include`/`extends.file` references
+Profiles, `.env`/service `env_file` resolution, remote Git/OCI references
 (explicitly disabled and rejected), import, project start/stop/restart,
-build/pull, logs, and project mutations are unsupported.
+build/pull, logs, and project mutations are unsupported. This multi-file
+validation slice does not complete Issue [#18](https://github.com/SzymonR1/ferrum-desktop/issues/18), which remains open; [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) remains blocked. It makes no full-issue, release, or broader platform-support claim.
 
-For official command and environment semantics, see Docker's
-[Compose `config` reference](https://docs.docker.com/reference/cli/docker/compose/config),
-[Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose),
-and [Compose environment variables guide](https://docs.docker.com/compose/how-tos/environment-variables/envvars/).
-
-The direct CLI probe, optional app-level discovery smoke, controlled
-temporary-file validation smoke, and loopback-only remote-loader safety smoke
-passed with Compose v5.6.0 and Docker Engine 29.9.0/API 1.56. Discovery reads
-the selected local engine; validation parses an owned temporary file without
-contacting an engine. The remote safety smoke verifies Git/OCI include
+For environment semantics, see Docker's [Compose environment variables guide](https://docs.docker.com/compose/how-tos/environment-variables/envvars/).
+The direct CLI probe and discovery smoke, single-file and ordered base/override
+temporary-file validation smokes, and loopback remote-loader safety smoke
+passed with Compose v5.6.0. The ordered smoke uses owned temporary files without
+an engine or user project; no project mutation is performed.
+Discovery reads the selected local engine; validation parses local files
+without contacting an engine. The remote safety smoke verifies Git/OCI include
 references do not open a local connection or contact an external host. None of
 the smokes mutates projects. Linux local Docker discovery was validated; the
-native Compose page visual check is unavailable. Issue
-[#18](https://github.com/SzymonR1/ferrum-desktop/issues/18) remains open; issue
-[#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) remains blocked.
-For security implications of remote and local references, see Docker's
-[Compose trust model](https://docs.docker.com/compose/trust-model).
+native Compose page visual check is unavailable. For security implications of
+remote and local references, see Docker's [Compose trust model](https://docs.docker.com/compose/trust-model).
 This page does not claim full issue completion or a release.

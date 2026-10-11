@@ -49,9 +49,29 @@ All notable project changes are documented here. The project has not published a
 - Hardened engine-returned volume-name and optional-detail presentation: selected control, bidi, zero-width, invisible-format, Unicode-tag, and Hangul-filler characters are escaped. The EngineClient omits optional volume metadata whose raw or escaped form exceeds 4 KiB before retaining it; those fields show as unavailable, while the UI independently applies its 4 KiB display cap and uses `[display text omitted]` for over-limit values that reach rendering. Raw names remain unchanged for identity and requests, and the mountpoint is never accessed. This is presentation hardening, not secret detection or redaction; issue #19 remains open, #10 remains open/blocked for Podman/rootless and broader endpoint validation, and native Volumes visual validation remains outstanding. No release is claimed.
 - Hardened volume-usage parsing so duplicate/conflicting `VolumeUsage`, `Items`, `Name`, or `UsageData` keys and repeated exact-name records cannot report an ambiguous zero reference count. Such usage remains unavailable and cannot enable removal. Issue #17 remains open.
 - Added an anonymous-only image push for one existing local `repository:tag` through the Linux local Docker Unix socket. Confirmation names the image/target and warns that layers and metadata may disclose secrets; Ferrum reinspects the image/tag before submission, reads no registry credentials, and streams bounded sanitized progress. Ambiguous request/stream failures keep image mutations latched for the application session without automatic retry or unlock. Fake-socket and headless UI tests do not contact a registry or mutate real images; no live push is claimed.
-- Extended the read-only Compose page with explicit validation of one locally selected `.yaml` or `.yml` file. Ferrum preflights `docker compose version --short` through the private isolated Docker config, distinguishing preflight failure from config-validation failure, then runs `docker compose --project-directory <parent> --file <selected-file> config --quiet --no-interpolate --no-env-resolution` with `COMPOSE_DISABLE_ENV_FILE=1`. Validation uses no engine and mutates no project files; success means structural validation only, with interpolation and service `env_file` resolution skipped. Compose may recursively read local Compose files referenced by `include` or service `extends.file`, including paths outside the selected file's directory, under the logged-in user's permissions: the selection is not a path-containment boundary. The Docker CLI and Compose plugin are trusted local code, and config isolation is not a sandbox; users should validate only trusted Compose files. The private isolated Docker config/HOME, cleared allowlisted environment, eight-second/1 MiB command bounds, bounded escaped basename, static result, and discarded raw diagnostics remain in effect. Added controlled CLI fixture and headless UI coverage for arguments, environment isolation, redaction, bounds, accessible states, cancellation, and stale results. Multi-file merge, profiles, `.env`/service `env_file` resolution, remote OCI/Git, import, lifecycle/build/pull/logs, and project mutations remain unsupported. Official semantics: [Compose config](https://docs.docker.com/reference/cli/docker/compose/config), [Compose CLI](https://docs.docker.com/reference/cli/docker/compose), and [Compose environment variables](https://docs.docker.com/compose/how-tos/environment-variables/envvars/). Discovery remains Linux local Docker only; issue #18 remains open, issue #10 remains blocked, and no release/support expansion is claimed.
-- Clarified the Compose validation trust boundary: included projects may still read their default `.env` and explicit `include.env_file` paths outside the selected directory despite `COMPOSE_DISABLE_ENV_FILE=1` and the no-interpolation/no-env-resolution flags. These reads are under the logged-in user's permissions, are not path-confined, and require validating only trusted Compose files.
-- Added an optional ignored Compose validation smoke using a controlled temporary project; it checks relative-path resolution with the real local CLI without connecting to an engine or modifying project files.
+- Extended Linux local Docker Compose validation from one selected file to an
+  ordered set: choose one base file, then append local overrides in user-chosen
+  order (one-based order, base at 1; maximum 16 total). Ferrum passes the base
+  first and each override as a separate `--file`; Compose merges in supplied
+  order. The base parent is `--project-directory`, anchoring relative paths.
+  The UI numbers files and allows removing overrides. Choosing a new base
+  clears current overrides so relative-path semantics remain explicit.
+  See Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
+  for ordered merge/path resolution and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
+  for the validation flags. Private-config preflight, structural-only
+  `config --quiet --no-interpolate --no-env-resolution`, engine-independent
+  The new multi-file CLI smoke uses a controlled temporary base/override pair;
+  it passed with Compose v5.6.0 without an engine or user project mutation.
+- Clarified the Compose validation trust boundary: included projects may still
+  read their default `.env` and explicit `include.env_file` paths outside the
+  base directory despite `COMPOSE_DISABLE_ENV_FILE=1` and the
+  no-interpolation/no-env-resolution flags. These reads are under the logged-in
+  user's permissions, are not path-confined, and require validating only
+  trusted Compose files.
+- Optional ignored validation smokes cover single-file relative paths and an
+  ordered temporary base/override pair. The multi-file smoke passed with
+  Compose v5.6.0; it contacted no engine, touched no user project, and performed
+  no project mutations.
 - Moved the Compose file picker to `rfd::AsyncFileDialog`; pending, cancelled, and stale file-selection results are covered by headless state tests.
 - Disabled remote Git/OCI `include`/`extends.file` loaders during Compose validation to prevent remote fetches; an opt-in loopback safety test verifies no connection is made.
 - Display the detected Compose CLI version from file-validation preflight when no engine context is selected or connected.
