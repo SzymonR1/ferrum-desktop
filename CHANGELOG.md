@@ -4,6 +4,8 @@ All notable project changes are documented here. The project has not published a
 
 ## Unreleased
 
+- Added confirmed Linux local Docker Buildx builds pinned to the selected Unix socket with an empty private CLI config. Confirmations name the selected context or a safe endpoint-source label and lock context switching until completion; no socket path is shown. Client validation rejects uppercase repository characters while Docker CLI validates complete repository grammar. Docker CLI handles `.dockerignore`; credentials, proxy settings, build args/secrets/SSH, push, and remote contexts are excluded, so private bases may fail. Output is bounded and transient; best-effort cancellation refreshes inventory. Issues #16/#19 remain open/ready, #10 open/blocked; no release or broader support claim.
+
 - Added a native Rust workspace with an eframe desktop entry point.
 - Added an asynchronous Linux local Docker-compatible inventory and typed inspection path using negotiated API requests.
 - Added state-gated container lifecycle actions and bounded Docker container-event synchronization with manual refresh fallback.

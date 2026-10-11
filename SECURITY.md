@@ -36,6 +36,36 @@ endpoints, error text, and daemon response bodies are not logged. These events
 are not persistent or tamper-proof; `request_error` does not establish that
 engine state remained unchanged.
 
+## Local image builds
+
+The Linux Images page supports confirmed local builds only through Docker CLI
+and its Buildx plugin in `PATH`, explicitly targeting the selected local Docker
+Unix socket. Builds accept only a local directory containing a regular
+root-level `Dockerfile` and a bounded `repository:tag` target; client validation
+rejects uppercase repository characters and Docker CLI validates the full
+repository grammar. Docker CLI handles `.dockerignore` and tar-context
+semantics. Ferrum uses a private temporary empty Docker config and isolated
+`HOME`; it does not read user registry credentials or pass proxy settings,
+build arguments, secrets, SSH access, push requests, or remote contexts.
+Private base-image authentication is unsupported and may cause a build to fail.
+Podman/rootless and broader endpoint/platform compatibility remain unvalidated
+under open, blocked issue #10.
+
+Every build requires confirmation because Dockerfiles can run arbitrary builder
+commands and an existing tag may be reassigned. The confirmation names the
+selected Docker context or a safe endpoint-source label when no named context is
+selected, without displaying the socket path. Context switching is disabled
+while the confirmation or build remains active. Output is sanitized plain text,
+bounded in memory, and not persisted to logs or audit traces. Cancellation is
+best effort and terminates the Docker CLI process group; builder work may
+continue and image/tag state may be uncertain. Ferrum refreshes image inventory
+after every terminal result. Build traces contain only static
+`image_mutation` / `build` action and `success`, `not_submitted`, or
+`request_error` outcome; context path, tag, and output are excluded.
+
+Issues #16 and #19 remain open and ready. This partial slice is not a release
+or a support claim beyond local Linux Docker.
+
 The Volumes page is available only for the selected local Docker Unix socket
 on Linux. Creation sends only `Name` to the negotiated volume-create endpoint
 and uses Docker's default local driver; no driver, labels, or options are

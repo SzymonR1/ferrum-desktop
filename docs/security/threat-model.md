@@ -1,6 +1,32 @@
 # Ferrum threat model
 
-**Status:** Initial scope documented; this is not a security audit. Ferrum provides container inventory and inspection, volume list/inspect/usage with name-only creation and dependency-gated removal, image tagging/removal, scoped container lifecycle actions, network list/inspect/create/removal/connect/disconnect on the Linux local-engine path, logs, and an experimental embedded terminal.
+**Status:** Initial scope documented; this is not a security audit. Ferrum provides container inventory and inspection, volume list/inspect/usage with name-only creation and dependency-gated removal, image listing/inspection/pulls/tagging/removal and confirmed local Buildx builds, scoped container lifecycle actions, network list/inspect/create/removal/connect/disconnect on the Linux local-engine path, logs, and an experimental embedded terminal.
+
+Local builds use Docker CLI Buildx on Linux only. Invoke it with argument
+arrays, explicitly pinned to `--host unix://<EngineClient::local_socket_path()>`;
+delegate `.dockerignore` and tar-context behavior to Docker CLI. Require the
+Buildx plugin in `PATH`, a local directory containing a regular root-level
+`Dockerfile`, and a bounded `repository:tag` check that rejects uppercase
+repository characters and leaves complete repository grammar to Docker CLI.
+Use a private temporary empty Docker config and isolated `HOME`; strip inherited
+Docker endpoint/context/TLS/custom-header/API/platform and proxy variables. Do
+not read user credentials or provide registry auth, build args, secrets, SSH,
+push, remote contexts, custom builders, or privileged entitlements. Private
+base images may fail without authentication.
+Confirm each build because Dockerfiles can execute arbitrary commands and
+existing tags may be reassigned; the confirmation names the selected context or
+a safe endpoint-source label when no named context is selected, without
+displaying the socket path. Context switching is disabled while confirmation
+or build is active. Stream only sanitized bounded plain text in memory; do not
+persist output. Best-effort cancellation terminates the CLI process group;
+refresh inventory after every terminal/cancel result because state may be
+uncertain. Build traces contain only static action and outcome, excluding
+context path, tag, and output.
+
+Compose support is not provided. Podman/rootless and broader endpoint/platform
+compatibility remain unvalidated under issue #10, which remains open and
+blocked. Issues #16 and #19 remain open and ready; no release or broader
+support claim is made.
 
 
 ## Trust boundaries
@@ -153,7 +179,9 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 
 - Remote TCP/HTTP/TLS/SSH transport trust, credentials, and identity validation.
 - Podman API compatibility and rootless endpoint discovery; issue #10 remains open for these and the broader engine matrix.
-- Terminal streams beyond this bounded local exec session, Compose files, external process invocation, archive extraction, and file paths.
+- Compose definitions remain unsupported. The explicit local Docker CLI Buildx
+  invocation is the only added external build process; other external process
+  integrations, archive extraction, and file-path surfaces remain deferred.
 - Credential stores, registry authentication, managed engines, and update delivery.
 
 These surfaces must receive explicit design and tests before their implementation. Engine access should be treated as privileged throughout; API version negotiation is not a security boundary. UI state gating and confirmation reduce accidental destructive operations but cannot constrain a compromised or malicious engine endpoint.
@@ -194,10 +222,9 @@ single-flight/context-switch gates. They do not contact a live engine; native
 UI click/visual validation remains unverified. Network usage is not implemented.
 Issues #17 and #10 remain open; Podman/rootless and remote behavior are not
 claimed.
-Fake-Unix-socket image protocol tests and headless Images UI tests cover tag
-and removal request/confirmation behavior without contacting a real engine or
-mutating images. There is no live image deletion or other live image-mutation
-test.
+Fake-Unix-socket image protocol tests, headless Images UI tests, and controlled
+helper-process Buildx tests do not contact a real engine or mutate images.
+There is no live pull, tag, removal, image build, or image-mutation test.
 Separate opt-in ignored lifecycle, logs, and terminal tests mutate engine state
 using one uniquely named disposable container and only its validated full ID as
 cleanup authority. Logs and terminal tests require locally installed images and
