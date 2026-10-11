@@ -375,6 +375,41 @@ pub(super) fn record_image_mutation_result(
     };
     AuditRecord::new("image_mutation", action.label(), outcome, None, None)
 }
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+pub(super) enum ImageBuildOutcome {
+    Success,
+    NotSubmitted,
+    RequestError,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn record_image_build_result(outcome: ImageBuildOutcome) {
+    match outcome {
+        ImageBuildOutcome::Success => tracing::info!(
+            target: "ferrum::audit",
+            audit_event = "image_mutation",
+            action = "build",
+            outcome = "success",
+            "Image build completed"
+        ),
+        ImageBuildOutcome::NotSubmitted => tracing::warn!(
+            target: "ferrum::audit",
+            audit_event = "image_mutation",
+            action = "build",
+            outcome = "not_submitted",
+            "Image build was not submitted"
+        ),
+        ImageBuildOutcome::RequestError => tracing::warn!(
+            target: "ferrum::audit",
+            audit_event = "image_mutation",
+            action = "build",
+            outcome = "request_error",
+            "Image build request failed"
+        ),
+    }
+}
 #[cfg(target_os = "linux")]
 /// Returns the redacted volume-create outcome after emitting its trace event.
 pub(super) fn record_volume_create_result(
@@ -441,7 +476,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::record_volume_remove_result;
     #[cfg(target_os = "linux")]
-    use super::{ImageMutation, record_image_mutation_result};
+    use super::{
+        ImageBuildOutcome, ImageMutation, record_image_build_result, record_image_mutation_result,
+    };
     use super::{
         NetworkMutation, record_container_action_result, record_network_attachment_result,
         record_network_mutation_result,
@@ -636,6 +673,37 @@ mod tests {
             assert!(!line.contains("tag="));
             assert!(!line.contains("endpoint_label="));
             assert!(!line.contains("local Docker Unix socket"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn records_static_image_build_outcomes() {
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(writer.clone())
+            .finish();
+        let dispatcher = tracing::Dispatch::new(subscriber);
+
+        tracing::dispatcher::with_default(&dispatcher, || {
+            record_image_build_result(ImageBuildOutcome::Success);
+            record_image_build_result(ImageBuildOutcome::NotSubmitted);
+            record_image_build_result(ImageBuildOutcome::RequestError);
+        });
+
+        let captured = match writer.0.lock() {
+            Ok(output) => output.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let output = String::from_utf8(captured).expect("audit events should be UTF-8");
+        let events = output.lines().collect::<Vec<_>>();
+        let expected = ["success", "not_submitted", "request_error"];
+        assert_eq!(events.len(), expected.len());
+        for (line, outcome) in events.iter().zip(expected) {
+            assert!(line.contains("audit_event=\"image_mutation\""));
+            assert!(line.contains("action=\"build\""));
+            assert!(line.contains(&format!("outcome=\"{outcome}\"")));
         }
     }
     #[cfg(target_os = "linux")]

@@ -1,6 +1,33 @@
 # Ferrum threat model
 
-**Status:** Initial scope documented; this is not a security audit. Ferrum provides container inventory and inspection, volume list/inspect/usage with name-only creation and dependency-gated removal, image tagging/removal, scoped container lifecycle actions, network list/inspect/create/removal/connect/disconnect on the Linux local-engine path, logs, and an experimental embedded terminal.
+**Status:** Initial scope documented; this is not a security audit. Ferrum provides container inventory and inspection, volume list/inspect/usage with name-only creation and dependency-gated removal, image listing/inspection/pulls/tagging/removal and confirmed local Buildx builds, scoped container lifecycle actions, network list/inspect/create/removal/connect/disconnect on the Linux local-engine path, logs, and an experimental embedded terminal.
+
+Local builds use Docker CLI Buildx on Linux only. Invoke it with argument
+arrays, explicitly pinned to `--host unix://<EngineClient::local_socket_path()>`;
+delegate `.dockerignore` and tar-context behavior to Docker CLI. Require the
+Buildx plugin in `PATH`, a local directory containing a regular root-level
+`Dockerfile`, and a bounded `repository:tag` check that rejects uppercase
+repository characters and leaves complete repository grammar to Docker CLI.
+Use a private temporary empty Docker config and isolated `HOME`; strip inherited
+Docker endpoint/context/TLS/custom-header/API/platform and proxy variables. Do
+not read user credentials or provide registry auth, build args, secrets, SSH,
+push, remote contexts, custom builders, or privileged entitlements. Private
+base images may fail without authentication.
+Confirm each build because Dockerfiles can execute arbitrary commands and
+existing tags may be reassigned; the confirmation names the selected context or
+a safe endpoint-source label when no named context is selected, without
+displaying the socket path. Context switching is disabled while confirmation
+or build is active. Stream only sanitized bounded plain text in memory; do not
+persist output. Best-effort cancellation terminates the CLI process group;
+refresh inventory after every terminal/cancel result because state may be
+uncertain. Build traces contain only static action and outcome, excluding
+context path, tag, and output; they are ephemeral process logs, not durable
+audit history.
+
+Compose support is not provided. Podman/rootless and broader endpoint/platform
+compatibility remain unvalidated under issue #10, which remains open and
+blocked. Issues #16 and #19 remain open and ready; no release or broader
+support claim is made.
 
 
 ## Trust boundaries
@@ -16,14 +43,19 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
 - Escape selected control, bidi, zero-width, invisible-format, Hangul-filler,
   and Unicode-tag characters in engine-provided container inventory/inspection
-  text, image identifiers/tags/inspection text, network metadata, and
-  membership/confirmation labels. Limit each engine-sourced display field to
-  4 KiB of raw or escaped text; values over the limit are shown as
-  `[display text omitted]`. Preserve raw values for identity comparisons and
-  ID-based requests; this does not detect or redact secrets or arbitrary log
-  content.
+  text, image identifiers/tags/inspection text, network metadata,
+  membership/confirmation labels, and volume names and optional detail values.
+  Limit each engine-sourced display field to 4 KiB of raw or escaped text;
+  values over the limit are shown as `[display text omitted]`. Apply this same
+  bounded UI display helper to volume names and optional driver, scope,
+  creation-time, and host-mountpoint details. Preserve raw names for identity
+  comparisons and requests; never access the mountpoint. This is display
+  hardening, not secret detection or redaction.
 - Use private bounded request paths for version, API negotiation, inventory, inspection, lifecycle, volume usage, and network creation/removal. Version/inventory/inspection and event-subscription setup use an 8-second timeout; lifecycle requests use a bounded 30-second timeout for graceful Stop/Restart; only the filtered volume-usage request uses a 30-second timeout with a 16 MiB response limit. Network creation uses bounded JSON `POST /v{negotiated}/networks/create` with only `Name`, a 1 KiB request-body limit, a 64 KiB success-response limit, and a safe typed response/error path. Network removal uses a bounded eight-second `DELETE /v{negotiated}/networks/{id}` after validating a full 64-character hexadecimal ID; it has no force/prune parameters, does not consume daemon response bodies, and exposes only safe typed errors. Timed-out or transport-interrupted mutations may still change state; never log or expose raw response bodies. Container Remove requires confirmation and sends neither force nor volume-removal parameters.
-- Restrict volume listing, inspection, and usage to the selected local Docker Unix socket on Linux. Retain/display only volume name, driver, scope, creation time, and mountpoint as untrusted plain text; never access the mountpoint. The separate filtered read-only `GET /v{api}/system/df?verbose=true&type=volume` provides usage only for an exact inventory-matched volume; retain/display only `Size` in bytes and point-in-time `RefCount` when reported. Missing, negative, or unknown metric values remain unavailable, and usage failures appear separately while successful inspect metadata remains visible. Discard unknown daemon fields, labels, options, status, and raw response bodies. A reference count is not a deletion-safety guarantee.
+- Restrict volume listing, inspection, and usage to the selected local Docker Unix socket on Linux. Retain/display only volume name, driver, scope, creation time, and mountpoint as untrusted plain text; never access the mountpoint. Apply the shared 4 KiB raw-or-escaped UI display bound to names and each optional driver, scope, creation-time, and host-mountpoint detail, showing `[display text omitted]` when over limit; preserve raw names for identity comparisons and API request values. The separate filtered read-only `GET /v{api}/system/df?verbose=true&type=volume` provides usage only for an exact inventory-matched volume; retain/display only `Size` in bytes and point-in-time `RefCount` when reported. Missing, negative, or unknown metric values remain unavailable, and usage failures appear separately while successful inspect metadata remains visible. Discard unknown daemon fields, labels, options, status, and raw response bodies. A reference count is not a deletion-safety guarantee.
+  EngineClient also omits optional volume metadata above the same 4 KiB
+  raw-or-escaped limit before retaining it, so the page shows those fields as
+  unavailable. The UI applies the display cap again before rendering.
   Create only by sending `Name` to the negotiated `POST /v{api}/volumes/create` endpoint. Validate nonblank names of at most 4096 UTF-8 bytes, reject control or selected invisible formatting characters and `.`/`..`, and send no driver, labels, or options. Bound the request body to 16 KiB, response to 64 KiB, and total request to eight seconds. Require the response name to match the submitted name exactly; escape selected control, bidi, and invisible formatting characters in optional display fields as visible `\u{...}` text.
   Remove only a selected listed volume whose matching inspection reports the exact name and whose exact-name usage snapshot reports `Some(0)` references. Require explicit confirmation naming the volume; positive or unavailable counts cannot be submitted. Send only the negotiated `DELETE /v{api}/volumes/{name}` without `force`, bound it to eight seconds, and do not consume or expose daemon response bodies. The usage count is not atomic with deletion; Docker may reject the request if dependencies change. Timeouts or transport errors may follow a successful removal. Permit one volume mutation at a time, block context switching while pending, and refresh inventory after every result. Do not offer pruning, modification, connection, disconnection, or filesystem browsing. Podman/rootless remains unvalidated and remote endpoints remain unsupported; issues #17 and #10 stay open.
 - Treat duplicate/conflicting volume-usage `VolumeUsage`, `Items`, `Name`, or
@@ -176,7 +208,9 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 
 - Remote TCP/HTTP/TLS/SSH transport trust, credentials, and identity validation.
 - Podman API compatibility and rootless endpoint discovery; issue #10 remains open for these and the broader engine matrix.
-- Terminal streams beyond this bounded local exec session, Compose files, external process invocation, archive extraction, and file paths.
+- Compose definitions remain unsupported. The explicit local Docker CLI Buildx
+  invocation is the only added external build process; other external process
+  integrations, archive extraction, and file-path surfaces remain deferred.
 - Credential stores, registry authentication, managed engines, and update delivery.
 
 These surfaces must receive explicit design and tests before their implementation. Engine access should be treated as privileged throughout; API version negotiation is not a security boundary. UI state gating and confirmation reduce accidental destructive operations but cannot constrain a compromised or malicious engine endpoint.
@@ -217,15 +251,14 @@ single-flight/context-switch gates. They do not contact a live engine; native
 UI click/visual validation remains unverified. Network usage is not implemented.
 Issues #17 and #10 remain open; Podman/rootless and remote behavior are not
 claimed.
-Fake-Unix-socket image protocol tests and headless Images UI tests cover tag
-and removal request/confirmation behavior without contacting a real engine or
-mutating images. There is no live image deletion or other live image-mutation
-test.
+Fake-Unix-socket image protocol tests, headless Images UI tests, and controlled
+helper-process Buildx tests do not contact a real engine or mutate images.
+There is no live pull, tag, removal, image build, or image-mutation test.
 Separate opt-in ignored lifecycle, logs, and terminal tests mutate engine state
 using one uniquely named disposable container and only its validated full ID as
 cleanup authority. Logs and terminal tests require locally installed images and
 never pull, tag, or delete images. See
-[issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
+ [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
 
 The optional ignored volume create/remove test uses the current local Docker
 context's parsed Unix socket path for EngineClient operations. It preflights a

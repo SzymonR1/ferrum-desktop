@@ -1,4 +1,4 @@
-use crate::search::CaseInsensitiveQuery;
+use crate::{display::escape_untrusted_display_text, search::CaseInsensitiveQuery};
 use eframe::egui;
 use ferrum_core::{VolumeDetails, VolumeSummary, VolumeUsage, is_untrusted_display_character};
 
@@ -488,10 +488,11 @@ impl VolumesView {
             .show_rows(ui, ROW_HEIGHT, self.visible.len(), |ui, rows| {
                 for row in rows {
                     let volume = &self.volumes[self.visible[row]];
+                    let display_name = escape_untrusted_display_text(&volume.name);
                     if ui
                         .add_sized(
                             [ui.available_width(), ROW_HEIGHT],
-                            egui::Button::new(&volume.name)
+                            egui::Button::new(display_name.as_ref())
                                 .selected(self.selected.as_deref() == Some(&volume.name)),
                         )
                         .clicked()
@@ -509,11 +510,12 @@ impl VolumesView {
         }
         if let Some(details) = &self.details {
             ui.separator();
-            ui.heading(&details.name);
-            crate::detail_row(ui, "Driver", details.driver.as_deref());
-            crate::detail_row(ui, "Scope", details.scope.as_deref());
-            crate::detail_row(ui, "Created", details.created_at.as_deref());
-            crate::detail_row(ui, "Host mountpoint", details.mountpoint.as_deref());
+            let name = escape_untrusted_display_text(&details.name);
+            ui.heading(name.as_ref());
+            crate::untrusted_detail_row(ui, "Driver", details.driver.as_deref());
+            crate::untrusted_detail_row(ui, "Scope", details.scope.as_deref());
+            crate::untrusted_detail_row(ui, "Created", details.created_at.as_deref());
+            crate::untrusted_detail_row(ui, "Host mountpoint", details.mountpoint.as_deref());
             let size = self
                 .usage
                 .as_ref()
@@ -564,11 +566,12 @@ impl VolumesView {
             if self.removing
                 && let Some(name) = &self.remove_result_name
             {
-                ui.spinner();
-                ui.label(format!("Removing volume '{name}'…"));
+                let display_name = escape_untrusted_display_text(name);
+                ui.label(format!("Removing volume '{display_name}'…"));
             }
             if let Some(name) = &self.remove_success {
-                ui.label(format!("Volume '{name}' was removed."));
+                let display_name = escape_untrusted_display_text(name);
+                ui.label(format!("Volume '{display_name}' was removed."));
             }
             if let Some(error) = &self.remove_error {
                 ui.colored_label(
@@ -591,9 +594,11 @@ impl VolumesView {
                 if self.confirmation_is_current(&confirmation) {
                     ui.group(|ui| {
                         ui.heading("Confirm volume removal");
+                        let display_name =
+                            escape_untrusted_display_text(&confirmation.name);
                         ui.label(format!(
                             "Remove volume '{}' and its data? The latest usage snapshot reports zero container references, but it can change before deletion. Docker may reject removal if the volume becomes in use. Force is not used.",
-                            confirmation.name
+                            display_name
                         ));
                         ui.horizontal(|ui| {
                             if ui.button("Confirm volume removal").clicked() {
@@ -789,6 +794,30 @@ mod tests {
             Role::Label,
             "Container-reference count is a point-in-time snapshot and does not guarantee deletion safety.",
         );
+    }
+
+    #[test]
+    fn oversized_engine_volume_details_are_omitted_from_accessible_rendering() {
+        let mut oversized_details = details("data");
+        let oversized = "x".repeat(4 * 1024 + 1);
+        oversized_details.driver = Some(oversized.clone());
+        oversized_details.scope = Some(oversized.clone());
+        oversized_details.created_at = Some(oversized.clone());
+        oversized_details.mountpoint = Some(oversized);
+
+        let mut view = loaded_view(&["data"]);
+        let (generation, inspection_generation, name) = view.begin_inspection("data".into());
+        view.finish_inspection(
+            generation,
+            inspection_generation,
+            &name,
+            inspection_result(oversized_details, Ok(None)),
+        );
+
+        let mut harness = harness_for(view, true);
+        harness.run();
+        let omitted = harness.get_all_by_role_and_label(Role::Label, "[display text omitted]");
+        assert_eq!(omitted.count(), 4);
     }
 
     #[test]
@@ -1236,6 +1265,89 @@ mod tests {
             } if name == "project-data"
         ));
         assert!(harness.state().removing);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_removable_volume_name_renders_and_removes(raw_name: &str, display_name: &str) {
+        let (action_sender, action_receiver) = std::sync::mpsc::channel();
+        let mut view = removable_view(raw_name, Some(0));
+        view.details.as_mut().unwrap().mountpoint =
+            Some("/var/lib/docker/volumes/safe-mountpoint".into());
+        let mut harness = Harness::new_ui_state(
+            move |ui, view: &mut VolumesView| {
+                if let Some(action @ VolumesAction::Remove { .. }) = view.show(ui, true, "") {
+                    action_sender
+                        .send(action)
+                        .expect("action receiver should stay open");
+                }
+            },
+            view,
+        );
+
+        harness.run();
+        let _row = harness.get_by_role_and_label(Role::Button, display_name);
+        let _details = harness.get_by_role_and_label(Role::Label, display_name);
+        let _mountpoint =
+            harness.get_by_role_and_label(Role::Label, "/var/lib/docker/volumes/safe-mountpoint");
+        harness
+            .get_by_role_and_label(Role::Button, "Remove volume")
+            .click_accesskit();
+        harness.run();
+        let warning = format!(
+            "Remove volume '{display_name}' and its data? The latest usage snapshot reports zero container references, but it can change before deletion. Docker may reject removal if the volume becomes in use. Force is not used."
+        );
+        let _confirmation = harness.get_by_role_and_label(Role::Label, &warning);
+        harness
+            .get_by_role_and_label(Role::Button, "Confirm volume removal")
+            .click_accesskit();
+        harness.step();
+
+        let VolumesAction::Remove {
+            generation,
+            inspection_generation,
+            removal_generation,
+            name,
+        } = action_receiver
+            .try_recv()
+            .expect("explicit confirmation should submit")
+        else {
+            panic!("confirmation should submit a removal");
+        };
+        assert_eq!(
+            name, raw_name,
+            "removing a displayed volume should submit its original engine name"
+        );
+        harness.run();
+        let _progress = harness
+            .get_by_role_and_label(Role::Label, &format!("Removing volume '{display_name}'…"));
+        assert!(harness.state_mut().finish_remove(
+            generation,
+            inspection_generation,
+            removal_generation,
+            raw_name,
+            Ok(()),
+        ));
+        harness.run();
+        let _success = harness.get_by_role_and_label(
+            Role::Label,
+            &format!("Volume '{display_name}' was removed."),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_supplied_volume_names_are_escaped_before_accessible_rendering() {
+        assert_removable_volume_name_renders_and_removes(
+            "engine\u{202e}volume",
+            "engine\\u{202e}volume",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_engine_volume_names_are_omitted_from_accessible_rendering() {
+        let raw_name = "x".repeat(MAX_VOLUME_NAME_BYTES + 1);
+        assert_removable_volume_name_renders_and_removes(&raw_name, "[display text omitted]");
     }
 
     #[cfg(target_os = "linux")]

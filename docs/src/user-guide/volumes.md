@@ -5,8 +5,19 @@ socket on Linux. Select a volume to inspect its name, optional driver, scope,
 creation time, and host mountpoint. Missing optional fields are shown as not
 reported. Selected controls and invisible formatting characters in driver,
 scope, creation time, and mountpoint are shown as visible `\u{...}` escapes;
-unsafe volume names are rejected. Ferrum displays the mountpoint as untrusted
-text and does not open, read, or browse that path.
+unsafe volume names are rejected on creation.
+
+Engine-returned volume names and optional detail values are untrusted display
+text. Ferrum escapes selected control, bidi, zero-width, invisible-format,
+Unicode-tag, and Hangul-filler characters. The engine adapter omits optional
+detail values—driver, scope, creation time, and host mountpoint—whose raw or
+escaped form exceeds 4 KiB before retaining them; the page shows those fields as
+**Not reported**. The UI applies the same bound at rendering and uses
+`[display text omitted]` for any oversized value that reaches it. This is
+presentation hardening, not secret detection or redaction: raw names remain
+unchanged for identity comparisons and API request values. Ferrum displays the
+mountpoint as untrusted text and never accesses, opens, reads, or browses that
+path.
 
 ## Create a volume
 
@@ -64,11 +75,13 @@ disconnection, and filesystem browsing are not offered.
 Only Linux with the selected local Docker Unix socket is covered. Podman and
 rootless behavior are unvalidated, remote endpoints are unsupported, and
 Windows and macOS volume support is not implemented. Headless UI and fake-socket
-tests cover the interface and protocol; the native Volumes page has not been
-visually validated. This slice does not complete issues
-[#17](https://github.com/SzymonR1/ferrum-desktop/issues/17) or
-[#10](https://github.com/SzymonR1/ferrum-desktop/issues/10), and it is not a
-release claim.
+tests cover the interface and protocol. This is a partial display-hardening
+slice; issues [#17](https://github.com/SzymonR1/ferrum-desktop/issues/17) and
+[#19](https://github.com/SzymonR1/ferrum-desktop/issues/19) remain open/ready,
+while [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) remains
+open/blocked for Podman/rootless behavior and broader endpoint validation. No
+endpoint/platform support or release is claimed; native Volumes visual
+validation remains unverified.
 
 The optional ignored live list/inspect/usage test requires `FERRUM_TEST_VOLUME`
 to name an existing volume on the current local Docker context. It is
