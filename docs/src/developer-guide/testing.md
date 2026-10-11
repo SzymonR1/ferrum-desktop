@@ -325,6 +325,17 @@ secret detection. Run the focused tests with:
 cargo test -p ferrum-app --bin ferrum log_buffer_tests
 ```
 
+The embedded terminal's parser tests use synthetic byte streams and no engine.
+They verify that raw OSC data passed to vt100 stays within the 1 KiB budget,
+including when `ESC ]` and BEL/ST/CAN/SUB boundaries cross output chunks, and
+that visible text resumes after an oversized string is discarded. Run them
+with:
+
+```sh
+cargo test -p ferrum-app --bin ferrum terminal::tests::
+```
+
+
 Headless AccessKit tests verify visible escaping for engine-controlled container
 inventory and inspection fields, image tags/inspection author/tag-confirmation
 IDs, network names/metadata, attached-container names in membership/confirmation
