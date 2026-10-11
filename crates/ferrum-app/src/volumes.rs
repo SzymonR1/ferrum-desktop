@@ -1268,79 +1268,9 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn engine_supplied_volume_names_are_escaped_before_accessible_rendering() {
-        let raw_name = "engine\u{202e}volume";
-        let visible_name = "engine\\u{202e}volume";
+    fn assert_removable_volume_name_renders_and_removes(raw_name: &str, display_name: &str) {
         let (action_sender, action_receiver) = std::sync::mpsc::channel();
         let mut view = removable_view(raw_name, Some(0));
-        view.details.as_mut().unwrap().mountpoint =
-            Some("/var/lib/docker/volumes/safe-mountpoint".into());
-        let mut harness = Harness::new_ui_state(
-            move |ui, view: &mut VolumesView| {
-                if let Some(action @ VolumesAction::Remove { .. }) = view.show(ui, true, "") {
-                    action_sender
-                        .send(action)
-                        .expect("action receiver should stay open");
-                }
-            },
-            view,
-        );
-
-        harness.run();
-        let _row = harness.get_by_role_and_label(Role::Button, visible_name);
-        let _details = harness.get_by_role_and_label(Role::Label, visible_name);
-        let _mountpoint =
-            harness.get_by_role_and_label(Role::Label, "/var/lib/docker/volumes/safe-mountpoint");
-        harness
-            .get_by_role_and_label(Role::Button, "Remove volume")
-            .click_accesskit();
-        harness.run();
-        let warning = format!(
-            "Remove volume '{visible_name}' and its data? The latest usage snapshot reports zero container references, but it can change before deletion. Docker may reject removal if the volume becomes in use. Force is not used."
-        );
-        let _confirmation = harness.get_by_role_and_label(Role::Label, &warning);
-        harness
-            .get_by_role_and_label(Role::Button, "Confirm volume removal")
-            .click_accesskit();
-        harness.step();
-
-        let VolumesAction::Remove {
-            generation,
-            inspection_generation,
-            removal_generation,
-            name,
-        } = action_receiver
-            .try_recv()
-            .expect("explicit confirmation should submit")
-        else {
-            panic!("confirmation should submit a removal");
-        };
-        assert_eq!(name, raw_name);
-        harness.run();
-        let _progress = harness
-            .get_by_role_and_label(Role::Label, &format!("Removing volume '{visible_name}'…"));
-        assert!(harness.state_mut().finish_remove(
-            generation,
-            inspection_generation,
-            removal_generation,
-            raw_name,
-            Ok(()),
-        ));
-        harness.run();
-        let _success = harness.get_by_role_and_label(
-            Role::Label,
-            &format!("Volume '{visible_name}' was removed."),
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn oversized_engine_volume_names_are_omitted_from_accessible_rendering() {
-        let raw_name = "x".repeat(MAX_VOLUME_NAME_BYTES + 1);
-        let display_name = "[display text omitted]";
-        let (action_sender, action_receiver) = std::sync::mpsc::channel();
-        let mut view = removable_view(&raw_name, Some(0));
         view.details.as_mut().unwrap().mountpoint =
             Some("/var/lib/docker/volumes/safe-mountpoint".into());
         let mut harness = Harness::new_ui_state(
@@ -1383,7 +1313,10 @@ mod tests {
         else {
             panic!("confirmation should submit a removal");
         };
-        assert_eq!(name, raw_name);
+        assert_eq!(
+            name, raw_name,
+            "removing a displayed volume should submit its original engine name"
+        );
         harness.run();
         let _progress = harness
             .get_by_role_and_label(Role::Label, &format!("Removing volume '{display_name}'…"));
@@ -1391,7 +1324,7 @@ mod tests {
             generation,
             inspection_generation,
             removal_generation,
-            &raw_name,
+            raw_name,
             Ok(()),
         ));
         harness.run();
@@ -1399,6 +1332,22 @@ mod tests {
             Role::Label,
             &format!("Volume '{display_name}' was removed."),
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_supplied_volume_names_are_escaped_before_accessible_rendering() {
+        assert_removable_volume_name_renders_and_removes(
+            "engine\u{202e}volume",
+            "engine\\u{202e}volume",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_engine_volume_names_are_omitted_from_accessible_rendering() {
+        let raw_name = "x".repeat(MAX_VOLUME_NAME_BYTES + 1);
+        assert_removable_volume_name_renders_and_removes(&raw_name, "[display text omitted]");
     }
 
     #[cfg(target_os = "linux")]
