@@ -37,27 +37,35 @@ bounded, escaped basename and a static result, never the full path or raw CLI
 diagnostics.
 
 Compose can recursively read local Compose files referenced by `include` or
-service `extends.file`, including paths outside the selected Compose file's
-directory, under the logged-in user's permissions. Remote Git and OCI loaders
-are explicitly disabled, so remote `include`/`extends.file` references fail
-validation without a fetch. The selected file is not a path-containment
-boundary. Private config/HOME and environment isolation are not a sandbox; the
-Docker CLI and Compose plugin are trusted local code. Validate only trusted
+service `extends.file`, plus each included project's default `.env` and
+explicit `include.env_file` paths. These may be outside the selected Compose
+file's directory and are opened with the logged-in user's permissions.
+`COMPOSE_DISABLE_ENV_FILE=1` disables only the selected project's default
+`.env`; `--no-interpolate` and `--no-env-resolution` do not confine these
+included-project reads. Remote Git/OCI loaders are disabled, so remote
+`include`/`extends.file` references fail without a fetch. The selected file is
+not a path-containment boundary. Private config/HOME and environment isolation
+are not a sandbox; the CLI/plugin is trusted local code. Validate only trusted
 Compose files.
 
 Ferrum clears inherited environment values, sets `COMPOSE_DISABLE_ENV_FILE=1`,
 and sets `COMPOSE_EXPERIMENTAL_GIT_REMOTE=false` and
-`COMPOSE_EXPERIMENTAL_OCI_REMOTE=false`. No user environment files are passed,
-and `--no-interpolate` and `--no-env-resolution` skip `.env` interpolation and
-service `env_file` resolution. The eight-second command deadline and 1 MiB
-stdout cap apply to each CLI command, and raw stderr/diagnostics are discarded.
+`COMPOSE_EXPERIMENTAL_OCI_REMOTE=false`. No user environment files are passed
+by Ferrum itself; however, included projects may still read their default
+`.env` and explicit `include.env_file` under the logged-in user's permissions.
+`--no-interpolate` and `--no-env-resolution` skip substitution and service
+`env_file` resolution but do not confine those include-env reads. The
+eight-second command deadline and 1 MiB stdout cap apply to each CLI command;
+raw stderr/diagnostics are discarded.
 
 Discovery and validation CLI processes use a private isolated Docker config
 and `HOME` with a cleared allowlisted environment. If Compose is installed in
 the standard per-user CLI plugin directory, only the `docker-compose`
 executable is linked into the private config; custom `cliPluginsExtraDirs`
-from saved Docker configuration are not loaded. The saved `config.json` is not
-read; credentials and proxy settings are neither read nor passed to the CLI.
+from saved Docker configuration are not loaded. Saved Docker `config.json`
+credentials and proxy settings are not read or passed to the CLI. This does
+not prevent Compose from reading local environment files declared by included
+projects as described above.
 
 This remains a read-only page. Multi-file merge, profiles, `.env`/service
 `env_file` resolution, remote Git/OCI `include`/`extends.file` references

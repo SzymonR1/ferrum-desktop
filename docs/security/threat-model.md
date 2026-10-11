@@ -39,15 +39,16 @@ interpolation and service `env_file` resolution are skipped.
 
 - Treat Compose file references as untrusted filesystem reads. Compose may
   recursively read local Compose files referenced by `include` or service
-  `extends.file`, including paths outside the selected Compose file's
-  directory, under the logged-in user's permissions. The selected file is not
-  a path-containment boundary. Remote Git and OCI loaders are explicitly
-  disabled with Compose-specific environment variables before config parsing,
-  so remote `include`/`extends.file` references fail without a fetch. The CLI
-  and plugin are trusted local code, and private config/environment isolation is
-  not a sandbox. Validate only trusted files; keep selected paths and raw
-  diagnostics private, displaying only a bounded escaped basename and a static
-  result.
+  `extends.file`, plus each included project's default `.env` and explicit
+  `include.env_file` paths. These files can be outside the selected file's
+  directory and are opened with the logged-in user's permissions.
+  `COMPOSE_DISABLE_ENV_FILE=1` disables only the selected project's default
+  `.env`; `--no-interpolate` and `--no-env-resolution` do not confine included
+  project file reads. Remote Git and OCI loaders are explicitly disabled, so
+  remote `include`/`extends.file` references fail without a fetch. The selected
+  file is not a path-containment boundary. The CLI/plugin is trusted local code
+  and not a sandbox; validate only trusted files. Keep selected paths and raw
+  diagnostics private; display only a bounded escaped basename and static result.
 - Defer multiple-file merge, profiles, `.env`/service `env_file` resolution,
   file import, project start/stop/restart, build/pull/logs, and project
   mutations. Remote OCI/Git references remain disabled, not fetched. Only

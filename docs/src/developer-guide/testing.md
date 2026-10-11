@@ -356,15 +356,15 @@ cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_
 Validation uses the official [Compose `config` reference](https://docs.docker.com/reference/cli/docker/compose/config),
 [Compose CLI semantics](https://docs.docker.com/reference/cli/docker/compose),
 and [Compose environment-variable guide](https://docs.docker.com/compose/how-tos/environment-variables/envvars/).
-`.env` interpolation and service `env_file` resolution are deliberately
-skipped. Compose may still recursively read local Compose files referenced by
-`include` or service `extends.file`, including paths outside the selected
-file's directory, under the logged-in user's permissions; selection is not a
-containment boundary. The CLI and plugin are trusted local code; isolated
-config is not a sandbox. Remote Git and OCI loaders are explicitly disabled,
-so remote include references fail without fetching. Validate only trusted
-files. Multi-file merge, profiles, `.env`/service `env_file` resolution, import,
-lifecycle/build/pull/logs, and project mutations remain unsupported.
+The selected project's `.env` interpolation and service `env_file` resolution
+are skipped. However, Compose may still read each included project's default
+`.env` or explicit `include.env_file`, including paths outside the selected
+directory, under the logged-in user's permissions; the no-interpolate and
+no-env-resolution options do not confine those reads. Remote Git and OCI
+loaders are explicitly disabled, so remote include/extends references fail
+without fetching. The CLI/plugin remains unsandboxed; validate only trusted
+files. Multi-file merge, profiles, import, lifecycle/build/pull/logs, and
+project mutations remain unsupported.
 
 Only Linux local Docker discovery was validated; validation uses no engine. The
 native Compose page visual check is unavailable, and Podman/rootless and remote

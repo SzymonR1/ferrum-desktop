@@ -154,12 +154,16 @@ result means structural validation only; interpolation and service `env_file`
 resolution are skipped. Only a bounded escaped basename and a static result
 are displayed; paths are session-only and raw diagnostics are discarded.
 Compose can recursively read local Compose files referenced by `include` or
-service `extends.file`, including paths outside the selected Compose file
-directory, under the logged-in user's permissions. Remote Git and OCI loaders
-are explicitly disabled during validation, so remote `include` and
-`extends.file` references fail without a fetch. The selected file is not a path-containment boundary. CLI/plugin code is
-trusted local code and config isolation is not a sandbox; users should validate
-only trusted Compose files.
+service `extends.file`, plus the included project's default `.env` and explicit
+`include.env_file` paths. These files can be outside the selected Compose file's
+directory and are opened with the logged-in user's permissions.
+`COMPOSE_DISABLE_ENV_FILE=1` disables only the selected project's default `.env`;
+`--no-interpolate` and `--no-env-resolution` do not confine included-project
+file reads. Remote Git and OCI loaders are explicitly disabled during
+validation, so remote `include`/`extends.file` references fail without a fetch.
+The selected file is not a path-containment boundary. CLI/plugin code is trusted
+local code and config isolation is not a sandbox; users should validate only
+trusted Compose files.
 
 Ferrum clears inherited environment values, sets `COMPOSE_DISABLE_ENV_FILE=1`,
 and sets `COMPOSE_EXPERIMENTAL_GIT_REMOTE=false` and
@@ -174,8 +178,9 @@ CLI processes use a private isolated Docker config/HOME and a cleared
 allowlisted environment. If Compose is installed in the standard per-user CLI
 plugin directory, only the `docker-compose` executable is linked into the
 private config; custom `cliPluginsExtraDirs` from saved config are not loaded.
-The saved `config.json` is not loaded; credentials and proxy settings are
-neither read nor passed to the CLI.
+The saved `config.json` is not loaded, so Docker credentials and proxy settings
+from that config are not read or passed to the CLI. Compose-declared local
+environment files may still be read as described above.
 
 For the command and environment contract, see Docker's [Compose `config`
 reference](https://docs.docker.com/reference/cli/docker/compose/config),

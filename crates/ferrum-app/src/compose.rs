@@ -274,10 +274,12 @@ impl ComposeView {
                 egui::Color32::from_rgb(224, 174, 109),
                 concat!(
                     "Security notice: validate only trusted Compose files. ",
-"Docker Compose may recursively read local Compose files referenced by include ",
-"or service extends.file, including files outside the selected file's directory, ",
-"using the logged-in user's permissions. Remote Git and OCI loaders are disabled. ",
-"The selected file is not a path containment boundary, and validation is not sandboxed."
+"Compose may recursively read local files referenced by include or service ",
+"extends.file, including each included project's default .env and explicit ",
+"include.env_file, even outside the selected directory under your permissions. ",
+"Disabling the root .env and using --no-interpolate/--no-env-resolution do not ",
+"confine these reads. Remote Git/OCI loaders are disabled. The selection is ",
+"not a path boundary, and validation is not sandboxed."
                 ),
             );
         });
@@ -1602,7 +1604,7 @@ mod tests {
 
             let _security_disclosure = harness.get_by_role_and_label(
                 Role::Label,
-                "Security notice: validate only trusted Compose files. Docker Compose may recursively read local Compose files referenced by include or service extends.file, including files outside the selected file's directory, using the logged-in user's permissions. Remote Git and OCI loaders are disabled. The selected file is not a path containment boundary, and validation is not sandboxed.",
+"Security notice: validate only trusted Compose files. Compose may recursively read local files referenced by include or service extends.file, including each included project's default .env and explicit include.env_file, even outside the selected directory under your permissions. Disabling the root .env and using --no-interpolate/--no-env-resolution do not confine these reads. Remote Git/OCI loaders are disabled. The selection is not a path boundary, and validation is not sandboxed.",
             );
             assert!(
                 !harness
