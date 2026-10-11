@@ -291,6 +291,30 @@ The engine integration targets Linux local Unix sockets. Podman/rootless
 behavior remains unvalidated, remote transports remain unsupported, and Windows
 named pipes and macOS remain deferred to issue #21/M8.
 
+Default Compose discovery tests use controlled CLI fixtures and headless UI
+state; they do not contact a live engine or mutate projects. The subprocess
+seam checks `docker compose version --short` and
+`docker compose ls --all --format json`. The version probe does not target an
+engine; only the listing is pinned with Docker global `--host unix://...` to
+the selected `EngineClient::local_socket_path()`. Tests verify private Docker
+config/HOME, the cleared allowlisted environment, plugin-only linking without
+saved config, refusal to import custom `cliPluginsExtraDirs`, bounded output
+and deadlines, escaped Name/Status, duplicate rejection, static errors, and
+accessible loading/empty/error/refresh states.
+
+The optional ignored app-level live smoke requires a local Docker-compatible
+Unix socket and Compose CLI. It only discovers the caller-selected engine's
+Compose version/projects and checks bounded, escaped output; it never creates,
+starts, stops, or removes projects:
+
+```sh
+cargo test -p ferrum-app --bin ferrum compose::tests::local_compose_discovery_smoke_is_read_only -- --exact --ignored
+```
+
+Only Linux local Docker was validated; Podman/rootless and remote transports
+remain unsupported or unvalidated. The native Compose page visual check is
+unavailable.
+
 The `audit::tests` module captures lifecycle trace events in memory and checks
 action/outcome fields, full-ID validation, and omission of untrusted identifiers.
 Run those behavior tests directly with:

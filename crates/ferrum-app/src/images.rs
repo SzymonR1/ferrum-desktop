@@ -14,6 +14,7 @@ pub(super) enum AppPage {
     Images,
     Volumes,
     Networks,
+    Compose,
 }
 
 impl AppPage {
@@ -23,6 +24,7 @@ impl AppPage {
             Self::Images => "Images",
             Self::Volumes => "Volumes",
             Self::Networks => "Networks",
+            Self::Compose => "Compose",
         }
     }
 }
@@ -34,6 +36,7 @@ pub(super) fn show_navigation(ui: &mut egui::Ui, active: AppPage) -> Option<AppP
         AppPage::Images,
         AppPage::Volumes,
         AppPage::Networks,
+        AppPage::Compose,
     ] {
         let response = ui.add(egui::Button::new(page.title()).selected(active == page));
         if response.clicked() && active != page {
@@ -1335,6 +1338,26 @@ mod tests {
         harness.run();
         assert_eq!(harness.state().page, AppPage::Networks);
         let _networks = harness.get_by_role_and_label(Role::Label, "Networks");
+    }
+
+    #[test]
+    fn navigation_opens_the_compose_page_through_an_accessible_action() {
+        let mut harness = Harness::new_ui_state(
+            |ui, state: &mut NavigationUi| {
+                if let Some(page) = show_navigation(ui, state.page) {
+                    state.page = page;
+                }
+                ui.heading(state.page.title());
+            },
+            NavigationUi::default(),
+        );
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Compose")
+            .click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().page, AppPage::Compose);
+        let _compose = harness.get_by_role_and_label(Role::Label, "Compose");
     }
 
     #[test]

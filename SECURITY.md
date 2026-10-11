@@ -131,3 +131,29 @@ credential access are not provided. Podman/rootless and remote endpoints
 remain unsupported or unvalidated. Issues #17 and #10 remain open; no release
 is claimed.
 
+The Compose page is read-only and limited to the selected Linux local Docker
+Unix socket. It detects the installed CLI version with
+`docker compose version --short`; this probe does not target an engine. It
+lists projects with `docker compose ls --all --format json`, pinning that
+listing to `EngineClient::local_socket_path()` through Docker global
+`--host unix://...`. CLI processes run with a private isolated Docker config/HOME
+and a cleared allowlisted environment. If Compose is installed in the standard
+per-user CLI plugin directory, only the `docker-compose` executable is linked
+into the private config for discovery; custom `cliPluginsExtraDirs` from the
+user's saved config are not loaded. The saved `config.json`, credentials, and
+proxy settings are not copied or passed to the CLI. Each command has an
+eight-second deadline and a 1 MiB stdout cap. Ferrum retains and displays only
+project Name and Status, rejecting malformed or duplicate fields and duplicate
+identities; it ignores ConfigFiles, paths, and raw diagnostics. Project text is
+bounded and escaped; raw stderr and daemon errors are not shown.
+
+The Docker CLI and Compose plugin execute as Ferrum under the logged-in user's
+normal filesystem and network permissions. Private config and environment
+isolation limit inherited settings; they are not a sandbox. Treat the installed
+binaries as trusted local code.
+No Compose-file validation/import, start/stop/restart, build/pull, logs, or
+project mutation is implemented. Podman/rootless, remote Docker, Windows, and
+macOS are not in scope; issue #10 remains blocked. Only Linux local Docker was
+validated, and the native Compose page visual check is unavailable. Issue #18
+remains open.
+

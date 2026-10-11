@@ -13,6 +13,26 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 - Keep direct remote `DOCKER_HOST` TCP/HTTP/HTTPS/SSH and remote Docker context transports disabled. Return typed unsupported errors without fallback to local discovery, and do not read remote TLS/SSH credentials.
 - Do not log or display raw `DOCKER_HOST` values, which may contain sensitive endpoint data.
 - Keep Docker CLI context selection session-only; do not log or display raw context endpoints. Linux `EngineClient::local_socket_path` exposes the already-connected local socket only so trusted local tooling can target the same daemon; it does not change socket permissions and must not be logged or displayed.
+- Keep Compose discovery read-only. `docker compose version --short` detects
+  the installed CLI version without targeting an engine; the project listing
+  alone uses `docker compose ls --all --format json` with Docker global
+  `--host unix://...` pinned to `EngineClient::local_socket_path()`. Run each
+  CLI process with a private isolated Docker config/HOME and a cleared
+  allowlisted environment. If the Compose plugin is in the standard per-user
+  directory, link only its `docker-compose` executable into the private
+  config. Custom `cliPluginsExtraDirs` from the saved config are not loaded;
+  do not copy or load user `config.json`, credentials, or proxy settings. Bound
+  each command to eight seconds and 1 MiB of stdout. Retain/display only
+  escaped project Name and Status; reject malformed or duplicate Name/Status
+  fields and duplicate project identities. Ignore ConfigFiles, paths, raw
+  stderr, and daemon errors. Do not implement Compose-file validation/import,
+  project start/stop/restart, build/pull, logs, or project mutations. Only
+  Linux local Docker was validated; the native page visual check is unavailable.
+  Issue #18 remains open and #10 remains blocked.
+  The Docker CLI and Compose plugin execute with the logged-in Ferrum user's
+  normal filesystem and network permissions; private config/environment
+  isolation is not a sandbox. Treat the installed binaries as trusted local
+  code.
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
 - Escape selected control, bidi, zero-width, invisible-format, Hangul-filler,
   and Unicode-tag characters in engine-provided container inventory/inspection

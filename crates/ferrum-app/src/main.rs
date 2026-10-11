@@ -26,6 +26,7 @@ fn action_requires_confirmation(action: ContainerAction) -> bool {
     action.is_destructive()
 }
 mod audit;
+mod compose;
 mod display;
 mod images;
 mod inventory;
@@ -150,6 +151,10 @@ enum EngineEvent {
         container_generation: u64,
         network_result: Result<Vec<NetworkSummary>, EngineError>,
         container_result: Result<Vec<ContainerSummary>, EngineError>,
+    },
+    ComposeListed {
+        generation: u64,
+        result: Result<compose::ComposeDiscovery, compose::ComposeError>,
     },
     NetworkCreated {
         generation: u64,
@@ -787,6 +792,7 @@ struct FerrumApp {
     images: images::ImagesView,
     volumes: volumes::VolumesView,
     networks: networks::NetworksView,
+    compose: compose::ComposeView,
     // Keep submitted network mutations alive across page invalidation; the
     // engine may already have accepted them and success should refresh inventory.
     network_create_task: Option<JoinHandle<()>>,
@@ -796,6 +802,7 @@ struct FerrumApp {
     volume_remove_task: Option<JoinHandle<()>>,
     resource_read_task: Option<JoinHandle<()>>,
     pending_resource_read: Option<PendingResourceRead>,
+    compose_task: Option<JoinHandle<()>>,
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
     // Hold the reader until the terminal response event releases the mutation gate.
@@ -978,6 +985,7 @@ impl FerrumApp {
             images: images::ImagesView::default(),
             volumes: volumes::VolumesView::default(),
             networks: networks::NetworksView::default(),
+            compose: compose::ComposeView::default(),
             network_create_task: None,
             network_remove_task: None,
             network_attachment_task: None,
@@ -985,6 +993,7 @@ impl FerrumApp {
             volume_remove_task: None,
             resource_read_task: None,
             pending_resource_read: None,
+            compose_task: None,
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
@@ -1158,6 +1167,41 @@ impl FerrumApp {
     fn invalidate_networks(&mut self) {
         self.pending_resource_read = None;
         self.networks.invalidate();
+    }
+    fn invalidate_compose(&mut self) {
+        if let Some(task) = self.compose_task.take() {
+            task.abort();
+        }
+        self.compose.invalidate();
+    }
+    fn load_compose(&mut self, context: egui::Context) {
+        #[cfg(target_os = "linux")]
+        {
+            if self.loading || self.compose.is_loading() {
+                return;
+            }
+            let Some(socket_path) = self
+                .engine
+                .as_ref()
+                .map(|engine| engine.local_socket_path().to_path_buf())
+            else {
+                return;
+            };
+            let generation = self.compose.begin_load();
+            let sender = self.sender.clone();
+            self.compose_task = Some(self.runtime.spawn(async move {
+                let result = compose::discover_projects(&socket_path).await;
+                if sender
+                    .send(EngineEvent::ComposeListed { generation, result })
+                    .await
+                    .is_ok()
+                {
+                    context.request_repaint();
+                }
+            }));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (self, context);
     }
     fn invalidate_resource_reads(&mut self) {
         self.pending_resource_read = None;
@@ -1838,6 +1882,9 @@ impl FerrumApp {
         if previous == images::AppPage::Networks {
             self.invalidate_networks();
         }
+        if previous == images::AppPage::Compose {
+            self.invalidate_compose();
+        }
         if page == images::AppPage::Images && !self.loading && self.engine.is_some() {
             self.load_images(context.clone());
         }
@@ -1845,7 +1892,14 @@ impl FerrumApp {
             self.load_volumes(context.clone());
         }
         if page == images::AppPage::Networks && !self.loading && self.engine.is_some() {
-            self.load_networks(context);
+            self.load_networks(context.clone());
+        }
+        if page == images::AppPage::Compose
+            && !self.loading
+            && self.engine.is_some()
+            && matches!(&self.connection, ConnectionState::Connected)
+        {
+            self.load_compose(context);
         }
     }
 
@@ -1857,6 +1911,7 @@ impl FerrumApp {
         self.cancel_terminal_session();
 
         self.invalidate_images();
+        self.invalidate_compose();
         self.loading = true;
         self.connection = ConnectionState::Connecting;
         self.refresh_error = None;
@@ -1897,6 +1952,7 @@ impl FerrumApp {
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
         self.invalidate_resource_reads();
+        self.invalidate_compose();
         self.loading = true;
         self.context_error = None;
         let sender = self.sender.clone();
@@ -1941,6 +1997,14 @@ impl FerrumApp {
         if self.page == images::AppPage::Networks {
             if self.engine.is_some() {
                 self.load_networks(context);
+            } else {
+                self.connect(context);
+            }
+            return;
+        }
+        if self.page == images::AppPage::Compose {
+            if self.engine.is_some() {
+                self.load_compose(context);
             } else {
                 self.connect(context);
             }
@@ -2052,6 +2116,11 @@ impl FerrumApp {
                         .finish_list(generation, result.map_err(|error| error.to_string()));
                     self.resource_read_task = None;
                     self.start_pending_resource_read(context.clone());
+                }
+                EngineEvent::ComposeListed { generation, result } => {
+                    if self.compose.finish_load(generation, result) {
+                        self.compose_task = None;
+                    }
                 }
                 EngineEvent::VolumeInspected {
                     generation,
@@ -2467,6 +2536,7 @@ impl FerrumApp {
         self.cancel_terminal_session();
         self.cancel_inspection();
         self.invalidate_resource_reads();
+        self.invalidate_compose();
         if let Some(task) = self.action_task.take() {
             task.abort();
         }
@@ -2485,7 +2555,10 @@ impl FerrumApp {
             self.load_volumes(context.clone());
         }
         if self.page == images::AppPage::Networks {
-            self.load_networks(context);
+            self.load_networks(context.clone());
+        }
+        if self.page == images::AppPage::Compose {
+            self.load_compose(context);
         }
     }
 
@@ -2830,6 +2903,48 @@ impl FerrumApp {
             &self.containers,
         )
     }
+    fn draw_compose(&mut self, ui: &mut egui::Ui) -> bool {
+        if self.loading {
+            ui.spinner();
+            ui.heading("Waiting for the engine context");
+            return self.compose.show(
+                ui,
+                false,
+                "Compose projects will load when the engine context change finishes.",
+                false,
+            );
+        }
+        let engine_selected = self.engine.is_some();
+        let connected = matches!(&self.connection, ConnectionState::Connected);
+        if cfg!(target_os = "linux")
+            && engine_selected
+            && connected
+            && !self.compose.is_loading()
+            && !self.compose.has_loaded()
+        {
+            self.load_compose(ui.ctx().clone());
+        }
+        let available = cfg!(target_os = "linux") && engine_selected;
+        let message = match (&self.connection, available) {
+            (_, false) if !cfg!(target_os = "linux") => {
+                "Compose project discovery is implemented only on Linux with a local Docker Unix socket."
+            }
+            (ConnectionState::Connecting, _) => "Connecting to the selected local Docker Engine.",
+            (ConnectionState::Disconnected(_), true) => {
+                "The selected local Docker Engine is unavailable; the displayed project snapshot may be stale."
+            }
+            (ConnectionState::Disconnected(_), false) | (ConnectionState::Connected, false) => {
+                "The selected local Docker Engine is unavailable."
+            }
+            (ConnectionState::Connected, true) => "",
+        };
+        self.compose.show(
+            ui,
+            available,
+            message,
+            cfg!(target_os = "linux") && !self.loading,
+        )
+    }
     fn draw_images(&mut self, ui: &mut egui::Ui) -> Option<images::ImageInspectionRequest> {
         if let Some(error) = &self.context_error {
             ui.colored_label(Color32::from_rgb(224, 174, 109), "Context switch failed");
@@ -2905,7 +3020,8 @@ impl FerrumApp {
                     || self.images.is_removing()
                     || self.image_tag_task.is_some()
                     || self.image_remove_task.is_some()))
-            || (self.page == images::AppPage::Volumes && self.volumes.is_loading());
+            || (self.page == images::AppPage::Volumes && self.volumes.is_loading())
+            || (self.page == images::AppPage::Compose && self.compose.is_loading());
         let network_mutation_in_flight = self.network_mutation_busy();
         let volume_mutation_in_flight = self.volume_mutation_busy();
 
@@ -3008,21 +3124,23 @@ impl FerrumApp {
                         if ui.button("Settings").clicked() {
                             *settings_requested = true;
                         }
-                        let button_text = if page_loading {
-                            "Loading"
-                        } else if self.engine.is_some() {
-                            "Refresh"
-                        } else {
-                            "Retry connection"
-                        };
-                        if ui
-                            .add_enabled(
-                                !page_loading && !self.action_busy(),
-                                egui::Button::new(button_text),
-                            )
-                            .clicked()
-                        {
-                            *refresh_requested = true;
+                        if self.page != images::AppPage::Compose {
+                            let button_text = if page_loading {
+                                "Loading"
+                            } else if self.engine.is_some() {
+                                "Refresh"
+                            } else {
+                                "Retry connection"
+                            };
+                            if ui
+                                .add_enabled(
+                                    !page_loading && !self.action_busy(),
+                                    egui::Button::new(button_text),
+                                )
+                                .clicked()
+                            {
+                                *refresh_requested = true;
+                            }
                         }
                     });
                 });
@@ -3735,6 +3853,7 @@ impl Drop for FerrumApp {
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
         self.cancel_image_read_tasks();
+        self.invalidate_compose();
         self.pending_resource_read = None;
         if let Some(task) = self.resource_read_task.take() {
             task.abort();
@@ -3796,6 +3915,7 @@ impl eframe::App for FerrumApp {
         let mut image_inspection = None;
         let mut volume_action = None;
         let mut network_action = None;
+        let mut compose_refresh = false;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 18)))
             .show(ui, |ui| match self.page {
@@ -3803,7 +3923,11 @@ impl eframe::App for FerrumApp {
                 images::AppPage::Images => image_inspection = self.draw_images(ui),
                 images::AppPage::Volumes => volume_action = self.draw_volumes(ui),
                 images::AppPage::Networks => network_action = self.draw_networks(ui),
+                images::AppPage::Compose => compose_refresh = self.draw_compose(ui),
             });
+        if compose_refresh {
+            self.refresh(context.clone());
+        }
         if let Some(index) = inspect_index {
             let container = &self.containers[index];
             let id = container.id.clone();
@@ -3880,6 +4004,7 @@ impl eframe::App for FerrumApp {
             || (self.page == images::AppPage::Volumes && self.volumes.is_loading())
             || (self.page == images::AppPage::Networks
                 && (self.networks.is_loading() || self.network_mutation_busy()))
+            || (self.page == images::AppPage::Compose && self.compose.is_loading())
         {
             context.request_repaint_after(Duration::from_millis(250));
         }
@@ -4300,9 +4425,11 @@ mod event_reconciliation_tests {
             images: images::ImagesView::default(),
             volumes: volumes::VolumesView::default(),
             networks: networks::NetworksView::default(),
+            compose: compose::ComposeView::default(),
             volume_create_task: None,
             volume_remove_task: None,
             resource_read_task: None,
+            compose_task: None,
             pending_resource_read: None,
             image_list_task: None,
             image_inspection_task: None,
@@ -6153,6 +6280,28 @@ mod event_reconciliation_tests {
         assert!(app.images.pull_progress().is_none());
         assert!(app.images.pull_error().is_none());
         assert!(!app.images.is_pull_complete());
+    }
+
+    #[test]
+    fn leaving_compose_aborts_its_read_and_invalidates_late_results() {
+        let (mut app, _) = app_with_open_inspection();
+        app.page = images::AppPage::Compose;
+        let generation = app.compose.begin_load();
+        let task = app.runtime.spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        app.compose_task = Some(task);
+
+        app.set_page(images::AppPage::Containers, egui::Context::default());
+        app.runtime.block_on(tokio::task::yield_now());
+
+        assert!(abort.is_finished());
+        assert!(app.compose_task.is_none());
+        assert!(!app.compose.is_loading());
+        assert!(!app.compose.has_loaded());
+        assert!(
+            !app.compose
+                .finish_load(generation, Err(compose::ComposeError::DockerCliMissing),)
+        );
     }
     #[test]
     fn refreshing_disconnected_volumes_retries_engine_connection() {
