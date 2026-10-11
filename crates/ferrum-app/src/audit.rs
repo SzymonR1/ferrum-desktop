@@ -904,7 +904,7 @@ mod tests {
         assert!(!contents.contains(invalid_network_id));
         assert!(!contents.contains(invalid_container_id));
         assert_eq!(trace.lines().count(), 2);
-        assert!(trace.contains(&format!("network_id=\"unavailable\"")));
+        assert!(trace.contains("network_id=\"unavailable\""));
         assert!(trace.contains(&format!("container_id=\"{valid_container_id}\"")));
         assert!(trace.contains(&format!("network_id=\"{valid_network_id}\"")));
         assert!(trace.contains("container_id=\"unavailable\""));
