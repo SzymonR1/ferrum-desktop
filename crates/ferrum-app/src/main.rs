@@ -1676,7 +1676,7 @@ impl FerrumApp {
                     )
                     .await
             };
-            if let Some(record) = audit::record_network_attachment_result(
+            let record = audit::record_network_attachment_result(
                 &operation.network_id,
                 &operation.container_id,
                 if operation.connect {
@@ -1685,9 +1685,8 @@ impl FerrumApp {
                     audit::NetworkMutation::Disconnect
                 },
                 mutation_result.is_ok(),
-            ) {
-                persist_audit_record(&audit_store, record).await;
-            }
+            );
+            persist_audit_record(&audit_store, record).await;
             let refreshed = async {
                 let networks = engine.list_networks().await?;
                 let containers = engine.list_containers().await?;

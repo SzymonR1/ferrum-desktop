@@ -268,13 +268,11 @@ pub(super) fn record_network_attachment_result(
     container_id: &str,
     action: NetworkMutation,
     request_succeeded: bool,
-) -> Option<AuditRecord> {
-    let (Some(network_id), Some(container_id)) = (
-        valid_resource_id(network_id),
-        valid_resource_id(container_id),
-    ) else {
-        return None;
-    };
+) -> AuditRecord {
+    let validated_network_id = valid_resource_id(network_id);
+    let validated_container_id = valid_resource_id(container_id);
+    let logged_network_id = validated_network_id.unwrap_or("unavailable");
+    let logged_container_id = validated_container_id.unwrap_or("unavailable");
     let outcome = if request_succeeded {
         "success"
     } else {
@@ -285,8 +283,8 @@ pub(super) fn record_network_attachment_result(
             target: "ferrum::audit",
             audit_event = "network_mutation",
             action = action.label(),
-            network_id,
-            container_id,
+            network_id = logged_network_id,
+            container_id = logged_container_id,
             outcome,
             "Network attachment request returned"
         );
@@ -295,19 +293,19 @@ pub(super) fn record_network_attachment_result(
             target: "ferrum::audit",
             audit_event = "network_mutation",
             action = action.label(),
-            network_id,
-            container_id,
+            network_id = logged_network_id,
+            container_id = logged_container_id,
             outcome,
             "Network attachment request returned"
         );
     }
-    Some(AuditRecord::new(
+    AuditRecord::new(
         "network_mutation",
         action.label(),
         outcome,
-        Some(container_id),
-        Some(network_id),
-    ))
+        validated_container_id,
+        validated_network_id,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -834,6 +832,87 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn persists_network_attachment_outcomes_without_invalid_ids() {
+        use super::{AuditStore, NetworkMutation, record_network_attachment_result};
+        use crate::settings::SettingsStore;
+        use std::fs;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ferrum-audit-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let store = AuditStore::new(Arc::new(SettingsStore::at(root.join("settings.toml"))));
+        let valid_network_id = "a".repeat(64);
+        let valid_container_id = "b".repeat(64);
+        let invalid_network_id = "invalid-network-ID-SECRET";
+        let invalid_container_id = "invalid-container-ID-SECRET";
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(writer.clone())
+            .finish();
+        let dispatcher = tracing::Dispatch::new(subscriber);
+
+        for (network_id, container_id, action, succeeded) in [
+            (
+                invalid_network_id,
+                valid_container_id.as_str(),
+                NetworkMutation::Connect,
+                true,
+            ),
+            (
+                valid_network_id.as_str(),
+                invalid_container_id,
+                NetworkMutation::Disconnect,
+                false,
+            ),
+        ] {
+            let record = tracing::dispatcher::with_default(&dispatcher, || {
+                record_network_attachment_result(network_id, container_id, action, succeeded)
+            });
+            store.persist(record).await.unwrap();
+        }
+
+        let log_path = root.join("audit.jsonl");
+        let contents = fs::read_to_string(&log_path).unwrap();
+        let records = contents
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let captured = match writer.0.lock() {
+            Ok(output) => output.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let trace = String::from_utf8(captured).expect("audit events should be UTF-8");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["event"], "network_mutation");
+        assert_eq!(records[0]["action"], "connect");
+        assert_eq!(records[0]["outcome"], "success");
+        assert_eq!(records[0]["container_id"], valid_container_id);
+        assert!(records[0].get("network_id").is_none());
+        assert_eq!(records[1]["event"], "network_mutation");
+        assert_eq!(records[1]["action"], "disconnect");
+        assert_eq!(records[1]["outcome"], "request_error");
+        assert_eq!(records[1]["network_id"], valid_network_id);
+        assert!(records[1].get("container_id").is_none());
+        assert!(!contents.contains(invalid_network_id));
+        assert!(!contents.contains(invalid_container_id));
+        assert_eq!(trace.lines().count(), 2);
+        assert!(trace.contains(&format!("network_id=\"unavailable\"")));
+        assert!(trace.contains(&format!("container_id=\"{valid_container_id}\"")));
+        assert!(trace.contains(&format!("network_id=\"{valid_network_id}\"")));
+        assert!(trace.contains("container_id=\"unavailable\""));
+        assert!(!trace.contains(invalid_network_id));
+        assert!(!trace.contains(invalid_container_id));
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn persists_redacted_audit_records_for_mutation_outcomes() {
         use super::{
             AuditStore, ImageBuildOutcome, ImageMutation, record_image_build_result,
@@ -901,15 +980,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .persist(
-                record_network_attachment_result(
-                    &network_id,
-                    &container_id,
-                    NetworkMutation::Disconnect,
-                    false,
-                )
-                .expect("validated network attachment IDs should produce a record"),
-            )
+            .persist(record_network_attachment_result(
+                &network_id,
+                &container_id,
+                NetworkMutation::Disconnect,
+                false,
+            ))
             .await
             .unwrap();
         store
