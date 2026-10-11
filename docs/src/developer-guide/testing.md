@@ -100,6 +100,50 @@ FERRUM_TEST_IMAGE=busybox:1.37.0 cargo test -p ferrum-engine --test live_engine 
 The pull is an optional manual prerequisite, not part of the test. A smoke run
 against an image already present needs only the second command.
 
+Image-build regressions exercise only temporary files and a controlled helper
+process. They do not invoke Docker or Buildx against an engine, build an image,
+or mutate image resources. Tests cover local-context and target validation,
+private config permissions and cleanup, socket-pinned command construction,
+credential isolation, bounded and escaped output, process failure/cancellation,
+explicit confirmation, context-switch gating, and static non-persistent build
+outcome tracing.
+
+The named tests are:
+
+- `private_build_config_is_owner_only_and_empty`
+- `build_request_rejects_invalid_context_and_target`
+- `build_target_rejects_uppercase_repository_names`
+- `validate_context_requires_regular_root_dockerfile_and_rejects_symlink_or_missing_file`
+- `build_command_uses_local_socket_and_private_config`
+- `build_process_streams_safe_bounded_output_and_reports_failure`
+- `build_cancellation_stops_the_process_group`
+- `build_target_is_bounded_and_rejects_invalid_controls`
+- `build_confirmation_requires_explicit_acceptance_and_cancel_submits_nothing`
+- `build_confirmation_gates_other_image_mutations`
+- `build_confirmation_names_the_selected_engine_source`
+- `build_start_progress_success_error_and_cancel_have_terminal_transitions`
+- `build_output_is_bounded_and_escaped`
+- `records_static_image_build_outcomes`
+- `event_reconciliation_tests::pending_image_build_confirmation_disables_context_switching`
+- `event_reconciliation_tests::pending_image_build_disables_context_selector_accessibly`
+- `event_reconciliation_tests::active_image_build_disables_context_switching`
+- `event_reconciliation_tests::build_engine_source_label_distinguishes_configured_socket_from_discovery`
+
+Run the focused checks with:
+
+```sh
+cargo test -p ferrum-app --bin ferrum image_build::tests
+cargo test -p ferrum-app --bin ferrum images::tests::build_
+cargo test -p ferrum-app --bin ferrum event_reconciliation_tests::pending_image_build
+cargo test -p ferrum-app --bin ferrum event_reconciliation_tests::active_image_build_disables_context_switching -- --exact
+cargo test -p ferrum-app --bin ferrum audit::tests::records_static_image_build_outcomes
+```
+
+Builds require Docker CLI and the Buildx plugin in `PATH`; this Linux local
+Docker slice does not validate Podman/rootless or broader endpoint/platform
+support. Issues #16 and #19 remain open and ready, issue #10 remains open and
+blocked, and no release or general support claim is made.
+
 The ignored read-only volume test requires `FERRUM_TEST_VOLUME` to name a
 volume already present on the selected local Docker Unix socket:
 
@@ -349,8 +393,9 @@ local state/events only; they never contact an engine or delete an image.
 
 Pull presentation tests use fixed progress values. Tag and removal tests
 exercise fake completion events only; they do not send requests or mutate image
-resources. No live pull, tag, or image-removal operation is claimed. Tests must
-not pull, tag, delete, or otherwise mutate user images or engines.
+resources. No live pull, tag, removal, or image build was performed; the
+separate optional image list/inspect test is read-only. Tests must not pull,
+tag, delete, or otherwise mutate user images or engines.
 
 Engine image pull, tag, and removal contract tests use fake Unix sockets, not a
 Docker engine or registry, and never pull, tag, or delete an image. Tag cases
