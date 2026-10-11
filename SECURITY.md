@@ -137,8 +137,9 @@ Docker Unix socket. It detects the installed CLI version with
 `docker compose ls --all --format json`, pinning the listing to
 `EngineClient::local_socket_path()` through Docker global `--host unix://...`.
 
-An explicit validation action accepts one local `.yaml` or `.yml` file from
-`rfd::FileDialog`. Before config validation, Ferrum runs
+An explicit validation action uses an asynchronous native file picker to accept
+one local `.yaml` or `.yml` file without blocking the app update thread.
+Before config validation, Ferrum runs
 `docker compose version --short` through the private isolated Docker config;
 a failed CLI preflight is distinct from config-validation failure. It passes
 the selected path as an argument to
