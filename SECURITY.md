@@ -15,10 +15,13 @@ engine-sourced display field is limited to 4 KiB of raw or escaped text; values
 beyond that are shown as `[display text omitted]`. Volume names receive this
 protection in the virtualized list button/accessibility label, details heading,
 removal confirmation, in-progress label, and success label. Optional volume
-detail values (driver, scope, creation time, and host mountpoint) use the same
-bounded UI display helper. Escaping is presentation-only; raw names remain
-unchanged for identity comparisons and requests. The mountpoint is never
-accessed. This does not detect or redact secrets or arbitrary log content.
+details (driver, scope, creation time, and host mountpoint) are omitted by the
+engine adapter when raw or escaped text exceeds 4 KiB; the page shows these as
+**Not reported**. The UI independently enforces the 4 KiB display bound and
+shows `[display text omitted]` for oversized values that reach rendering.
+Escaping is presentation-only; raw names remain unchanged for identity
+comparisons and requests. The mountpoint is never accessed. This does not detect
+or redact secrets or arbitrary log content.
 
 ## Reporting a vulnerability
 

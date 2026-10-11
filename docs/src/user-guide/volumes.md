@@ -9,13 +9,15 @@ unsafe volume names are rejected on creation.
 
 Engine-returned volume names and optional detail values are untrusted display
 text. Ferrum escapes selected control, bidi, zero-width, invisible-format,
-Unicode-tag, and Hangul-filler characters. Volume names and each optional
-detail value—driver, scope, creation time, and host mountpoint—use the same
-4 KiB raw-or-escaped display bound at the UI boundary. Longer values are shown
-as `[display text omitted]`. This is presentation hardening, not secret
-detection or redaction: raw names remain unchanged for identity comparisons
-and API request values. Ferrum displays the mountpoint as untrusted text and
-never accesses, opens, reads, or browses that path.
+Unicode-tag, and Hangul-filler characters. The engine adapter omits optional
+detail values—driver, scope, creation time, and host mountpoint—whose raw or
+escaped form exceeds 4 KiB before retaining them; the page shows those fields as
+**Not reported**. The UI applies the same bound at rendering and uses
+`[display text omitted]` for any oversized value that reaches it. This is
+presentation hardening, not secret detection or redaction: raw names remain
+unchanged for identity comparisons and API request values. Ferrum displays the
+mountpoint as untrusted text and never accesses, opens, reads, or browses that
+path.
 
 ## Create a volume
 

@@ -124,6 +124,9 @@ focused regression with:
 ```sh
 cargo test -p ferrum-engine volume_api_tests
 ```
+The fake-socket `volume_api_tests` also verify that control-heavy metadata with
+an escaped form over 4 KiB and raw optional fields over 4 KiB are omitted before
+they are retained in `VolumeSummary` or `VolumeDetails`.
 
 Headless Volumes UI and fake-socket protocol tests need no live engine and
 perform no mutations. UI coverage checks reported zero versus unavailable
