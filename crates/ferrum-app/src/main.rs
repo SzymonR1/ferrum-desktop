@@ -72,7 +72,7 @@ use eframe::egui::{self, Color32, RichText};
 use ferrum_core::ContainerLogLine;
 use ferrum_core::{
     ContainerAction, ContainerDetails, ContainerState, ContainerSummary, ImageDetails,
-    ImagePullProgress, ImageSummary,
+    ImageHistoryEntry, ImagePullProgress, ImageSummary,
 };
 #[cfg(target_os = "linux")]
 use ferrum_engine::ContainerLogsOptions;
@@ -235,6 +235,7 @@ enum EngineEvent {
         inspection_generation: u64,
         id: String,
         result: Result<ImageDetails, EngineError>,
+        history_result: Result<Vec<ImageHistoryEntry>, EngineError>,
     },
     ActionFinished {
         generation: u64,
@@ -801,6 +802,16 @@ struct CachedDroppedLogNotice {
     galley: std::sync::Arc<egui::Galley>,
 }
 
+#[cfg(target_os = "linux")]
+async fn persist_audit_record(store: &audit::AuditStore, record: audit::AuditRecord) {
+    if store.persist(record).await.is_err() {
+        tracing::warn!("Could not persist local audit record");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn persist_audit_record(_store: &audit::AuditStore, _record: audit::AuditRecord) {}
+
 struct FerrumApp {
     runtime: Runtime,
     sender: mpsc::Sender<EngineEvent>,
@@ -905,7 +916,8 @@ struct FerrumApp {
     terminal_shell: String,
     #[cfg(target_os = "linux")]
     terminal_notice: Option<String>,
-    settings_store: settings::SettingsStore,
+    settings_store: Arc<settings::SettingsStore>,
+    audit_store: audit::AuditStore,
     settings: settings::Settings,
     settings_draft: settings::Settings,
     settings_open: bool,
@@ -924,8 +936,12 @@ impl FerrumApp {
         visuals.widgets.hovered.bg_fill = Color32::from_rgb(59, 73, 84);
         creation_context.egui_ctx.set_visuals(visuals);
 
-        let settings_store = settings::SettingsStore::new();
+        let settings_store = Arc::new(settings::SettingsStore::new());
         let (settings, settings_error) = settings_store.load();
+        #[cfg(target_os = "linux")]
+        let audit_store = audit::AuditStore::new(Arc::clone(&settings_store));
+        #[cfg(not(target_os = "linux"))]
+        let audit_store = audit::AuditStore::disabled();
         if settings_error.is_some() {
             tracing::warn!(
                 error_kind = "settings",
@@ -1045,6 +1061,7 @@ impl FerrumApp {
             action_task: None,
             event_warning: None,
             event_refresh_pending: false,
+            audit_store,
             settings_store,
             settings_draft: settings.clone(),
             settings,
@@ -1254,10 +1271,11 @@ impl FerrumApp {
             return;
         };
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.volume_create_task = Some(self.runtime.spawn(async move {
             let result = engine.create_volume(&name).await;
             #[cfg(target_os = "linux")]
-            audit::record_volume_create_result(&result);
+            persist_audit_record(&audit_store, audit::record_volume_create_result(&result)).await;
             if sender
                 .send(EngineEvent::VolumeCreated {
                     generation,
@@ -1306,10 +1324,11 @@ impl FerrumApp {
             return;
         };
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.volume_remove_task = Some(self.runtime.spawn(async move {
             let result = engine.remove_volume(&name).await;
             #[cfg(target_os = "linux")]
-            audit::record_volume_remove_result(&result);
+            persist_audit_record(&audit_store, audit::record_volume_remove_result(&result)).await;
             if sender
                 .send(EngineEvent::VolumeRemoved {
                     generation,
@@ -1382,13 +1401,18 @@ impl FerrumApp {
             return;
         };
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.network_create_task = Some(self.runtime.spawn(async move {
             let result = engine.create_network(&name).await;
-            audit::record_network_mutation_result(
-                result.as_deref().ok(),
-                audit::NetworkMutation::Create,
-                result.is_ok(),
-            );
+            persist_audit_record(
+                &audit_store,
+                audit::record_network_mutation_result(
+                    result.as_deref().ok(),
+                    audit::NetworkMutation::Create,
+                    result.is_ok(),
+                ),
+            )
+            .await;
             if sender
                 .send(EngineEvent::NetworkCreated {
                     generation,
@@ -1432,13 +1456,18 @@ impl FerrumApp {
             return;
         };
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.network_remove_task = Some(self.runtime.spawn(async move {
             let result = engine.remove_network(&id).await;
-            audit::record_network_mutation_result(
-                Some(&id),
-                audit::NetworkMutation::Remove,
-                result.is_ok(),
-            );
+            persist_audit_record(
+                &audit_store,
+                audit::record_network_mutation_result(
+                    Some(&id),
+                    audit::NetworkMutation::Remove,
+                    result.is_ok(),
+                ),
+            )
+            .await;
             if sender
                 .send(EngineEvent::NetworkRemoved {
                     generation,
@@ -1482,6 +1511,7 @@ impl FerrumApp {
         };
         let container_generation = self.container_inventory_generation;
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.network_attachment_task = Some(self.runtime.spawn(async move {
             let mutation_result = if operation.connect {
                 engine
@@ -1495,7 +1525,7 @@ impl FerrumApp {
                     )
                     .await
             };
-            audit::record_network_attachment_result(
+            if let Some(record) = audit::record_network_attachment_result(
                 &operation.network_id,
                 &operation.container_id,
                 if operation.connect {
@@ -1504,7 +1534,9 @@ impl FerrumApp {
                     audit::NetworkMutation::Disconnect
                 },
                 mutation_result.is_ok(),
-            );
+            ) {
+                persist_audit_record(&audit_store, record).await;
+            }
             let refreshed = async {
                 let networks = engine.list_networks().await?;
                 let containers = engine.list_containers().await?;
@@ -1899,6 +1931,7 @@ impl FerrumApp {
             return;
         };
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         let progress_reporting = Arc::new(AtomicBool::new(true));
         self.image_pull_progress_reporting = Some(Arc::clone(&progress_reporting));
         self.image_pull_task = Some(self.runtime.spawn(async move {
@@ -1924,7 +1957,11 @@ impl FerrumApp {
                 Ok::<(), EngineError>(())
             }
             .await;
-            audit::record_image_mutation_result(audit::ImageMutation::Pull, &result);
+            persist_audit_record(
+                &audit_store,
+                audit::record_image_mutation_result(audit::ImageMutation::Pull, &result),
+            )
+            .await;
             if sender
                 .send(EngineEvent::ImagePullFinished { generation, result })
                 .await
@@ -1953,11 +1990,16 @@ impl FerrumApp {
         };
 
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.image_tag_task = Some(self.runtime.spawn(async move {
             let result = engine
                 .tag_image(&request.image_id, &request.repository, &request.tag)
                 .await;
-            audit::record_image_mutation_result(audit::ImageMutation::Tag, &result);
+            persist_audit_record(
+                &audit_store,
+                audit::record_image_mutation_result(audit::ImageMutation::Tag, &result),
+            )
+            .await;
             if sender
                 .send(EngineEvent::ImageTagged {
                     generation: request.generation,
@@ -1988,9 +2030,14 @@ impl FerrumApp {
             return;
         };
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.image_remove_task = Some(self.runtime.spawn(async move {
             let result = engine.remove_image(&request.image_id).await;
-            audit::record_image_mutation_result(audit::ImageMutation::Remove, &result);
+            persist_audit_record(
+                &audit_store,
+                audit::record_image_mutation_result(audit::ImageMutation::Remove, &result),
+            )
+            .await;
             if sender
                 .send(EngineEvent::ImageRemoved {
                     generation: request.generation,
@@ -2031,13 +2078,17 @@ impl FerrumApp {
         }
         let sender = self.sender.clone();
         self.image_inspection_task = Some(self.runtime.spawn(async move {
-            let result = engine.inspect_image(&request.id).await;
+            let (result, history_result) = tokio::join!(
+                engine.inspect_image(&request.id),
+                engine.image_history(&request.id),
+            );
             if sender
                 .send(EngineEvent::ImageInspected {
                     generation: request.list_generation,
                     inspection_generation: request.inspection_generation,
                     id: request.id,
                     result,
+                    history_result,
                 })
                 .await
                 .is_ok()
@@ -2503,13 +2554,21 @@ impl FerrumApp {
                     inspection_generation,
                     id,
                     result,
+                    history_result,
                 } => {
-                    if self.images.complete_inspection(
+                    let details_applied = self.images.complete_inspection(
                         generation,
                         inspection_generation,
                         &id,
                         result,
-                    ) {
+                    );
+                    let history_applied = self.images.complete_history(
+                        generation,
+                        inspection_generation,
+                        &id,
+                        history_result,
+                    );
+                    if details_applied || history_applied {
                         self.image_inspection_task = None;
                     }
                 }
@@ -2859,9 +2918,14 @@ impl FerrumApp {
         let id = inspection.container_id.clone();
         let generation = inspection.generation;
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.action_task = Some(self.runtime.spawn(async move {
             let result = engine.perform_container_action(&id, action).await;
-            audit::record_container_action_result(&id, action, result.is_ok());
+            persist_audit_record(
+                &audit_store,
+                audit::record_container_action_result(&id, action, result.is_ok()),
+            )
+            .await;
             if sender
                 .send(EngineEvent::ActionFinished {
                     generation,
@@ -4681,7 +4745,8 @@ mod event_reconciliation_tests {
             log_stdout: true,
             #[cfg(target_os = "linux")]
             log_stderr: true,
-            settings_store: settings::SettingsStore::new(),
+            settings_store: Arc::new(settings::SettingsStore::new()),
+            audit_store: audit::AuditStore::disabled(),
             settings_draft: settings.clone(),
             settings,
             settings_open: false,

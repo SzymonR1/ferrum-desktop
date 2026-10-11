@@ -195,6 +195,22 @@ pub struct ImageSummary {
     /// Image size in bytes, when reported by the engine.
     pub size_bytes: Option<u64>,
 }
+/// Read-only allowlisted fields from one row of a local Docker image history
+/// response, obtained through the negotiated local Unix-socket API.
+///
+/// `layer_id` is present only for a validated full SHA-256 identifier.
+/// Timestamps and sizes are retained only when nonnegative. Docker's
+/// `CreatedBy` command text, tags, comments, and all other daemon fields are
+/// intentionally not modeled or retained.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageHistoryEntry {
+    /// Validated full layer identifier, when reported.
+    pub layer_id: Option<String>,
+    /// Creation time as nonnegative Unix seconds, when reported.
+    pub created_unix_seconds: Option<i64>,
+    /// Nonnegative layer size in bytes, when reported.
+    pub size_bytes: Option<u64>,
+}
 /// Engine-independent information about one local volume.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VolumeSummary {

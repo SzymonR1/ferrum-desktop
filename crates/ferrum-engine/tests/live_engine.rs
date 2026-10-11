@@ -410,7 +410,7 @@ async fn local_engine_connects_and_disconnects_network_with_verified_owned_conta
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires a current local Docker context and a preinstalled FERRUM_TEST_IMAGE"]
-async fn local_engine_lists_and_inspects_preinstalled_image_read_only() {
+async fn local_engine_lists_inspects_and_reads_history_for_preinstalled_image_read_only() {
     let image_reference = std::env::var("FERRUM_TEST_IMAGE")
         .expect("set FERRUM_TEST_IMAGE to an image already installed locally");
     let image_reference = image_reference.trim();
@@ -447,6 +447,14 @@ async fn local_engine_lists_and_inspects_preinstalled_image_read_only() {
     assert!(
         images.iter().any(|image| image.id == details.id),
         "the inspected image should be present in the listed local image inventory"
+    );
+    let history = engine
+        .image_history(&details.id)
+        .await
+        .expect("the preinstalled image's read-only history should be available");
+    assert!(
+        !history.is_empty(),
+        "the preinstalled image should report at least one layer-history row"
     );
 }
 

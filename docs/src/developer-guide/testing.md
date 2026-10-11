@@ -87,18 +87,22 @@ cargo test -p ferrum-app settings::tests::inherited_valid_marker_cannot_write_th
 cargo test -p ferrum-app settings::tests::inherited_umask_child_marker_cannot_touch_ambient_settings_or_umask -- --exact
 ```
 
-The opt-in image list/inspect test is read-only and requires
+The opt-in image list/inspect/history test is read-only and requires
 `FERRUM_TEST_IMAGE` to name an image already present on the current local Docker
 context. The image does not need a shell; the test never pulls or mutates image
 resources. For example, after manually installing `busybox:1.37.0` if needed:
 
 ```sh
 docker pull busybox:1.37.0
-FERRUM_TEST_IMAGE=busybox:1.37.0 cargo test -p ferrum-engine --test live_engine local_engine_lists_and_inspects_preinstalled_image_read_only -- --exact --ignored
+FERRUM_TEST_IMAGE=busybox:1.37.0 cargo test -p ferrum-engine --test live_engine local_engine_lists_inspects_and_reads_history_for_preinstalled_image_read_only -- --exact --ignored
 ```
 
 The pull is an optional manual prerequisite, not part of the test. A smoke run
 against an image already present needs only the second command.
+
+The 2026-10-11 read-only history smoke passed against Docker Engine 29.9.0/API
+1.56 using the preinstalled `ghcr.io/catthehacker/ubuntu:rust-latest` image
+and current local Unix context; it read history without mutating the image.
 
 Image-build regressions exercise only temporary files and a controlled helper
 process. They do not invoke Docker or Buildx against an engine, build an image,
@@ -346,6 +350,17 @@ secret detection. Run the focused tests with:
 cargo test -p ferrum-app --bin ferrum log_buffer_tests
 ```
 
+The embedded terminal's parser tests use synthetic byte streams and no engine.
+They verify that raw OSC data passed to vt100 stays within the 1 KiB budget,
+including when `ESC ]` and BEL/ST/CAN/SUB boundaries cross output chunks, and
+that visible text resumes after an oversized string is discarded. Run them
+with:
+
+```sh
+cargo test -p ferrum-app --bin ferrum terminal::tests::
+```
+
+
 Headless AccessKit tests verify visible escaping for engine-controlled container
 inventory and inspection fields, image tags/inspection author/tag-confirmation
 IDs, network names/metadata, attached-container names in membership/confirmation
@@ -379,16 +394,33 @@ The engine integration targets Linux local Unix sockets. Podman/rootless
 behavior remains unvalidated, remote transports remain unsupported, and Windows
 named pipes and macOS remain deferred to issue #21/M8.
 
-The `audit::tests` module captures lifecycle trace events in memory and checks
-action/outcome fields, full-ID validation, and omission of untrusted identifiers.
-Run those behavior tests directly with:
+The mutation audit tests verify redacted JSONL records for lifecycle, image,
+volume, and network outcomes; they also check the 16 MiB hard cap and that
+audit files are created privately and reject symlink, hard-link, and non-regular
+targets.
+Lock-contention coverage holds the audit file lock through a separate open file
+descriptor and verifies persistence fails within the bounded wait. No real
+engine resource is used.
+
+The records are a local Ferrum-request history, not tamper-proof and not proof
+of final engine state; they do not capture external engine actions. Run the
+focused tests directly:
 
 ```sh
-cargo test -p ferrum-app audit::tests
+cargo test -p ferrum-app --bin ferrum audit::tests
+cargo test -p ferrum-app --bin ferrum settings::tests::audit_file_
 ```
 
-Audit events are process tracing output only; the app does not persist a
-tamper-proof audit history.
+The named regression tests are:
+`persists_redacted_audit_records_for_mutation_outcomes`,
+`durable_audit_log_stops_at_the_configured_size_limit`,
+`audit_persistence_returns_bounded_failure_under_lock_contention`,
+`audit_file_is_created_with_private_permissions`,
+`audit_file_rejects_symlink_and_hardlink_targets`, and
+`audit_file_rejects_non_regular_targets`. This is partial Issue #19 work:
+issues #17 and #19 remain open/ready; #10 remains open/blocked for
+Podman/rootless and broader endpoint validation. No endpoint/platform support
+or release is claimed.
 
 ## Accessibility and performance samples
 
@@ -418,15 +450,18 @@ resources. No live pull, tag, removal, or image build was performed; the
 separate optional image list/inspect test is read-only. Tests must not pull,
 tag, delete, or otherwise mutate user images or engines.
 
-Engine image pull, tag, and removal contract tests use fake Unix sockets, not a
-Docker engine or registry, and never pull, tag, or delete an image. Tag cases
-cover encoded request paths/queries, success response, omitted force/auth
-fields, invalid input without a connection, and safe typed status rejection.
-Pull cases cover query encoding, chunked progress, response/event errors,
-malformed or oversized input, and invalid references. Removal cases cover the
-encoded image ID, DELETE with `noprune=true`, omitted force/auth fields, success,
-invalid input without a connection, and safe rejection/status without response
-body exposure. Run the image protocol tests with:
+Engine image pull, tag, removal, and history contract tests use fake Unix
+sockets, not a Docker engine or registry, and never pull, tag, or delete an
+image. Tag cases cover encoded request paths/queries, success response, omitted
+force/auth fields, invalid input without a connection, and safe typed status
+rejection. Pull cases cover query encoding, chunked progress, response/event
+errors, malformed or oversized input, and invalid references. Removal cases
+cover the encoded image ID, DELETE with `noprune=true`, omitted force/auth
+fields, success, invalid input without a connection, and safe rejection/status
+without response body exposure. History cases cover exact encoded routing,
+allowlisted fields, discarded command/tag/comment data, empty and malformed/API
+errors, invalid IDs without a connection, acceptance of the 65,536-row
+boundary, and rejection of excess rows. Run the image protocol tests with:
 
 ```sh
 cargo test -p ferrum-engine image_pull::tests
@@ -434,10 +469,10 @@ cargo test -p ferrum-engine image_api_tests
 ```
 
 The separate opt-in ignored
-`local_engine_lists_and_inspects_preinstalled_image_read_only` test exercises
-image list and inspect requests against the local Docker Unix socket. It is
-read-only and does not tag, pull, or modify images. No live image tag, pull, or
-removal request or image mutation test is provided.
+`local_engine_lists_inspects_and_reads_history_for_preinstalled_image_read_only`
+test lists and inspects a preinstalled image, then reads its history through the
+selected local Docker Unix socket. It is read-only and does not pull, tag,
+remove, or modify images. No live image mutation is claimed.
 
 Image pull, tag, and removal requests use the validated local Docker Unix-socket
 endpoint; private-registry authentication is not implemented.

@@ -30,6 +30,11 @@ Please use the private vulnerability-reporting feature for this repository in Gi
 ## Current scope
 
 The Linux application provides container inventory, inspection, bounded historical/live logs, state-gated lifecycle actions, image listing, inspection, anonymous public pulls, tagging, confirmed image removal, and an experimental embedded exec terminal over the selected local Docker-compatible Unix socket. Container Remove requires explicit confirmation and does not force-remove containers or remove volumes. Every image-tag request requires explicit confirmation because Docker Engine v1.56 may reassign an existing `repository:tag`; the image data remains. Image removal confirmation snapshots the selected image ID and known tags, warns that removal of the final reference may delete image data, and explains that the non-force request may be rejected for images used by containers or with other tags. The request sets `noprune=true` to preserve untagged parent images, omits `force`, and does not send registry credentials or authentication. A bounded 30-second removal timeout does not prove that engine state remained unchanged; invalidating the page ignores stale results without aborting or claiming to undo a submitted request. Only one image mutation is allowed at a time. Image pull, tag, and removal operate only through the selected local Linux Docker Unix socket; remote engine connections, credentials, Compose, archive handling, managed engines, and release updates are not implemented. The terminal does not launch an external terminal; closing its exec session does not stop or remove the container. Issue #10 remains open for Podman/rootless and remote compatibility. Image removal has fake-socket and headless UI coverage only; tests do not delete a real image or mutate image resources. See [`docs/security/threat-model.md`](docs/security/threat-model.md) for current risks and controls.
+Image layer history is read-only on the selected Linux local Docker socket and
+bounded to a 16 MiB response and 65,536 rows. Only validated full layer IDs and
+nonnegative creation times/sizes are retained; `CreatedBy` command text, tags,
+comments, and other daemon fields are discarded.
+
 Hiding image-pull progress or invalidating the Images page/context does not abort
 an active pull reader: Ferrum drains the response and keeps the mutation gate
 closed until a terminal event. Closing Ferrum does not guarantee that the
@@ -39,9 +44,27 @@ Image pull, tag, and removal requests emit local structured process traces with
 only the static action and a `success`, `not_submitted`, or `request_error`
 outcome. `not_submitted` identifies local image ID, reference, or tag validation
 that occurs before HTTP submission. Image IDs, references, repository tags,
-endpoints, error text, and daemon response bodies are not logged. These events
-are not persistent or tamper-proof; `request_error` does not establish that
-engine state remained unchanged.
+endpoints, error text, and daemon response bodies are not included in those
+traces.
+
+Ferrum also maintains a Linux-local, bounded JSONL copy of mutation outcomes
+for container lifecycle, image pull/tag/removal, volume create/removal, and
+network create/removal/connect/disconnect requests. `audit.jsonl` is created
+lazily in Ferrum's descriptor-anchored config directory with directory mode
+`0700` and file mode `0600`. Schema version 1 records a timestamp, static
+event/action/outcome, and validated full resource IDs only where existing
+traces permit. It excludes names, image references/tags, endpoints,
+credentials, raw errors, daemon bodies, and terminal/log contents. Each record
+is synced; the file has a 16 MiB hard cap and is not automatically truncated or
+rotated. Interprocess lock acquisition uses nonblocking retries with a 250 ms
+deadline; continued contention is a persistence failure. When full or when
+persistence fails, Ferrum emits a static process warning and does not claim the
+event was persisted; the engine request outcome is unchanged. This is local
+Ferrum-request history only, mutable by the same-UID user, not tamper-proof, and
+does not prove final engine state or record external engine actions.
+Issues #17 and #19 remain open/ready; issue #10 remains open/blocked for
+Podman/rootless and broader endpoint validation. No release or platform/endpoint
+support is claimed.
 
 ## Local image builds
 
@@ -90,7 +113,7 @@ invalidation does not abort a submitted request.
 Volume create and removal results emit local structured traces with only the
 static action (`create` or `remove`) and `success`, `not_submitted`, or
 `request_error` outcome. Volume names, mountpoints, endpoints, error text, and
-daemon bodies are excluded; the process trace is not persistent or tamper-proof.
+daemon bodies are excluded. A durable redacted copy is described above.
 
 Ferrum lists and inspects volumes, then makes a separate filtered read-only
 usage request; only `Size` in bytes and the point-in-time `RefCount` for an
@@ -174,14 +197,10 @@ Network mutation traces record only the static create/remove/connect/disconnect
 action, `success` or `request_error`, and validated full IDs when available.
 Connect/disconnect events include both network and container IDs; names,
 endpoints, error text, and daemon bodies are excluded. These process traces are
-not persistent or tamper-proof. Only one network mutation may be active, and
-context switching is blocked until it returns. Inspection exposes only
-point-in-time aggregate IPAM allocation counts when reported. An invalid CIDR
-or duplicate normalized subnet makes both aggregates unavailable; a missing,
-malformed, negative, or overflowing count or sum overflow makes only the
-affected aggregate unavailable, and the other metric may remain available.
-Subnet/CIDR keys, addresses, endpoint data, and raw status are not exposed.
-Per-container/interface counters are not aggregated. Credential access is not
-provided. Podman/rootless and remote endpoints remain unsupported or
-unvalidated. Issues #17 and #10 remain open; no release is claimed.
+not persistent or tamper-proof; a separate durable redacted copy is described
+above. Only one network mutation may be active, and context switching is blocked
+until it returns. IPAM parsing and metric availability are as described above;
+credential access is not provided. Podman/rootless and remote endpoints remain
+unsupported or unvalidated. Issues #17, #19, and #10 remain open; no release is
+claimed.
 
