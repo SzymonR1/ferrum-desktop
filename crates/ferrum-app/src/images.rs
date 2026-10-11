@@ -3,7 +3,7 @@ use crate::{display::escape_untrusted_display_text, search::CaseInsensitiveQuery
 #[cfg(target_os = "linux")]
 use crate::image_build::{ImageBuildError, ImageBuildRequest};
 use eframe::egui;
-use ferrum_core::{ImageDetails, ImagePullProgress, ImageSummary};
+use ferrum_core::{ImageDetails, ImageHistoryEntry, ImagePullProgress, ImageSummary};
 use std::fmt::Display;
 #[cfg(target_os = "linux")]
 use std::{collections::VecDeque, path::PathBuf};
@@ -42,6 +42,7 @@ impl BuildOutputBuffer {
 
 const IMAGE_ROW_HEIGHT: f32 = 34.0;
 const IMAGE_CELL_HEIGHT: f32 = 32.0;
+const IMAGE_HISTORY_ROW_HEIGHT: f32 = 30.0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum AppPage {
@@ -105,6 +106,9 @@ pub(super) struct ImagesView {
     details: Option<ImageDetails>,
     detail_error: Option<String>,
     inspection_loading: bool,
+    history: Vec<ImageHistoryEntry>,
+    history_error: Option<String>,
+    history_loading: bool,
     loading: bool,
     loaded: bool,
     error: Option<String>,
@@ -768,6 +772,33 @@ impl ImagesView {
         }
         true
     }
+    pub(super) fn complete_history<E: Display>(
+        &mut self,
+        list_generation: u64,
+        inspection_generation: u64,
+        id: &str,
+        result: Result<Vec<ImageHistoryEntry>, E>,
+    ) -> bool {
+        if self.generation != list_generation
+            || self.inspection_generation != inspection_generation
+            || self.selected_id.as_deref() != Some(id)
+            || !self.images.iter().any(|image| image.id == id)
+        {
+            return false;
+        }
+        self.history_loading = false;
+        match result {
+            Ok(history) => {
+                self.history = history;
+                self.history_error = None;
+            }
+            Err(error) => {
+                self.history.clear();
+                self.history_error = Some(error.to_string());
+            }
+        }
+        true
+    }
 
     pub(super) fn show(
         &mut self,
@@ -873,8 +904,9 @@ impl ImagesView {
             selected_id = self.draw_image_list(ui);
         }
 
-        let request = selected_id.map(|id| self.select_image(id));
+        let request = selected_id.and_then(|id| self.select_image(id));
         self.draw_details(ui);
+        self.draw_history(ui);
         self.draw_tag_controls(ui, connected, operations_allowed, mutation_busy);
         self.draw_remove_controls(ui, connected, operations_allowed, mutation_busy);
         request
@@ -977,18 +1009,97 @@ impl ImagesView {
             image_detail(ui, "Author", details.author.as_deref());
         }
     }
+    fn draw_history(&self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.separator();
+        ui.heading("Image layer history");
+        if self.selected_id.is_none() {
+            ui.label("Select an image to load its read-only layer history.");
+        } else if self.history_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading image history…");
+            });
+        } else if let Some(error) = &self.history_error {
+            ui.colored_label(
+                egui::Color32::from_rgb(227, 113, 102),
+                "Image history unavailable",
+            );
+            ui.label(error);
+        } else if self.history.is_empty() {
+            ui.label("No safe image history fields were reported.");
+        } else {
+            let width = ui.available_width();
+            let layer_width = width * 0.52;
+            let created_width = width * 0.24;
+            let size_width = width - layer_width - created_width;
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [layer_width, IMAGE_CELL_HEIGHT],
+                    egui::Label::new("Layer ID"),
+                );
+                ui.add_sized(
+                    [created_width, IMAGE_CELL_HEIGHT],
+                    egui::Label::new("Created (Unix seconds)"),
+                );
+                ui.add_sized([size_width, IMAGE_CELL_HEIGHT], egui::Label::new("Size"));
+            });
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .id_salt("image-history")
+                .max_height(180.0)
+                .show_rows(
+                    ui,
+                    IMAGE_HISTORY_ROW_HEIGHT,
+                    self.history.len(),
+                    |ui, rows| {
+                        for row in rows {
+                            let entry = &self.history[row];
+                            let layer_id = entry.layer_id.as_deref().unwrap_or("Not reported");
+                            let created = entry.created_unix_seconds.map_or_else(
+                                || "Not reported".to_owned(),
+                                |value| value.to_string(),
+                            );
+                            let size = format_size(entry.size_bytes);
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [layer_width, IMAGE_HISTORY_ROW_HEIGHT],
+                                    egui::Label::new(layer_id)
+                                        .truncate()
+                                        .show_tooltip_when_elided(true),
+                                );
+                                ui.add_sized(
+                                    [created_width, IMAGE_HISTORY_ROW_HEIGHT],
+                                    egui::Label::new(created),
+                                );
+                                ui.add_sized(
+                                    [size_width, IMAGE_HISTORY_ROW_HEIGHT],
+                                    egui::Label::new(size),
+                                );
+                            });
+                        }
+                    },
+                );
+        }
+    }
 
-    fn select_image(&mut self, id: String) -> ImageInspectionRequest {
+    fn select_image(&mut self, id: String) -> Option<ImageInspectionRequest> {
+        if !self.images.iter().any(|image| image.id == id) {
+            return None;
+        }
         self.selected_id = Some(id.clone());
         self.details = None;
         self.detail_error = None;
         self.inspection_loading = true;
+        self.history.clear();
+        self.history_error = None;
+        self.history_loading = true;
         self.inspection_generation = self.inspection_generation.wrapping_add(1);
-        ImageInspectionRequest {
+        Some(ImageInspectionRequest {
             list_generation: self.generation,
             inspection_generation: self.inspection_generation,
             id,
-        }
+        })
     }
 
     fn clear_selection(&mut self) {
@@ -996,6 +1107,9 @@ impl ImagesView {
         self.details = None;
         self.detail_error = None;
         self.inspection_loading = false;
+        self.history.clear();
+        self.history_error = None;
+        self.history_loading = false;
     }
 
     fn rebuild_visible(&mut self) {
@@ -1861,7 +1975,7 @@ mod tests {
         row.focus();
         harness.run();
         harness.key_down(egui::Key::Space);
-        harness.run();
+        harness.step();
         let _loading = harness.get_by_role_and_label(Role::Label, "Loading image details…");
         let request = harness.state_mut().inspection.take().unwrap();
         assert!(harness.state_mut().view.complete_inspection(
@@ -1869,6 +1983,12 @@ mod tests {
             request.inspection_generation,
             &request.id,
             Ok::<_, &str>(details("sha256:alpine", "alpine:3.20")),
+        ));
+        assert!(harness.state_mut().view.complete_history(
+            request.list_generation,
+            request.inspection_generation,
+            &request.id,
+            Ok::<_, &str>(Vec::new()),
         ));
         harness.run();
         let _os = harness.get_by_role_and_label(Role::Label, "linux");
@@ -1889,7 +2009,7 @@ mod tests {
             Some(safe_tag)
         );
         image_row.click_accesskit();
-        harness.run();
+        harness.step();
         let request = harness.state_mut().inspection.take().unwrap();
         let mut details = details(&request.id, tag);
         details.author = Some("author\u{e0001}text\u{200b}".to_owned());
@@ -1898,6 +2018,12 @@ mod tests {
             request.inspection_generation,
             &request.id,
             Ok::<_, &str>(details),
+        ));
+        assert!(harness.state_mut().view.complete_history(
+            request.list_generation,
+            request.inspection_generation,
+            &request.id,
+            Ok::<_, &str>(Vec::new()),
         ));
         harness.run();
 
@@ -1925,13 +2051,19 @@ mod tests {
         harness
             .get_by_role_and_label(Role::Button, "private:latest")
             .click_accesskit();
-        harness.run();
+        harness.step();
         let request = harness.state_mut().inspection.take().unwrap();
         assert!(harness.state_mut().view.complete_inspection(
             request.list_generation,
             request.inspection_generation,
             &request.id,
             Err::<ImageDetails, _>("inspection denied"),
+        ));
+        assert!(harness.state_mut().view.complete_history(
+            request.list_generation,
+            request.inspection_generation,
+            &request.id,
+            Ok::<_, &str>(Vec::new()),
         ));
         harness.run();
         let _error = harness.get_by_role_and_label(Role::Label, "Image inspection unavailable");
@@ -2005,7 +2137,7 @@ mod tests {
         harness
             .get_by_role_and_label(Role::Button, "current:tag")
             .click_accesskit();
-        harness.run();
+        harness.step();
         let stale_inspection = harness.state_mut().inspection.take().unwrap();
 
         let next_generation = harness.state_mut().view.begin_load();
@@ -2019,7 +2151,7 @@ mod tests {
         harness
             .get_by_role_and_label(Role::Button, "fresh:tag")
             .click_accesskit();
-        harness.run();
+        harness.step();
         let current_inspection = harness.state_mut().inspection.take().unwrap();
 
         harness.state_mut().view.complete_inspection(
@@ -2028,7 +2160,7 @@ mod tests {
             &stale_inspection.id,
             Ok::<_, &str>(details("current", "current:tag")),
         );
-        harness.run();
+        harness.step();
         let _loading = harness.get_by_role_and_label(Role::Label, "Loading image details…");
 
         harness.state_mut().view.complete_inspection(
@@ -2037,8 +2169,108 @@ mod tests {
             &current_inspection.id,
             Ok::<_, &str>(details("fresh", "fresh:tag")),
         );
+        assert!(harness.state_mut().view.complete_history(
+            current_inspection.list_generation,
+            current_inspection.inspection_generation,
+            &current_inspection.id,
+            Ok::<_, &str>(Vec::new()),
+        ));
         harness.run();
         let _fresh_tag = harness.get_by_role_and_label(Role::Label, "fresh:tag");
+    }
+    #[test]
+    fn selected_image_history_shows_loading_empty_and_error_states() {
+        let mut harness = harness_for(loaded_view(vec![image(
+            "sha256:history-image",
+            "history:latest",
+            1024,
+        )]));
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "history:latest")
+            .click_accesskit();
+        harness.step();
+        let request = harness.state_mut().inspection.take().unwrap();
+        let _loading = harness.get_by_role_and_label(Role::Label, "Loading image history…");
+
+        assert!(harness.state_mut().view.complete_history(
+            request.list_generation,
+            request.inspection_generation,
+            &request.id,
+            Ok::<_, &str>(Vec::new()),
+        ));
+        harness.run();
+        let _empty = harness
+            .get_by_role_and_label(Role::Label, "No safe image history fields were reported.");
+
+        harness
+            .get_by_role_and_label(Role::Button, "history:latest")
+            .click_accesskit();
+        harness.step();
+        let request = harness.state_mut().inspection.take().unwrap();
+        assert!(harness.state_mut().view.complete_history(
+            request.list_generation,
+            request.inspection_generation,
+            &request.id,
+            Err::<Vec<ferrum_core::ImageHistoryEntry>, _>("history denied"),
+        ));
+        harness.run();
+        let _error = harness.get_by_role_and_label(Role::Label, "Image history unavailable");
+        let _message = harness.get_by_role_and_label(Role::Label, "history denied");
+    }
+
+    #[test]
+    fn image_history_results_for_stale_or_noninventory_ids_are_ignored() {
+        let mut harness = harness_for(loaded_view(vec![
+            image("sha256:first", "first:latest", 1024),
+            image("sha256:current", "current:latest", 2048),
+        ]));
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "first:latest")
+            .click_accesskit();
+        harness.step();
+        let stale = harness.state_mut().inspection.take().unwrap();
+        harness
+            .get_by_role_and_label(Role::Button, "current:latest")
+            .click_accesskit();
+        harness.step();
+        let current = harness.state_mut().inspection.take().unwrap();
+
+        assert!(!harness.state_mut().view.complete_history(
+            stale.list_generation,
+            stale.inspection_generation,
+            &stale.id,
+            Ok::<_, &str>(vec![ferrum_core::ImageHistoryEntry {
+                layer_id: Some(format!("sha256:{}", "a".repeat(64))),
+                created_unix_seconds: Some(1),
+                size_bytes: Some(1),
+            }]),
+        ));
+        assert!(!harness.state_mut().view.complete_history(
+            current.list_generation,
+            current.inspection_generation,
+            "sha256:not-in-inventory",
+            Ok::<_, &str>(Vec::new()),
+        ));
+        harness.step();
+        let _loading = harness.get_by_role_and_label(Role::Label, "Loading image history…");
+
+        assert!(harness.state_mut().view.complete_history(
+            current.list_generation,
+            current.inspection_generation,
+            &current.id,
+            Ok::<_, &str>(vec![ferrum_core::ImageHistoryEntry {
+                layer_id: Some(format!("sha256:{}", "b".repeat(64))),
+                created_unix_seconds: Some(1_720_000_000),
+                size_bytes: Some(4096),
+            }]),
+        ));
+        harness.run();
+        let _layer =
+            harness.get_by_role_and_label(Role::Label, &format!("sha256:{}", "b".repeat(64)));
+        let _created = harness.get_by_role_and_label(Role::Label, "1720000000");
+        let _size = harness.get_by_role_and_label(Role::Label, "4096 bytes");
     }
 
     fn progress(

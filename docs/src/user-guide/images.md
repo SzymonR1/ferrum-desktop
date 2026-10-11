@@ -1,16 +1,27 @@
 # Images
 
-**Status:** implemented for the Linux local Docker Unix socket: image
-listing/inspection, anonymous public pulls, local image tagging/removal, and
-confirmed local Buildx builds. No live pull, tag, removal, or build was
-performed during validation; native Images-page visual validation remains
-unverified.
+**Status:** Implemented for the Linux local Docker Unix socket: image
+listing/inspection and bounded read-only layer history, anonymous public pulls,
+local image tagging/removal, and confirmed local Buildx builds. An opt-in
+read-only history smoke passed on Docker Engine 29.9.0/API 1.56; no live pull,
+tag, removal, or build was performed during validation, and no image mutation
+is claimed. Native Images-page visual validation remains unverified.
 
 Open **Images** in the sidebar to view images returned by the connected local
 Docker engine. Search is case-insensitive across repository tags and image IDs.
 Select a row to load its details, including tags, creation time, size,
 architecture, operating system, and author when reported by the engine. Missing
 engine fields are shown as **Not reported**.
+
+The read-only layer-history view loads asynchronously for the exact selected
+image ID in the current inventory. It retains only validated full SHA-256 layer
+IDs, nonnegative creation timestamps, and nonnegative sizes; `CreatedBy` command
+text, tags, comments, and all other daemon fields are discarded and never
+displayed.
+The request uses the negotiated API version over the selected local socket and
+is bounded to an eight-second timeout, a 16 MiB response, and 65,536 rows. If a
+bound is exceeded or the response is invalid, the page shows a safe unavailable
+state.
 
 Image tags, identifiers, and inspection fields supplied by the engine are
 treated as untrusted text. Selected controls, bidi/zero-width and
@@ -20,9 +31,10 @@ fields whose raw or escaped text exceeds 4 KiB are shown as
 `[display text omitted]`. Requests still use the original ID; ordinary tag and
 author text is not redacted.
 
-The list and inspection requests run asynchronously. Loading, empty, connection,
-and engine-error states are shown in the page. Search filters the most recently
-loaded inventory; use **Refresh** to request a new image list.
+The list, inspection, and history requests run asynchronously. Loading, empty,
+connection, and engine-error states are shown in the page. Search filters the
+most recently loaded inventory; use **Refresh** to request a new image list.
+History results are discarded if the selected image or current inventory changes.
 
 ## Pulling public images
 
@@ -80,15 +92,18 @@ the UI does not expose daemon response bodies.
 
 ## Scope and limitations
 
-Image listing, inspection, anonymous pulls, tagging, removal, and builds are
-limited to the local Docker Unix socket on Linux. Builds require Docker CLI and
-the Buildx plugin in `PATH`. Podman/rootless behavior and broader endpoint or
-platform compatibility remain unvalidated under open, blocked [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10).
+Image listing, inspection, read-only history, anonymous pulls, tagging,
+removal, and builds are limited to the local Docker Unix socket on Linux.
+Builds require Docker CLI and the Buildx plugin in `PATH`. Build, push, and
+private-registry authentication beyond anonymous pulls are not offered.
+Podman/rootless behavior and broader endpoint or platform compatibility remain
+unvalidated under open, blocked [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10).
 This partial slice does not complete [issue #16](https://github.com/SzymonR1/ferrum-desktop/issues/16),
 which remains open and ready; [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19)
 also remains open and ready. No release or broader support claim is made.
 No live pull, tag, removal, or build was performed during validation. Native
-Images-page visual validation remains unverified. See the
+Images-page visual validation remains unverified. Fake-socket and headless
+tests do not contact a real engine or mutate image resources. See the
 [platform support matrix](../platform-support.md).
 
 ## Building a local image

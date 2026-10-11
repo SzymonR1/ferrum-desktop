@@ -72,7 +72,7 @@ use eframe::egui::{self, Color32, RichText};
 use ferrum_core::ContainerLogLine;
 use ferrum_core::{
     ContainerAction, ContainerDetails, ContainerState, ContainerSummary, ImageDetails,
-    ImagePullProgress, ImageSummary,
+    ImageHistoryEntry, ImagePullProgress, ImageSummary,
 };
 #[cfg(target_os = "linux")]
 use ferrum_engine::ContainerLogsOptions;
@@ -235,6 +235,7 @@ enum EngineEvent {
         inspection_generation: u64,
         id: String,
         result: Result<ImageDetails, EngineError>,
+        history_result: Result<Vec<ImageHistoryEntry>, EngineError>,
     },
     ActionFinished {
         generation: u64,
@@ -2077,13 +2078,17 @@ impl FerrumApp {
         }
         let sender = self.sender.clone();
         self.image_inspection_task = Some(self.runtime.spawn(async move {
-            let result = engine.inspect_image(&request.id).await;
+            let (result, history_result) = tokio::join!(
+                engine.inspect_image(&request.id),
+                engine.image_history(&request.id),
+            );
             if sender
                 .send(EngineEvent::ImageInspected {
                     generation: request.list_generation,
                     inspection_generation: request.inspection_generation,
                     id: request.id,
                     result,
+                    history_result,
                 })
                 .await
                 .is_ok()
@@ -2549,13 +2554,21 @@ impl FerrumApp {
                     inspection_generation,
                     id,
                     result,
+                    history_result,
                 } => {
-                    if self.images.complete_inspection(
+                    let details_applied = self.images.complete_inspection(
                         generation,
                         inspection_generation,
                         &id,
                         result,
-                    ) {
+                    );
+                    let history_applied = self.images.complete_history(
+                        generation,
+                        inspection_generation,
+                        &id,
+                        history_result,
+                    );
+                    if details_applied || history_applied {
                         self.image_inspection_task = None;
                     }
                 }

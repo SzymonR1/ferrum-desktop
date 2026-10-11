@@ -1,6 +1,6 @@
 # Ferrum threat model
 
-**Status:** Initial scope documented; this is not a security audit. Ferrum provides container inventory and inspection, volume list/inspect/usage with name-only creation and dependency-gated removal, image listing/inspection/pulls/tagging/removal and confirmed local Buildx builds, scoped container lifecycle actions, network list/inspect/create/removal/connect/disconnect on the Linux local-engine path, logs, and an experimental embedded terminal.
+**Status:** Initial scope documented; this is not a security audit. Ferrum provides container inventory and inspection, volume list/inspect/usage with name-only creation and dependency-gated removal, image listing/inspection and bounded read-only history plus anonymous pulls/tagging/removal and confirmed local Buildx builds, scoped container lifecycle actions, network list/inspect/create/removal/connect/disconnect on the Linux local-engine path, logs, and an experimental embedded terminal.
 
 Local builds use Docker CLI Buildx on Linux only. Invoke it with argument
 arrays, explicitly pinned to `--host unix://<EngineClient::local_socket_path()>`;
@@ -74,6 +74,13 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   the response until a terminal event, keeping the image-mutation gate closed.
   Page/context invalidation hides stale progress without aborting the reader.
   Closing Ferrum still does not guarantee that daemon-side pull work stops.
+- Read image layer history only from the selected Linux local Docker Unix
+  socket. Bound the response body to 16 MiB and deserialize at most 65,536
+  typed rows, then probe one additional value as `IgnoredAny` to reject excess
+  without materializing a full response vector. Retain only validated full
+  SHA-256 layer IDs, nonnegative timestamps, and sizes; discard `CreatedBy` text,
+  tags, comments, and all other daemon fields. This keeps command text out of the
+  UI model but does not detect secrets in other image metadata.
 - Send image-tag requests only to the selected local Docker Unix-socket engine
   using the negotiated API version and the bounded 8-second request timeout.
   Validate the image ID and bound the combined `repository:tag` target to 512
