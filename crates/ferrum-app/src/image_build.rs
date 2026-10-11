@@ -123,6 +123,19 @@ pub(super) fn validate_context(context: &Path) -> Result<PathBuf, ImageBuildErro
     Ok(canonical)
 }
 
+fn isolate_docker_cli_environment(command: &mut Command, config: &Path) {
+    let path = std::env::var_os("PATH").filter(|path| !path.is_empty());
+    command.env_clear();
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    command
+        .env("HOME", config)
+        .env("DOCKER_CONFIG", config)
+        .env("XDG_CONFIG_HOME", config)
+        .env("BUILDX_CONFIG", config);
+}
+
 pub(super) fn build_command(
     docker: &OsStr,
     request: &ImageBuildRequest,
@@ -149,16 +162,7 @@ pub(super) fn build_command(
         .stderr(Stdio::piped())
         .kill_on_drop(false)
         .process_group(0);
-    let path = std::env::var_os("PATH").filter(|path| !path.is_empty());
-    command.env_clear();
-    if let Some(path) = path {
-        command.env("PATH", path);
-    }
-    command
-        .env("HOME", config)
-        .env("DOCKER_CONFIG", config)
-        .env("XDG_CONFIG_HOME", config)
-        .env("BUILDX_CONFIG", config);
+    isolate_docker_cli_environment(&mut command, config);
     Ok(command)
 }
 
@@ -175,16 +179,7 @@ pub(super) fn version_command(docker: &OsStr, config: &Path) -> Result<Command, 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    let path = std::env::var_os("PATH").filter(|path| !path.is_empty());
-    command.env_clear();
-    if let Some(path) = path {
-        command.env("PATH", path);
-    }
-    command
-        .env("HOME", config)
-        .env("DOCKER_CONFIG", config)
-        .env("XDG_CONFIG_HOME", config)
-        .env("BUILDX_CONFIG", config);
+    isolate_docker_cli_environment(&mut command, config);
     Ok(command)
 }
 
