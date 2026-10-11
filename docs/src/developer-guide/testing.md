@@ -308,15 +308,19 @@ no inherited engine or credential/proxy settings, and no user config copied
 into the child config. Failure diagnostics and selected paths are not exposed;
 output and subprocess deadlines are bounded.
 
-Headless AccessKit coverage verifies the local file-selection action without
-engine access; the recursive `include`/`extends.file` trusted-file disclosure;
-success wording; validation failure, missing-plugin, and cancelled states;
-bounded escaped basename display; and stale-result rejection. Controlled CLI
-fixtures verify version-probe and config arguments, the same private
-configuration across both commands, selected file/parent paths, a cleared
-environment without inherited engine or credential/proxy settings, plugin-
-unavailable classification before config invocation, redaction, output bounds,
-and deadline cancellation. Run the Compose tests with:
+Headless AccessKit coverage verifies the file-selection action and its
+asynchronous pending/cancelled states without engine access; stale chooser
+results are rejected, while the native chooser itself is not exercised
+headlessly. The same UI tests cover the recursive `include`/`extends.file`
+trusted-file disclosure, success wording, validation failure, missing-plugin,
+bounded escaped basename display, and validation cancellation.
+
+The controlled CLI fixtures verify version-probe and config arguments, the same
+private configuration across both commands, selected file/parent paths, a
+cleared environment without inherited engine or credential/proxy settings, and
+explicitly disabled Git/OCI remote loaders. They also cover plugin-unavailable
+classification before config invocation, redaction, output bounds, and
+deadline cancellation. Run the Compose tests with:
 
 ```sh
 cargo test -p ferrum-app --bin ferrum compose::tests::
@@ -340,6 +344,15 @@ it does not touch user project files or mutate engine resources:
 cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_validation_reads_a_controlled_relative_path_project -- --exact --ignored
 ```
 
+The optional ignored remote-loader safety smoke uses only a `127.0.0.1`
+listener and Git/OCI-shaped `include` references. It passes only when Compose
+rejects the references without making a local connection; it contacts no
+external host and uses no engine:
+
+```sh
+cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_validation_rejects_remote_includes_without_network_access -- --exact --ignored
+```
+
 Validation uses the official [Compose `config` reference](https://docs.docker.com/reference/cli/docker/compose/config),
 [Compose CLI semantics](https://docs.docker.com/reference/cli/docker/compose),
 and [Compose environment-variable guide](https://docs.docker.com/compose/how-tos/environment-variables/envvars/).
@@ -347,9 +360,10 @@ and [Compose environment-variable guide](https://docs.docker.com/compose/how-tos
 skipped. Compose may still recursively read local Compose files referenced by
 `include` or service `extends.file`, including paths outside the selected
 file's directory, under the logged-in user's permissions; selection is not a
-containment boundary. The Docker CLI and Compose plugin are trusted local code;
-isolated config is not a sandbox. Validate only trusted files. Multi-file merge,
-profiles, `.env`/service `env_file` resolution, remote OCI/Git inputs, import,
+containment boundary. The CLI and plugin are trusted local code; isolated
+config is not a sandbox. Remote Git and OCI loaders are explicitly disabled,
+so remote include references fail without fetching. Validate only trusted
+files. Multi-file merge, profiles, `.env`/service `env_file` resolution, import,
 lifecycle/build/pull/logs, and project mutations remain unsupported.
 
 Only Linux local Docker discovery was validated; validation uses no engine. The

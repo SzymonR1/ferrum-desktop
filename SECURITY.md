@@ -154,16 +154,20 @@ resolution are skipped. Only a bounded escaped basename and a static result
 are displayed; paths are session-only and raw diagnostics are discarded.
 Compose can recursively read local Compose files referenced by `include` or
 service `extends.file`, including paths outside the selected Compose file
-directory, under the logged-in user's permissions. The selected file is not a
-path-containment boundary. CLI/plugin code is trusted local code and config
-isolation is not a sandbox; users should validate only trusted Compose files.
+directory, under the logged-in user's permissions. Remote Git and OCI loaders
+are explicitly disabled during validation, so remote `include` and
+`extends.file` references fail without a fetch. The selected file is not a path-containment boundary. CLI/plugin code is
+trusted local code and config isolation is not a sandbox; users should validate
+only trusted Compose files.
 
-Ferrum clears inherited environment values and sets
-`COMPOSE_DISABLE_ENV_FILE=1`; it does not pass user environment files. Multi-file
-merge, profiles, `.env`/service `env_file` resolution, remote OCI/Git, file
-import, lifecycle actions, build/pull/logs, and project mutations are
-unsupported. Each CLI command has an eight-second deadline and a 1 MiB stdout
-cap.
+Ferrum clears inherited environment values, sets `COMPOSE_DISABLE_ENV_FILE=1`,
+and sets `COMPOSE_EXPERIMENTAL_GIT_REMOTE=false` and
+`COMPOSE_EXPERIMENTAL_OCI_REMOTE=false`. This prevents remote Compose sources
+from making Git or registry requests during config validation. It does not pass
+user environment files. Multi-file merge, profiles, `.env`/service `env_file`
+resolution, remote Git/OCI references, file import, lifecycle actions,
+build/pull/logs, and project mutations are unsupported. Each CLI command has an
+eight-second deadline and a 1 MiB stdout cap.
 
 CLI processes use a private isolated Docker config/HOME and a cleared
 allowlisted environment. If Compose is installed in the standard per-user CLI

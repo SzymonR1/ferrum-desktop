@@ -156,6 +156,10 @@ enum EngineEvent {
         generation: u64,
         result: Result<compose::ComposeDiscovery, compose::ComposeError>,
     },
+    ComposeFileSelectionFinished {
+        generation: u64,
+        file: Option<std::path::PathBuf>,
+    },
     ComposeValidationFinished {
         generation: u64,
         result: Result<(), compose::ComposeValidationError>,
@@ -1195,27 +1199,45 @@ impl FerrumApp {
     fn select_compose_file(&mut self, context: egui::Context) {
         #[cfg(target_os = "linux")]
         {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Compose YAML files", &["yaml", "yml"])
-                .pick_file()
-            {
-                self.start_compose_validation(path, context);
-            } else {
-                self.compose.cancel_file_selection();
-                context.request_repaint();
+            if self.compose.is_file_selection_running() || self.compose.is_validation_running() {
+                return;
             }
+            if let Some(task) = self.compose_validation_task.take() {
+                task.abort();
+            }
+            let generation = self.compose.begin_file_selection();
+            context.request_repaint();
+            let sender = self.sender.clone();
+            self.compose_validation_task = Some(self.runtime.spawn(async move {
+                let file = rfd::AsyncFileDialog::new()
+                    .add_filter("Compose YAML files", &["yaml", "yml"])
+                    .pick_file()
+                    .await
+                    .map(|file| file.path().to_path_buf());
+                if sender
+                    .send(EngineEvent::ComposeFileSelectionFinished { generation, file })
+                    .await
+                    .is_ok()
+                {
+                    context.request_repaint();
+                }
+            }));
         }
         #[cfg(not(target_os = "linux"))]
         let _ = (self, context);
     }
 
     #[cfg(target_os = "linux")]
-    fn start_compose_validation(&mut self, file: std::path::PathBuf, context: egui::Context) {
+    fn start_compose_validation(
+        &mut self,
+        file: std::path::PathBuf,
+        generation: u64,
+        context: egui::Context,
+    ) {
         context.request_repaint();
         if let Some(task) = self.compose_validation_task.take() {
             task.abort();
         }
-        let generation = self.compose.begin_validation(&file);
         let sender = self.sender.clone();
         self.compose_validation_task = Some(self.runtime.spawn(async move {
             let result = compose::validate_compose_file(&file).await;
@@ -1228,6 +1250,7 @@ impl FerrumApp {
             }
         }));
     }
+
     fn load_compose(&mut self, context: egui::Context) {
         #[cfg(target_os = "linux")]
         {
@@ -2174,6 +2197,17 @@ impl FerrumApp {
                 EngineEvent::ComposeListed { generation, result } => {
                     if self.compose.finish_load(generation, result) {
                         self.compose_task = None;
+                    }
+                }
+                EngineEvent::ComposeFileSelectionFinished { generation, file } => {
+                    if self
+                        .compose
+                        .finish_file_selection(generation, file.as_deref())
+                    {
+                        self.compose_validation_task = None;
+                        if let Some(file) = file {
+                            self.start_compose_validation(file, generation, context.clone());
+                        }
                     }
                 }
                 EngineEvent::ComposeValidationFinished { generation, result } => {
@@ -6355,9 +6389,11 @@ mod event_reconciliation_tests {
         let (mut app, _) = app_with_open_inspection();
         app.page = images::AppPage::Compose;
         let generation = app.compose.begin_load();
-        let validation_generation = app
-            .compose
-            .begin_validation(std::path::Path::new("/private/compose.yaml"));
+        let validation_generation = app.compose.begin_file_selection();
+        assert!(app.compose.finish_file_selection(
+            validation_generation,
+            Some(std::path::Path::new("/private/compose.yaml")),
+        ));
         let task = app.runtime.spawn(std::future::pending::<()>());
         let abort = task.abort_handle();
         app.compose_task = Some(task);

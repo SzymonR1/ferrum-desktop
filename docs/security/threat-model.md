@@ -41,16 +41,19 @@ interpolation and service `env_file` resolution are skipped.
   recursively read local Compose files referenced by `include` or service
   `extends.file`, including paths outside the selected Compose file's
   directory, under the logged-in user's permissions. The selected file is not
-  a path-containment boundary. The CLI and plugin are trusted local code, and
-  private config/environment isolation is not a sandbox. Users must validate
-  only trusted Compose files. Keep selected paths and raw diagnostics private;
-  display only a bounded escaped basename and a static result.
+  a path-containment boundary. Remote Git and OCI loaders are explicitly
+  disabled with Compose-specific environment variables before config parsing,
+  so remote `include`/`extends.file` references fail without a fetch. The CLI
+  and plugin are trusted local code, and private config/environment isolation is
+  not a sandbox. Validate only trusted files; keep selected paths and raw
+  diagnostics private, displaying only a bounded escaped basename and a static
+  result.
 - Defer multiple-file merge, profiles, `.env`/service `env_file` resolution,
-  remote OCI/Git inputs, file import, project start/stop/restart, build/pull,
-  logs, and project mutations. Only Linux local Docker was validated;
-  validation uses no engine, and the native page visual check is unavailable.
-  Issue #18 remains open and #10 remains blocked; no release/support expansion
-  is claimed.
+  file import, project start/stop/restart, build/pull/logs, and project
+  mutations. Remote OCI/Git references remain disabled, not fetched. Only
+  Linux local Docker was validated; validation uses no engine, and the native
+  page visual check is unavailable. Issue #18 remains open and #10 remains
+  blocked; no release/support expansion is claimed.
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
 - Escape selected control, bidi, zero-width, invisible-format, Hangul-filler,
   and Unicode-tag characters in engine-provided container inventory/inspection
@@ -192,8 +195,9 @@ interpolation and service `env_file` resolution are skipped.
 - Remote TCP/HTTP/TLS/SSH transport trust, credentials, and identity validation.
 - Podman API compatibility and rootless endpoint discovery; issue #10 remains open for these and the broader engine matrix.
 - Compose features not implemented in this slice: multi-file merges, profile
-  selection, `.env`/service `env_file` resolution, remote OCI/Git inputs, file
-  import, project lifecycle actions, build/pull/logs, and project mutations.
+  selection, `.env`/service `env_file` resolution, remote OCI/Git inputs (the
+  remote loaders are disabled during validation), file import, project
+  lifecycle actions, build/pull/logs, and project mutations.
 - Credential stores, registry authentication, managed engines, and update delivery.
 
 These surfaces must receive explicit design and tests before their implementation. Engine access should be treated as privileged throughout; API version negotiation is not a security boundary. UI state gating and confirmation reduce accidental destructive operations but cannot constrain a compromised or malicious engine endpoint.
@@ -212,6 +216,11 @@ The optional ignored Compose-validation smoke uses a controlled temporary
 project and the installed CLI to exercise relative-path resolution without
 contacting an engine or modifying user project files. The default Compose tests
 use controlled subprocess fixtures and headless UI state coverage.
+
+The optional ignored Compose remote-loader safety smoke uses Git/OCI-shaped
+`include` references that target only an ephemeral `127.0.0.1` listener. It
+passes only when the installed CLI rejects those references without a local
+connection; it contacts no external host or engine.
 
 The opt-in network connect/disconnect smoke test requires the current local
 Unix Docker context and a preinstalled `FERRUM_TEST_IMAGE` containing

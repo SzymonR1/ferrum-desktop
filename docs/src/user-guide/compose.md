@@ -38,17 +38,19 @@ diagnostics.
 
 Compose can recursively read local Compose files referenced by `include` or
 service `extends.file`, including paths outside the selected Compose file's
-directory, under the logged-in user's permissions. The selected file is not a
-path-containment boundary. Private config/HOME and environment isolation are not
-a sandbox; the Docker CLI and Compose plugin are trusted local code. Validate
-only trusted Compose files.
+directory, under the logged-in user's permissions. Remote Git and OCI loaders
+are explicitly disabled, so remote `include`/`extends.file` references fail
+validation without a fetch. The selected file is not a path-containment
+boundary. Private config/HOME and environment isolation are not a sandbox; the
+Docker CLI and Compose plugin are trusted local code. Validate only trusted
+Compose files.
 
 Ferrum clears inherited environment values, sets `COMPOSE_DISABLE_ENV_FILE=1`,
-passes no user environment files, and supplies `--no-interpolate` and
-`--no-env-resolution`. Thus `.env` interpolation and service `env_file`
-resolution are intentionally skipped. The eight-second command deadline and
-1 MiB stdout cap apply to each CLI command, and raw stderr/diagnostics are
-discarded.
+and sets `COMPOSE_EXPERIMENTAL_GIT_REMOTE=false` and
+`COMPOSE_EXPERIMENTAL_OCI_REMOTE=false`. No user environment files are passed,
+and `--no-interpolate` and `--no-env-resolution` skip `.env` interpolation and
+service `env_file` resolution. The eight-second command deadline and 1 MiB
+stdout cap apply to each CLI command, and raw stderr/diagnostics are discarded.
 
 Discovery and validation CLI processes use a private isolated Docker config
 and `HOME` with a cleared allowlisted environment. If Compose is installed in
@@ -58,7 +60,8 @@ from saved Docker configuration are not loaded. The saved `config.json` is not
 read; credentials and proxy settings are neither read nor passed to the CLI.
 
 This remains a read-only page. Multi-file merge, profiles, `.env`/service
-`env_file` resolution, remote OCI/Git, import, project start/stop/restart,
+`env_file` resolution, remote Git/OCI `include`/`extends.file` references
+(explicitly disabled and rejected), import, project start/stop/restart,
 build/pull, logs, and project mutations are unsupported.
 
 For official command and environment semantics, see Docker's
@@ -66,11 +69,16 @@ For official command and environment semantics, see Docker's
 [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose),
 and [Compose environment variables guide](https://docs.docker.com/compose/how-tos/environment-variables/envvars/).
 
-The direct CLI probe, optional app-level discovery smoke, and controlled
-temporary-file validation smoke passed with Compose v5.6.0 and Docker Engine
-29.9.0/API 1.56. Discovery reads the selected local engine; validation parses
-an owned temporary file without contacting an engine. Neither smoke mutates
-projects. Linux local Docker discovery was validated; the native Compose page
-visual check is unavailable. Issue [#18](https://github.com/SzymonR1/ferrum-desktop/issues/18) remains open; issue
+The direct CLI probe, optional app-level discovery smoke, controlled
+temporary-file validation smoke, and loopback-only remote-loader safety smoke
+passed with Compose v5.6.0 and Docker Engine 29.9.0/API 1.56. Discovery reads
+the selected local engine; validation parses an owned temporary file without
+contacting an engine. The remote safety smoke verifies Git/OCI include
+references do not open a local connection or contact an external host. None of
+the smokes mutates projects. Linux local Docker discovery was validated; the
+native Compose page visual check is unavailable. Issue
+[#18](https://github.com/SzymonR1/ferrum-desktop/issues/18) remains open; issue
 [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) remains blocked.
+For security implications of remote and local references, see Docker's
+[Compose trust model](https://docs.docker.com/compose/trust-model).
 This page does not claim full issue completion or a release.

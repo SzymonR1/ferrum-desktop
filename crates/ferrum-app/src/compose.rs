@@ -95,6 +95,7 @@ impl ComposeValidationError {
 enum ComposeValidationState {
     #[default]
     Idle,
+    SelectingFile,
     Validating {
         file_name: String,
     },
@@ -185,11 +186,9 @@ impl ComposeView {
         true
     }
 
-    pub(super) fn begin_validation(&mut self, path: &std::path::Path) -> u64 {
+    pub(super) fn begin_file_selection(&mut self) -> u64 {
         self.validation_generation = self.validation_generation.wrapping_add(1);
-        self.validation = ComposeValidationState::Validating {
-            file_name: display_compose_basename(path),
-        };
+        self.validation = ComposeValidationState::SelectingFile;
         self.validation_generation
     }
 
@@ -218,6 +217,29 @@ impl ComposeView {
         matches!(&self.validation, ComposeValidationState::Validating { .. })
     }
 
+    pub(super) fn is_file_selection_running(&self) -> bool {
+        matches!(&self.validation, ComposeValidationState::SelectingFile)
+    }
+
+    pub(super) fn finish_file_selection(
+        &mut self,
+        generation: u64,
+        selected_file: Option<&std::path::Path>,
+    ) -> bool {
+        if generation != self.validation_generation
+            || !matches!(&self.validation, ComposeValidationState::SelectingFile)
+        {
+            return false;
+        }
+        self.validation = match selected_file {
+            Some(path) => ComposeValidationState::Validating {
+                file_name: display_compose_basename(path),
+            },
+            None => ComposeValidationState::SelectionCancelled,
+        };
+        true
+    }
+
     pub(super) fn cancel_validation(&mut self) {
         if let ComposeValidationState::Validating { file_name } =
             std::mem::take(&mut self.validation)
@@ -225,11 +247,6 @@ impl ComposeView {
             self.validation_generation = self.validation_generation.wrapping_add(1);
             self.validation = ComposeValidationState::Cancelled { file_name };
         }
-    }
-
-    pub(super) fn cancel_file_selection(&mut self) {
-        self.validation_generation = self.validation_generation.wrapping_add(1);
-        self.validation = ComposeValidationState::SelectionCancelled;
     }
 
     pub(super) fn invalidate(&mut self) {
@@ -259,8 +276,8 @@ impl ComposeView {
                     "Security notice: validate only trusted Compose files. ",
 "Docker Compose may recursively read local Compose files referenced by include ",
 "or service extends.file, including files outside the selected file's directory, ",
-"using the logged-in user's permissions. The selected file is not a path ",
-"containment boundary. Validation is read-only, but it is not sandboxed."
+"using the logged-in user's permissions. Remote Git and OCI loaders are disabled. ",
+"The selected file is not a path containment boundary, and validation is not sandboxed."
                 ),
             );
         });
@@ -273,7 +290,9 @@ impl ComposeView {
                 .clicked();
             actions.select_file = ui
                 .add_enabled(
-                    validation_enabled && !self.is_validation_running(),
+                    validation_enabled
+                        && !self.is_file_selection_running()
+                        && !self.is_validation_running(),
                     egui::Button::new("Validate Compose file"),
                 )
                 .clicked();
@@ -285,6 +304,12 @@ impl ComposeView {
         match &self.validation {
             ComposeValidationState::Idle => {
                 ui.label("Select one local Compose YAML file to validate its structure.");
+            }
+            ComposeValidationState::SelectingFile => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Choosing a Compose file…");
+                });
             }
             ComposeValidationState::Validating { file_name } => {
                 ui.horizontal(|ui| {
@@ -731,7 +756,11 @@ impl PrivateDockerConfig {
             .env("HOME", &self.home)
             .env("DOCKER_CONFIG", &self.docker_config)
             .env("LANG", "C")
-            .env("LC_ALL", "C");
+            .env("LC_ALL", "C")
+            // Remote Compose sources can make Git/registry requests during
+            // config parsing; disable both loaders for every CLI invocation.
+            .env("COMPOSE_EXPERIMENTAL_GIT_REMOTE", "false")
+            .env("COMPOSE_EXPERIMENTAL_OCI_REMOTE", "false");
     }
 }
 
@@ -1003,8 +1032,9 @@ mod tests {
                    [ -n \"$PATH\" ] && [ -d \"$HOME\" ] && [ -d \"$DOCKER_CONFIG\" ] || exit 86\n\
                    [ \"$HOME\" != \"$DOCKER_CONFIG\" ] && [ ! -e \"$DOCKER_CONFIG/config.json\" ] || exit 87\n\
                    [ -z \"${{COMPOSE_DISABLE_ENV_FILE+x}}\" ] || exit 90\n\
+                   [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = \"false\" ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = \"false\" ] || exit 91\n\
                    env | while IFS='=' read -r name value; do\n\
-                     case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|PWD|SHLVL|_) : ;; *) exit 89 ;; esac\n\
+                     case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|PWD|SHLVL|_) : ;; *) exit 89 ;; esac\n\
                    done || exit 89\n\
                    printf '%s\\n%s' \"$DOCKER_CONFIG\" \"$HOME\" > {}\n\
                    printf '%s' {}\n\
@@ -1016,12 +1046,13 @@ mod tests {
                  [ \"$6\" = config ] && [ \"$7\" = --quiet ] || exit 83\n\
                  [ \"$8\" = --no-interpolate ] && [ \"$9\" = --no-env-resolution ] || exit 84\n\
                  [ \"$COMPOSE_DISABLE_ENV_FILE\" = 1 ] || exit 85\n\
+                 [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = \"false\" ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = \"false\" ] || exit 91\n\
                  [ -n \"$PATH\" ] && [ -d \"$HOME\" ] && [ -d \"$DOCKER_CONFIG\" ] || exit 86\n\
                  [ \"$HOME\" != \"$DOCKER_CONFIG\" ] && [ ! -e \"$DOCKER_CONFIG/config.json\" ] || exit 87\n\
                  [ \"$(cat {})\" = \"$(printf '%s\\n%s' \"$DOCKER_CONFIG\" \"$HOME\")\" ] || exit 90\n\
                  if [ -n \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{DOCKER_API_VERSION+x}}${{DOCKER_CERT_PATH+x}}${{DOCKER_TLS+x}}${{DOCKER_TLS_VERIFY+x}}${{DOCKER_CUSTOM_HEADERS+x}}${{DOCKER_DEFAULT_PLATFORM+x}}${{HTTP_PROXY+x}}${{HTTPS_PROXY+x}}${{NO_PROXY+x}}${{ALL_PROXY+x}}${{FTP_PROXY+x}}${{http_proxy+x}}${{https_proxy+x}}${{no_proxy+x}}${{all_proxy+x}}${{ftp_proxy+x}}${{COMPOSE_FILE+x}}${{COMPOSE_ENV_FILES+x}}${{COMPOSE_PROFILES+x}}${{COMPOSE_PROJECT_NAME+x}}${{COMPOSE_PATH_SEPARATOR+x}}\" ]; then exit 88; fi\n\
                  env | while IFS='=' read -r name value; do\n\
-                   case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_DISABLE_ENV_FILE|PWD|SHLVL|_) : ;; *) exit 89 ;; esac\n\
+                   case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_DISABLE_ENV_FILE|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|PWD|SHLVL|_) : ;; *) exit 89 ;; esac\n\
                  done || exit 89\n\
                  : > {}\n\
                  {}\n\
@@ -1205,6 +1236,96 @@ mod tests {
                 .expect("the local Compose CLI should validate the temporary project");
         }
 
+        #[tokio::test]
+        #[ignore = "requires Docker CLI and Compose; remote references target only a local loopback listener"]
+        async fn local_compose_validation_rejects_remote_includes_without_network_access() {
+            use std::{
+                io::Write,
+                net::TcpListener,
+                sync::{
+                    Arc,
+                    atomic::{AtomicBool, AtomicUsize, Ordering},
+                },
+                thread,
+            };
+
+            let search_path = search_path();
+            let binary = docker_binary(&search_path).expect("Docker CLI should be installed");
+            let user_compose_plugin = user_compose_plugin();
+            let directory = FixtureDirectory::new();
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .expect("the controlled loopback listener should bind");
+            listener
+                .set_nonblocking(true)
+                .expect("the loopback listener should be nonblocking");
+            let address = listener
+                .local_addr()
+                .expect("the local listener address should be available");
+            let stop_server = Arc::new(AtomicBool::new(false));
+            let connection_count = Arc::new(AtomicUsize::new(0));
+            let server_stop = Arc::clone(&stop_server);
+            let server_connection_count = Arc::clone(&connection_count);
+            let server = thread::spawn(move || {
+                while !server_stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            server_connection_count.fetch_add(1, Ordering::Relaxed);
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let mut results = Vec::new();
+            for (name, remote_reference) in [
+                (
+                    "git",
+                    format!("https://{address}/remote.git#main:compose.yaml"),
+                ),
+                ("oci", format!("oci://{address}/remote:latest")),
+            ] {
+                let project_directory = directory.path().join(name);
+                fs::create_dir(&project_directory)
+                    .expect("the controlled project directory should be created");
+                let file = project_directory.join("compose.yaml");
+                fs::write(
+                    &file,
+                    format!("include:\n  - {remote_reference}\nservices: {{}}\n"),
+                )
+                .expect("the controlled remote-reference Compose file should be written");
+                results.push(
+                    validate_with_binary(
+                        &binary,
+                        &file,
+                        &search_path,
+                        user_compose_plugin.as_deref(),
+                        Duration::from_secs(4),
+                    )
+                    .await,
+                );
+            }
+            thread::sleep(std::time::Duration::from_millis(25));
+            stop_server.store(true, Ordering::Relaxed);
+            server
+                .join()
+                .expect("the controlled loopback listener should stop");
+
+            for result in results {
+                assert_eq!(result, Err(ComposeValidationError::ValidationFailed));
+            }
+            assert_eq!(
+                connection_count.load(Ordering::Relaxed),
+                0,
+                "Compose validation must not fetch Git or OCI include references"
+            );
+        }
+
         #[test]
         fn isolated_docker_config_and_home_are_owner_only() {
             let private = PrivateDockerConfig::new(None)
@@ -1361,7 +1482,10 @@ mod tests {
                     .await
                     .expect_err("the fixture should exceed the short test deadline");
 
-            assert!(matches!(failure, CommandFailure::TimedOut));
+            assert!(
+                matches!(&failure, CommandFailure::TimedOut),
+                "expected a timeout, got {failure:?}"
+            );
         }
 
         #[test]
@@ -1478,7 +1602,7 @@ mod tests {
 
             let _security_disclosure = harness.get_by_role_and_label(
                 Role::Label,
-"Security notice: validate only trusted Compose files. Docker Compose may recursively read local Compose files referenced by include or service extends.file, including files outside the selected file's directory, using the logged-in user's permissions. The selected file is not a path containment boundary. Validation is read-only, but it is not sandboxed.",
+                "Security notice: validate only trusted Compose files. Docker Compose may recursively read local Compose files referenced by include or service extends.file, including files outside the selected file's directory, using the logged-in user's permissions. Remote Git and OCI loaders are disabled. The selected file is not a path containment boundary, and validation is not sandboxed.",
             );
             assert!(
                 !harness
@@ -1494,12 +1618,56 @@ mod tests {
         }
 
         #[test]
+        fn pending_file_selection_is_accessible_and_rejects_stale_or_cancelled_results() {
+            let mut waiting = ComposeView::default();
+            waiting.begin_file_selection();
+            assert!(waiting.is_file_selection_running());
+            let mut harness = harness_for(waiting);
+            harness.step();
+            let _waiting = harness.get_by_role_and_label(Role::Label, "Choosing a Compose file…");
+            assert!(
+                harness
+                    .get_by_role_and_label(Role::Button, "Validate Compose file")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            drop(harness);
+
+            let selected_file = std::path::Path::new("/private/project/compose\u{202e}.yaml");
+            let mut selected = ComposeView::default();
+            let generation = selected.begin_file_selection();
+            assert!(selected.finish_file_selection(generation, Some(selected_file)));
+            assert!(selected.is_validation_running());
+            assert!(matches!(
+                &selected.validation,
+                ComposeValidationState::Validating { file_name }
+                    if file_name == "compose\\u{202e}.yaml"
+            ));
+
+            let mut stale = ComposeView::default();
+            let stale_generation = stale.begin_file_selection();
+            stale.invalidate();
+            assert!(!stale.finish_file_selection(stale_generation, Some(selected_file)));
+            assert!(!stale.is_validation_running());
+
+            let mut cancelled = ComposeView::default();
+            let cancel_generation = cancelled.begin_file_selection();
+            assert!(cancelled.finish_file_selection(cancel_generation, None));
+            assert!(matches!(
+                &cancelled.validation,
+                ComposeValidationState::SelectionCancelled
+            ));
+            assert!(!cancelled.is_file_selection_running());
+        }
+
+        #[test]
         fn validation_states_are_accessible_and_show_only_safe_file_names() {
             let selected_file = std::path::Path::new("/private/project/compose\u{202e}.yaml");
             let safe_name = "compose\\u{202e}.yaml";
 
             let mut validating = ComposeView::default();
-            validating.begin_validation(selected_file);
+            let generation = validating.begin_file_selection();
+            assert!(validating.finish_file_selection(generation, Some(selected_file)));
             assert!(
                 !format!("{:?}", validating.validation).contains("/private/project"),
                 "the view must retain only a bounded basename"
@@ -1517,7 +1685,11 @@ mod tests {
                 "x".repeat(MAX_COMPOSE_FILENAME_DISPLAY_BYTES),
             );
             let mut bounded = ComposeView::default();
-            bounded.begin_validation(std::path::Path::new(&overlong_file_name));
+            let generation = bounded.begin_file_selection();
+            assert!(bounded.finish_file_selection(
+                generation,
+                Some(std::path::Path::new(&overlong_file_name)),
+            ));
             assert!(matches!(
                 &bounded.validation,
                 ComposeValidationState::Validating { file_name } if file_name == "[name omitted]"
@@ -1528,7 +1700,8 @@ mod tests {
             drop(harness);
 
             let mut succeeded = ComposeView::default();
-            let generation = succeeded.begin_validation(selected_file);
+            let generation = succeeded.begin_file_selection();
+            assert!(succeeded.finish_file_selection(generation, Some(selected_file)));
             assert!(succeeded.finish_validation(generation, Ok(())));
             let mut harness = harness_for(succeeded);
             harness.run();
@@ -1542,7 +1715,8 @@ mod tests {
             drop(harness);
 
             let mut failed = ComposeView::default();
-            let generation = failed.begin_validation(selected_file);
+            let generation = failed.begin_file_selection();
+            assert!(failed.finish_file_selection(generation, Some(selected_file)));
             assert!(
                 failed
                     .finish_validation(generation, Err(ComposeValidationError::ValidationFailed),)
@@ -1557,7 +1731,8 @@ mod tests {
             drop(harness);
 
             let mut unavailable = ComposeView::default();
-            let generation = unavailable.begin_validation(selected_file);
+            let generation = unavailable.begin_file_selection();
+            assert!(unavailable.finish_file_selection(generation, Some(selected_file)));
             assert!(unavailable.finish_validation(
                 generation,
                 Err(ComposeValidationError::ComposePluginUnavailable),
@@ -1575,8 +1750,10 @@ mod tests {
             let stale_file = std::path::Path::new("/private/stale/old.yaml");
             let current_file = std::path::Path::new("/private/current/compose.yaml");
             let mut view = ComposeView::default();
-            let stale_generation = view.begin_validation(stale_file);
-            let current_generation = view.begin_validation(current_file);
+            let stale_generation = view.begin_file_selection();
+            assert!(view.finish_file_selection(stale_generation, Some(stale_file)));
+            let current_generation = view.begin_file_selection();
+            assert!(view.finish_file_selection(current_generation, Some(current_file)));
             assert!(!view.finish_validation(stale_generation, Ok(())));
             assert!(view.is_validation_running());
             assert!(view.finish_validation(current_generation, Ok(())));
@@ -1596,7 +1773,8 @@ mod tests {
             drop(harness);
 
             let mut cancellable = ComposeView::default();
-            cancellable.begin_validation(current_file);
+            let generation = cancellable.begin_file_selection();
+            assert!(cancellable.finish_file_selection(generation, Some(current_file)));
             let mut harness = harness_for(cancellable);
             harness.step();
             harness
@@ -1607,7 +1785,8 @@ mod tests {
             drop(harness);
 
             let mut cancelled = ComposeView::default();
-            cancelled.begin_validation(current_file);
+            let generation = cancelled.begin_file_selection();
+            assert!(cancelled.finish_file_selection(generation, Some(current_file)));
             cancelled.cancel_validation();
             let mut harness = harness_for(cancelled);
             harness.run();
@@ -1619,7 +1798,8 @@ mod tests {
             drop(harness);
 
             let mut selection_cancelled = ComposeView::default();
-            selection_cancelled.cancel_file_selection();
+            let generation = selection_cancelled.begin_file_selection();
+            assert!(selection_cancelled.finish_file_selection(generation, None));
             let mut harness = harness_for(selection_cancelled);
             harness.run();
             let _cancelled =
