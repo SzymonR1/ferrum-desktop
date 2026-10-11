@@ -17,7 +17,15 @@ Open **Container details**, choose a shell, and select **Open terminal**. Click 
 
 ## Safety and limitations
 
-Terminal output is untrusted and may include sensitive or deceptive text. OSC 52 clipboard writes and terminal-title requests are ignored. Ferrum never copies output to or reads clipboard contents automatically; clipboard operations require explicit user action. When exec creation fails, Ferrum displays a typed error without the daemon response body. Terminal bytes and engine response bodies are not included in diagnostics.
+Terminal output is untrusted and may include sensitive or deceptive text. OSC
+52 clipboard writes and terminal-title requests are ignored. Ferrum caps raw
+OSC strings at 1 KiB before parsing. For an oversized string, the parser retains
+only the capped prefix while Ferrum discards the tail; the actual BEL, CAN, SUB,
+or ESC terminator is passed through before rendering resumes.
+Ferrum never copies output to or reads clipboard contents
+automatically; clipboard operations require explicit user action. When exec
+creation fails, Ferrum displays a typed error without the daemon response body.
+Terminal bytes and engine response bodies are not included in diagnostics.
 
 Closing the terminal, switching the engine connection, or exiting Ferrum ends the exec session only; it does not stop or remove the container. The terminal feature is experimental and has not been visually or screen-reader validated.
 

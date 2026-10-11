@@ -7,6 +7,135 @@ use vt100::{Callbacks, Color, Parser, Screen};
 const SCROLLBACK_ROWS: usize = 10_000;
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLUMNS: u16 = 80;
+// Match vte's fixed no-std OSC budget even though its default std parser uses an unbounded Vec.
+const MAX_OSC_SEQUENCE_BYTES: usize = 1024;
+
+#[derive(Clone, Copy, Default)]
+enum OscState {
+    #[default]
+    Ground,
+    Escape,
+    InOsc {
+        bytes: usize,
+    },
+    EscapeAfterOsc,
+    DiscardOsc,
+}
+
+#[derive(Default)]
+struct OscStringLimiter {
+    state: OscState,
+}
+
+impl OscStringLimiter {
+    fn feed<CB: Callbacks>(&mut self, parser: &mut Parser<CB>, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            match self.state {
+                OscState::Ground => {
+                    let Some(escape) = bytes.iter().position(|byte| *byte == 0x1b) else {
+                        parser.process(bytes);
+                        return;
+                    };
+                    if escape > 0 {
+                        parser.process(&bytes[..escape]);
+                    }
+                    bytes = &bytes[escape + 1..];
+                    self.state = OscState::Escape;
+                }
+                OscState::Escape => {
+                    let byte = bytes[0];
+                    if byte == b']' {
+                        parser.process(b"\x1b]");
+                        bytes = &bytes[1..];
+                        self.state = OscState::InOsc { bytes: 0 };
+                    } else {
+                        let sequence = [0x1b, byte];
+                        parser.process(&sequence);
+                        bytes = &bytes[1..];
+                        self.state = if escape_keeps_pending(byte) {
+                            OscState::EscapeAfterOsc
+                        } else {
+                            OscState::Ground
+                        };
+                    }
+                }
+                OscState::InOsc { bytes: seen } => {
+                    if is_osc_terminator(bytes[0]) {
+                        let terminator = bytes[0];
+                        parser.process(&bytes[..1]);
+                        bytes = &bytes[1..];
+                        self.state = if terminator == 0x1b {
+                            OscState::EscapeAfterOsc
+                        } else {
+                            OscState::Ground
+                        };
+                        continue;
+                    }
+
+                    let data_length = bytes
+                        .iter()
+                        .position(|byte| is_osc_terminator(*byte))
+                        .unwrap_or(bytes.len());
+                    let remaining = MAX_OSC_SEQUENCE_BYTES - seen;
+                    if data_length > remaining {
+                        if remaining > 0 {
+                            parser.process(&bytes[..remaining]);
+                        }
+                        // Keep the parser's buffer at the limit; do not feed the string tail.
+                        bytes = &bytes[remaining..];
+                        self.state = OscState::DiscardOsc;
+                    } else {
+                        if data_length > 0 {
+                            parser.process(&bytes[..data_length]);
+                        }
+                        bytes = &bytes[data_length..];
+                        self.state = OscState::InOsc {
+                            bytes: seen + data_length,
+                        };
+                    }
+                }
+                OscState::EscapeAfterOsc => {
+                    let byte = bytes[0];
+                    parser.process(&bytes[..1]);
+                    bytes = &bytes[1..];
+                    self.state = if byte == b']' {
+                        OscState::InOsc { bytes: 0 }
+                    } else if escape_keeps_pending(byte) {
+                        OscState::EscapeAfterOsc
+                    } else {
+                        OscState::Ground
+                    };
+                }
+                OscState::DiscardOsc => {
+                    let Some(terminator_index) =
+                        bytes.iter().position(|byte| is_osc_terminator(*byte))
+                    else {
+                        return;
+                    };
+                    let terminator = bytes[terminator_index];
+                    parser.process(&bytes[terminator_index..terminator_index + 1]);
+                    bytes = &bytes[terminator_index + 1..];
+                    self.state = if terminator == 0x1b {
+                        OscState::EscapeAfterOsc
+                    } else {
+                        OscState::Ground
+                    };
+                }
+            }
+        }
+    }
+}
+
+fn is_osc_terminator(byte: u8) -> bool {
+    matches!(byte, 0x07 | 0x18 | 0x1a | 0x1b)
+}
+
+fn escape_keeps_pending(byte: u8) -> bool {
+    matches!(
+        byte,
+        0x00..=0x17 | 0x19 | 0x1b | 0x1c..=0x1f | 0x7f..=0xff
+    )
+}
 
 #[derive(Default)]
 struct NoopCallbacks;
@@ -20,6 +149,7 @@ impl Callbacks for NoopCallbacks {
 
 pub(crate) struct TerminalModel {
     parser: Parser<NoopCallbacks>,
+    osc_limiter: OscStringLimiter,
     rows: u16,
     columns: u16,
     revision: u64,
@@ -52,6 +182,7 @@ impl TerminalModel {
         let columns = columns.max(1);
         Self {
             parser: Parser::new_with_callbacks(rows, columns, SCROLLBACK_ROWS, NoopCallbacks),
+            osc_limiter: OscStringLimiter::default(),
             rows,
             columns,
             revision: 0,
@@ -60,8 +191,7 @@ impl TerminalModel {
     }
     pub(crate) fn feed(&mut self, bytes: &[u8]) {
         // Clipboard and title requests are explicitly discarded by NoopCallbacks.
-
-        self.parser.process(bytes);
+        self.osc_limiter.feed(&mut self.parser, bytes);
         self.bump_revision();
     }
 
@@ -433,6 +563,89 @@ mod tests {
         terminal.scroll_to_bottom();
         assert_eq!(terminal.scrollback_position(), 0);
         assert_eq!(terminal.contents(), current);
+    }
+    #[derive(Default)]
+    struct ClipboardProbe {
+        max_payload_bytes: usize,
+        copy_calls: usize,
+    }
+
+    impl Callbacks for ClipboardProbe {
+        fn copy_to_clipboard(&mut self, _: &mut Screen, _: &[u8], data: &[u8]) {
+            self.max_payload_bytes = self.max_payload_bytes.max(data.len());
+            self.copy_calls += 1;
+        }
+    }
+
+    #[test]
+    fn osc52_payload_is_capped_at_the_terminal_budget() {
+        let header_len = b"52;c;".len();
+        let prefixes: [&[u8]; 4] = [b"\x1b]", b"\x1b\x07]", b"\x1b\x7f]", b"\x1b\x9d]"];
+        for prefix in prefixes {
+            for payload_len in [
+                MAX_OSC_SEQUENCE_BYTES - header_len,
+                MAX_OSC_SEQUENCE_BYTES * 8,
+            ] {
+                let mut parser = Parser::new_with_callbacks(2, 20, 0, ClipboardProbe::default());
+                let mut limiter = OscStringLimiter::default();
+                let mut sequence = prefix.to_vec();
+                sequence.extend_from_slice(b"52;c;");
+                sequence.resize(sequence.len() + payload_len, b'A');
+                sequence.push(b'\x07');
+
+                limiter.feed(&mut parser, &sequence);
+
+                assert_eq!(parser.callbacks().copy_calls, 1);
+                assert_eq!(
+                    parser.callbacks().max_payload_bytes,
+                    payload_len.min(MAX_OSC_SEQUENCE_BYTES - header_len),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_osc_resynchronizes_after_bel_across_io_chunks() {
+        let mut terminal = TerminalModel::new(2, 40);
+        terminal.feed(b"before\x1b");
+        terminal.feed(b"]52;c;");
+        let payload = vec![b'A'; MAX_OSC_SEQUENCE_BYTES * 8];
+        for chunk in payload.chunks(127) {
+            terminal.feed(chunk);
+        }
+        terminal.feed(b"\x07after");
+
+        let contents = terminal.contents();
+        assert!(contents.contains("before"));
+        assert!(contents.contains("after"));
+        assert!(!contents.contains("AAAA"));
+    }
+
+    #[test]
+    fn oversized_osc_resynchronizes_after_split_string_terminator() {
+        let mut terminal = TerminalModel::new(2, 40);
+        terminal.feed(b"\x1b]52;c;");
+        let payload = vec![b'A'; MAX_OSC_SEQUENCE_BYTES * 8];
+        for chunk in payload.chunks(311) {
+            terminal.feed(chunk);
+        }
+        terminal.feed(b"\x1b");
+        terminal.feed(b"\\resumed");
+
+        assert!(terminal.contents().contains("resumed"));
+    }
+
+    #[test]
+    fn oversized_osc_resynchronizes_after_cancel_controls() {
+        let payload = vec![b'A'; MAX_OSC_SEQUENCE_BYTES * 8];
+        for terminator in [b"\x18".as_slice(), b"\x1a".as_slice()] {
+            let mut terminal = TerminalModel::new(2, 40);
+            terminal.feed(b"\x1b]52;c;");
+            terminal.feed(&payload);
+            terminal.feed(terminator);
+            terminal.feed(b"resumed");
+            assert!(terminal.contents().contains("resumed"));
+        }
     }
     #[test]
     fn scrollback_is_bounded_and_osc52_is_ignored() {
