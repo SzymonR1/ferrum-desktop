@@ -7,14 +7,21 @@ bidirectional, zero-width, and invisible formatting characters before rendering,
 clipboard copy, and file export. This reduces display spoofing but does not
 detect or redact arbitrary data printed by a container.
 Engine-provided container names, image identifiers/tags/inspection fields,
-network names/metadata, and attached-container names are untrusted. Ferrum
-escapes selected control, bidirectional, zero-width, invisible-format, Unicode
-tag, and Hangul filler characters in resource rows, details, and
-membership/confirmation labels. Each engine-sourced display field is limited
-to 4 KiB of raw or escaped text; values beyond that are shown as `[display
-text omitted]`. Escaping is presentation-only; original values remain for
-comparisons and requests. It does not detect or redact secrets or arbitrary
-log content.
+network names/metadata, attached-container names, and volume names and optional
+volume detail values are untrusted. Ferrum escapes selected control,
+bidirectional, zero-width, invisible-format, Unicode-tag, and Hangul-filler
+characters in resource rows, details, and membership/confirmation labels. Each
+engine-sourced display field is limited to 4 KiB of raw or escaped text; values
+beyond that are shown as `[display text omitted]`. Volume names receive this
+protection in the virtualized list button/accessibility label, details heading,
+removal confirmation, in-progress label, and success label. Optional volume
+details (driver, scope, creation time, and host mountpoint) are omitted by the
+engine adapter when raw or escaped text exceeds 4 KiB; the page shows these as
+**Not reported**. The UI independently enforces the 4 KiB display bound and
+shows `[display text omitted]` for oversized values that reach rendering.
+Escaping is presentation-only; raw names remain unchanged for identity
+comparisons and requests. The mountpoint is never accessed. This does not detect
+or redact secrets or arbitrary log content.
 
 ## Reporting a vulnerability
 
@@ -35,6 +42,38 @@ that occurs before HTTP submission. Image IDs, references, repository tags,
 endpoints, error text, and daemon response bodies are not logged. These events
 are not persistent or tamper-proof; `request_error` does not establish that
 engine state remained unchanged.
+
+## Local image builds
+
+The Linux Images page supports confirmed local builds only through Docker CLI
+and its Buildx plugin in `PATH`, explicitly targeting the selected local Docker
+Unix socket. Builds accept only a local directory containing a regular
+root-level `Dockerfile` and a bounded `repository:tag` target; client validation
+rejects uppercase repository characters and Docker CLI validates the full
+repository grammar. Docker CLI handles `.dockerignore` and tar-context
+semantics. Ferrum uses a private temporary empty Docker config and isolated
+`HOME`; it does not read user registry credentials or pass proxy settings,
+build arguments, secrets, SSH access, push requests, or remote contexts.
+Private base-image authentication is unsupported and may cause a build to fail.
+Podman/rootless and broader endpoint/platform compatibility remain unvalidated
+under open, blocked issue #10.
+
+Every build requires confirmation because Dockerfiles can run arbitrary builder
+commands and an existing tag may be reassigned. The confirmation names the
+selected Docker context or a safe endpoint-source label when no named context is
+selected, without displaying the socket path. Context switching is disabled
+while the confirmation or build remains active. Output is sanitized plain text,
+bounded in memory, and not persisted to logs or audit traces. Cancellation is
+best effort and terminates the Docker CLI process group; builder work may
+continue and image/tag state may be uncertain. Ferrum refreshes image inventory
+after every terminal result.
+Build traces contain only static `image_mutation` / `build` action and
+`success`, `not_submitted`, or `request_error` outcome; context path, tag, and
+output are excluded. The build trace is ephemeral process logging, not durable
+audit history.
+
+Issues #16 and #19 remain open and ready. This partial slice is not a release
+or a support claim beyond local Linux Docker.
 
 The Volumes page is available only for the selected local Docker Unix socket
 on Linux. Creation sends only `Name` to the negotiated volume-create endpoint
@@ -59,10 +98,14 @@ exact inventory-matched volume are displayed when reported. Missing, negative,
 or unknown metric values remain unavailable. A usage failure is shown
 separately while successful inspect metadata stays visible. Only volume name,
 driver, scope, creation time, and mountpoint are retained; selected control,
-bidirectional, and invisible formatting characters in optional display fields
-are escaped as visible `\u{...}` text. The mountpoint is never accessed.
-Labels, options, status, raw response bodies, and filesystem browsing are not
-exposed.
+bidirectional, invisible-format, Unicode-tag, and Hangul-filler characters in
+volume names are escaped at UI display boundaries, with raw-or-escaped text
+capped at 4 KiB and longer text shown as `[display text omitted]`. Raw names
+remain unchanged for identity comparisons and API request values. Selected
+control, bidirectional, and invisible formatting characters in optional
+display fields are escaped as visible `\u{...}` text. The mountpoint is never
+accessed. Labels, options, status, raw response bodies, and filesystem browsing
+are not exposed.
 
 Removal is offered only for a listed volume with a matching inspection and an
 exact-name usage snapshot reporting `RefCount == 0`; positive, missing, or
@@ -92,12 +135,14 @@ attached-container count. The `Containers` map keys are retained only as full
 64-character hexadecimal IDs when every key is valid; endpoint values are
 discarded. Container names are shown only from the current inventory. When
 verbose inspect reports IPAM status, Ferrum retains only aggregate
-`IPsInUse` and `DynamicIPsAvailable` allocation counts across subnets. Missing,
-malformed, negative, or overflowing metrics, invalid CIDR keys, and subnet
-duplicates after CIDR normalization make the aggregates unavailable.
-Subnet/CIDR keys, addresses, endpoint names/IDs/configuration, labels, options,
-peers, services, raw status, and raw response bodies are not retained or
-displayed. These are not per-network traffic counters.
+`IPsInUse` and `DynamicIPsAvailable` allocation counts across subnets. Invalid
+CIDRs or duplicate normalized subnet keys make both metrics unavailable.
+Missing, malformed, negative, or overflowing count values and checked-sum
+overflow make only the corresponding metric unavailable; the other may remain
+available. Subnet/CIDR keys, addresses, endpoint names/IDs/configuration, labels,
+options, peers, services, raw status, and raw response bodies are not retained
+or displayed. These point-in-time values describe IP allocation, not network
+traffic; per-container/interface counters are not aggregated.
 
 Removal is offered only for selected custom networks, never Docker's predefined
 `bridge`, `host`, or `none` networks. A fresh inspection of the selected exact
@@ -131,12 +176,12 @@ Connect/disconnect events include both network and container IDs; names,
 endpoints, error text, and daemon bodies are excluded. These process traces are
 not persistent or tamper-proof. Only one network mutation may be active, and
 context switching is blocked until it returns. Inspection exposes only
-point-in-time aggregate IPAM allocation counts when reported; malformed or
-negative counts, invalid CIDR keys, normalized duplicate subnets, and overflow
-remain unavailable. Subnet/CIDR keys, addresses, endpoint data, and raw status
-are not exposed.
-per-container/interface counters are not aggregated. Credential access is not
+point-in-time aggregate IPAM allocation counts when reported. An invalid CIDR
+or duplicate normalized subnet makes both aggregates unavailable; a missing,
+malformed, negative, or overflowing count or sum overflow makes only the
+affected aggregate unavailable, and the other metric may remain available.
+Subnet/CIDR keys, addresses, endpoint data, and raw status are not exposed.
+Per-container/interface counters are not aggregated. Credential access is not
 provided. Podman/rootless and remote endpoints remain unsupported or
-unvalidated.
-Issues #17 and #10 remain open; no release is claimed.
+unvalidated. Issues #17 and #10 remain open; no release is claimed.
 

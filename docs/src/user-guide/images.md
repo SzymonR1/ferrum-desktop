@@ -1,8 +1,10 @@
 # Images
 
-**Status:** Linux local Docker Unix-socket image listing/inspection, anonymous
-public pulls, local image tagging, and confirmed local image removal. No live
-pull, tag, or image removal operation is claimed.
+**Status:** implemented for the Linux local Docker Unix socket: image
+listing/inspection, anonymous public pulls, local image tagging/removal, and
+confirmed local Buildx builds. No live pull, tag, removal, or build was
+performed during validation; native Images-page visual validation remains
+unverified.
 
 Open **Images** in the sidebar to view images returned by the connected local
 Docker engine. Search is case-insensitive across repository tags and image IDs.
@@ -78,14 +80,44 @@ the UI does not expose daemon response bodies.
 
 ## Scope and limitations
 
-Image listing, inspection, anonymous pulls, tagging, and removal are limited to
-the local Docker Unix socket on Linux. Build, push, and private-registry
-authentication are not offered. Issue
-[#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) remains open; this
-sub-slice is not a release. Podman/rootless behavior, remote endpoints, and
-broader engine compatibility remain unsupported or unvalidated under the
-still-open [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10).
-There are no live pull, tag, or removal operations, no tests that mutate image
-resources, and no native image-page visual validation. See the
+Image listing, inspection, anonymous pulls, tagging, removal, and builds are
+limited to the local Docker Unix socket on Linux. Builds require Docker CLI and
+the Buildx plugin in `PATH`. Podman/rootless behavior and broader endpoint or
+platform compatibility remain unvalidated under open, blocked [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10).
+This partial slice does not complete [issue #16](https://github.com/SzymonR1/ferrum-desktop/issues/16),
+which remains open and ready; [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19)
+also remains open and ready. No release or broader support claim is made.
+No live pull, tag, removal, or build was performed during validation. Native
+Images-page visual validation remains unverified. See the
 [platform support matrix](../platform-support.md).
+
+## Building a local image
+
+Choose a local directory containing a regular root-level `Dockerfile` and
+enter a bounded `repository:tag` target. Ferrum rejects uppercase repository
+characters and validates Docker tag syntax and target length, but leaves the
+full repository grammar to Docker CLI. It invokes Docker CLI Buildx using
+argument arrays with `--host unix://<selected EngineClient socket>` pinned to
+the selected local Docker Engine Unix socket on Linux. Docker CLI applies
+`.dockerignore` and its normal tar-context semantics. Remote contexts, custom
+builders, platform selection, and push are unsupported. Private base-image
+authentication is unsupported and may cause a build to fail.
+
+Ferrum requires Docker CLI and the Buildx plugin in `PATH`. Before every build,
+it requests explicit confirmation because Dockerfiles can run arbitrary builder
+commands and may reassign an existing tag. The confirmation names the selected
+Docker context or a safe endpoint-source label when no named context is
+selected; it never displays the socket path. Context switching is disabled
+while the confirmation is open and until the build reaches a terminal result.
+Build execution uses a private temporary empty Docker config and isolated
+`HOME`; Ferrum does not read user registry credentials or forward proxy
+settings, build arguments, secrets, or SSH access.
+
+Output is streamed as sanitized plain text with bounded in-memory retention and
+is not persisted to logs or audit traces. Build outcome tracing records only a
+static action and result, remains process-local, and is not durable audit
+history. Cancellation is best effort: Ferrum terminates the Docker CLI process
+group, but cannot guarantee builder work stopped or determine whether the
+image/tag changed. Inventory refreshes after every terminal result, including
+cancellation, because the outcome may be uncertain.
 
