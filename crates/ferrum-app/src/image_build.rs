@@ -79,7 +79,7 @@ impl ImageBuildRequest {
 pub(super) fn valid_target(repository: &str, tag: &str) -> bool {
     repository.len().saturating_add(1).saturating_add(tag.len()) <= 512
         && valid_repository(repository)
-        && valid_tag(tag)
+        && crate::images::valid_docker_tag(tag)
 }
 fn valid_repository(repository: &str) -> bool {
     !repository.is_empty()
@@ -92,16 +92,6 @@ fn valid_repository(repository: &str) -> bool {
         && !repository.starts_with('/')
         && !repository.ends_with('/')
         && !repository.contains("//")
-}
-
-fn valid_tag(tag: &str) -> bool {
-    let bytes = tag.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= 128
-        && (bytes[0].is_ascii_alphanumeric() || bytes[0] == b'_')
-        && bytes[1..]
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
 pub(super) fn validate_context(context: &Path) -> Result<PathBuf, ImageBuildError> {

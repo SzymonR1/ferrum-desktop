@@ -1171,7 +1171,7 @@ impl ImagesView {
     }
 }
 
-fn valid_docker_tag(tag: &str) -> bool {
+pub(super) fn valid_docker_tag(tag: &str) -> bool {
     let bytes = tag.as_bytes();
     let Some((&first, rest)) = bytes.split_first() else {
         return false;
