@@ -162,7 +162,7 @@ enum EngineEvent {
     },
     ComposeValidationFinished {
         generation: u64,
-        result: Result<(), compose::ComposeValidationError>,
+        result: compose::ComposeValidationResult,
     },
     NetworkCreated {
         generation: u64,
@@ -6415,7 +6415,13 @@ mod event_reconciliation_tests {
             !app.compose
                 .finish_load(generation, Err(compose::ComposeError::DockerCliMissing),)
         );
-        assert!(!app.compose.finish_validation(validation_generation, Ok(())));
+        assert!(!app.compose.finish_validation(
+            validation_generation,
+            compose::ComposeValidationResult {
+                version: None,
+                outcome: Ok(()),
+            },
+        ));
     }
     #[test]
     fn refreshing_disconnected_volumes_retries_engine_connection() {

@@ -90,6 +90,20 @@ impl ComposeValidationError {
         }
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ComposeValidationResult {
+    pub(super) version: Option<String>,
+    pub(super) outcome: Result<(), ComposeValidationError>,
+}
+
+impl ComposeValidationResult {
+    fn failed(error: ComposeValidationError) -> Self {
+        Self {
+            version: None,
+            outcome: Err(error),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum ComposeValidationState {
@@ -195,18 +209,21 @@ impl ComposeView {
     pub(super) fn finish_validation(
         &mut self,
         generation: u64,
-        result: Result<(), ComposeValidationError>,
+        result: ComposeValidationResult,
     ) -> bool {
         if generation != self.validation_generation
             || !matches!(&self.validation, ComposeValidationState::Validating { .. })
         {
             return false;
         }
+        if let Some(version) = result.version {
+            self.version = Some(version);
+        }
         let ComposeValidationState::Validating { file_name } = std::mem::take(&mut self.validation)
         else {
             unreachable!("the validation state was checked above");
         };
-        self.validation = match result {
+        self.validation = match result.outcome {
             Ok(()) => ComposeValidationState::Succeeded { file_name },
             Err(error) => ComposeValidationState::Failed { file_name, error },
         };
@@ -339,6 +356,13 @@ impl ComposeView {
             }
         }
 
+        if let Some(version) = &self.version {
+            ui.horizontal(|ui| {
+                ui.label("Docker Compose version:");
+                ui.label(version);
+            });
+        }
+
         if !available {
             ui.label(unavailable_message);
             return actions;
@@ -354,12 +378,6 @@ impl ComposeView {
             return actions;
         }
         if let Some(error) = &self.error {
-            if let Some(version) = &self.version {
-                ui.horizontal(|ui| {
-                    ui.label("Docker Compose version:");
-                    ui.label(version);
-                });
-            }
             ui.colored_label(
                 egui::Color32::from_rgb(224, 174, 109),
                 "Compose projects unavailable",
@@ -372,12 +390,6 @@ impl ComposeView {
             return actions;
         }
 
-        if let Some(version) = &self.version {
-            ui.horizontal(|ui| {
-                ui.label("Docker Compose version:");
-                ui.label(version);
-            });
-        }
         if self.projects.is_empty() {
             ui.label("No Compose projects found.");
             return actions;
@@ -818,15 +830,17 @@ fn docker_binary(search_path: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) async fn validate_compose_file(
-    file: &std::path::Path,
-) -> Result<(), ComposeValidationError> {
+pub(super) async fn validate_compose_file(file: &std::path::Path) -> ComposeValidationResult {
     use std::env;
 
-    let search_path = env::var_os("PATH").ok_or(ComposeValidationError::DockerCliMissing)?;
-    let binary = docker_binary(&search_path).ok_or(ComposeValidationError::DockerCliMissing)?;
+    let Some(search_path) = env::var_os("PATH") else {
+        return ComposeValidationResult::failed(ComposeValidationError::DockerCliMissing);
+    };
+    let Some(binary) = docker_binary(&search_path) else {
+        return ComposeValidationResult::failed(ComposeValidationError::DockerCliMissing);
+    };
     let user_compose_plugin = user_compose_plugin();
-    validate_with_binary(
+    validate_with_binary_report(
         &binary,
         file,
         &search_path,
@@ -836,7 +850,7 @@ pub(super) async fn validate_compose_file(
     .await
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 async fn validate_with_binary(
     binary: &std::path::Path,
     file: &std::path::Path,
@@ -844,31 +858,59 @@ async fn validate_with_binary(
     user_compose_plugin: Option<&std::path::Path>,
     deadline: Duration,
 ) -> Result<(), ComposeValidationError> {
+    validate_with_binary_report(binary, file, search_path, user_compose_plugin, deadline)
+        .await
+        .outcome
+}
+
+#[cfg(target_os = "linux")]
+async fn validate_with_binary_report(
+    binary: &std::path::Path,
+    file: &std::path::Path,
+    search_path: &std::ffi::OsStr,
+    user_compose_plugin: Option<&std::path::Path>,
+    deadline: Duration,
+) -> ComposeValidationResult {
     use tokio::process::Command;
 
     if !file.is_absolute() || !file.is_file() {
-        return Err(ComposeValidationError::InvalidSelectedFile);
+        return ComposeValidationResult::failed(ComposeValidationError::InvalidSelectedFile);
     }
-    let parent = file
+    let Some(parent) = file
         .parent()
         .filter(|directory| !directory.as_os_str().is_empty())
-        .ok_or(ComposeValidationError::InvalidSelectedFile)?;
+    else {
+        return ComposeValidationResult::failed(ComposeValidationError::InvalidSelectedFile);
+    };
     if !parent.is_dir() {
-        return Err(ComposeValidationError::InvalidSelectedFile);
+        return ComposeValidationResult::failed(ComposeValidationError::InvalidSelectedFile);
     }
 
-    let isolated = PrivateDockerConfig::new(user_compose_plugin)
-        .map_err(|_| ComposeValidationError::PrivateConfigSetupFailed)?;
-    let version_output = probe_compose_version(binary, &isolated, search_path, deadline)
-        .await
-        .map_err(|failure| match failure {
-            CommandFailure::Launch => ComposeValidationError::DockerCliMissing,
-            CommandFailure::Rejected
-            | CommandFailure::TimedOut
-            | CommandFailure::OutputLimit
-            | CommandFailure::Io => ComposeValidationError::ComposePluginUnavailable,
-        })?;
-    parse_version(&version_output).ok_or(ComposeValidationError::ComposePluginUnavailable)?;
+    let isolated = match PrivateDockerConfig::new(user_compose_plugin) {
+        Ok(isolated) => isolated,
+        Err(_) => {
+            return ComposeValidationResult::failed(
+                ComposeValidationError::PrivateConfigSetupFailed,
+            );
+        }
+    };
+    let version_output = match probe_compose_version(binary, &isolated, search_path, deadline).await
+    {
+        Ok(output) => output,
+        Err(failure) => {
+            let error = match failure {
+                CommandFailure::Launch => ComposeValidationError::DockerCliMissing,
+                CommandFailure::Rejected
+                | CommandFailure::TimedOut
+                | CommandFailure::OutputLimit
+                | CommandFailure::Io => ComposeValidationError::ComposePluginUnavailable,
+            };
+            return ComposeValidationResult::failed(error);
+        }
+    };
+    let Some(version) = parse_version(&version_output).map(str::to_owned) else {
+        return ComposeValidationResult::failed(ComposeValidationError::ComposePluginUnavailable);
+    };
     let mut command = Command::new(binary);
     isolated.configure(&mut command, search_path);
     command
@@ -884,7 +926,7 @@ async fn validate_with_binary(
             "--no-interpolate",
             "--no-env-resolution",
         ]);
-    match run_command_with_timeout(&mut command, deadline).await {
+    let outcome = match run_command_with_timeout(&mut command, deadline).await {
         Ok(_) => Ok(()),
         Err(CommandFailure::Launch) => Err(ComposeValidationError::DockerCliMissing),
         Err(
@@ -893,6 +935,10 @@ async fn validate_with_binary(
             | CommandFailure::OutputLimit
             | CommandFailure::Io,
         ) => Err(ComposeValidationError::ValidationFailed),
+    };
+    ComposeValidationResult {
+        version: Some(version),
+        outcome,
     }
 }
 
@@ -1097,10 +1143,14 @@ mod tests {
                 ValidationFixtureOptions::default(),
             );
 
-            validate_with_binary(&binary, &file, &search_path(), None, COMMAND_TIMEOUT)
-                .await
-                .expect("the controlled Compose validation should succeed");
+            let result =
+                validate_with_binary_report(&binary, &file, &search_path(), None, COMMAND_TIMEOUT)
+                    .await;
+
+            assert_eq!(result.version.as_deref(), Some("v5.6.0"));
+            assert!(result.outcome.is_ok());
         }
+
         #[tokio::test]
         async fn validation_reports_missing_compose_plugin_before_running_config() {
             let directory = FixtureDirectory::new();
@@ -1235,6 +1285,7 @@ mod tests {
 
             validate_compose_file(&file)
                 .await
+                .outcome
                 .expect("the local Compose CLI should validate the temporary project");
         }
 
@@ -1560,6 +1611,38 @@ mod tests {
                 },
             )
         }
+        fn validation_result(
+            outcome: Result<(), ComposeValidationError>,
+        ) -> ComposeValidationResult {
+            ComposeValidationResult {
+                version: None,
+                outcome,
+            }
+        }
+
+        #[test]
+        fn compose_version_is_visible_without_an_available_engine() {
+            let mut view = ComposeView::default();
+            let generation = view.begin_file_selection();
+            assert!(view.finish_file_selection(
+                generation,
+                Some(std::path::Path::new("/tmp/compose.yaml")),
+            ));
+            assert!(view.finish_validation(
+                generation,
+                ComposeValidationResult {
+                    version: Some("v5.6.0".to_owned()),
+                    outcome: Ok(()),
+                },
+            ));
+            let mut harness = harness_for_availability(view, false);
+
+            harness.run();
+
+            let _version_label =
+                harness.get_by_role_and_label(Role::Label, "Docker Compose version:");
+            let _version = harness.get_by_role_and_label(Role::Label, "v5.6.0");
+        }
 
         #[test]
         fn compose_project_page_exposes_accessible_refresh_and_read_only_inventory() {
@@ -1704,7 +1787,7 @@ mod tests {
             let mut succeeded = ComposeView::default();
             let generation = succeeded.begin_file_selection();
             assert!(succeeded.finish_file_selection(generation, Some(selected_file)));
-            assert!(succeeded.finish_validation(generation, Ok(())));
+            assert!(succeeded.finish_validation(generation, validation_result(Ok(()))));
             let mut harness = harness_for(succeeded);
             harness.run();
             {
@@ -1719,10 +1802,10 @@ mod tests {
             let mut failed = ComposeView::default();
             let generation = failed.begin_file_selection();
             assert!(failed.finish_file_selection(generation, Some(selected_file)));
-            assert!(
-                failed
-                    .finish_validation(generation, Err(ComposeValidationError::ValidationFailed),)
-            );
+            assert!(failed.finish_validation(
+                generation,
+                validation_result(Err(ComposeValidationError::ValidationFailed)),
+            ));
             let mut harness = harness_for(failed);
             harness.run();
             {
@@ -1737,7 +1820,7 @@ mod tests {
             assert!(unavailable.finish_file_selection(generation, Some(selected_file)));
             assert!(unavailable.finish_validation(
                 generation,
-                Err(ComposeValidationError::ComposePluginUnavailable),
+                validation_result(Err(ComposeValidationError::ComposePluginUnavailable)),
             ));
             let mut harness = harness_for(unavailable);
             harness.run();
@@ -1756,9 +1839,8 @@ mod tests {
             assert!(view.finish_file_selection(stale_generation, Some(stale_file)));
             let current_generation = view.begin_file_selection();
             assert!(view.finish_file_selection(current_generation, Some(current_file)));
-            assert!(!view.finish_validation(stale_generation, Ok(())));
-            assert!(view.is_validation_running());
-            assert!(view.finish_validation(current_generation, Ok(())));
+            assert!(!view.finish_validation(stale_generation, validation_result(Ok(()))));
+            assert!(view.finish_validation(current_generation, validation_result(Ok(()))));
             assert!(matches!(
                 &view.validation,
                 ComposeValidationState::Succeeded { file_name } if file_name == "compose.yaml"

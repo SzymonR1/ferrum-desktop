@@ -19,6 +19,8 @@ Windows, or macOS.
 Choose **Validate Compose file** and select one local `.yaml` or `.yml` file.
 Ferrum first preflights the installed Compose CLI with
 `docker compose version --short` through its private isolated Docker config.
+Ferrum displays the detected version even when no engine is selected or connected;
+project listing still requires the selected local Docker socket.
 A preflight failure (for example, unavailable CLI/plugin) is distinct from a
 Compose config-validation failure. On successful preflight, Ferrum passes the
 selected path as a separate argument:

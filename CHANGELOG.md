@@ -50,3 +50,4 @@ All notable project changes are documented here. The project has not published a
 - Added an optional ignored Compose validation smoke using a controlled temporary project; it checks relative-path resolution with the real local CLI without connecting to an engine or modifying project files.
 - Moved the Compose file picker to `rfd::AsyncFileDialog`; pending, cancelled, and stale file-selection results are covered by headless state tests.
 - Disabled remote Git/OCI `include`/`extends.file` loaders during Compose validation to prevent remote fetches; an opt-in loopback safety test verifies no connection is made.
+- Display the detected Compose CLI version from file-validation preflight when no engine context is selected or connected.
