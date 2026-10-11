@@ -24,16 +24,25 @@ uncertain. Build traces contain only static action and outcome, excluding
 context path, tag, and output; they are ephemeral process logs, not durable
 audit history.
 
-Compose support is limited to read-only Docker CLI version and project discovery
-and explicitly selected, single-file structural validation on Linux. It does
-not provide import, multi-file or profile support; interpolation or environment
-file resolution; project lifecycle actions, service logs, builds, pulls, or
-project mutations. Validation runs as the logged-in user and is not sandboxed;
-local `include` and `extends` references may read files outside the selected
-path under that user's permissions. Remote Git and OCI loaders are disabled.
-Validate only trusted files. Issue #18 remains partial and open; issue #10
-remains blocked and open. Issues #16 and #19 remain open and ready; no release
-or broader support claim is made.
+Compose support includes read-only Docker CLI version/project discovery and
+explicit structural validation of a user-selected local base file followed by
+user-ordered local overrides on Linux. Files are numbered from 1 (the base)
+and limited to 16 total. Docker merges `-f` files in the order supplied;
+relative paths resolve from the first/base config or `--project-directory`,
+which Ferrum sets to the base file's parent. See Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
+for ordered merge and path semantics and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
+for validation flags.
+
+Validation skips interpolation and service `env_file` resolution, uses no
+engine, and does not mutate project files. Compose can still recursively read
+local `include`/`extends.file` Compose files and included projects' default
+`.env` and explicit `include.env_file` paths under the logged-in user's
+permissions, potentially outside the base directory. Remote Git/OCI loaders
+are disabled. The selected files and private CLI environment do not sandbox
+those reads; validate only trusted files. Profiles, `.env`/service
+`env_file` resolution, import, lifecycle/build/pull/logs, and project mutations
+remain unsupported. Issue #18 remains partial/open; issue #10 remains
+blocked/open. No release or broader support claim is made.
 
 
 ## Trust boundaries
@@ -59,35 +68,44 @@ seconds and 1 MiB of stdout. Retain/display only escaped project Name and
 Status; reject malformed or duplicate Name/Status fields and duplicate project
 identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
 
-- Allow an explicit structural validation action for one user-selected local
-`.yaml` or `.yml` file. First preflight the Compose CLI with
-`docker compose version --short` through the private isolated Docker config;
-distinguish a failed preflight from a Compose config-validation failure. Run
-`docker compose --project-directory <parent> --file <selected-file> config
---quiet --no-interpolate --no-env-resolution` with
-`COMPOSE_DISABLE_ENV_FILE=1`, a cleared allowlisted environment, and the same
-eight-second/1 MiB bounds. Validation is read-only, requires no engine socket,
-and does not mutate project files. Success means structural validation only:
-interpolation and service `env_file` resolution are skipped.
+- Allow an explicit structural validation action with one selected local
+  `.yaml`/`.yml` base file and local overrides appended in user-chosen order.
+  Order is one-based, with the base at 1; accept no more than 16 total files.
+  Preflight Compose with `docker compose version --short` through the private
+  isolated Docker config and distinguish preflight failure from config failure.
+  Invoke Compose with the base `--file` first and each override afterward,
+  plus `--project-directory <base-parent> config --quiet --no-interpolate
+  --no-env-resolution`. Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
+  specifies ordered `-f` merge and path resolution relative to the first config
+  or `--project-directory`; the [`config` reference](https://docs.docker.com/reference/cli/docker/compose/config)
+  documents the validation flags.
 
-- Treat Compose file references as untrusted filesystem reads. Compose may
-  recursively read local Compose files referenced by `include` or service
+- Keep validation read-only, engine-independent, and bounded to eight seconds
+  and 1 MiB stdout per command. Success is structural validation only;
+  interpolation and service `env_file` resolution are skipped. Do not mutate,
+  extract, or write project files.
+
+- Treat Compose references as untrusted filesystem reads. Compose may
+  recursively read local files referenced by `include` or service
   `extends.file`, plus each included project's default `.env` and explicit
-  `include.env_file` paths. These files can be outside the selected file's
-  directory and are opened with the logged-in user's permissions.
+  `include.env_file`. Those files may be outside the base directory and are
+  opened under the logged-in user's permissions.
   `COMPOSE_DISABLE_ENV_FILE=1` disables only the selected project's default
   `.env`; `--no-interpolate` and `--no-env-resolution` do not confine included
-  project file reads. Remote Git and OCI loaders are explicitly disabled, so
-  remote `include`/`extends.file` references fail without a fetch. The selected
-  file is not a path-containment boundary. The CLI/plugin is trusted local code
-  and not a sandbox; validate only trusted files. Keep selected paths and raw
+  project reads. Remote Git and OCI loaders are disabled, so remote
+  `include`/`extends.file` references fail without fetching. The selected files
+  are not a path-containment boundary. The CLI/plugin is trusted local code,
+  not a sandbox; validate only trusted files. Keep selected paths and raw
   diagnostics private; display only a bounded escaped basename and static result.
-- Defer multiple-file merge, profiles, `.env`/service `env_file` resolution,
-  file import, project start/stop/restart, build/pull/logs, and project
-  mutations. Remote OCI/Git references remain disabled, not fetched. Only
-  Linux local Docker was validated; validation uses no engine, and the native
-  page visual check is unavailable. Issue #18 remains open and #10 remains
-  blocked; no release/support expansion is claimed.
+
+- Keep profiles, `.env`/service `env_file` resolution, file import, project
+  start/stop/restart, build/pull/logs, and project mutations unsupported.
+  Remote references remain disabled and are not fetched. Linux local discovery,
+  single-file validation, ordered temporary base/override, and remote-loader
+  safety smokes passed with Compose v5.6.0; they do not validate arbitrary
+  projects or lifecycle behavior. The native page visual check is unavailable.
+  Issue #18 remains partial/open and #10 remains blocked/open; no release or
+  support expansion is claimed.
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
 - Escape selected control, bidi, zero-width, invisible-format, Hangul-filler,
   and Unicode-tag characters in engine-provided container inventory/inspection
@@ -283,7 +301,9 @@ interpolation and service `env_file` resolution are skipped.
 
 - Remote TCP/HTTP/TLS/SSH transport trust, credentials, and identity validation.
 - Podman API compatibility and rootless endpoint discovery; issue #10 remains open for these and the broader engine matrix.
-- Compose validation in this slice is limited to one user-selected local file; it does not implement multi-file merges, profile selection, `.env`/service `env_file` resolution, remote OCI/Git inputs (the remote loaders are disabled during validation), file import, project lifecycle actions, build/pull/logs, or project mutations.
+- Compose profiles, `.env`/service `env_file` resolution, remote OCI/Git inputs
+  (remote loaders are disabled during validation), file import, project
+  lifecycle actions, build/pull/logs, and project mutations.
 - The explicit local Docker CLI Buildx invocation is an added external build process. Other external process integrations, archive extraction, and file-path surfaces remain deferred.
 - Credential stores, registry authentication, managed engines, and update delivery.
 

@@ -400,23 +400,44 @@ Discovery fixtures check `docker compose version --short` and
 `docker compose ls --all --format json`, with only the listing pinned to the
 selected `EngineClient::local_socket_path()`. Validation preflights
 `docker compose version --short` through the private isolated Docker config;
-preflight failure is distinct from config-validation failure. Validation
-fixtures check the single selected local file passed as an argument to
+preflight failure is distinct from config-validation failure. Existing
+controlled-file validation coverage checks a local Compose file passed as an
+argument to
 `docker compose --project-directory <parent> --file <file> config --quiet
 --no-interpolate --no-env-resolution`, including parent-directory path
-resolution and `COMPOSE_DISABLE_ENV_FILE=1`. Success is structural validation
-only, with interpolation and service `env_file` resolution skipped. The
-fixture also verifies private Docker config/HOME, a cleared environment with
-no inherited engine or credential/proxy settings, and no user config copied
-into the child config. Failure diagnostics and selected paths are not exposed;
-output and subprocess deadlines are bounded.
+resolution and `COMPOSE_DISABLE_ENV_FILE=1`. That fixture is not evidence of
+multi-file merge coverage. Success wording means structural validation only,
+with interpolation and service `env_file` resolution skipped. The fixture also
+verifies private Docker config/HOME, a cleared environment with no inherited
+engine or credential/proxy settings, and no user config copied into the child
+config. Failure diagnostics and selected paths are not exposed; output and
+subprocess deadlines are bounded.
 
-Headless AccessKit coverage verifies the file-selection action and its
-asynchronous pending/cancelled states without engine access; stale chooser
-results are rejected, while the native chooser itself is not exercised
-headlessly. The same UI tests cover the recursive `include`/`extends.file`
-trusted-file disclosure, success wording, validation failure, missing-plugin,
-bounded escaped basename display, and validation cancellation.
+Headless AccessKit/state tests cover ordered base/override selection, removing
+overrides and explicitly revalidating the remaining set, replacing the base
+(which clears overrides), the 16-file limit, escaped basename display,
+pending/cancelled/stale selection, validation success/failure, the trusted-file
+notice, and cancellation. They do not open the native file chooser or claim
+native Compose-page visual validation.
+
+Validation accepts one selected base Compose file followed by user-ordered
+local override files, using one-based order and a maximum of 16 total files.
+The base file's parent anchors project-directory path resolution; Compose
+applies `-f` files in order. See Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
+for ordered merging and path resolution, and [`config`](https://docs.docker.com/reference/cli/docker/compose/config) for the validation flags.
+The single-file smoke below covers relative paths. The ordered base/override
+smoke uses the real CLI with temporary files, but is not arbitrary user-project
+or lifecycle validation.
+
+The validation trust boundary is unchanged with multiple selected files:
+Compose can recursively read local `include` and service `extends.file`
+references, plus included projects' default `.env` and explicit
+`include.env_file` paths. Those reads may be outside the base directory and
+occur with the logged-in user's permissions. `COMPOSE_DISABLE_ENV_FILE=1`
+disables only the selected project's default `.env`; `--no-interpolate` and
+`--no-env-resolution` do not confine included-project reads. Remote Git and OCI
+loaders are disabled, so remote references fail without fetching. The CLI/plugin
+is unsandboxed; validate only trusted files.
 
 The controlled CLI fixtures verify version-probe and config arguments, the same
 private configuration across both commands, selected file/parent paths, a
@@ -424,6 +445,7 @@ cleared environment without inherited engine or credential/proxy settings, and
 explicitly disabled Git/OCI remote loaders. They also cover plugin-unavailable
 classification before config invocation, redaction, output bounds, and
 deadline cancellation. Run the Compose tests with:
+
 
 ```sh
 cargo test -p ferrum-app --bin ferrum compose::tests::
@@ -438,13 +460,15 @@ starts, stops, or removes projects:
 cargo test -p ferrum-app --bin ferrum compose::tests::local_compose_discovery_smoke_is_read_only -- --exact --ignored
 ```
 
-The separate optional ignored validation smoke requires Docker CLI/Compose but
-does not use an engine. It creates a controlled temporary Compose YAML and a
-relative `./data` directory, then runs the isolated CLI config-validation path;
-it does not touch user project files or mutate engine resources:
+The optional ignored validation smokes require Docker CLI/Compose but no engine.
+The single-file smoke creates one controlled Compose YAML and a relative
+`./data` directory. The multi-file smoke creates an ordered controlled base and
+override pair and verifies the real CLI accepts their relative paths; neither
+touches user project files or mutates engine resources:
 
 ```sh
 cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_validation_reads_a_controlled_relative_path_project -- --exact --ignored
+cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_validation_reads_ordered_temporary_base_and_override_files -- --exact --ignored
 ```
 
 The optional ignored remote-loader safety smoke uses only a `127.0.0.1`
@@ -456,23 +480,27 @@ external host and uses no engine:
 cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_validation_rejects_remote_includes_without_network_access -- --exact --ignored
 ```
 
-Validation uses the official [Compose `config` reference](https://docs.docker.com/reference/cli/docker/compose/config),
-[Compose CLI semantics](https://docs.docker.com/reference/cli/docker/compose),
-and [Compose environment-variable guide](https://docs.docker.com/compose/how-tos/environment-variables/envvars/).
-The selected project's `.env` interpolation and service `env_file` resolution
-are skipped. However, Compose may still read each included project's default
-`.env` or explicit `include.env_file`, including paths outside the selected
-directory, under the logged-in user's permissions; the no-interpolate and
-no-env-resolution options do not confine those reads. Remote Git and OCI
+See Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
+for ordered `-f` merging and path resolution relative to the first/base config
+or `--project-directory`, and [`config`](https://docs.docker.com/reference/cli/docker/compose/config) for the validation flags.
+The smoke above exercises ordered base/override validation with a real local
+Compose CLI and temporary files. It does not test arbitrary projects, engine
+operations, or broader CLI/plugin compatibility.
+
+Compose may still read each included project's default `.env` or explicit
+`include.env_file`, including paths outside the base directory, under the
+logged-in user's permissions. `COMPOSE_DISABLE_ENV_FILE=1` disables only the
+selected project's default `.env`; `--no-interpolate` and
+`--no-env-resolution` do not confine included-project reads. Remote Git and OCI
 loaders are explicitly disabled, so remote include/extends references fail
 without fetching. The CLI/plugin remains unsandboxed; validate only trusted
-files. Multi-file merge, profiles, import, lifecycle/build/pull/logs, and
-project mutations remain unsupported.
+files. Profiles, import, lifecycle/build/pull/logs, and project mutations
+remain unsupported.
 
-Only Linux local Docker discovery was validated; validation uses no engine. The
-native Compose page visual check is unavailable, and Podman/rootless and remote
-transports remain unsupported or unvalidated. Issue #18 remains open and #10
-remains blocked; no release/support expansion is claimed.
+Only Linux local Docker discovery was validated; validation uses no engine.
+The native Compose page visual check is unavailable, and Podman/rootless and
+remote transports remain unsupported or unvalidated. Issue #18 remains open
+(partial); #10 remains blocked. No release/support expansion is claimed.
 
 The mutation audit tests verify redacted JSONL records for lifecycle, image,
 volume, and network outcomes; they also check the 16 MiB hard cap and that

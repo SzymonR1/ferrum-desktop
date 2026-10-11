@@ -1274,7 +1274,7 @@ impl FerrumApp {
         context.request_repaint();
     }
 
-    fn select_compose_file(&mut self, context: egui::Context) {
+    fn select_compose_file(&mut self, override_file: bool, context: egui::Context) {
         #[cfg(target_os = "linux")]
         {
             if self.compose.is_file_selection_running() || self.compose.is_validation_running() {
@@ -1283,7 +1283,11 @@ impl FerrumApp {
             if let Some(task) = self.compose_validation_task.take() {
                 task.abort();
             }
-            let generation = self.compose.begin_file_selection();
+            let generation = if override_file {
+                self.compose.begin_override_selection()
+            } else {
+                self.compose.begin_file_selection()
+            };
             context.request_repaint();
             let sender = self.sender.clone();
             self.compose_validation_task = Some(self.runtime.spawn(async move {
@@ -1302,13 +1306,13 @@ impl FerrumApp {
             }));
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = (self, context);
+        let _ = (self, override_file, context);
     }
 
     #[cfg(target_os = "linux")]
     fn start_compose_validation(
         &mut self,
-        file: std::path::PathBuf,
+        files: Vec<std::path::PathBuf>,
         generation: u64,
         context: egui::Context,
     ) {
@@ -1318,7 +1322,7 @@ impl FerrumApp {
         }
         let sender = self.sender.clone();
         self.compose_validation_task = Some(self.runtime.spawn(async move {
-            let result = compose::validate_compose_file(&file).await;
+            let result = compose::validate_compose_files(&files).await;
             if sender
                 .send(EngineEvent::ComposeValidationFinished { generation, result })
                 .await
@@ -2609,8 +2613,12 @@ impl FerrumApp {
                         .finish_file_selection(generation, file.as_deref())
                     {
                         self.compose_validation_task = None;
-                        if let Some(file) = file {
-                            self.start_compose_validation(file, generation, context.clone());
+                        if self.compose.is_validation_running() {
+                            self.start_compose_validation(
+                                self.compose.selected_files().to_vec(),
+                                generation,
+                                context.clone(),
+                            );
                         }
                     }
                 }
@@ -4508,8 +4516,17 @@ impl eframe::App for FerrumApp {
         if compose_actions.cancel_validation {
             self.cancel_compose_validation(context.clone());
         }
-        if compose_actions.select_file {
-            self.select_compose_file(context.clone());
+        if let Some(index) = compose_actions.remove_override {
+            self.compose.remove_override(index);
+        }
+        if compose_actions.select_base_file {
+            self.select_compose_file(false, context.clone());
+        } else if compose_actions.add_override_file {
+            self.select_compose_file(true, context.clone());
+        } else if compose_actions.validate_files
+            && let Some((generation, files)) = self.compose.begin_validation()
+        {
+            self.start_compose_validation(files, generation, context.clone());
         }
         if compose_actions.refresh {
             self.refresh(context.clone());

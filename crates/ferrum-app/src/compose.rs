@@ -109,7 +109,9 @@ impl ComposeValidationResult {
 enum ComposeValidationState {
     #[default]
     Idle,
-    SelectingFile,
+    SelectingFile {
+        override_file: bool,
+    },
     Validating {
         file_name: String,
     },
@@ -129,9 +131,14 @@ enum ComposeValidationState {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ComposeActions {
     pub(super) refresh: bool,
-    pub(super) select_file: bool,
+    pub(super) select_base_file: bool,
+    pub(super) add_override_file: bool,
+    pub(super) remove_override: Option<usize>,
+    pub(super) validate_files: bool,
     pub(super) cancel_validation: bool,
 }
+
+const MAX_COMPOSE_FILES: usize = 16;
 
 fn display_compose_basename(path: &std::path::Path) -> String {
     let Some(file_name) = path.file_name() else {
@@ -142,6 +149,16 @@ fn display_compose_basename(path: &std::path::Path) -> String {
         MAX_COMPOSE_FILENAME_DISPLAY_BYTES,
     )
     .unwrap_or_else(|| "[name omitted]".to_owned())
+}
+fn display_compose_file_list(files: &[std::path::PathBuf]) -> String {
+    let mut names = String::new();
+    for (index, file) in files.iter().enumerate() {
+        if index > 0 {
+            names.push_str(" + ");
+        }
+        names.push_str(&display_compose_basename(file));
+    }
+    names
 }
 
 #[derive(Default)]
@@ -154,6 +171,7 @@ pub(super) struct ComposeView {
     generation: u64,
     validation_generation: u64,
     validation: ComposeValidationState,
+    selected_files: Vec<std::path::PathBuf>,
 }
 
 impl ComposeView {
@@ -201,9 +219,21 @@ impl ComposeView {
     }
 
     pub(super) fn begin_file_selection(&mut self) -> u64 {
+        self.begin_selection(false)
+    }
+
+    pub(super) fn begin_override_selection(&mut self) -> u64 {
+        self.begin_selection(true)
+    }
+
+    fn begin_selection(&mut self, override_file: bool) -> u64 {
         self.validation_generation = self.validation_generation.wrapping_add(1);
-        self.validation = ComposeValidationState::SelectingFile;
+        self.validation = ComposeValidationState::SelectingFile { override_file };
         self.validation_generation
+    }
+
+    pub(super) fn selected_files(&self) -> &[std::path::PathBuf] {
+        &self.selected_files
     }
 
     pub(super) fn finish_validation(
@@ -216,6 +246,10 @@ impl ComposeView {
         {
             return false;
         }
+        let invalid_file_set = matches!(
+            result.outcome,
+            Err(ComposeValidationError::InvalidSelectedFile)
+        );
         if let Some(version) = result.version {
             self.version = Some(version);
         }
@@ -223,6 +257,9 @@ impl ComposeView {
         else {
             unreachable!("the validation state was checked above");
         };
+        if invalid_file_set {
+            self.selected_files.clear();
+        }
         self.validation = match result.outcome {
             Ok(()) => ComposeValidationState::Succeeded { file_name },
             Err(error) => ComposeValidationState::Failed { file_name, error },
@@ -235,7 +272,10 @@ impl ComposeView {
     }
 
     pub(super) fn is_file_selection_running(&self) -> bool {
-        matches!(&self.validation, ComposeValidationState::SelectingFile)
+        matches!(
+            &self.validation,
+            ComposeValidationState::SelectingFile { .. }
+        )
     }
 
     pub(super) fn finish_file_selection(
@@ -243,18 +283,57 @@ impl ComposeView {
         generation: u64,
         selected_file: Option<&std::path::Path>,
     ) -> bool {
-        if generation != self.validation_generation
-            || !matches!(&self.validation, ComposeValidationState::SelectingFile)
-        {
+        if generation != self.validation_generation {
             return false;
         }
-        self.validation = match selected_file {
-            Some(path) => ComposeValidationState::Validating {
-                file_name: display_compose_basename(path),
-            },
-            None => ComposeValidationState::SelectionCancelled,
+        let ComposeValidationState::SelectingFile { override_file } = &self.validation else {
+            return false;
         };
+        let Some(path) = selected_file else {
+            self.validation = ComposeValidationState::SelectionCancelled;
+            return true;
+        };
+        if !path.is_absolute()
+            || (*override_file && self.selected_files.is_empty())
+            || (*override_file && self.selected_files.len() >= MAX_COMPOSE_FILES)
+            || (*override_file && self.selected_files.iter().any(|selected| selected == path))
+        {
+            self.validation = ComposeValidationState::Failed {
+                file_name: display_compose_file_list(&self.selected_files),
+                error: ComposeValidationError::InvalidSelectedFile,
+            };
+            return true;
+        }
+        if *override_file {
+            self.selected_files.push(path.to_path_buf());
+        } else {
+            self.selected_files.clear();
+            self.selected_files.push(path.to_path_buf());
+        }
+        let file_name = display_compose_file_list(&self.selected_files);
+        self.validation = ComposeValidationState::Validating { file_name };
         true
+    }
+
+    pub(super) fn remove_override(&mut self, index: usize) {
+        if index > 0 && index < self.selected_files.len() {
+            self.selected_files.remove(index);
+            self.validation_generation = self.validation_generation.wrapping_add(1);
+            self.validation = ComposeValidationState::Idle;
+        }
+    }
+    pub(super) fn begin_validation(&mut self) -> Option<(u64, Vec<std::path::PathBuf>)> {
+        if self.selected_files.is_empty()
+            || self.is_file_selection_running()
+            || self.is_validation_running()
+        {
+            return None;
+        }
+        self.validation_generation = self.validation_generation.wrapping_add(1);
+        let generation = self.validation_generation;
+        let file_name = display_compose_file_list(&self.selected_files);
+        self.validation = ComposeValidationState::Validating { file_name };
+        Some((generation, self.selected_files.clone()))
     }
 
     pub(super) fn cancel_validation(&mut self) {
@@ -275,6 +354,7 @@ impl ComposeView {
         self.error = None;
         self.validation_generation = self.validation_generation.wrapping_add(1);
         self.validation = ComposeValidationState::Idle;
+        self.selected_files.clear();
     }
 
     pub(super) fn show(
@@ -300,6 +380,9 @@ impl ComposeView {
                 ),
             );
         });
+        let selection_enabled = validation_enabled
+            && !self.is_file_selection_running()
+            && !self.is_validation_running();
         ui.horizontal(|ui| {
             actions.refresh = ui
                 .add_enabled(
@@ -307,49 +390,88 @@ impl ComposeView {
                     egui::Button::new("Refresh Compose projects"),
                 )
                 .clicked();
-            actions.select_file = ui
-                .add_enabled(
-                    validation_enabled
-                        && !self.is_file_selection_running()
-                        && !self.is_validation_running(),
-                    egui::Button::new("Validate Compose file"),
-                )
-                .clicked();
+            if self.selected_files.is_empty() {
+                actions.select_base_file = ui
+                    .add_enabled(selection_enabled, egui::Button::new("Choose base file"))
+                    .clicked();
+            } else {
+                actions.select_base_file = ui
+                    .add_enabled(
+                        selection_enabled,
+                        egui::Button::new("Change base file (clears overrides)"),
+                    )
+                    .clicked();
+                actions.add_override_file = ui
+                    .add_enabled(
+                        selection_enabled && self.selected_files.len() < MAX_COMPOSE_FILES,
+                        egui::Button::new("Add override file"),
+                    )
+                    .clicked();
+            }
+            if !self.selected_files.is_empty() {
+                actions.validate_files = ui
+                    .add_enabled(
+                        selection_enabled,
+                        egui::Button::new("Validate selected files"),
+                    )
+                    .clicked();
+            }
             if self.is_validation_running() {
                 actions.cancel_validation = ui.button("Cancel validation").clicked();
             }
         });
+        if !self.selected_files.is_empty() {
+            ui.label("Compose file order (base first, then overrides):");
+            for (index, file) in self.selected_files.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}.", index + 1));
+                    ui.label(display_compose_basename(file));
+                    if index > 0
+                        && ui
+                            .add_enabled(
+                                selection_enabled,
+                                egui::Button::new(format!("Remove override {}", index + 1)),
+                            )
+                            .clicked()
+                    {
+                        actions.remove_override = Some(index);
+                    }
+                });
+            }
+        } else {
+            ui.label("Choose one local Compose YAML base file, then add overrides in order.");
+        }
 
         match &self.validation {
-            ComposeValidationState::Idle => {
-                ui.label("Select one local Compose YAML file to validate its structure.");
-            }
-            ComposeValidationState::SelectingFile => {
+            ComposeValidationState::Idle => {}
+            ComposeValidationState::SelectingFile { override_file } => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Choosing a Compose file…");
+                    ui.label(if *override_file {
+                        "Choosing an override file…"
+                    } else {
+                        "Choosing a base file…"
+                    });
                 });
             }
             ComposeValidationState::Validating { file_name } => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Validating Compose file:");
-                    ui.label(file_name);
-                });
+                ui.spinner();
+                ui.label(format!("Validating Compose files: {file_name}"));
             }
             ComposeValidationState::Succeeded { file_name } => {
-                ui.label(file_name);
-                ui.label(
-                    "Structural validation succeeded. Environment interpolation and service env_file resolution were skipped.",
-                );
+                ui.label(format!("Validated Compose files: {file_name}"));
+                ui.label("Structural validation succeeded. Environment interpolation and service env_file resolution were skipped.");
             }
             ComposeValidationState::Failed { file_name, error } => {
-                ui.label(file_name);
+                if !file_name.is_empty() {
+                    ui.label(format!("Selected Compose files: {file_name}"));
+                }
                 ui.colored_label(egui::Color32::from_rgb(224, 174, 109), error.message());
             }
             ComposeValidationState::Cancelled { file_name } => {
-                ui.label(file_name);
-                ui.label("Compose file validation cancelled.");
+                ui.label(format!(
+                    "Validation cancelled for Compose files: {file_name}"
+                ));
             }
             ComposeValidationState::SelectionCancelled => {
                 ui.label("File selection cancelled.");
@@ -828,10 +950,28 @@ fn docker_binary(search_path: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
                 .flatten()
         })
 }
+#[cfg(target_os = "linux")]
+fn selected_compose_files_are_valid(files: &[std::path::PathBuf]) -> bool {
+    !files.is_empty()
+        && files.len() <= MAX_COMPOSE_FILES
+        && files.iter().enumerate().all(|(index, file)| {
+            file.is_absolute()
+                && file.parent().is_some_and(std::path::Path::is_dir)
+                && file
+                    .symlink_metadata()
+                    .is_ok_and(|metadata| metadata.file_type().is_file())
+                && !files[..index].iter().any(|selected| selected == file)
+        })
+}
 
 #[cfg(target_os = "linux")]
-pub(super) async fn validate_compose_file(file: &std::path::Path) -> ComposeValidationResult {
+pub(super) async fn validate_compose_files(
+    files: &[std::path::PathBuf],
+) -> ComposeValidationResult {
     use std::env;
+    if !selected_compose_files_are_valid(files) {
+        return ComposeValidationResult::failed(ComposeValidationError::InvalidSelectedFile);
+    }
 
     let Some(search_path) = env::var_os("PATH") else {
         return ComposeValidationResult::failed(ComposeValidationError::DockerCliMissing);
@@ -840,9 +980,9 @@ pub(super) async fn validate_compose_file(file: &std::path::Path) -> ComposeVali
         return ComposeValidationResult::failed(ComposeValidationError::DockerCliMissing);
     };
     let user_compose_plugin = user_compose_plugin();
-    validate_with_binary_report(
+    validate_with_files_report(
         &binary,
-        file,
+        files,
         &search_path,
         user_compose_plugin.as_deref(),
         COMMAND_TIMEOUT,
@@ -858,12 +998,24 @@ async fn validate_with_binary(
     user_compose_plugin: Option<&std::path::Path>,
     deadline: Duration,
 ) -> Result<(), ComposeValidationError> {
-    validate_with_binary_report(binary, file, search_path, user_compose_plugin, deadline)
+    let files = [file.to_path_buf()];
+    validate_with_files(binary, &files, search_path, user_compose_plugin, deadline).await
+}
+
+#[cfg(all(target_os = "linux", test))]
+async fn validate_with_files(
+    binary: &std::path::Path,
+    files: &[std::path::PathBuf],
+    search_path: &std::ffi::OsStr,
+    user_compose_plugin: Option<&std::path::Path>,
+    deadline: Duration,
+) -> Result<(), ComposeValidationError> {
+    validate_with_files_report(binary, files, search_path, user_compose_plugin, deadline)
         .await
         .outcome
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 async fn validate_with_binary_report(
     binary: &std::path::Path,
     file: &std::path::Path,
@@ -871,21 +1023,24 @@ async fn validate_with_binary_report(
     user_compose_plugin: Option<&std::path::Path>,
     deadline: Duration,
 ) -> ComposeValidationResult {
+    let files = [file.to_path_buf()];
+    validate_with_files_report(binary, &files, search_path, user_compose_plugin, deadline).await
+}
+
+#[cfg(target_os = "linux")]
+async fn validate_with_files_report(
+    binary: &std::path::Path,
+    files: &[std::path::PathBuf],
+    search_path: &std::ffi::OsStr,
+    user_compose_plugin: Option<&std::path::Path>,
+    deadline: Duration,
+) -> ComposeValidationResult {
     use tokio::process::Command;
 
-    if !file.is_absolute() || !file.is_file() {
+    if !selected_compose_files_are_valid(files) {
         return ComposeValidationResult::failed(ComposeValidationError::InvalidSelectedFile);
     }
-    let Some(parent) = file
-        .parent()
-        .filter(|directory| !directory.as_os_str().is_empty())
-    else {
-        return ComposeValidationResult::failed(ComposeValidationError::InvalidSelectedFile);
-    };
-    if !parent.is_dir() {
-        return ComposeValidationResult::failed(ComposeValidationError::InvalidSelectedFile);
-    }
-
+    let parent = files[0].parent().expect("absolute file has a parent");
     let isolated = match PrivateDockerConfig::new(user_compose_plugin) {
         Ok(isolated) => isolated,
         Err(_) => {
@@ -917,15 +1072,16 @@ async fn validate_with_binary_report(
         .env("COMPOSE_DISABLE_ENV_FILE", "1")
         .args(["compose"])
         .arg("--project-directory")
-        .arg(parent)
-        .arg("--file")
-        .arg(file)
-        .args([
-            "config",
-            "--quiet",
-            "--no-interpolate",
-            "--no-env-resolution",
-        ]);
+        .arg(parent);
+    for file in files {
+        command.arg("--file").arg(file);
+    }
+    command.args([
+        "config",
+        "--quiet",
+        "--no-interpolate",
+        "--no-env-resolution",
+    ]);
     let outcome = match run_command_with_timeout(&mut command, deadline).await {
         Ok(_) => Ok(()),
         Err(CommandFailure::Launch) => Err(ComposeValidationError::DockerCliMissing),
@@ -1125,6 +1281,37 @@ mod tests {
                 .expect("validation CLI fixture should be executable");
             path
         }
+        fn ordered_validation_fixture_cli(
+            directory: &FixtureDirectory,
+            project_directory: &std::path::Path,
+            base_file: &std::path::Path,
+            first_override: &std::path::Path,
+            second_override: &std::path::Path,
+        ) -> PathBuf {
+            let script = format!(
+                "#!/bin/sh\n\
+                 if [ \"$#\" -eq 3 ]; then [ \"$1\" = compose ] && [ \"$2\" = version ] && [ \"$3\" = --short ] || exit 70; printf 'v5.6.0\\n'; exit 0; fi\n\
+                 [ \"$#\" -eq 13 ] || exit 71\n\
+                 [ \"$1\" = compose ] && [ \"$2\" = --project-directory ] && [ \"$3\" = {} ] || exit 72\n\
+                 [ \"$4\" = --file ] && [ \"$5\" = {} ] && [ \"$6\" = --file ] && [ \"$7\" = {} ] && [ \"$8\" = --file ] && [ \"$9\" = {} ] || exit 73\n\
+                 [ \"${{10}}\" = config ] && [ \"${{11}}\" = --quiet ] && [ \"${{12}}\" = --no-interpolate ] && [ \"${{13}}\" = --no-env-resolution ] || exit 74\n\
+                 [ \"$COMPOSE_DISABLE_ENV_FILE\" = 1 ] || exit 75\n\
+                 [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = false ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = false ] || exit 76\n\
+                 [ -n \"$PATH\" ] && [ -d \"$HOME\" ] && [ -d \"$DOCKER_CONFIG\" ] && [ \"$HOME\" != \"$DOCKER_CONFIG\" ] || exit 77\n\
+                 if [ -n \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{DOCKER_API_VERSION+x}}${{DOCKER_CERT_PATH+x}}${{DOCKER_TLS+x}}${{DOCKER_TLS_VERIFY+x}}${{HTTP_PROXY+x}}${{HTTPS_PROXY+x}}${{NO_PROXY+x}}${{COMPOSE_FILE+x}}${{COMPOSE_ENV_FILES+x}}\" ]; then exit 78; fi\n\
+                 env | while IFS='=' read -r name value; do case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_DISABLE_ENV_FILE|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|PWD|SHLVL|_) : ;; *) exit 79 ;; esac; done || exit 79\n\
+                 exit 0\n",
+                shell_quote(&project_directory.to_string_lossy()),
+                shell_quote(&base_file.to_string_lossy()),
+                shell_quote(&first_override.to_string_lossy()),
+                shell_quote(&second_override.to_string_lossy()),
+            );
+            let path = directory.path().join("docker-ordered-validation-fixture");
+            fs::write(&path, script).expect("ordered validation fixture should be written");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("ordered validation fixture should be executable");
+            path
+        }
 
         fn search_path() -> std::ffi::OsString {
             std::env::var_os("PATH").unwrap_or_else(|| OsStr::new("/usr/bin:/bin").to_owned())
@@ -1149,6 +1336,90 @@ mod tests {
 
             assert_eq!(result.version.as_deref(), Some("v5.6.0"));
             assert!(result.outcome.is_ok());
+        }
+        #[tokio::test]
+        async fn validation_passes_base_and_ordered_overrides_as_separate_arguments() {
+            let directory = FixtureDirectory::new();
+            let project_directory = directory.path().join("base project with spaces");
+            fs::create_dir(&project_directory).expect("the base directory should exist");
+            let base = project_directory.join("base compose.yaml");
+            let override_one = directory.path().join("override one.yaml");
+            let override_two = directory.path().join("override two.yaml");
+            fs::write(&base, "services: {}\n").expect("the base file should exist");
+            fs::write(&override_one, "services: {}\n").expect("the first override should exist");
+            fs::write(&override_two, "services: {}\n").expect("the second override should exist");
+            let binary = ordered_validation_fixture_cli(
+                &directory,
+                &project_directory,
+                &base,
+                &override_one,
+                &override_two,
+            );
+
+            let files = [base, override_one, override_two];
+            let result =
+                validate_with_files(&binary, &files, &search_path(), None, COMMAND_TIMEOUT).await;
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn validation_rejects_invalid_duplicate_and_over_limit_file_sets_before_cli() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("project");
+            fs::create_dir(&project).expect("the project directory should exist");
+            let base = project.join("base.yaml");
+            fs::write(&base, "services: {}\n").expect("the base file should exist");
+            let binary = directory.path().join("does-not-exist");
+            let duplicate = validate_with_files(
+                &binary,
+                &[base.clone(), base.clone()],
+                &search_path(),
+                None,
+                COMMAND_TIMEOUT,
+            )
+            .await;
+            assert_eq!(duplicate, Err(ComposeValidationError::InvalidSelectedFile));
+            let non_absolute = validate_with_files(
+                &binary,
+                &[PathBuf::from("relative.yaml")],
+                &search_path(),
+                None,
+                COMMAND_TIMEOUT,
+            )
+            .await;
+            assert_eq!(
+                non_absolute,
+                Err(ComposeValidationError::InvalidSelectedFile)
+            );
+            let directory_input = validate_with_files(
+                &binary,
+                std::slice::from_ref(&project),
+                &search_path(),
+                None,
+                COMMAND_TIMEOUT,
+            )
+            .await;
+            assert_eq!(
+                directory_input,
+                Err(ComposeValidationError::InvalidSelectedFile)
+            );
+            let missing = validate_with_files(
+                &binary,
+                &[project.join("missing.yaml")],
+                &search_path(),
+                None,
+                COMMAND_TIMEOUT,
+            )
+            .await;
+            assert_eq!(missing, Err(ComposeValidationError::InvalidSelectedFile));
+            let empty =
+                validate_with_files(&binary, &[], &search_path(), None, COMMAND_TIMEOUT).await;
+            assert_eq!(empty, Err(ComposeValidationError::InvalidSelectedFile));
+            let too_many = vec![base; MAX_COMPOSE_FILES + 1];
+            let over_limit =
+                validate_with_files(&binary, &too_many, &search_path(), None, COMMAND_TIMEOUT)
+                    .await;
+            assert_eq!(over_limit, Err(ComposeValidationError::InvalidSelectedFile));
         }
 
         #[tokio::test]
@@ -1268,25 +1539,32 @@ mod tests {
         }
 
         #[tokio::test]
-        #[ignore = "requires Docker CLI and Compose; validates an owned temporary file and contacts no engine"]
-        async fn local_compose_validation_reads_a_controlled_relative_path_project() {
+        #[ignore = "requires Docker CLI and Compose; validates owned temporary base and override files and contacts no engine"]
+        async fn local_compose_validation_reads_ordered_temporary_base_and_override_files() {
             let directory = FixtureDirectory::new();
             let project_directory = directory.path().join("project with spaces");
             fs::create_dir(&project_directory)
                 .expect("the temporary project directory should be created");
             fs::create_dir(project_directory.join("data"))
                 .expect("the relative data directory should be created");
-            let file = project_directory.join("compose.yaml");
+            let base = project_directory.join("compose.yaml");
+            let override_file = project_directory.join("compose.override.yaml");
             fs::write(
-                &file,
+                &base,
                 "services:\n  app:\n    image: busybox:latest\n    volumes:\n      - ./data:/data\n",
             )
-            .expect("the controlled Compose file should be written");
+            .expect("the controlled base Compose file should be written");
+            fs::write(
+                &override_file,
+                "services:\n  app:\n    environment:\n      CONTROLLED: value\n",
+            )
+            .expect("the controlled override Compose file should be written");
 
-            validate_compose_file(&file)
+            let files = [base, override_file];
+            validate_compose_files(&files)
                 .await
                 .outcome
-                .expect("the local Compose CLI should validate the temporary project");
+                .expect("the local Compose CLI should validate the temporary project without contacting an engine");
         }
 
         #[tokio::test]
@@ -1621,6 +1899,122 @@ mod tests {
         }
 
         #[test]
+        fn override_files_append_in_order_can_be_removed_and_cancelled_without_path_display() {
+            let mut view = ComposeView::default();
+            let base = std::path::Path::new("/private/base/base-compose.yaml");
+            let first = std::path::Path::new("/private/override/one.yaml");
+            let second = std::path::Path::new("/private/override/two.yaml");
+
+            let generation = view.begin_file_selection();
+            assert!(view.finish_file_selection(generation, Some(base)));
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
+            let generation = view.begin_override_selection();
+            assert!(view.finish_file_selection(generation, Some(first)));
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
+            let generation = view.begin_override_selection();
+            assert!(view.finish_file_selection(generation, Some(second)));
+            assert_eq!(
+                view.selected_files(),
+                &[
+                    base.to_path_buf(),
+                    first.to_path_buf(),
+                    second.to_path_buf()
+                ]
+            );
+            assert!(!format!("{:?}", view.validation).contains("/private/"));
+
+            let cancelled_generation = view.begin_override_selection();
+            assert!(view.finish_file_selection(cancelled_generation, None));
+            assert_eq!(
+                view.selected_files(),
+                &[
+                    base.to_path_buf(),
+                    first.to_path_buf(),
+                    second.to_path_buf()
+                ]
+            );
+            view.remove_override(1);
+            assert_eq!(
+                view.selected_files(),
+                &[base.to_path_buf(), second.to_path_buf()]
+            );
+            let (generation, files) = view
+                .begin_validation()
+                .expect("the remaining ordered file set should be revalidatable");
+            assert_eq!(files, [base.to_path_buf(), second.to_path_buf()]);
+            assert!(view.is_validation_running());
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
+
+            let mut harness = harness_for(view);
+            harness.run();
+            let _order = harness.get_by_role_and_label(
+                Role::Label,
+                "Compose file order (base first, then overrides):",
+            );
+            let _base_name = harness.get_by_role_and_label(Role::Label, "base-compose.yaml");
+            let _remaining_override = harness.get_by_role_and_label(Role::Label, "two.yaml");
+            let _validate = harness.get_by_role_and_label(Role::Button, "Validate selected files");
+        }
+        #[test]
+        fn changing_base_replaces_previous_base_and_clears_overrides() {
+            let mut view = ComposeView::default();
+            let original = std::path::Path::new("/private/old/base.yaml");
+            let override_file = std::path::Path::new("/private/old/override.yaml");
+            let replacement = std::path::Path::new("/private/new/base.yaml");
+
+            let generation = view.begin_file_selection();
+            assert!(view.finish_file_selection(generation, Some(original)));
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
+            let generation = view.begin_override_selection();
+            assert!(view.finish_file_selection(generation, Some(override_file)));
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
+
+            let generation = view.begin_file_selection();
+            assert!(view.finish_file_selection(generation, Some(replacement)));
+            assert_eq!(view.selected_files(), &[replacement.to_path_buf()]);
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
+
+            let mut harness = harness_for(view);
+            harness.run();
+            let _change_base =
+                harness.get_by_role_and_label(Role::Button, "Change base file (clears overrides)");
+        }
+
+        #[test]
+        fn compose_selection_enforces_sixteen_file_limit() {
+            let mut view = ComposeView::default();
+            let base = std::path::PathBuf::from("/private/base.yaml");
+            let generation = view.begin_file_selection();
+            assert!(view.finish_file_selection(generation, Some(&base)));
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
+            for index in 0..(MAX_COMPOSE_FILES - 1) {
+                let path = std::path::PathBuf::from(format!("/private/override-{index}.yaml"));
+                let generation = view.begin_override_selection();
+                assert!(view.finish_file_selection(generation, Some(&path)));
+                assert!(view.finish_validation(generation, validation_result(Ok(()))));
+            }
+            assert_eq!(view.selected_files().len(), MAX_COMPOSE_FILES);
+            let extra = std::path::PathBuf::from("/private/extra.yaml");
+            let generation = view.begin_override_selection();
+            assert!(view.finish_file_selection(generation, Some(&extra)));
+            assert_eq!(view.selected_files().len(), MAX_COMPOSE_FILES);
+            assert!(matches!(
+                &view.validation,
+                ComposeValidationState::Failed {
+                    error: ComposeValidationError::InvalidSelectedFile,
+                    ..
+                }
+            ));
+            let mut harness = harness_for(view);
+            harness.run();
+            assert!(
+                harness
+                    .get_by_role_and_label(Role::Button, "Add override file")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+        }
+        #[test]
         fn compose_version_is_visible_without_an_available_engine() {
             let mut view = ComposeView::default();
             let generation = view.begin_file_selection();
@@ -1691,15 +2085,15 @@ mod tests {
             );
             assert!(
                 !harness
-                    .get_by_role_and_label(Role::Button, "Validate Compose file")
+                    .get_by_role_and_label(Role::Button, "Choose base file")
                     .accesskit_node()
                     .is_disabled()
             );
             harness
-                .get_by_role_and_label(Role::Button, "Validate Compose file")
+                .get_by_role_and_label(Role::Button, "Choose base file")
                 .click_accesskit();
             harness.step();
-            assert!(harness.state().actions.select_file);
+            assert!(harness.state().actions.select_base_file);
         }
 
         #[test]
@@ -1709,10 +2103,10 @@ mod tests {
             assert!(waiting.is_file_selection_running());
             let mut harness = harness_for(waiting);
             harness.step();
-            let _waiting = harness.get_by_role_and_label(Role::Label, "Choosing a Compose file…");
+            let _waiting = harness.get_by_role_and_label(Role::Label, "Choosing a base file…");
             assert!(
                 harness
-                    .get_by_role_and_label(Role::Button, "Validate Compose file")
+                    .get_by_role_and_label(Role::Button, "Choose base file")
                     .accesskit_node()
                     .is_disabled()
             );
@@ -1760,9 +2154,10 @@ mod tests {
             let mut harness = harness_for(validating);
             harness.step();
             {
-                let _validating =
-                    harness.get_by_role_and_label(Role::Label, "Validating Compose file:");
-                let _name = harness.get_by_role_and_label(Role::Label, safe_name);
+                let _validating = harness.get_by_role_and_label(
+                    Role::Label,
+                    "Validating Compose files: compose\\u{202e}.yaml",
+                );
             }
             drop(harness);
             let overlong_file_name = format!(
@@ -1837,6 +2232,7 @@ mod tests {
             let mut view = ComposeView::default();
             let stale_generation = view.begin_file_selection();
             assert!(view.finish_file_selection(stale_generation, Some(stale_file)));
+            view.invalidate();
             let current_generation = view.begin_file_selection();
             assert!(view.finish_file_selection(current_generation, Some(current_file)));
             assert!(!view.finish_validation(stale_generation, validation_result(Ok(()))));
@@ -1876,8 +2272,10 @@ mod tests {
             harness.run();
             {
                 let _name = harness.get_by_role_and_label(Role::Label, "compose.yaml");
-                let _cancelled = harness
-                    .get_by_role_and_label(Role::Label, "Compose file validation cancelled.");
+                let _cancelled = harness.get_by_role_and_label(
+                    Role::Label,
+                    "Validation cancelled for Compose files: compose.yaml",
+                );
             }
             drop(harness);
 
