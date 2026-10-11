@@ -9,6 +9,7 @@
 - [Embedded terminal](user-guide/terminal.md)
 - [Volumes](user-guide/volumes.md)
 - [Networks](user-guide/networks.md)
+- [Compose](user-guide/compose.md)
 
 # Developer guide
 

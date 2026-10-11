@@ -368,6 +368,21 @@ pub struct NetworkDetails {
     pub attached_container_count: Option<usize>,
     /// Validated full container IDs only when complete membership keys are available.
     pub attached_container_ids: Option<Vec<String>>,
+    /// Aggregate point-in-time IP allocation counts, when safely reported.
+    pub ipam_usage: NetworkIpamUsage,
+}
+
+/// Aggregate allocation counts reported by Docker for a network's IPAM pools.
+///
+/// These are address-allocation counts, not network traffic statistics.
+/// Each metric is independently unavailable when it is missing, ambiguous, or
+/// cannot be safely aggregated. Subnet and endpoint details are never retained.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NetworkIpamUsage {
+    /// Used or reserved addresses across reported subnets.
+    pub ips_in_use: Option<u64>,
+    /// Dynamically available addresses across reported subnets.
+    pub dynamic_ips_available: Option<u64>,
 }
 
 /// Read-only details reported for one local volume.

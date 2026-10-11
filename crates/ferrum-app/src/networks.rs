@@ -82,6 +82,8 @@ pub(super) struct NetworksView {
     selected: Option<String>,
     details: Option<NetworkDetails>,
     attached_container_count_display: Option<String>,
+    ips_in_use_display: Option<String>,
+    dynamic_ips_available_display: Option<String>,
     create_name: String,
     create_generation: u64,
     creating: bool,
@@ -119,6 +121,8 @@ impl NetworksView {
         self.selected = None;
         self.details = None;
         self.attached_container_count_display = None;
+        self.ips_in_use_display = None;
+        self.dynamic_ips_available_display = None;
         self.loading = false;
         self.loaded = false;
         self.inspecting = false;
@@ -146,6 +150,8 @@ impl NetworksView {
         self.error = None;
         self.details = None;
         self.attached_container_count_display = None;
+        self.ips_in_use_display = None;
+        self.dynamic_ips_available_display = None;
         self.selected = None;
         self.inspecting = false;
         self.removing = false;
@@ -339,6 +345,8 @@ impl NetworksView {
         }
         self.details = None;
         self.attached_container_count_display = None;
+        self.ips_in_use_display = None;
+        self.dynamic_ips_available_display = None;
         self.attachment_result = Some((
             operation.network_id.clone(),
             operation.container_id.clone(),
@@ -555,6 +563,8 @@ impl NetworksView {
         }
         self.details = None;
         self.attached_container_count_display = None;
+        self.ips_in_use_display = None;
+        self.dynamic_ips_available_display = None;
         self.inspecting = false;
         self.remove_confirmation = None;
         match result {
@@ -580,6 +590,8 @@ impl NetworksView {
         self.selected = None;
         self.details = None;
         self.attached_container_count_display = None;
+        self.ips_in_use_display = None;
+        self.dynamic_ips_available_display = None;
         self.inspecting = false;
         self.removing = false;
         self.attachment_confirmation = None;
@@ -595,6 +607,8 @@ impl NetworksView {
         self.selected = Some(id.clone());
         self.details = None;
         self.attached_container_count_display = None;
+        self.ips_in_use_display = None;
+        self.dynamic_ips_available_display = None;
         self.detail_error = None;
         self.attachment_confirmation = None;
         self.attachment_result = None;
@@ -623,6 +637,18 @@ impl NetworksView {
                 self.attached_container_count_display = Some(
                     details
                         .attached_container_count
+                        .map_or_else(|| "Not reported".to_owned(), |count| count.to_string()),
+                );
+                self.ips_in_use_display = Some(
+                    details
+                        .ipam_usage
+                        .ips_in_use
+                        .map_or_else(|| "Not reported".to_owned(), |count| count.to_string()),
+                );
+                self.dynamic_ips_available_display = Some(
+                    details
+                        .ipam_usage
+                        .dynamic_ips_available
                         .map_or_else(|| "Not reported".to_owned(), |count| count.to_string()),
                 );
                 self.details = Some(details);
@@ -787,6 +813,16 @@ impl NetworksView {
                 ui,
                 "Attached containers",
                 self.attached_container_count_display.as_deref(),
+            );
+            crate::untrusted_detail_row(
+                ui,
+                "IPs in use/reserved (point-in-time allocation; not traffic)",
+                self.ips_in_use_display.as_deref(),
+            );
+            crate::untrusted_detail_row(
+                ui,
+                "Dynamically available IPs (point-in-time allocation; not traffic)",
+                self.dynamic_ips_available_display.as_deref(),
             );
         }
         let mut requested_attachment = None;
@@ -1064,6 +1100,7 @@ mod tests {
             enable_ipv6: Some(false),
             attached_container_count: count,
             attached_container_ids: None,
+            ipam_usage: ferrum_core::NetworkIpamUsage::default(),
         }
     }
     fn removable_view(name: &str, count: Option<usize>) -> NetworksView {
@@ -1644,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn accessible_network_navigation_and_inspection_show_only_count() {
+    fn accessible_network_navigation_and_inspection_show_counts_and_ipam_usage() {
         let mut view = NetworksView::default();
         let generation = view.begin_list();
         view.finish_list(generation, Ok(vec![summary("network-id", "bridge-net")]));
@@ -1660,14 +1697,26 @@ mod tests {
             harness.state().inspection_generation,
             "network-id",
         );
-        harness.state_mut().finish_inspection(
-            generation,
-            inspection,
-            id,
-            Ok(details(id, "bridge-net", Some(3))),
-        );
+        let mut details = details(id, "bridge-net", Some(3));
+        details.ipam_usage = ferrum_core::NetworkIpamUsage {
+            ips_in_use: Some(5),
+            dynamic_ips_available: Some(7),
+        };
+        harness
+            .state_mut()
+            .finish_inspection(generation, inspection, id, Ok(details));
         harness.run();
         let _count = harness.get_by_role_and_label(Role::Label, "3");
+        let _ips_used = harness.get_by_role_and_label(
+            Role::Label,
+            "IPs in use/reserved (point-in-time allocation; not traffic)",
+        );
+        let _ips_used_value = harness.get_by_role_and_label(Role::Label, "5");
+        let _dynamic_ips = harness.get_by_role_and_label(
+            Role::Label,
+            "Dynamically available IPs (point-in-time allocation; not traffic)",
+        );
+        let _dynamic_ips_value = harness.get_by_role_and_label(Role::Label, "7");
         let rendered = format!("{:?}", harness.state().details.as_ref().unwrap());
         assert!(!rendered.contains("container-id"));
     }
@@ -1744,7 +1793,7 @@ mod tests {
         assert_eq!(view.details.unwrap().attached_container_count, None);
     }
     #[test]
-    fn inspection_renders_missing_attached_count_as_not_reported() {
+    fn inspection_renders_all_missing_counts_as_not_reported() {
         let mut view = NetworksView::default();
         let generation = view.begin_list();
         view.finish_list(generation, Ok(vec![summary("id", "bridge")]));
@@ -1757,7 +1806,16 @@ mod tests {
         );
         let mut harness = harness_for(view, true);
         harness.run();
-        let _not_reported = harness.get_by_role_and_label(Role::Label, "Not reported");
+        let not_reported = harness.get_all_by_role_and_label(Role::Label, "Not reported");
+        assert_eq!(not_reported.count(), 3);
+        let _used_label = harness.get_by_role_and_label(
+            Role::Label,
+            "IPs in use/reserved (point-in-time allocation; not traffic)",
+        );
+        let _dynamic_label = harness.get_by_role_and_label(
+            Role::Label,
+            "Dynamically available IPs (point-in-time allocation; not traffic)",
+        );
     }
     #[test]
     fn removal_requires_a_fresh_zero_count_and_rejects_predefined_networks() {

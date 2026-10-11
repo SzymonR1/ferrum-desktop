@@ -22,7 +22,7 @@ pub use image_push::ImagePushStream;
 #[cfg(target_os = "linux")]
 pub use logs::{ContainerLogStream, ContainerLogsOptions};
 #[cfg(target_os = "linux")]
-use std::{env, path::PathBuf, time::Duration};
+use std::{borrow::Cow, env, path::PathBuf, time::Duration};
 
 #[cfg(target_os = "linux")]
 use http_body_util::{BodyExt, Empty, Full, Limited};
@@ -50,7 +50,8 @@ use ferrum_core::ImagePushTarget;
 use ferrum_core::{
     ContainerAction, ContainerChange, ContainerDetails, ContainerMount, ContainerState,
     ContainerSummary, ImageDetails, ImageHistoryEntry, ImageSummary, NetworkDetails,
-    NetworkSummary, VolumeDetails, VolumeSummary, VolumeUsage, is_untrusted_display_character,
+    NetworkIpamUsage, NetworkSummary, VolumeDetails, VolumeSummary, VolumeUsage,
+    is_untrusted_display_character,
 };
 #[cfg(target_os = "linux")]
 use serde::Serialize;
@@ -598,15 +599,655 @@ struct NetworkCreateResponse {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct NetworkInspectResponse {
-    #[serde(flatten)]
-    network: NetworkResponse,
-    #[serde(default)]
-    containers: Option<NetworkContainerMembership>,
+fn set_unique_network_metadata<T>(
+    target: &mut Option<T>,
+    seen: &mut std::collections::HashSet<&'static str>,
+    field: &'static str,
+    value: Option<T>,
+) {
+    if seen.insert(field) {
+        *target = value;
+    } else {
+        *target = None;
+    }
 }
 
+#[cfg(target_os = "linux")]
+struct NetworkMapKey<'de>(Cow<'de, str>);
+
+#[cfg(target_os = "linux")]
+impl<'de> Deserialize<'de> for NetworkMapKey<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct KeyVisitor;
+        impl<'de> Visitor<'de> for KeyVisitor {
+            type Value = NetworkMapKey<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a map key string")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+                Ok(NetworkMapKey(Cow::Borrowed(value)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(NetworkMapKey(Cow::Owned(value.to_owned())))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(NetworkMapKey(Cow::Owned(value)))
+            }
+        }
+        deserializer.deserialize_str(KeyVisitor)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct NetworkInspectResponse {
+    network: NetworkResponse,
+    containers: Option<NetworkContainerMembership>,
+    ipam_usage: NetworkIpamUsage,
+}
+
+#[cfg(target_os = "linux")]
+impl<'de> Deserialize<'de> for NetworkInspectResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct InspectVisitor;
+        impl<'de> Visitor<'de> for InspectVisitor {
+            type Value = NetworkInspectResponse;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Docker network inspection object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut network = NetworkResponse {
+                    id: None,
+                    name: None,
+                    driver: None,
+                    scope: None,
+                    created: None,
+                    internal: None,
+                    attachable: None,
+                    enable_ipv4: None,
+                    enable_ipv6: None,
+                };
+                let mut metadata_seen = std::collections::HashSet::new();
+                let mut containers = None;
+                let mut containers_seen = false;
+                let mut ipam_usage = NetworkIpamUsage::default();
+                let mut status_seen = false;
+                let mut status_ambiguous = false;
+                while let Some(field) = map.next_key::<NetworkMapKey<'de>>()? {
+                    match field.0.as_ref() {
+                        "Id" => set_unique_network_metadata(
+                            &mut network.id,
+                            &mut metadata_seen,
+                            "Id",
+                            map.next_value()?,
+                        ),
+                        "Name" => set_unique_network_metadata(
+                            &mut network.name,
+                            &mut metadata_seen,
+                            "Name",
+                            map.next_value()?,
+                        ),
+                        "Driver" => set_unique_network_metadata(
+                            &mut network.driver,
+                            &mut metadata_seen,
+                            "Driver",
+                            map.next_value()?,
+                        ),
+                        "Scope" => set_unique_network_metadata(
+                            &mut network.scope,
+                            &mut metadata_seen,
+                            "Scope",
+                            map.next_value()?,
+                        ),
+                        "Created" => set_unique_network_metadata(
+                            &mut network.created,
+                            &mut metadata_seen,
+                            "Created",
+                            map.next_value()?,
+                        ),
+                        "Internal" => set_unique_network_metadata(
+                            &mut network.internal,
+                            &mut metadata_seen,
+                            "Internal",
+                            map.next_value()?,
+                        ),
+                        "Attachable" => set_unique_network_metadata(
+                            &mut network.attachable,
+                            &mut metadata_seen,
+                            "Attachable",
+                            map.next_value()?,
+                        ),
+                        "EnableIPv4" => set_unique_network_metadata(
+                            &mut network.enable_ipv4,
+                            &mut metadata_seen,
+                            "EnableIPv4",
+                            map.next_value()?,
+                        ),
+                        "EnableIPv6" => set_unique_network_metadata(
+                            &mut network.enable_ipv6,
+                            &mut metadata_seen,
+                            "EnableIPv6",
+                            map.next_value()?,
+                        ),
+                        "Containers" => {
+                            let value = map.next_value()?;
+                            if containers_seen {
+                                containers = None;
+                            } else {
+                                containers = value;
+                            }
+                            containers_seen = true;
+                        }
+                        "Status" => {
+                            let value = map.next_value::<NetworkStatusUsage>()?.0;
+                            if status_seen {
+                                status_ambiguous = true;
+                            } else {
+                                ipam_usage = value;
+                            }
+                            status_seen = true;
+                        }
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    };
+                }
+                if status_ambiguous {
+                    ipam_usage = NetworkIpamUsage::default();
+                }
+                Ok(NetworkInspectResponse {
+                    network,
+                    containers,
+                    ipam_usage,
+                })
+            }
+        }
+        deserializer.deserialize_map(InspectVisitor)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct NetworkStatusUsage(NetworkIpamUsage);
+
+#[cfg(target_os = "linux")]
+impl<'de> Deserialize<'de> for NetworkStatusUsage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StatusVisitor;
+        impl<'de> Visitor<'de> for StatusVisitor {
+            type Value = NetworkStatusUsage;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("network status containing optional IPAM usage")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut usage = NetworkIpamUsage::default();
+                let mut ipam_seen = false;
+                let mut ambiguous = false;
+                while let Some(field) = map.next_key::<NetworkMapKey<'de>>()? {
+                    if field.0.as_ref() == "IPAM" {
+                        let value = map.next_value::<NetworkIpamStatus>()?.0;
+                        if ipam_seen {
+                            ambiguous = true;
+                        } else {
+                            usage = value;
+                        }
+                        ipam_seen = true;
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(NetworkStatusUsage(if ambiguous {
+                    NetworkIpamUsage::default()
+                } else {
+                    usage
+                }))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(NetworkStatusUsage(NetworkIpamUsage::default()))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(NetworkStatusUsage(NetworkIpamUsage::default()))
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(NetworkStatusUsage(NetworkIpamUsage::default()))
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(NetworkStatusUsage(NetworkIpamUsage::default()))
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(NetworkStatusUsage(NetworkIpamUsage::default()))
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(NetworkStatusUsage(NetworkIpamUsage::default()))
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(NetworkStatusUsage(NetworkIpamUsage::default()))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(NetworkStatusUsage(NetworkIpamUsage::default()))
+            }
+        }
+        deserializer.deserialize_any(StatusVisitor)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct NetworkIpamStatus(NetworkIpamUsage);
+
+#[cfg(target_os = "linux")]
+impl<'de> Deserialize<'de> for NetworkIpamStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct IpamVisitor;
+        impl<'de> Visitor<'de> for IpamVisitor {
+            type Value = NetworkIpamStatus;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("network IPAM status containing optional subnet usage")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut usage = NetworkIpamUsage::default();
+                let mut subnets_seen = false;
+                let mut ambiguous = false;
+                while let Some(field) = map.next_key::<NetworkMapKey<'de>>()? {
+                    if field.0.as_ref() == "Subnets" {
+                        let value = map.next_value::<NetworkSubnetUsageMap>()?.0;
+                        if subnets_seen {
+                            ambiguous = true;
+                        } else {
+                            usage = value;
+                        }
+                        subnets_seen = true;
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(NetworkIpamStatus(if ambiguous {
+                    NetworkIpamUsage::default()
+                } else {
+                    usage
+                }))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(NetworkIpamStatus(NetworkIpamUsage::default()))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(NetworkIpamStatus(NetworkIpamUsage::default()))
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(NetworkIpamStatus(NetworkIpamUsage::default()))
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(NetworkIpamStatus(NetworkIpamUsage::default()))
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(NetworkIpamStatus(NetworkIpamUsage::default()))
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(NetworkIpamStatus(NetworkIpamUsage::default()))
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(NetworkIpamStatus(NetworkIpamUsage::default()))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(NetworkIpamStatus(NetworkIpamUsage::default()))
+            }
+        }
+        deserializer.deserialize_any(IpamVisitor)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_ipam_subnet_cidr(cidr: &str) -> Option<(std::net::IpAddr, u8)> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let (address, prefix) = cidr.split_once('/')?;
+    if !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let prefix = prefix.parse::<u8>().ok()?;
+    match address.parse::<IpAddr>().ok()? {
+        IpAddr::V4(address) if prefix <= 32 => {
+            let host_bits = 32 - u32::from(prefix);
+            let mask = if host_bits == 32 {
+                0
+            } else {
+                u32::MAX << host_bits
+            };
+            Some((
+                IpAddr::V4(Ipv4Addr::from(u32::from(address) & mask)),
+                prefix,
+            ))
+        }
+        IpAddr::V6(address) if prefix <= 128 => {
+            let host_bits = 128 - u32::from(prefix);
+            let mask = if host_bits == 128 {
+                0
+            } else {
+                u128::MAX << host_bits
+            };
+            Some((
+                IpAddr::V6(Ipv6Addr::from(u128::from(address) & mask)),
+                prefix,
+            ))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct NetworkSubnetUsageMap(NetworkIpamUsage);
+
+#[cfg(target_os = "linux")]
+impl<'de> Deserialize<'de> for NetworkSubnetUsageMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SubnetsVisitor;
+        impl<'de> Visitor<'de> for SubnetsVisitor {
+            type Value = NetworkSubnetUsageMap;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a CIDR-keyed map of network subnet usage")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut seen = std::collections::HashSet::new();
+                let mut ips_in_use = Some(0_u64);
+                let mut dynamic_ips_available = Some(0_u64);
+                let mut ambiguous_subnet = false;
+                let mut malformed_subnet = false;
+                let mut count = 0usize;
+                while let Some(cidr) = map.next_key::<NetworkMapKey<'de>>()? {
+                    let Some(normalized_cidr) = normalize_ipam_subnet_cidr(cidr.0.as_ref()) else {
+                        malformed_subnet = true;
+                        map.next_value::<IgnoredAny>()?;
+                        continue;
+                    };
+                    let subnet = map.next_value::<NetworkSubnetUsage>()?;
+                    count = count.saturating_add(1);
+                    if !seen.insert(normalized_cidr) {
+                        ambiguous_subnet = true;
+                    }
+                    ips_in_use = ips_in_use.and_then(|total| {
+                        subnet.ips_in_use.and_then(|value| total.checked_add(value))
+                    });
+                    dynamic_ips_available = dynamic_ips_available.and_then(|total| {
+                        subnet
+                            .dynamic_ips_available
+                            .and_then(|value| total.checked_add(value))
+                    });
+                }
+                if count == 0 || ambiguous_subnet || malformed_subnet {
+                    return Ok(NetworkSubnetUsageMap(NetworkIpamUsage::default()));
+                }
+                Ok(NetworkSubnetUsageMap(NetworkIpamUsage {
+                    ips_in_use,
+                    dynamic_ips_available,
+                }))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(NetworkSubnetUsageMap(NetworkIpamUsage::default()))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(NetworkSubnetUsageMap(NetworkIpamUsage::default()))
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(NetworkSubnetUsageMap(NetworkIpamUsage::default()))
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(NetworkSubnetUsageMap(NetworkIpamUsage::default()))
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(NetworkSubnetUsageMap(NetworkIpamUsage::default()))
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(NetworkSubnetUsageMap(NetworkIpamUsage::default()))
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(NetworkSubnetUsageMap(NetworkIpamUsage::default()))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(NetworkSubnetUsageMap(NetworkIpamUsage::default()))
+            }
+        }
+        deserializer.deserialize_any(SubnetsVisitor)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct NetworkSubnetUsage {
+    ips_in_use: Option<u64>,
+    dynamic_ips_available: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl<'de> Deserialize<'de> for NetworkSubnetUsage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SubnetVisitor;
+        impl<'de> Visitor<'de> for SubnetVisitor {
+            type Value = NetworkSubnetUsage;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("one network subnet's IP allocation usage")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut ips_in_use = None;
+                let mut dynamic_ips_available = None;
+                let mut ips_seen = false;
+                let mut dynamic_seen = false;
+                while let Some(field) = map.next_key::<NetworkMapKey<'de>>()? {
+                    match field.0.as_ref() {
+                        "IPsInUse" => {
+                            let value = map.next_value::<NetworkUsageMetric>()?.0;
+                            if ips_seen {
+                                ips_in_use = None;
+                            } else {
+                                ips_in_use = value;
+                            }
+                            ips_seen = true;
+                        }
+                        "DynamicIPsAvailable" => {
+                            let value = map.next_value::<NetworkUsageMetric>()?.0;
+                            if dynamic_seen {
+                                dynamic_ips_available = None;
+                            } else {
+                                dynamic_ips_available = value;
+                            }
+                            dynamic_seen = true;
+                        }
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(NetworkSubnetUsage {
+                    ips_in_use,
+                    dynamic_ips_available,
+                })
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(NetworkSubnetUsage::default())
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(NetworkSubnetUsage::default())
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(NetworkSubnetUsage::default())
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(NetworkSubnetUsage::default())
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(NetworkSubnetUsage::default())
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(NetworkSubnetUsage::default())
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(NetworkSubnetUsage::default())
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(NetworkSubnetUsage::default())
+            }
+        }
+        deserializer.deserialize_any(SubnetVisitor)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct NetworkUsageMetric(Option<u64>);
+
+#[cfg(target_os = "linux")]
+impl<'de> Deserialize<'de> for NetworkUsageMetric {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct MetricVisitor;
+        impl<'de> Visitor<'de> for MetricVisitor {
+            type Value = NetworkUsageMetric;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a nonnegative integer allocation count")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(NetworkUsageMetric(Some(value)))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(NetworkUsageMetric(u64::try_from(value).ok()))
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(NetworkUsageMetric(None))
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(NetworkUsageMetric(None))
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(NetworkUsageMetric(None))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(NetworkUsageMetric(None))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(NetworkUsageMetric(None))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(NetworkUsageMetric(None))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                while map.next_key::<IgnoredAny>()?.is_some() {
+                    map.next_value::<IgnoredAny>()?;
+                }
+                Ok(NetworkUsageMetric(None))
+            }
+        }
+        deserializer.deserialize_any(MetricVisitor)
+    }
+}
 #[cfg(target_os = "linux")]
 struct NetworkContainerMembership {
     count: usize,
@@ -1788,9 +2429,12 @@ impl EngineClient {
     /// Inspects one local network by its engine ID or name.
     ///
     /// The identifier must be non-empty, at most 4096 bytes, and not `.` or
-    /// `..`. Endpoint values are discarded. Full 64-character hexadecimal
-    /// container IDs are retained only when every `Containers` map key is
-    /// valid; the point-in-time attached-container count remains separate.
+    /// `..`. Inspect requests `verbose=true`; endpoint values are discarded.
+    /// Full 64-character hexadecimal container IDs are retained only when
+    /// every `Containers` map key is valid; the point-in-time attached-
+    /// container count remains separate from aggregate IP allocation counts.
+    /// IPAM usage is unavailable when reported values cannot be safely
+    /// aggregated.
     ///
     /// # Errors
     ///
@@ -1804,7 +2448,7 @@ impl EngineClient {
             if !network_id_path_safe(id) {
                 return Err(EngineError::InvalidNetworkId);
             }
-            let path = resource_request_path(&self.api_version, "networks", id, "")
+            let path = resource_request_path(&self.api_version, "networks", id, "?verbose=true")
                 .map_err(|_| EngineError::InvalidNetworkId)?;
             let endpoint_label = self.info.endpoint_label;
             let response: NetworkInspectResponse = request_json(
@@ -1817,6 +2461,7 @@ impl EngineClient {
             .map_err(|_| EngineError::NetworkInspectionUnavailable { endpoint_label })?;
             let summary = map_network(response.network)
                 .map_err(|()| EngineError::NetworkInspectionUnavailable { endpoint_label })?;
+            let ipam_usage = response.ipam_usage;
             Ok(NetworkDetails {
                 id: summary.id,
                 name: summary.name,
@@ -1832,6 +2477,7 @@ impl EngineClient {
                     .as_ref()
                     .map(|containers| containers.count),
                 attached_container_ids: response.containers.and_then(|containers| containers.ids),
+                ipam_usage,
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -6239,7 +6885,7 @@ mod network_api_tests {
             .await
             .expect("details");
         let request = server.await.expect("server");
-        assert!(request.starts_with("GET /v1.45/networks/a%2Fb%20c HTTP/1.1\r\n"));
+        assert!(request.starts_with("GET /v1.45/networks/a%2Fb%20c?verbose=true HTTP/1.1\r\n"));
         assert_eq!(
             details,
             NetworkDetails {
@@ -6254,6 +6900,7 @@ mod network_api_tests {
                 enable_ipv6: Some(true),
                 attached_container_count: Some(1),
                 attached_container_ids: None,
+                ipam_usage: NetworkIpamUsage::default(),
             }
         );
         let debug = format!("{details:?}");
@@ -6270,6 +6917,148 @@ mod network_api_tests {
         cleanup(&socket, &directory);
     }
 
+    #[tokio::test]
+    async fn inspection_rejects_duplicate_required_network_metadata() {
+        for body in [
+            r#"{"Id":"network-id","Id":"other-id","Name":"bridge"}"#,
+            r#"{"Id":"network-id","Name":"bridge","Name":"other"}"#,
+        ] {
+            let (socket, directory, server) = fixture(response("200 OK", body.as_bytes())).await;
+            let result = client(socket.clone()).inspect_network("network-id").await;
+            assert!(matches!(
+                result,
+                Err(EngineError::NetworkInspectionUnavailable { .. })
+            ));
+            let _request = server.await.expect("server");
+            cleanup(&socket, &directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn inspection_makes_duplicate_optional_network_metadata_unavailable() {
+        let body = br#"{"Id":"network-id","Name":"bridge","Driver":"bridge","Driver":"host","Scope":"local","Scope":"swarm","Created":"first","Created":"second","Internal":true,"Internal":false,"Attachable":true,"Attachable":false,"EnableIPv4":true,"EnableIPv4":false,"EnableIPv6":true,"EnableIPv6":false}"#;
+        let (socket, directory, server) = fixture(response("200 OK", body)).await;
+        let details = client(socket.clone())
+            .inspect_network("network-id")
+            .await
+            .expect("valid identity remains inspectable");
+        let _request = server.await.expect("server");
+        assert_eq!(details.id, "network-id");
+        assert_eq!(details.name, "bridge");
+        assert_eq!(details.driver, None);
+        assert_eq!(details.scope, None);
+        assert_eq!(details.created_at, None);
+        assert_eq!(details.internal, None);
+        assert_eq!(details.attachable, None);
+        assert_eq!(details.enable_ipv4, None);
+        assert_eq!(details.enable_ipv6, None);
+        cleanup(&socket, &directory);
+    }
+
+    #[tokio::test]
+    async fn verbose_network_inspection_aggregates_allocation_counts_only() {
+        let body = br#"{"Id":"network","Name":"custom","Containers":{},"Status":{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":3,"DynamicIPsAvailable":240},"2001:db8::/64":{"IPsInUse":4,"DynamicIPsAvailable":250}}}}}"#;
+        let (socket, directory, server) = fixture(response("200 OK", body)).await;
+        let details = client(socket.clone())
+            .inspect_network("network")
+            .await
+            .expect("valid network inspection");
+        let request = server.await.expect("server");
+        assert!(request.starts_with("GET /v1.45/networks/network?verbose=true HTTP/1.1\r\n"));
+        assert_eq!(details.attached_container_count, Some(0));
+        assert_eq!(details.ipam_usage.ips_in_use, Some(7));
+        assert_eq!(details.ipam_usage.dynamic_ips_available, Some(490));
+        let debug = format!("{details:?}");
+        assert!(!debug.contains("192.0.2.0/24"));
+        assert!(!debug.contains("2001:db8::/64"));
+        cleanup(&socket, &directory);
+    }
+
+    #[test]
+    fn network_ipam_usage_accepts_escaped_json_keys() {
+        let usage = serde_json::from_str::<NetworkStatusUsage>(
+            r#"{"\u0049PAM":{"\u0053ubnets":{"192.0.2.0\u002f24":{"\u0049PsInUse":3,"\u0044ynamicIPsAvailable":8}}}}"#,
+        )
+        .expect("escaped map keys retain their decoded values")
+        .0;
+        assert_eq!(usage.ips_in_use, Some(3));
+        assert_eq!(usage.dynamic_ips_available, Some(8));
+    }
+
+    #[test]
+    fn network_ipam_usage_missing_invalid_ambiguous_and_overflowing_values_fail_closed() {
+        for status in [
+            r#"{}"#,
+            r#"{"IPAM":{}}"#,
+            r#"{"IPAM":{"Subnets":{}}}"#,
+            r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":-1,"DynamicIPsAvailable":"8"}}}}"#,
+            r#"{"IPAM":{"Subnets":{"not-a-cidr":{"IPsInUse":1,"DynamicIPsAvailable":8}}}}"#,
+            r#"{"IPAM":{"Subnets":{"192.0.2.0/33":{"IPsInUse":1,"DynamicIPsAvailable":8}}}}"#,
+            r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"DynamicIPsAvailable":8},"192.0.2.129/24":{"IPsInUse":2,"DynamicIPsAvailable":9}}}}"#,
+            r#"{"IPAM":{"Subnets":{"2001:db8::/64":{"IPsInUse":1,"DynamicIPsAvailable":8},"2001:0db8:0:0::1/64":{"IPsInUse":2,"DynamicIPsAvailable":9}}}}"#,
+            r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1},"2001:db8::/64":{"IPsInUse":2}},"Subnets":{}}}"#,
+            r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":18446744073709551615,"DynamicIPsAvailable":18446744073709551615},"2001:db8::/64":{"IPsInUse":1,"DynamicIPsAvailable":1}}}}"#,
+            r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"IPsInUse":2,"DynamicIPsAvailable":8,"DynamicIPsAvailable":9}}}}"#,
+            r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"DynamicIPsAvailable":8}}},"IPAM":{"Subnets":{}}}"#,
+            r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"DynamicIPsAvailable":8}}},"\u0049PAM":{"Subnets":{}}}"#,
+        ] {
+            let usage = serde_json::from_str::<NetworkStatusUsage>(status)
+                .expect("malformed usage fields stay isolated")
+                .0;
+            assert_eq!(usage.ips_in_use, None);
+            assert_eq!(usage.dynamic_ips_available, None);
+        }
+
+        let missing_ips_in_use = serde_json::from_str::<NetworkStatusUsage>(
+            r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"DynamicIPsAvailable":8}}}}"#,
+        )
+        .expect("missing count is unavailable without invalidating independent metrics")
+        .0;
+        assert_eq!(missing_ips_in_use.ips_in_use, None);
+        assert_eq!(missing_ips_in_use.dynamic_ips_available, Some(8));
+
+        let independently_available = serde_json::from_str::<NetworkStatusUsage>(
+            r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":-1,"DynamicIPsAvailable":8},"2001:db8::/64":{"IPsInUse":2,"DynamicIPsAvailable":9}}}}"#,
+        )
+        .expect("valid usage envelope")
+        .0;
+        assert_eq!(independently_available.ips_in_use, None);
+        assert_eq!(independently_available.dynamic_ips_available, Some(17));
+    }
+
+    #[tokio::test]
+    async fn malformed_ipam_usage_does_not_hide_network_membership() {
+        for status in [
+            "",
+            r#","Status":null"#,
+            r#","Status":{}"#,
+            r#","Status":{"IPAM":{"Subnets":{}}}"#,
+            r#","Status":{"IPAM":{"Subnets":[]}}"#,
+            r#","Status":{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":-1,"DynamicIPsAvailable":"bad"}}}}"#,
+            r#","Status":{"IPAM":{"Subnets":{"not-a-cidr":{"IPsInUse":1,"DynamicIPsAvailable":8}}}}"#,
+            r#","Status":{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"DynamicIPsAvailable":8},"192.0.2.0/24":{"IPsInUse":2,"DynamicIPsAvailable":9}}}}"#,
+            r#","Status":{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"DynamicIPsAvailable":8}}},"IPAM":{"Subnets":{}}}"#,
+            r#","Status":{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"DynamicIPsAvailable":8}}}},"Status":{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":2,"DynamicIPsAvailable":9}}}}"#,
+            r#","Status":{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"IPsInUse":2,"DynamicIPsAvailable":8,"DynamicIPsAvailable":9}}}}"#,
+            r#","Status":{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"DynamicIPsAvailable":8}},"Subnets":{"2001:db8::/64":{"IPsInUse":2,"DynamicIPsAvailable":9}}}}"#,
+        ] {
+            let body = format!(
+                r#"{{"Id":"network","Name":"bridge","Containers":{{"bad-key":{{"EndpointID":"secret"}}}}{status}}}"#
+            );
+            let (socket, directory, server) = fixture(response("200 OK", body.as_bytes())).await;
+            let details = client(socket.clone())
+                .inspect_network("network")
+                .await
+                .expect("invalid usage must not hide network details");
+            let _request = server.await.expect("server");
+            assert_eq!(details.id, "network");
+            assert_eq!(details.attached_container_count, Some(1));
+            assert_eq!(details.attached_container_ids, None);
+            assert_eq!(details.ipam_usage, NetworkIpamUsage::default());
+            assert!(!format!("{details:?}").contains("secret"));
+            cleanup(&socket, &directory);
+        }
+    }
     #[tokio::test]
     async fn missing_null_and_empty_containers_have_distinct_count_shapes() {
         for (containers, expected) in [
