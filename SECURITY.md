@@ -241,16 +241,16 @@ The size check covers only explicitly selected files. Local
 `include`/`extends.file` files may remain outside it and are read by the same
 limited CLI process under the logged-in user's permissions.
 
-On Linux, each Compose subprocess for version, discovery, and validation has
-`RLIMIT_AS` capped at 4 GiB and `RLIMIT_DATA` capped at 512 MiB, preserving any
-lower inherited limits. These per-process limits apply to selected and included
-file reads. Child processes inherit these limits, which bound each process,
-not aggregate process-tree RSS. The private child environment
+On Linux, each Compose subprocess for version, discovery, validation, and status
+has `RLIMIT_AS` capped at 4 GiB and `RLIMIT_DATA` capped at 512 MiB, preserving
+lower inherited limits. The per-process limits apply while Compose reads
+selected and included files; child processes inherit them, so they bound each
+process, not aggregate process-tree RSS. The private child environment
 sets `GOMEMLIMIT=402653184` (384 MiB) for Go runtimes. This is a soft runtime
 target, not a hard cap: Go may exceed it to avoid excessive GC thrashing.
-Resource exhaustion can produce a generic validation failure. These limits and
-the point-in-time selected-file check do not make the trusted CLI a sandbox or
-confine local included-file reads.
+Resource exhaustion can produce generic validation or status failures. These
+limits and the point-in-time selected-file check do not make the trusted CLI a
+sandbox or confine local included-file reads.
 
 Validation is read-only, does not contact or require an engine socket, and
 Ferrum does not write, modify, delete, or extract project files. Success means
@@ -259,6 +259,23 @@ are skipped. Only bounded escaped basenames and a static result are displayed;
 paths are session-only and raw diagnostics are discarded. Profiles,
 `.env`/service `env_file` resolution, remote Git/OCI references, file import,
 lifecycle actions, build/pull/logs, and project mutations are unsupported.
+
+Read-only container status is available for selected files after structural
+validation. It pins `docker compose ps --all --format json` to the selected
+local Unix socket and does not create, start, stop, remove, or otherwise mutate
+containers or project files. `--all` includes stopped containers; the CLI's
+default orphan inclusion is preserved. Ferrum retains only bounded escaped
+container `Name`, `Service`, `State`, and optional `Health`; IDs, command text,
+published ports, project labels, exit codes, and other response fields are
+discarded. Empty output means no existing containers matched this isolated
+project selection, not that no services are declared. Status is a manually
+refreshed point-in-time snapshot.
+
+Status uses the private cleared environment described below and disables the
+selected project's default `.env`; environment-dependent projects may fail or
+resolve differently than when Compose runs in the user's shell. Compose may
+still read local includes and included-project environment sources under the
+logged-in user's permissions. Validate only trusted files.
 
 Compose can recursively read local files referenced by `include` or service
 `extends.file`, plus each included project's default `.env` and explicit
@@ -280,12 +297,13 @@ plugin directory, only the `docker-compose` executable is linked into the
 private config; custom `cliPluginsExtraDirs` from saved config are not loaded.
 Saved `config.json` credentials and proxy settings are not read or passed.
 Each command has an eight-second deadline and a 1 MiB stdout cap. Process
-resource exhaustion may cause a generic validation failure.
+resource exhaustion may cause a generic validation or status failure.
 
-Linux local Compose discovery and single-file validation, loopback-loader, and
-ordered multi-file temporary-file smokes passed with Compose v5.6.0. The
-multi-file smoke used an owned base/override pair without an engine or user
-project access. The native page visual check remains unavailable.
+Linux local Compose discovery and single-file validation, loopback-loader,
+ordered multi-file temporary-file, and read-only temporary-project status
+smokes passed with Compose v5.6.0. Status used Docker Engine 29.9.0 and created
+no containers; validation smokes used only owned temporary files without an
+engine or user-project access. The native page visual check remains unavailable.
 Issue #18 remains partial/open; issue #19 remains partial/open; issue #10
 remains blocked/open. No full issue completion, release, or broader support
 claim is made.

@@ -187,6 +187,10 @@ enum EngineEvent {
         generation: u64,
         result: compose::ComposeValidationResult,
     },
+    ComposeStatusFinished {
+        generation: u64,
+        result: compose::ComposeStatusResult,
+    },
     NetworkCreated {
         generation: u64,
         name: String,
@@ -864,6 +868,7 @@ struct FerrumApp {
     pending_resource_read: Option<PendingResourceRead>,
     compose_task: Option<JoinHandle<()>>,
     compose_validation_task: Option<JoinHandle<()>>,
+    compose_status_task: Option<JoinHandle<()>>,
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
     // Hold the reader until the terminal response event releases the mutation gate.
@@ -1070,6 +1075,7 @@ impl FerrumApp {
             pending_resource_read: None,
             compose_task: None,
             compose_validation_task: None,
+            compose_status_task: None,
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
@@ -1266,6 +1272,9 @@ impl FerrumApp {
         if let Some(task) = self.compose_validation_task.take() {
             task.abort();
         }
+        if let Some(task) = self.compose_status_task.take() {
+            task.abort();
+        }
         self.compose.invalidate();
     }
 
@@ -1284,6 +1293,9 @@ impl FerrumApp {
                 return;
             }
             if let Some(task) = self.compose_validation_task.take() {
+                task.abort();
+            }
+            if let Some(task) = self.compose_status_task.take() {
                 task.abort();
             }
             let generation = if override_file {
@@ -1324,6 +1336,9 @@ impl FerrumApp {
             task.abort();
         }
         let sender = self.sender.clone();
+        if let Some(task) = self.compose_status_task.take() {
+            task.abort();
+        }
         self.compose_validation_task = Some(self.runtime.spawn(async move {
             let result = compose::validate_compose_files(&files).await;
             if sender
@@ -1334,6 +1349,46 @@ impl FerrumApp {
                 context.request_repaint();
             }
         }));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_compose_status_refresh(&mut self, context: egui::Context) {
+        if !matches!(&self.connection, ConnectionState::Connected) || self.compose.is_loading() {
+            return;
+        }
+        let Some(socket_path) = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.local_socket_path().to_path_buf())
+        else {
+            return;
+        };
+        let Some((generation, files)) = self.compose.begin_status_refresh() else {
+            return;
+        };
+        if let Some(task) = self.compose_status_task.take() {
+            task.abort();
+        }
+        context.request_repaint();
+        let sender = self.sender.clone();
+        self.compose_status_task = Some(self.runtime.spawn(async move {
+            let result = compose::existing_compose_containers(&socket_path, &files).await;
+            if sender
+                .send(EngineEvent::ComposeStatusFinished { generation, result })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
+
+    fn cancel_compose_status_refresh(&mut self, context: egui::Context) {
+        if let Some(task) = self.compose_status_task.take() {
+            task.abort();
+        }
+        self.compose.cancel_status_refresh();
+        context.request_repaint();
     }
 
     fn load_compose(&mut self, context: egui::Context) {
@@ -2670,6 +2725,11 @@ impl FerrumApp {
                         self.compose_validation_task = None;
                     }
                 }
+                EngineEvent::ComposeStatusFinished { generation, result } => {
+                    if self.compose.finish_status_refresh(generation, result) {
+                        self.compose_status_task = None;
+                    }
+                }
                 EngineEvent::VolumeInspected {
                     generation,
                     inspection_generation,
@@ -3503,6 +3563,7 @@ impl FerrumApp {
                 "Compose projects will load when the engine context change finishes.",
                 false,
                 cfg!(target_os = "linux"),
+                false,
             );
         }
         let engine_selected = self.engine.is_some();
@@ -3535,6 +3596,7 @@ impl FerrumApp {
             message,
             cfg!(target_os = "linux") && !self.loading,
             cfg!(target_os = "linux"),
+            available && connected && !self.loading && !self.compose.is_loading(),
         )
     }
     fn draw_images(&mut self, ui: &mut egui::Ui) -> Option<images::ImageInspectionRequest> {
@@ -4559,8 +4621,14 @@ impl eframe::App for FerrumApp {
         if compose_actions.cancel_validation {
             self.cancel_compose_validation(context.clone());
         }
+        if compose_actions.cancel_status {
+            self.cancel_compose_status_refresh(context.clone());
+        }
         if let Some(index) = compose_actions.remove_override {
             self.compose.remove_override(index);
+            if let Some(task) = self.compose_status_task.take() {
+                task.abort();
+            }
         }
         if compose_actions.select_base_file {
             self.select_compose_file(false, context.clone());
@@ -4570,6 +4638,10 @@ impl eframe::App for FerrumApp {
             && let Some((generation, files)) = self.compose.begin_validation()
         {
             self.start_compose_validation(files, generation, context.clone());
+        }
+        if compose_actions.refresh_containers {
+            #[cfg(target_os = "linux")]
+            self.start_compose_status_refresh(context.clone());
         }
         if compose_actions.refresh {
             self.refresh(context.clone());
@@ -5096,6 +5168,7 @@ mod event_reconciliation_tests {
             resource_read_task: None,
             compose_task: None,
             compose_validation_task: None,
+            compose_status_task: None,
             pending_resource_read: None,
             image_list_task: None,
             image_inspection_task: None,
