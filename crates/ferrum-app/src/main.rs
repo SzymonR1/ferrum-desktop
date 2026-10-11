@@ -1884,12 +1884,15 @@ impl FerrumApp {
         succeeded && self.page == images::AppPage::Images
     }
     fn finish_image_push(&mut self, generation: u64, result: Result<(), EngineError>) -> bool {
+        #[cfg(target_os = "linux")]
         let outcome_unknown = matches!(
             &result,
             Err(EngineError::ImagePushOutcomeUnknown { .. }
                 | EngineError::ImagePushTimedOut { .. }
                 | EngineError::ImagePushStreamInterrupted { .. })
         );
+        #[cfg(not(target_os = "linux"))]
+        let outcome_unknown = false;
         if outcome_unknown {
             if let Err(error) = result {
                 // Do not unlock other image mutations when the daemon may still
