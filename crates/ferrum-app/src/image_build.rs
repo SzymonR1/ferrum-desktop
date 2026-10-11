@@ -305,6 +305,9 @@ pub(super) async fn run_command(
     cancel: oneshot::Receiver<()>,
     output: mpsc::Sender<String>,
 ) -> Result<(), ImageBuildError> {
+    #[cfg(test)]
+    let _test_subprocess_guard = crate::TEST_SUBPROCESS_LOCK.lock().await;
+
     command.process_group(0);
     command
         .stdin(Stdio::null())

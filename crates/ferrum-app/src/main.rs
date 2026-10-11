@@ -98,6 +98,9 @@ const EVENT_CHANNEL_CAPACITY: usize = 4;
 const ROW_HEIGHT: f32 = 34.0;
 const CELL_HEIGHT: f32 = 28.0;
 
+/// Limits concurrent app-test subprocesses to keep fixture launches reliable.
+#[cfg(test)]
+pub(crate) static TEST_SUBPROCESS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(

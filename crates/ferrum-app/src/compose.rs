@@ -757,6 +757,9 @@ async fn run_command_with_timeout(
     command: &mut tokio::process::Command,
     deadline: Duration,
 ) -> Result<Vec<u8>, CommandFailure> {
+    #[cfg(test)]
+    let _test_subprocess_guard = crate::TEST_SUBPROCESS_LOCK.lock().await;
+
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
 

@@ -1142,6 +1142,7 @@ mod tests {
         let home_fallback_file = config_home.join(".config/ferrum/settings.toml");
         let child_marker = format!("{pid}:{nonce}");
 
+        let _subprocess_guard = crate::TEST_SUBPROCESS_LOCK.blocking_lock();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -1217,6 +1218,7 @@ mod tests {
         use std::os::unix::process::CommandExt;
 
         for (marker, config_home) in cases {
+            let _subprocess_guard = crate::TEST_SUBPROCESS_LOCK.blocking_lock();
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
                 .args([
@@ -1291,6 +1293,7 @@ mod tests {
             let target_config_root = target_parent.join("missing-xdg-root");
             let config_home = test_root.join("existing-xdg-parent/missing-xdg-root");
             let target_settings = target_config_root.join("ferrum/settings.toml");
+            let _subprocess_guard = crate::TEST_SUBPROCESS_LOCK.blocking_lock();
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
                 .args([
