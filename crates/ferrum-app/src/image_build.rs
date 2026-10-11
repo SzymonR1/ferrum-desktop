@@ -38,7 +38,7 @@ impl fmt::Display for ImageBuildError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct ImageBuildRequest {
     context: PathBuf,
     repository: String,
@@ -46,16 +46,13 @@ pub(super) struct ImageBuildRequest {
 }
 
 impl ImageBuildRequest {
+    #[cfg(test)]
     pub(super) fn new(
         context: PathBuf,
         repository: String,
         tag: String,
     ) -> Result<Self, ImageBuildError> {
-        if !valid_target(&repository, &tag) {
-            return Err(ImageBuildError::InvalidTarget);
-        }
-        let context = validate_context(&context)?;
-        Ok(Self::unchecked(context, repository, tag))
+        Self::unchecked(context, repository, tag).validate()
     }
 
     pub(super) fn unchecked(context: PathBuf, repository: String, tag: String) -> Self {
@@ -66,19 +63,16 @@ impl ImageBuildRequest {
         }
     }
 
+    pub(super) fn validate(self) -> Result<Self, ImageBuildError> {
+        if !valid_target(&self.repository, &self.tag) {
+            return Err(ImageBuildError::InvalidTarget);
+        }
+        let context = validate_context(&self.context)?;
+        Ok(Self::unchecked(context, self.repository, self.tag))
+    }
+
     fn target(&self) -> String {
         format!("{}:{}", self.repository, self.tag)
-    }
-    pub(super) fn context(&self) -> &Path {
-        &self.context
-    }
-
-    pub(super) fn repository(&self) -> &str {
-        &self.repository
-    }
-
-    pub(super) fn tag(&self) -> &str {
-        &self.tag
     }
 }
 

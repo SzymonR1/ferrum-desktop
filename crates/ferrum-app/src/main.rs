@@ -1724,9 +1724,6 @@ impl FerrumApp {
         let Some((generation, draft)) = self.images.begin_build() else {
             return;
         };
-        let build_context = draft.context().to_path_buf();
-        let repository = draft.repository().to_owned();
-        let tag = draft.tag().to_owned();
         let (output_sender, mut output_receiver) = mpsc::channel(32);
         let (cancel_sender, mut cancel_receiver) = oneshot::channel();
         self.image_build_cancel = Some(cancel_sender);
@@ -1734,7 +1731,7 @@ impl FerrumApp {
         let repaint = context.clone();
         self.image_build_task = Some(self.runtime.spawn(async move {
             let preparation = tokio::task::spawn_blocking(move || {
-                let request = image_build::ImageBuildRequest::new(build_context, repository, tag)?;
+                let request = draft.validate()?;
                 let config = image_build::create_private_config()?;
                 let command = image_build::build_command(
                     std::ffi::OsStr::new("docker"),
