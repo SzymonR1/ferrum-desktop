@@ -855,6 +855,44 @@ impl<'de> Deserialize<'de> for NetworkIpamStatus {
 }
 
 #[cfg(target_os = "linux")]
+fn normalize_ipam_subnet_cidr(cidr: &str) -> Option<(std::net::IpAddr, u8)> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let (address, prefix) = cidr.split_once('/')?;
+    if !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let prefix = prefix.parse::<u8>().ok()?;
+    match address.parse::<IpAddr>().ok()? {
+        IpAddr::V4(address) if prefix <= 32 => {
+            let host_bits = 32 - u32::from(prefix);
+            let mask = if host_bits == 32 {
+                0
+            } else {
+                u32::MAX << host_bits
+            };
+            Some((
+                IpAddr::V4(Ipv4Addr::from(u32::from(address) & mask)),
+                prefix,
+            ))
+        }
+        IpAddr::V6(address) if prefix <= 128 => {
+            let host_bits = 128 - u32::from(prefix);
+            let mask = if host_bits == 128 {
+                0
+            } else {
+                u128::MAX << host_bits
+            };
+            Some((
+                IpAddr::V6(Ipv6Addr::from(u128::from(address) & mask)),
+                prefix,
+            ))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
 struct NetworkSubnetUsageMap(NetworkIpamUsage);
 
 #[cfg(target_os = "linux")]
@@ -879,11 +917,17 @@ impl<'de> Deserialize<'de> for NetworkSubnetUsageMap {
                 let mut ips_in_use = Some(0_u64);
                 let mut dynamic_ips_available = Some(0_u64);
                 let mut ambiguous_subnet = false;
+                let mut malformed_subnet = false;
                 let mut count = 0usize;
                 while let Some(cidr) = map.next_key::<String>()? {
+                    let Some(normalized_cidr) = normalize_ipam_subnet_cidr(&cidr) else {
+                        malformed_subnet = true;
+                        map.next_value::<IgnoredAny>()?;
+                        continue;
+                    };
                     let subnet = map.next_value::<NetworkSubnetUsage>()?;
                     count = count.saturating_add(1);
-                    if !seen.insert(cidr) {
+                    if !seen.insert(normalized_cidr) {
                         ambiguous_subnet = true;
                     }
                     ips_in_use = ips_in_use.and_then(|total| {
@@ -895,7 +939,7 @@ impl<'de> Deserialize<'de> for NetworkSubnetUsageMap {
                             .and_then(|value| total.checked_add(value))
                     });
                 }
-                if count == 0 || ambiguous_subnet {
+                if count == 0 || ambiguous_subnet || malformed_subnet {
                     return Ok(NetworkSubnetUsageMap(NetworkIpamUsage::default()));
                 }
                 Ok(NetworkSubnetUsageMap(NetworkIpamUsage {
@@ -6453,6 +6497,10 @@ mod network_api_tests {
             r#"{"IPAM":{}}"#,
             r#"{"IPAM":{"Subnets":{}}}"#,
             r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":-1,"DynamicIPsAvailable":"8"}}}}"#,
+            r#"{"IPAM":{"Subnets":{"not-a-cidr":{"IPsInUse":1,"DynamicIPsAvailable":8}}}}"#,
+            r#"{"IPAM":{"Subnets":{"192.0.2.0/33":{"IPsInUse":1,"DynamicIPsAvailable":8}}}}"#,
+            r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"DynamicIPsAvailable":8},"192.0.2.129/24":{"IPsInUse":2,"DynamicIPsAvailable":9}}}}"#,
+            r#"{"IPAM":{"Subnets":{"2001:db8::/64":{"IPsInUse":1,"DynamicIPsAvailable":8},"2001:0db8:0:0::1/64":{"IPsInUse":2,"DynamicIPsAvailable":9}}}}"#,
             r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1},"2001:db8::/64":{"IPsInUse":2}},"Subnets":{}}}"#,
             r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":18446744073709551615,"DynamicIPsAvailable":18446744073709551615},"2001:db8::/64":{"IPsInUse":1,"DynamicIPsAvailable":1}}}}"#,
             r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"IPsInUse":2,"DynamicIPsAvailable":8,"DynamicIPsAvailable":9}}}}"#,
@@ -6491,6 +6539,7 @@ mod network_api_tests {
             r#","Status":{"IPAM":{"Subnets":{}}}"#,
             r#","Status":{"IPAM":{"Subnets":[]}}"#,
             r#","Status":{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":-1,"DynamicIPsAvailable":"bad"}}}}"#,
+            r#","Status":{"IPAM":{"Subnets":{"not-a-cidr":{"IPsInUse":1,"DynamicIPsAvailable":8}}}}"#,
             r#","Status":{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"DynamicIPsAvailable":8},"192.0.2.0/24":{"IPsInUse":2,"DynamicIPsAvailable":9}}}}"#,
             r#","Status":{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"DynamicIPsAvailable":8}}},"IPAM":{"Subnets":{}}}"#,
             r#","Status":{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"DynamicIPsAvailable":8}}}},"Status":{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":2,"DynamicIPsAvailable":9}}}}"#,

@@ -80,10 +80,12 @@ disabled when the container read is stale or fails.
 
 Verbose IPAM inspection reports only aggregate point-in-time used/reserved and
 dynamically available IP allocation counts when the local Docker Engine reports
-them. These are not per-network traffic totals; per-container/interface
-counters are not aggregated. Subnet/CIDR keys, addresses, endpoint data, and raw
-status are not exposed. Podman/rootless behavior remains unvalidated for this
-usage data.
+them. Invalid subnet CIDR keys and duplicate networks after CIDR normalization
+make the aggregates unavailable, as do missing, malformed, ambiguous, negative,
+or overflowing metric values. These are not per-network traffic totals;
+per-container/interface counters are not aggregated. Subnet/CIDR keys,
+addresses, endpoint data, and raw status are not exposed. Podman/rootless
+behavior remains unvalidated for this usage data.
 
 The optional read-only `local_engine_reads_verbose_ipam_allocation_for_existing_network_read_only`
 test passed on 2026-10-11 against Docker Engine 29.9.0/API 1.56 with

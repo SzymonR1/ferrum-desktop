@@ -23,12 +23,13 @@ the current container inventory and to show network-attachment controls.
 When the Docker Engine reports verbose IPAM status, inspection also shows
 aggregate point-in-time allocation counts across its reported subnets: IPs in
 use (including reserved addresses) and dynamically available IPs. These are
-allocation counts, not traffic counters. Missing, malformed, ambiguous, or
-overflowing values are shown as “Not reported”; attached-container count is a
-separate membership snapshot. Subnet/CIDR keys, addresses, endpoints, and raw
-status are not exposed. The Engine API does not expose per-network traffic
-totals through this endpoint; per-container/interface counters exist but are
-not aggregated here.
+allocation counts, not traffic counters. Missing, malformed, negative, or
+overflowing metrics, invalid subnet CIDR keys, and duplicate subnets after CIDR
+normalization are shown as “Not reported”; attached-container count is a
+separate membership snapshot.
+Subnet/CIDR keys, addresses, endpoints, and raw status are not exposed. The
+Engine API does not expose per-network traffic totals through this endpoint;
+per-container/interface counters exist but are not aggregated here.
 
 Engine-provided network names/metadata and attached-container names are
 untrusted text. Ferrum visibly escapes selected controls, bidi/zero-width and

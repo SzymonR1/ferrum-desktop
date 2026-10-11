@@ -92,8 +92,9 @@ attached-container count. The `Containers` map keys are retained only as full
 64-character hexadecimal IDs when every key is valid; endpoint values are
 discarded. Container names are shown only from the current inventory. When
 verbose inspect reports IPAM status, Ferrum retains only aggregate
-`IPsInUse` and `DynamicIPsAvailable` allocation counts across subnets; missing,
-malformed, ambiguous, negative, or overflowing metrics remain unavailable.
+`IPsInUse` and `DynamicIPsAvailable` allocation counts across subnets. Missing,
+malformed, negative, or overflowing metrics, invalid CIDR keys, and subnet
+duplicates after CIDR normalization make the aggregates unavailable.
 Subnet/CIDR keys, addresses, endpoint names/IDs/configuration, labels, options,
 peers, services, raw status, and raw response bodies are not retained or
 displayed. These are not per-network traffic counters.
@@ -130,9 +131,10 @@ Connect/disconnect events include both network and container IDs; names,
 endpoints, error text, and daemon bodies are excluded. These process traces are
 not persistent or tamper-proof. Only one network mutation may be active, and
 context switching is blocked until it returns. Inspection exposes only
-point-in-time aggregate IPAM allocation counts when reported; missing or
-invalid counts remain unavailable. Subnet/CIDR keys, addresses, endpoint data,
-and raw status are not exposed. These are not per-network traffic totals;
+point-in-time aggregate IPAM allocation counts when reported; malformed or
+negative counts, invalid CIDR keys, normalized duplicate subnets, and overflow
+remain unavailable. Subnet/CIDR keys, addresses, endpoint data, and raw status
+are not exposed.
 per-container/interface counters are not aggregated. Credential access is not
 provided. Podman/rootless and remote endpoints remain unsupported or
 unvalidated.

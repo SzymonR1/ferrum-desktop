@@ -132,12 +132,13 @@ not been visually validated.
 
 Network IPAM usage fake-socket regressions exercise the `verbose=true` inspect
 request, aggregation across subnets, missing/empty status, missing or invalid
-negative counts, duplicate status/IPAM/subnet/metric fields, repeated CIDR
-records, and checked-addition overflow.
-Malformed allocation usage remains unavailable without hiding valid network
-inspection or membership. Headless Networks coverage checks reported versus
-unavailable allocation counts and labels them explicitly as point-in-time
-allocation rather than traffic. Neither coverage contacts or mutates an engine.
+counts, invalid IPv4/IPv6 CIDR keys, equivalent subnet keys after normalization,
+duplicate status/IPAM/subnet/metric fields, repeated CIDR records, and checked
+addition overflow. Malformed allocation usage remains unavailable without
+hiding valid network inspection or membership. Headless Networks coverage checks
+reported versus unavailable allocation counts and labels them explicitly as
+point-in-time allocation rather than traffic. Neither coverage contacts or
+mutates an engine.
 
 The optional ignored live volume create/remove test is mutating and requires
 the current local Docker CLI context to use a Unix socket:
