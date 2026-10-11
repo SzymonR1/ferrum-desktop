@@ -5135,6 +5135,7 @@ mod event_reconciliation_tests {
                 enable_ipv6: Some(false),
                 attached_container_count: Some(0),
                 attached_container_ids: None,
+                ipam_usage: ferrum_core::NetworkIpamUsage::default(),
             }),
         );
         let (action_sender, action_receiver) = std::sync::mpsc::channel();

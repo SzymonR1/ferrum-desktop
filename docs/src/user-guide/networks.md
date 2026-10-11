@@ -16,9 +16,20 @@ membership IDs only when the `Containers` map is present and every key is a
 full 64-character hexadecimal ID. Endpoint values are discarded. A missing
 map means the count is not reported; an empty map means zero. Ferrum never
 retains or displays endpoint names, endpoint IDs/configuration, addresses,
-labels, options, IPAM, peers, services, status, or raw response bodies. The
-validated membership set is used only to compare exact container IDs against
+labels, options, raw status, subnet/CIDR keys, endpoint data, peers, or services.
+The validated membership set is used only to compare exact container IDs against
 the current container inventory and to show network-attachment controls.
+
+When the Docker Engine reports verbose IPAM status, inspection also shows
+aggregate point-in-time allocation counts across its reported subnets: IPs in
+use (including reserved addresses) and dynamically available IPs. These are
+allocation counts, not traffic counters. Missing, malformed, negative, or
+overflowing metrics, invalid subnet CIDR keys, and duplicate subnets after CIDR
+normalization are shown as “Not reported”; attached-container count is a
+separate membership snapshot.
+Subnet/CIDR keys, addresses, endpoints, and raw status are not exposed. The
+Engine API does not expose per-network traffic totals through this endpoint;
+per-container/interface counters exist but are not aggregated here.
 
 Engine-provided network names/metadata and attached-container names are
 untrusted text. Ferrum visibly escapes selected controls, bidi/zero-width and
@@ -74,7 +85,7 @@ the network list is marked stale and must be reloaded before another action.
 Only one network mutation may be active, and context switching is blocked
 until its result arrives.
 
-Network usage statistics and credential access are not provided. This
+Per-network traffic totals and credential access are not provided. This
 implementation is scoped to the selected local Docker Unix socket on Linux;
 this scope statement is not a platform or engine support claim.
 Podman/rootless behavior remains unvalidated, remote endpoints are unsupported,

@@ -84,6 +84,34 @@ async fn local_engine_lists_and_inspects_existing_network_read_only() {
     assert_eq!(details.name, name);
     let _: Option<usize> = details.attached_container_count;
 }
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires an existing local Docker network with verbose IPAM counts; read-only"]
+async fn local_engine_reads_verbose_ipam_allocation_for_existing_network_read_only() {
+    let name = std::env::var("FERRUM_TEST_NETWORK")
+        .expect("set FERRUM_TEST_NETWORK to an existing network with IPAM status");
+    assert!(!name.is_empty(), "FERRUM_TEST_NETWORK must not be empty");
+    let engine = EngineClient::connect_default()
+        .await
+        .expect("local engine should be accessible");
+    let networks = engine
+        .list_networks()
+        .await
+        .expect("network inventory should be readable");
+    let listed = networks
+        .iter()
+        .find(|network| network.name == name)
+        .expect("configured existing network must appear in inventory");
+    let details = engine
+        .inspect_network(&listed.id)
+        .await
+        .expect("configured existing network should be inspectable");
+    assert!(
+        details.ipam_usage.ips_in_use.is_some()
+            || details.ipam_usage.dynamic_ips_available.is_some(),
+        "configured network should report at least one verbose IPAM count"
+    );
+}
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
