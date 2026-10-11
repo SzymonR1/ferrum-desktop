@@ -18,7 +18,7 @@ enum OscState {
     InOsc {
         bytes: usize,
     },
-    EscapeAfterOsc,
+    ParserEscape,
     DiscardOsc,
 }
 
@@ -53,7 +53,7 @@ impl OscStringLimiter {
                         parser.process(&sequence);
                         bytes = &bytes[1..];
                         self.state = if escape_keeps_pending(byte) {
-                            OscState::EscapeAfterOsc
+                            OscState::ParserEscape
                         } else {
                             OscState::Ground
                         };
@@ -65,7 +65,7 @@ impl OscStringLimiter {
                         parser.process(&bytes[..1]);
                         bytes = &bytes[1..];
                         self.state = if terminator == 0x1b {
-                            OscState::EscapeAfterOsc
+                            OscState::ParserEscape
                         } else {
                             OscState::Ground
                         };
@@ -91,14 +91,14 @@ impl OscStringLimiter {
                         };
                     }
                 }
-                OscState::EscapeAfterOsc => {
+                OscState::ParserEscape => {
                     let byte = bytes[0];
                     parser.process(&bytes[..1]);
                     bytes = &bytes[1..];
                     self.state = if byte == b']' {
                         OscState::InOsc { bytes: 0 }
                     } else if escape_keeps_pending(byte) {
-                        OscState::EscapeAfterOsc
+                        OscState::ParserEscape
                     } else {
                         OscState::Ground
                     };
@@ -111,7 +111,7 @@ impl OscStringLimiter {
                     parser.process(&bytes[terminator_index..terminator_index + 1]);
                     bytes = &bytes[terminator_index + 1..];
                     self.state = if terminator == 0x1b {
-                        OscState::EscapeAfterOsc
+                        OscState::ParserEscape
                     } else {
                         OscState::Ground
                     };
