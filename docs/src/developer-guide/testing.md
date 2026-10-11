@@ -130,6 +130,15 @@ perform no mutations. UI coverage checks reported zero versus unavailable
 values, separate usage errors, and stale responses. The native Volumes page has
 not been visually validated.
 
+Network IPAM usage fake-socket regressions exercise the `verbose=true` inspect
+request, aggregation across subnets, missing/empty status, missing or invalid
+negative counts, duplicate status/IPAM/subnet/metric fields, repeated CIDR
+records, and checked-addition overflow.
+Malformed allocation usage remains unavailable without hiding valid network
+inspection or membership. Headless Networks coverage checks reported versus
+unavailable allocation counts and labels them explicitly as point-in-time
+allocation rather than traffic. Neither coverage contacts or mutates an engine.
+
 The optional ignored live volume create/remove test is mutating and requires
 the current local Docker CLI context to use a Unix socket:
 
@@ -156,6 +165,17 @@ context. It lists networks, then inspects the matching listed network ID:
 ```sh
 FERRUM_TEST_NETWORK=my-existing-network cargo test -p ferrum-engine --test live_engine local_engine_lists_and_inspects_existing_network_read_only -- --exact --ignored
 ```
+
+The optional ignored live IPAM check is also read-only. Set
+`FERRUM_TEST_NETWORK` to an existing local network that reports at least one
+verbose IPAM allocation count:
+
+```sh
+FERRUM_TEST_NETWORK=bridge cargo test -p ferrum-engine --test live_engine local_engine_reads_verbose_ipam_allocation_for_existing_network_read_only -- --exact --ignored
+```
+
+It only lists and inspects the selected network; it does not create, connect,
+disconnect, or remove resources.
 
 An optional ignored live test creates and removes one uniquely named default
 bridge network through the current local Docker Unix context. It preflights

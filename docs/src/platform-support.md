@@ -78,6 +78,19 @@ single-flight and block context switching. Container-change events invalidate
 cached state; a Networks refresh reloads both inventories, and controls remain
 disabled when the container read is stale or fails.
 
+Verbose IPAM inspection reports only aggregate point-in-time used/reserved and
+dynamically available IP allocation counts when the local Docker Engine reports
+them. These are not per-network traffic totals; per-container/interface
+counters are not aggregated. Subnet/CIDR keys, addresses, endpoint data, and raw
+status are not exposed. Podman/rootless behavior remains unvalidated for this
+usage data.
+
+The optional read-only `local_engine_reads_verbose_ipam_allocation_for_existing_network_read_only`
+test passed on 2026-10-11 against Docker Engine 29.9.0/API 1.56 with
+`FERRUM_TEST_NETWORK=bridge`. It confirmed that this local engine reports an
+aggregate allocation count. This does not validate other engines or endpoints;
+the native Networks page remains visually unverified.
+
 The opt-in live attachment test requires a current local Unix Docker context
 and a preinstalled `FERRUM_TEST_IMAGE` containing `/bin/sleep`. On 2026-10-10
 it passed against Docker Engine 29.9.0/API 1.56: the test created a uniquely
