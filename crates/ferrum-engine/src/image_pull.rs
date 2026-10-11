@@ -26,12 +26,108 @@ const MAX_STATUS_BYTES: usize = 256;
 /// Ferrum's HTTP response stream; it does not guarantee that the daemon-side
 /// pull is stopped.
 pub struct ImagePullStream {
-    body: hyper::body::Incoming,
+    inner: ImageProgressStream,
     endpoint_label: &'static str,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ImageProgressRecord {
+    pub(crate) status: String,
+    pub(crate) current_bytes: Option<u64>,
+    pub(crate) total_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ImageProgressStreamError {
+    Malformed,
+    DaemonFailure,
+    Interrupted,
+}
+
+pub(crate) struct ImageProgressStream {
+    body: hyper::body::Incoming,
     pending: Vec<u8>,
     frame: Option<Bytes>,
     frame_offset: usize,
     finished: bool,
+}
+
+impl ImageProgressStream {
+    pub(crate) fn new(body: hyper::body::Incoming) -> Self {
+        Self {
+            body,
+            pending: Vec::with_capacity(256),
+            frame: None,
+            frame_offset: 0,
+            finished: false,
+        }
+    }
+
+    pub(crate) async fn next_record(
+        &mut self,
+    ) -> Result<Option<ImageProgressRecord>, ImageProgressStreamError> {
+        loop {
+            if let Some(frame) = self.frame.as_ref() {
+                let remaining = &frame[self.frame_offset..];
+                if let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') {
+                    let line_len = self.pending.len().saturating_add(newline);
+                    if line_len > MAX_JSON_LINE_BYTES {
+                        return Err(ImageProgressStreamError::Malformed);
+                    }
+                    self.pending.extend_from_slice(&remaining[..newline]);
+                    let result = parse_line(&self.pending);
+                    self.frame_offset += newline + 1;
+                    self.pending.clear();
+                    let result = result.map_err(Self::parse_error)?;
+                    if let Some(progress) = result {
+                        return Ok(Some(progress));
+                    }
+                    continue;
+                }
+
+                let remaining_len = remaining.len();
+                if self.pending.len().saturating_add(remaining_len) > MAX_JSON_LINE_BYTES {
+                    return Err(ImageProgressStreamError::Malformed);
+                }
+                self.pending.extend_from_slice(remaining);
+                self.frame = None;
+                self.frame_offset = 0;
+                continue;
+            }
+
+            if self.finished {
+                if self.pending.is_empty() {
+                    return Ok(None);
+                }
+                let line = std::mem::take(&mut self.pending);
+                return parse_line(&line).map_err(Self::parse_error);
+            }
+
+            let frame = timeout(IDLE_TIMEOUT, self.body.frame())
+                .await
+                .map_err(|_| ImageProgressStreamError::Interrupted)?;
+            match frame {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        validate_http_data_frame(data.len())
+                            .map_err(|_| ImageProgressStreamError::Malformed)?;
+                        if !data.is_empty() {
+                            self.frame = Some(data.clone());
+                        }
+                    }
+                }
+                Some(Err(_)) => return Err(ImageProgressStreamError::Interrupted),
+                None => self.finished = true,
+            }
+        }
+    }
+
+    fn parse_error(error: ImageProgressParseError) -> ImageProgressStreamError {
+        match error {
+            ImageProgressParseError::Malformed => ImageProgressStreamError::Malformed,
+            ImageProgressParseError::DaemonFailure => ImageProgressStreamError::DaemonFailure,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -85,15 +181,10 @@ pub(crate) async fn open_image_pull(
         });
     }
     Ok(ImagePullStream {
-        body: response.into_body(),
+        inner: ImageProgressStream::new(response.into_body()),
         endpoint_label,
-        pending: Vec::with_capacity(256),
-        frame: None,
-        frame_offset: 0,
-        finished: false,
     })
 }
-
 impl ImagePullStream {
     /// Returns the next safe progress update, or `None` when the stream ends.
     ///
@@ -102,75 +193,22 @@ impl ImagePullStream {
     /// Returns a safe typed error if the daemon reports a failed pull or the
     /// response is malformed, oversized, interrupted, or idle for 60 seconds.
     pub async fn next_progress(&mut self) -> Result<Option<ImagePullProgress>, EngineError> {
-        loop {
-            if let Some(frame) = self.frame.as_ref() {
-                let remaining = &frame[self.frame_offset..];
-                if let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') {
-                    let line_len = self.pending.len().saturating_add(newline);
-                    if line_len > MAX_JSON_LINE_BYTES {
-                        return Err(self.interrupted());
-                    }
-                    self.pending.extend_from_slice(&remaining[..newline]);
-                    let result =
-                        parse_line(&self.pending).map_err(|error| self.parse_error(error))?;
-                    self.frame_offset += newline + 1;
-                    self.pending.clear();
-                    if let Some(progress) = result {
-                        return Ok(Some(progress));
-                    }
-                    continue;
-                }
-
-                let remaining_len = remaining.len();
-                if self.pending.len().saturating_add(remaining_len) > MAX_JSON_LINE_BYTES {
-                    return Err(self.interrupted());
-                }
-                self.pending.extend_from_slice(remaining);
-                self.frame = None;
-                self.frame_offset = 0;
-                continue;
+        match self.inner.next_record().await {
+            Ok(Some(progress)) => Ok(Some(ImagePullProgress {
+                status: progress.status,
+                current_bytes: progress.current_bytes,
+                total_bytes: progress.total_bytes,
+            })),
+            Ok(None) => Ok(None),
+            Err(ImageProgressStreamError::DaemonFailure) => Err(EngineError::ImagePullFailed),
+            Err(ImageProgressStreamError::Malformed | ImageProgressStreamError::Interrupted) => {
+                Err(EngineError::ImagePullStreamInterrupted {
+                    endpoint_label: self.endpoint_label,
+                })
             }
-
-            if self.finished {
-                if self.pending.is_empty() {
-                    return Ok(None);
-                }
-                let line = std::mem::take(&mut self.pending);
-                return parse_line(&line).map_err(|error| self.parse_error(error));
-            }
-
-            let frame = timeout(IDLE_TIMEOUT, self.body.frame())
-                .await
-                .map_err(|_| self.interrupted())?;
-            match frame {
-                Some(Ok(frame)) => {
-                    if let Some(data) = frame.data_ref() {
-                        validate_http_data_frame(data.len())
-                            .map_err(|error| self.parse_error(error))?;
-                        if !data.is_empty() {
-                            self.frame = Some(data.clone());
-                        }
-                    }
-                }
-                Some(Err(_)) => return Err(self.interrupted()),
-                None => self.finished = true,
-            }
-        }
-    }
-
-    fn interrupted(&self) -> EngineError {
-        EngineError::ImagePullStreamInterrupted {
-            endpoint_label: self.endpoint_label,
-        }
-    }
-    fn parse_error(&self, error: PullParseError) -> EngineError {
-        match error {
-            PullParseError::Malformed => self.interrupted(),
-            PullParseError::DaemonFailure => EngineError::ImagePullFailed,
         }
     }
 }
-
 fn valid_reference(reference: &str) -> bool {
     !reference.is_empty()
         && reference.len() <= MAX_IMAGE_REFERENCE_BYTES
@@ -179,32 +217,32 @@ fn valid_reference(reference: &str) -> bool {
             .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
 }
 
-fn parse_line(bytes: &[u8]) -> Result<Option<ImagePullProgress>, PullParseError> {
+fn parse_line(bytes: &[u8]) -> Result<Option<ImageProgressRecord>, ImageProgressParseError> {
     let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
     if bytes.is_empty() {
         return Ok(None);
     }
     if bytes.len() > MAX_JSON_LINE_BYTES {
-        return Err(PullParseError::Malformed);
+        return Err(ImageProgressParseError::Malformed);
     }
     let record: PullRecord =
-        serde_json::from_slice(bytes).map_err(|_| PullParseError::Malformed)?;
+        serde_json::from_slice(bytes).map_err(|_| ImageProgressParseError::Malformed)?;
     if record.error.is_some() || record.error_detail.is_some() {
-        return Err(PullParseError::DaemonFailure);
+        return Err(ImageProgressParseError::DaemonFailure);
     }
     let status = sanitize_status(record.status.unwrap_or_default());
     let (current_bytes, total_bytes) = record
         .progress_detail
         .map_or((None, None), |progress| (progress.current, progress.total));
-    Ok(Some(ImagePullProgress {
+    Ok(Some(ImageProgressRecord {
         status,
         current_bytes,
         total_bytes,
     }))
 }
-fn validate_http_data_frame(frame_len: usize) -> Result<(), PullParseError> {
+fn validate_http_data_frame(frame_len: usize) -> Result<(), ImageProgressParseError> {
     if frame_len > MAX_HTTP_DATA_FRAME_BYTES {
-        Err(PullParseError::Malformed)
+        Err(ImageProgressParseError::Malformed)
     } else {
         Ok(())
     }
@@ -212,7 +250,7 @@ fn validate_http_data_frame(frame_len: usize) -> Result<(), PullParseError> {
 
 // Public errors intentionally don't carry daemon text or response metadata.
 #[derive(Clone, Copy)]
-enum PullParseError {
+enum ImageProgressParseError {
     Malformed,
     DaemonFailure,
 }
@@ -582,7 +620,7 @@ mod tests {
         assert!(validate_http_data_frame(MAX_HTTP_DATA_FRAME_BYTES).is_ok());
         assert!(matches!(
             validate_http_data_frame(MAX_HTTP_DATA_FRAME_BYTES + 1),
-            Err(PullParseError::Malformed)
+            Err(ImageProgressParseError::Malformed)
         ));
     }
     #[test]

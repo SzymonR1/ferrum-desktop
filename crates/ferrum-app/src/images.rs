@@ -3,7 +3,10 @@ use crate::{display::escape_untrusted_display_text, search::CaseInsensitiveQuery
 #[cfg(target_os = "linux")]
 use crate::image_build::{ImageBuildError, ImageBuildRequest};
 use eframe::egui;
-use ferrum_core::{ImageDetails, ImageHistoryEntry, ImagePullProgress, ImageSummary};
+use ferrum_core::{
+    ImageDetails, ImageHistoryEntry, ImagePullProgress, ImagePushProgress, ImagePushTarget,
+    ImageSummary,
+};
 use std::fmt::Display;
 #[cfg(target_os = "linux")]
 use std::{collections::VecDeque, path::PathBuf};
@@ -98,6 +101,11 @@ pub(super) struct ImageTagRequest {
     pub(super) repository: String,
     pub(super) tag: String,
 }
+pub(super) struct ImagePushRequest {
+    pub(super) generation: u64,
+    pub(super) image_id: String,
+    pub(super) target: ImagePushTarget,
+}
 
 #[derive(Default)]
 pub(super) struct ImagesView {
@@ -128,6 +136,25 @@ pub(super) struct ImagesView {
     pull_error: Option<String>,
     pull_requested: bool,
     hide_progress_requested: bool,
+    push_generation: u64,
+    // Survives view invalidation; only the matching terminal event releases it.
+    active_push_generation: Option<u64>,
+    push_target_reference: String,
+    push_confirmation_open: bool,
+    push_confirmation_image_id: Option<String>,
+    push_confirmation_target: Option<ImagePushTarget>,
+    push_confirmed: bool,
+    push_requested: bool,
+    hide_push_progress_requested: bool,
+    push_loading: bool,
+    push_progress_hidden: bool,
+    push_complete: bool,
+    // An ambiguous push result keeps the mutation gate latched for this session.
+    push_outcome_uncertain: bool,
+    push_progress: Option<ImagePushProgress>,
+    push_error: Option<String>,
+    push_result_image_id: Option<String>,
+    push_result_target: Option<String>,
     tag_repository: String,
     tag_name: String,
     tag_generation: u64,
@@ -298,6 +325,9 @@ impl ImagesView {
     pub(super) fn is_pulling(&self) -> bool {
         self.pull_loading
     }
+    pub(super) fn is_pushing(&self) -> bool {
+        self.push_loading
+    }
     #[cfg(test)]
     pub(super) fn is_pull_progress_hidden(&self) -> bool {
         self.pull_progress_hidden
@@ -305,6 +335,23 @@ impl ImagesView {
     #[cfg(test)]
     pub(super) fn is_pull_complete(&self) -> bool {
         self.pull_complete
+    }
+    #[cfg(test)]
+    pub(super) fn set_push_source_for_test(&mut self, image_id: &str, target_reference: &str) {
+        self.selected_id = Some(image_id.to_owned());
+        self.push_target_reference = target_reference.to_owned();
+    }
+    #[cfg(test)]
+    pub(super) fn push_progress(&self) -> Option<&ImagePushProgress> {
+        self.push_progress.as_ref()
+    }
+    #[cfg(test)]
+    pub(super) fn is_push_complete(&self) -> bool {
+        self.push_complete
+    }
+    #[cfg(test)]
+    pub(super) fn is_push_outcome_uncertain(&self) -> bool {
+        self.push_outcome_uncertain
     }
     #[cfg(target_os = "linux")]
     fn draw_build_controls(
@@ -403,13 +450,20 @@ impl ImagesView {
     }
     pub(super) fn has_mutation_in_flight(&self) -> bool {
         let mut busy = self.active_pull_generation.is_some()
+            || self.active_push_generation.is_some()
+            || self.push_confirmation_open
+            || self.push_confirmed
+            || self.push_requested
             || self.tag_loading
             || self.remove_loading
             || self.tag_confirmation_open
             || self.remove_confirmation_open;
         #[cfg(target_os = "linux")]
         {
-            busy |= self.active_build_generation.is_some() || self.build_confirmation_open;
+            busy |= self.active_build_generation.is_some()
+                || self.build_confirmation_open
+                || self.build_confirmed
+                || self.build_requested;
         }
         busy
     }
@@ -418,6 +472,12 @@ impl ImagesView {
     }
     pub(super) fn take_hide_progress_requested(&mut self) -> bool {
         std::mem::take(&mut self.hide_progress_requested)
+    }
+    pub(super) fn take_push_requested(&mut self) -> bool {
+        std::mem::take(&mut self.push_requested)
+    }
+    pub(super) fn take_hide_push_progress_requested(&mut self) -> bool {
+        std::mem::take(&mut self.hide_push_progress_requested)
     }
     #[cfg(test)]
     pub(super) fn set_pull_reference(&mut self, reference: String) {
@@ -435,6 +495,7 @@ impl ImagesView {
     pub(super) fn invalidate(&mut self) {
         self.reset_inventory();
         self.invalidate_pull_view();
+        self.invalidate_push_view();
         #[cfg(target_os = "linux")]
         {
             self.build_confirmation_open = false;
@@ -476,6 +537,13 @@ impl ImagesView {
         self.images.clear();
         self.visible.clear();
         self.clear_selection();
+        self.push_target_reference.clear();
+        self.push_confirmation_open = false;
+        self.push_confirmation_image_id = None;
+        self.push_confirmation_target = None;
+        self.push_confirmed = false;
+        self.push_requested = false;
+        self.hide_push_progress_requested = false;
         self.tag_confirmation_open = false;
         if !self.tag_loading {
             self.tag_confirmation_image_id = None;
@@ -719,6 +787,176 @@ impl ImagesView {
         self.hide_progress_requested = false;
     }
 
+    pub(super) fn push_target_valid(&self) -> bool {
+        let Some(image_id) = self.selected_id.as_deref() else {
+            return false;
+        };
+        ImagePushTarget::is_valid_reference(&self.push_target_reference)
+            && self
+                .images
+                .iter()
+                .find(|image| image.id == image_id)
+                .is_some_and(|image| {
+                    image
+                        .repo_tags
+                        .iter()
+                        .any(|tag| tag == &self.push_target_reference)
+                })
+    }
+
+    pub(super) fn begin_push_confirmation(&mut self) {
+        if !self.push_target_valid()
+            || self.push_loading
+            || self.push_confirmation_open
+            || self.has_mutation_in_flight()
+        {
+            return;
+        }
+        let Some(image_id) = self.selected_id.clone() else {
+            return;
+        };
+        let Some(target) = ImagePushTarget::parse(&self.push_target_reference) else {
+            return;
+        };
+        self.push_confirmation_image_id = Some(image_id);
+        self.push_confirmation_target = Some(target);
+        self.push_confirmation_open = true;
+        self.push_complete = false;
+        self.push_result_image_id = None;
+        self.push_result_target = None;
+        self.push_error = None;
+    }
+
+    pub(super) fn confirm_push(&mut self) {
+        if self.push_confirmation_open
+            && self.push_confirmation_image_id.is_some()
+            && self.push_confirmation_target.is_some()
+        {
+            self.push_confirmation_open = false;
+            self.push_confirmed = true;
+            self.push_requested = true;
+        }
+    }
+
+    pub(super) fn cancel_push_confirmation(&mut self) {
+        self.push_confirmation_open = false;
+        self.push_confirmation_image_id = None;
+        self.push_confirmation_target = None;
+        self.push_confirmed = false;
+        self.push_requested = false;
+    }
+
+    pub(super) fn begin_push(&mut self) -> Option<ImagePushRequest> {
+        if !std::mem::take(&mut self.push_confirmed) || self.has_mutation_in_flight() {
+            self.cancel_push_confirmation();
+            return None;
+        }
+        let image_id = self.push_confirmation_image_id.take()?;
+        let target = self.push_confirmation_target.take()?;
+        let target_is_still_local = self
+            .images
+            .iter()
+            .find(|image| image.id == image_id)
+            .is_some_and(|image| image.repo_tags.iter().any(|tag| tag == target.as_str()));
+        if !target_is_still_local {
+            self.cancel_push_confirmation();
+            return None;
+        }
+
+        self.push_generation = self.push_generation.wrapping_add(1);
+        self.active_push_generation = Some(self.push_generation);
+        self.push_loading = true;
+        self.push_progress_hidden = false;
+        self.push_complete = false;
+        self.push_outcome_uncertain = false;
+        self.push_progress = None;
+        self.push_error = None;
+        self.push_result_image_id = Some(image_id.clone());
+        self.push_result_target = Some(target.as_str().to_owned());
+        Some(ImagePushRequest {
+            generation: self.push_generation,
+            image_id,
+            target,
+        })
+    }
+
+    pub(super) fn update_push(&mut self, generation: u64, progress: ImagePushProgress) -> bool {
+        if generation != self.push_generation || !self.push_loading {
+            return false;
+        }
+        self.push_progress = Some(progress);
+        true
+    }
+
+    pub(super) fn finish_push(&mut self, generation: u64, result: Result<(), String>) -> bool {
+        if self.active_push_generation != Some(generation) || self.push_outcome_uncertain {
+            return false;
+        }
+        self.active_push_generation = None;
+        if generation != self.push_generation || (!self.push_loading && !self.push_progress_hidden)
+        {
+            self.push_loading = false;
+            self.push_progress_hidden = false;
+            self.push_progress = None;
+            self.push_complete = false;
+            self.push_error = None;
+            self.push_result_image_id = None;
+            self.push_result_target = None;
+            return false;
+        }
+        self.push_loading = false;
+        self.push_progress_hidden = false;
+        self.push_outcome_uncertain = false;
+        match result {
+            Ok(()) => self.push_complete = true,
+            Err(error) => self.push_error = Some(error),
+        }
+        true
+    }
+
+    pub(super) fn finish_push_uncertain(&mut self, generation: u64, error: String) -> bool {
+        if self.active_push_generation != Some(generation) {
+            return false;
+        }
+        self.push_loading = false;
+        self.push_progress_hidden = false;
+        self.push_complete = false;
+        self.push_progress = None;
+        self.push_error = Some(error);
+        self.push_outcome_uncertain = true;
+        true
+    }
+
+    pub(super) fn hide_push_progress(&mut self) {
+        self.push_loading = false;
+        self.push_progress_hidden = true;
+        self.push_progress = None;
+        self.push_error = None;
+        self.push_complete = false;
+    }
+
+    // Invalidate only the displayed generation; an active/uncertain push keeps the mutation gate.
+    fn invalidate_push_view(&mut self) {
+        let push_is_active = self.active_push_generation.is_some();
+        self.push_generation = self.push_generation.wrapping_add(1);
+        self.push_loading = false;
+        self.push_progress_hidden = push_is_active && !self.push_outcome_uncertain;
+        self.push_complete = false;
+        self.push_progress = None;
+        self.push_requested = false;
+        self.hide_push_progress_requested = false;
+        if !push_is_active && !self.push_outcome_uncertain {
+            self.push_error = None;
+            self.push_result_image_id = None;
+            self.push_result_target = None;
+        }
+        self.push_confirmation_open = false;
+        self.push_confirmation_image_id = None;
+        self.push_confirmation_target = None;
+        self.push_confirmed = false;
+        self.push_target_reference.clear();
+    }
+
     pub(super) fn begin_load(&mut self) -> u64 {
         self.reset_inventory();
         self.loading = true;
@@ -816,7 +1054,7 @@ impl ImagesView {
             ui.heading("Pull public image");
             ui.label("Anonymous pulls only; private registry authentication is not supported.");
             if mutation_busy && !self.pull_loading {
-                ui.label("An image operation is in progress; wait for it to finish before starting another pull, tag, or removal.");
+                ui.label("An image operation is in progress; wait for it to finish before starting another pull, push, tag, or removal.");
             }
             ui.horizontal(|ui| {
                 let label = ui.label("Image reference");
@@ -911,6 +1149,7 @@ impl ImagesView {
         self.draw_details(ui);
         self.draw_history(ui);
         self.draw_tag_controls(ui, connected, operations_allowed, mutation_busy);
+        self.draw_push_controls(ui, connected, operations_allowed, mutation_busy);
         self.draw_remove_controls(ui, connected, operations_allowed, mutation_busy);
         request
     }
@@ -1087,9 +1326,13 @@ impl ImagesView {
     }
 
     fn select_image(&mut self, id: String) -> Option<ImageInspectionRequest> {
-        if !self.images.iter().any(|image| image.id == id) {
-            return None;
-        }
+        let image = self.images.iter().find(|image| image.id == id)?;
+        self.push_target_reference = image
+            .repo_tags
+            .iter()
+            .find(|tag| ImagePushTarget::is_valid_reference(tag))
+            .cloned()
+            .unwrap_or_default();
         self.selected_id = Some(id.clone());
         self.details = None;
         self.detail_error = None;
@@ -1110,6 +1353,7 @@ impl ImagesView {
         self.details = None;
         self.detail_error = None;
         self.inspection_loading = false;
+        self.push_target_reference.clear();
         self.history.clear();
         self.history_error = None;
         self.history_loading = false;
@@ -1208,6 +1452,123 @@ impl ImagesView {
                 }
             } else if let Some(error) = &self.tag_error {
                 ui.label("Image tag request failed.");
+                ui.label(error);
+            }
+        });
+    }
+    fn draw_push_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        connected: bool,
+        operations_allowed: bool,
+        mutation_busy: bool,
+    ) {
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.heading("Push selected image");
+            if self.selected_id.is_none() {
+                ui.label("Select an image before pushing it.");
+            }
+            if !operations_allowed && connected {
+                ui.label("Image pushing is available only through the local Docker Unix socket on Linux.");
+            }
+            ui.add_enabled_ui(
+                self.selected_id.is_some() && !self.push_loading && !self.push_confirmation_open,
+                |ui| {
+                    ui.horizontal(|ui| {
+                        let label = ui.label("Existing local repository:tag");
+                        ui.text_edit_singleline(&mut self.push_target_reference)
+                            .labelled_by(label.id);
+                    });
+                },
+            );
+            let target_valid = self.push_target_valid();
+            if self.selected_id.is_some() && !target_valid {
+                ui.label("Select a tagged repository reference already present on this image; tag it first if needed.");
+            }
+            if ui
+                .add_enabled(
+                    connected
+                        && operations_allowed
+                        && !mutation_busy
+                        && target_valid
+                        && !self.push_loading
+                        && !self.push_confirmation_open,
+                    egui::Button::new("Push image"),
+                )
+                .clicked()
+            {
+                self.begin_push_confirmation();
+            }
+            if self.push_confirmation_open
+                && let (Some(image_id), Some(target)) = (
+                    self.push_confirmation_image_id.clone(),
+                    self.push_confirmation_target.as_ref(),
+                )
+            {
+                let safe_image_id = escape_untrusted_display_text(&image_id);
+                let safe_target = escape_untrusted_display_text(target.as_str());
+                let mut confirm_requested = false;
+                let mut cancel_requested = false;
+                ui.group(|ui| {
+                    ui.heading("Confirm image push");
+                    ui.label(format!(
+                        "Push image {safe_image_id} as {safe_target}? This sends image layers and metadata to the registry and may disclose secrets. Only anonymous access is used; registries that require credentials will reject the push. Confirm to send this request to the connected local Docker engine."
+                    ));
+                    ui.horizontal(|ui| {
+                        confirm_requested = ui.button("Confirm push").clicked();
+                        cancel_requested = ui.button("Cancel").clicked();
+                    });
+                });
+                if confirm_requested {
+                    self.confirm_push();
+                }
+                if cancel_requested {
+                    self.cancel_push_confirmation();
+                }
+            }
+            if self.push_outcome_uncertain {
+                ui.colored_label(
+                    egui::Color32::from_rgb(224, 174, 109),
+                    "Push outcome is unknown. The daemon may still be transferring layers; Ferrum keeps image mutations blocked for this session.",
+                );
+                if let Some(target) = self.push_result_target.as_deref() {
+                    let safe_target = escape_untrusted_display_text(target);
+                    ui.label(format!("Unresolved push target: {safe_target}"));
+                }
+                ui.label("Verify registry state before using another image client. Closing Ferrum does not guarantee the transfer stopped.");
+                if let Some(error) = &self.push_error {
+                    ui.label(error);
+                }
+            } else if self.push_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    if let Some(target) = self.push_result_target.as_deref() {
+                        let safe_target = escape_untrusted_display_text(target);
+                        ui.label(format!("Pushing {safe_target}…"));
+                    }
+                });
+                if let Some(progress) = &self.push_progress {
+                    ui.label(&progress.status);
+                    if let Some(current) = progress.current_bytes {
+                        ui.label(format!("{current} bytes uploaded"));
+                    }
+                    if let Some(total) = progress.total_bytes {
+                        ui.label(format!("Total: {total} bytes"));
+                    }
+                }
+                if ui.button("Hide push progress").clicked() {
+                    self.hide_push_progress_requested = true;
+                }
+            } else if self.push_progress_hidden {
+                ui.label("Progress hidden. The registry transfer may continue; other image operations remain disabled until Ferrum receives the terminal response.");
+            } else if self.push_complete {
+                if let Some(target) = &self.push_result_target {
+                    let safe_target = escape_untrusted_display_text(target);
+                    ui.label(format!("Image push completed for {safe_target}."));
+                }
+            } else if let Some(error) = &self.push_error {
+                ui.label("Image push request failed.");
                 ui.label(error);
             }
         });
@@ -1390,6 +1751,18 @@ mod tests {
     fn taggable_view() -> ImagesView {
         let mut view = loaded_view(vec![image("sha256:image", "existing:tag", 1024)]);
         view.selected_id = Some("sha256:image".to_owned());
+        view.tag_repository = "example/image".to_owned();
+        view.tag_name = "release-1".to_owned();
+        view
+    }
+    fn pushable_view() -> ImagesView {
+        let mut view = loaded_view(vec![image(
+            "sha256:image",
+            "registry.example/team/app:stable",
+            1024,
+        )]);
+        view.selected_id = Some("sha256:image".to_owned());
+        view.push_target_reference = "registry.example/team/app:stable".to_owned();
         view.tag_repository = "example/image".to_owned();
         view.tag_name = "release-1".to_owned();
         view
@@ -1643,7 +2016,7 @@ mod tests {
         );
         let _notice = harness.get_by_role_and_label(
             Role::Label,
-            "An image operation is in progress; wait for it to finish before starting another pull, tag, or removal.",
+            "An image operation is in progress; wait for it to finish before starting another pull, push, tag, or removal.",
         );
     }
 
@@ -1678,7 +2051,7 @@ mod tests {
         );
         let _busy_notice = harness.get_by_role_and_label(
             Role::Label,
-            "An image operation is in progress; wait for it to finish before starting another pull, tag, or removal.",
+            "An image operation is in progress; wait for it to finish before starting another pull, push, tag, or removal.",
         );
 
         let mut active = taggable_view();
@@ -2539,7 +2912,7 @@ mod tests {
         );
         let _busy_notice = harness.get_by_role_and_label(
             Role::Label,
-            "An image operation is in progress; wait for it to finish before starting another pull, tag, or removal.",
+            "An image operation is in progress; wait for it to finish before starting another pull, push, tag, or removal.",
         );
         assert!(harness.state_mut().view.finish_pull(generation, Ok(())));
         assert!(!harness.state().view.has_mutation_in_flight());
@@ -2601,5 +2974,173 @@ mod tests {
         ));
         assert!(view.is_pulling());
         assert!(!view.is_pull_complete());
+    }
+    #[test]
+    fn image_push_requires_confirmation_and_cancel_sends_no_request() {
+        let mut view = loaded_view(vec![image(
+            "sha256:image",
+            "registry.example/team/app:stable",
+            1024,
+        )]);
+        view.selected_id = Some("sha256:image".to_owned());
+        view.push_target_reference = "registry.example/team/app:stable".to_owned();
+        let mut harness = harness_for(view);
+        harness.run();
+
+        harness
+            .get_by_role_and_label(Role::Button, "Push image")
+            .click_accesskit();
+        harness.run();
+        let _heading = harness.get_by_role_and_label(Role::Label, "Confirm image push");
+        let _warning = harness.get_by_role_and_label(
+            Role::Label,
+            "Push image sha256:image as registry.example/team/app:stable? This sends image layers and metadata to the registry and may disclose secrets. Only anonymous access is used; registries that require credentials will reject the push. Confirm to send this request to the connected local Docker engine.",
+        );
+        assert!(!harness.state().view.push_requested);
+
+        harness
+            .get_by_role_and_label(Role::Button, "Cancel")
+            .click_accesskit();
+        harness.run();
+        assert!(!harness.state_mut().view.take_push_requested());
+        assert!(!harness.state().view.push_loading);
+    }
+    #[test]
+    fn headless_push_confirmation_accepts_request_and_starts_snapshotted_push() {
+        let view = pushable_view();
+        let mut harness = harness_for(view);
+        harness.run();
+
+        harness
+            .get_by_role_and_label(Role::Button, "Push image")
+            .click_accesskit();
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Confirm push")
+            .click_accesskit();
+        harness.run();
+
+        assert!(harness.state().view.push_requested);
+        assert!(harness.state_mut().view.take_push_requested());
+        let request = harness
+            .state_mut()
+            .view
+            .begin_push()
+            .expect("confirmed push should start");
+        assert_eq!(request.image_id, "sha256:image");
+        assert_eq!(request.target.as_str(), "registry.example/team/app:stable");
+    }
+    #[test]
+    fn image_push_button_requires_a_tag_owned_by_the_selected_image() {
+        let mut view = pushable_view();
+        view.push_target_reference = "registry.example/other:stable".to_owned();
+        let mut harness = harness_for(view);
+        harness.run();
+
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, "Push image")
+                .accesskit_node()
+                .is_disabled()
+        );
+        let _reason = harness.get_by_role_and_label(
+            Role::Label,
+            "Select a tagged repository reference already present on this image; tag it first if needed.",
+        );
+    }
+
+    #[test]
+    fn confirmed_push_keeps_the_selected_source_and_tracks_terminal_progress() {
+        let mut view = pushable_view();
+        view.begin_push_confirmation();
+        view.selected_id = Some("sha256:other".to_owned());
+        view.push_target_reference = "other:tag".to_owned();
+        view.confirm_push();
+        assert!(view.take_push_requested());
+
+        let request = view.begin_push().expect("confirmed local tag should start");
+        assert_eq!(request.image_id, "sha256:image");
+        assert_eq!(request.target.as_str(), "registry.example/team/app:stable");
+        assert!(view.has_mutation_in_flight());
+        assert!(view.update_push(
+            request.generation,
+            ImagePushProgress {
+                status: "Pushing".to_owned(),
+                current_bytes: Some(17),
+                total_bytes: Some(100),
+            },
+        ));
+        assert_eq!(
+            view.push_progress,
+            Some(ImagePushProgress {
+                status: "Pushing".to_owned(),
+                current_bytes: Some(17),
+                total_bytes: Some(100),
+            })
+        );
+        assert!(view.finish_push(request.generation, Ok(())));
+        assert!(view.push_complete);
+        assert!(!view.has_mutation_in_flight());
+    }
+
+    #[test]
+    fn hidden_or_invalidated_push_keeps_its_mutation_gate_until_terminal_event() {
+        let mut view = pushable_view();
+        view.begin_push_confirmation();
+        view.confirm_push();
+        assert!(view.take_push_requested());
+        let request = view.begin_push().unwrap();
+        view.hide_push_progress();
+        assert!(view.push_progress_hidden);
+        assert!(view.has_mutation_in_flight());
+
+        view.pull_reference = "alpine:latest".to_owned();
+        view.tag_confirmed = true;
+        view.tag_confirmation_image_id = Some("sha256:image".to_owned());
+        view.remove_confirmed = true;
+        view.remove_confirmation_image_id = Some("sha256:image".to_owned());
+        assert!(view.begin_pull().is_none());
+        assert!(view.begin_tag().is_none());
+        assert!(view.begin_remove().is_none());
+
+        view.invalidate();
+        assert!(view.has_mutation_in_flight());
+        assert!(!view.is_pushing());
+        assert!(!view.finish_push(request.generation, Err("stale push result".to_owned())));
+        assert!(!view.has_mutation_in_flight());
+        assert!(view.push_error.is_none());
+    }
+    #[test]
+    fn uncertain_push_outcome_latches_the_gate_and_displays_recovery_warning() {
+        let mut view = pushable_view();
+        view.begin_push_confirmation();
+        view.confirm_push();
+        assert!(view.take_push_requested());
+        let request = view.begin_push().unwrap();
+        assert!(view.finish_push_uncertain(
+            request.generation,
+            "push connection outcome is unknown".to_owned()
+        ));
+        assert!(view.is_push_outcome_uncertain());
+        assert!(view.has_mutation_in_flight());
+
+        let mut harness = Harness::new_ui_state(
+            |ui, view: &mut ImagesView| {
+                let mutation_busy = view.has_mutation_in_flight();
+                view.show(ui, true, "", true, mutation_busy, "");
+            },
+            view,
+        );
+        harness.run();
+        let _warning = harness.get_by_role_and_label(
+            Role::Label,
+            "Push outcome is unknown. The daemon may still be transferring layers; Ferrum keeps image mutations blocked for this session.",
+        );
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, "Push image")
+                .accesskit_node()
+                .is_disabled()
+        );
     }
 }

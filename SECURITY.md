@@ -40,15 +40,14 @@ an active pull reader: Ferrum drains the response and keeps the mutation gate
 closed until a terminal event. Closing Ferrum does not guarantee that the
 daemon-side pull stops.
 
-Image pull, tag, and removal requests emit local structured process traces with
-only the static action and a `success`, `not_submitted`, or `request_error`
-outcome. `not_submitted` identifies local image ID, reference, or tag validation
-that occurs before HTTP submission. Image IDs, references, repository tags,
-endpoints, error text, and daemon response bodies are not included in those
-traces.
+Image pull, push, tag, and removal requests emit local structured process traces
+with only the static action and a `success`, `not_submitted`, or `request_error`
+outcome. `not_submitted` identifies local validation rejection before HTTP
+submission. Image IDs, references, repository tags, endpoints, error text, and
+daemon response bodies are not included in those traces.
 
 Ferrum also maintains a Linux-local, bounded JSONL copy of mutation outcomes
-for container lifecycle, image pull/tag/removal, volume create/removal, and
+for container lifecycle, image pull/push/tag/removal, volume create/removal, and
 network create/removal/connect/disconnect requests. `audit.jsonl` is created
 lazily in Ferrum's descriptor-anchored config directory with directory mode
 `0700` and file mode `0600`. Schema version 1 records a timestamp, static
@@ -62,7 +61,7 @@ persistence fails, Ferrum emits a static process warning and does not claim the
 event was persisted; the engine request outcome is unchanged. This is local
 Ferrum-request history only, mutable by the same-UID user, not tamper-proof, and
 does not prove final engine state or record external engine actions.
-Issues #17 and #19 remain open/ready; issue #10 remains open/blocked for
+Issues #16, #17, and #19 remain open/ready; issue #10 remains open/blocked for
 Podman/rootless and broader endpoint validation. No release or platform/endpoint
 support is claimed.
 

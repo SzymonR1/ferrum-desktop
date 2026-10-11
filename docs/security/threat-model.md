@@ -123,6 +123,25 @@ interpolation and service `env_file` resolution are skipped.
   the response until a terminal event, keeping the image-mutation gate closed.
   Page/context invalidation hides stale progress without aborting the reader.
   Closing Ferrum still does not guarantee that daemon-side pull work stops.
+
+- Anonymous image push is limited to one existing `repository:tag` on the
+  selected image and the selected Linux local Docker Unix socket. Ferrum
+  reinspects the selected ID and verifies that tag before submitting the push;
+  this point-in-time check is not atomic with another Docker client. Require
+  confirmation naming the image ID and target, and warn that layers and
+  metadata may contain secrets. Never read Docker config, credential helpers,
+  or stored credentials. The generated API schema marks `X-Registry-Auth`
+  required, but the Docker/Moby client omits it for anonymous access and sends
+  an empty JSON object body; Ferrum follows that path without credentials. A
+  registry requiring auth rejects the operation. Always pass one explicit tag,
+  never the daemon's all-tags behavior. Use bounded, sanitized progress and
+  discard daemon error details and response bodies. Hiding progress or
+  invalidating the page suppresses UI updates but continues draining until a
+  terminal event, keeping the image-mutation gate closed. If the request or
+  stream fails ambiguously without a terminal response, latch the image-mutation
+  gate for the rest of the application session. An interrupted push may have
+  transferred layers; closing/restarting Ferrum does not guarantee daemon-side
+  work stops.
 - Read image layer history only from the selected Linux local Docker Unix
   socket. Bound the response body to 16 MiB and deserialize at most 65,536
   typed rows, then probe one additional value as `IgnoredAny` to reject excess
@@ -153,7 +172,7 @@ interpolation and service `env_file` resolution are skipped.
   platform parameters, and never read or expose response bodies. Typed errors
   expose only safe endpoint/status information; timeout errors must explain
   that state may have changed. Only one image mutation may be active across
-  pull/tag/remove. Page/context invalidation ignores stale UI results but does
+  pull/push/tag/remove. Page/context invalidation ignores stale UI results but does
   not abort or claim to undo a possibly submitted removal; refresh inventory
   after success only while Images is current.
 
@@ -171,7 +190,7 @@ interpolation and service `env_file` resolution are skipped.
   64-character hexadecimal ID. Do not log network/container names, endpoints,
   raw errors, or daemon response bodies. A request error does not prove engine
   state remained unchanged; the durable copy is described below.
-- Emit local structured tracing events when image pull, tag, or removal
+- Emit local structured tracing events when image pull, push, tag, or removal
   requests return, containing only the static action and `success`,
   `not_submitted`, or `request_error` outcome. `not_submitted` identifies local
   validation rejection before HTTP submission. Do not log image IDs,
@@ -180,7 +199,7 @@ interpolation and service `env_file` resolution are skipped.
   durable copy is described below.
 
 - Maintain a Linux-local bounded JSONL copy of Ferrum-originated mutation
-  outcomes for container lifecycle, image pull/tag/removal, volume
+  outcomes for container lifecycle, image pull/push/tag/removal, volume
   create/removal, and network create/removal/connect/disconnect. Lazily create
   `audit.jsonl` in the descriptor-anchored Ferrum config directory, with
   directory mode `0700` and file mode `0600`. Schema v1 contains a timestamp,
@@ -317,14 +336,7 @@ UI click/visual validation remains unverified. IPAM allocation counts are
 implemented as described above; per-network traffic totals are not implemented.
 Issues #17 and #10 remain open; Podman/rootless and remote behavior are not
 claimed.
-Fake-Unix-socket image protocol tests, headless Images UI tests, and controlled
-helper-process Buildx tests do not contact a real engine or mutate images.
-There is no live pull, tag, removal, image build, or image-mutation test.
-Separate opt-in ignored lifecycle, logs, and terminal tests mutate engine state
-using one uniquely named disposable container and only its validated full ID as
-cleanup authority. Logs and terminal tests require locally installed images and
-never pull, tag, or delete images. See
- [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
+Fake-Unix-socket image protocol tests and headless Images UI tests cover tag/removal and anonymous push request/confirmation behavior without contacting a real engine or registry, and without mutating image resources. Push tests verify exact image/tag preflight, one explicit target tag, the empty anonymous JSON body with no auth header, bounded progress, safe HTTP rejection, and daemon error redaction. No live image push, deletion, or other image mutation test is claimed. Fake-socket image protocol tests, headless Images UI tests, and controlled helper-process Buildx tests do not contact a real engine or mutate images. There is no live pull, tag, removal, image build, or image-mutation test. Separate opt-in ignored lifecycle, logs, and terminal tests mutate engine state using one uniquely named disposable container and only its validated full ID as cleanup authority. Logs and terminal tests require locally installed images and never pull, tag, push, or delete images. See [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
 
 The optional ignored volume create/remove test uses the current local Docker
 context's parsed Unix socket path for EngineClient operations. It preflights a

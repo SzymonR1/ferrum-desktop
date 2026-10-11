@@ -8,6 +8,8 @@ mod exec;
 #[cfg(target_os = "linux")]
 mod image_pull;
 #[cfg(target_os = "linux")]
+mod image_push;
+#[cfg(target_os = "linux")]
 mod logs;
 
 pub use contexts::{ContextTransport, DockerContext};
@@ -15,6 +17,8 @@ pub use contexts::{ContextTransport, DockerContext};
 pub use exec::{ExecResizeHandle, ExecSession, TerminalSize};
 #[cfg(target_os = "linux")]
 pub use image_pull::ImagePullStream;
+#[cfg(target_os = "linux")]
+pub use image_push::ImagePushStream;
 #[cfg(target_os = "linux")]
 pub use logs::{ContainerLogStream, ContainerLogsOptions};
 #[cfg(target_os = "linux")]
@@ -41,6 +45,8 @@ use contexts::{
     resolve_startup_source, valid_context_name,
 };
 
+#[cfg(target_os = "linux")]
+use ferrum_core::ImagePushTarget;
 use ferrum_core::{
     ContainerAction, ContainerChange, ContainerDetails, ContainerMount, ContainerState,
     ContainerSummary, ImageDetails, ImageHistoryEntry, ImageSummary, NetworkDetails,
@@ -1699,6 +1705,67 @@ pub enum EngineError {
     #[cfg(target_os = "linux")]
     #[error("The engine could not pull the requested image.")]
     ImagePullFailed,
+    /// The selected local image/tag could not be verified before the push.
+    #[cfg(target_os = "linux")]
+    #[error("The selected local image could not be verified for pushing at the {endpoint_label}.")]
+    ImagePushSourceUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The selected tag no longer refers to the selected local image.
+    #[cfg(target_os = "linux")]
+    #[error("The selected local image tag changed before pushing at the {endpoint_label}.")]
+    ImagePushSourceChanged {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The image-push request could not reach the local engine.
+    #[cfg(target_os = "linux")]
+    #[error("Image pushing is unavailable at the {endpoint_label}.")]
+    ImagePushUnavailable {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The push connection failed after the request may have reached the daemon.
+    #[cfg(target_os = "linux")]
+    #[error(
+        "The image push connection to the {endpoint_label} failed; the registry transfer outcome is unknown."
+    )]
+    ImagePushOutcomeUnknown {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// Opening the push stream timed out; the registry transfer may have started.
+    #[cfg(target_os = "linux")]
+    #[error(
+        "Opening image push at the {endpoint_label} timed out; the registry transfer may have started."
+    )]
+    ImagePushTimedOut {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The local engine rejected the image-push request.
+    #[cfg(target_os = "linux")]
+    #[error("The image push request was rejected at the {endpoint_label} (HTTP {status}).")]
+    ImagePushRejected {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+        /// HTTP response status.
+        status: u16,
+    },
+    /// Image-push progress ended, stalled, or returned malformed or oversized data.
+    #[cfg(target_os = "linux")]
+    #[error(
+        "Image push progress from the {endpoint_label} was interrupted; the registry transfer may continue."
+    )]
+    ImagePushStreamInterrupted {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
+    /// The engine reported that the image push failed.
+    #[cfg(target_os = "linux")]
+    #[error("The engine could not complete the anonymous image push.")]
+    ImagePushFailed,
     /// An image inspection response omitted its required engine identifier.
     #[cfg(target_os = "linux")]
     #[error("The engine at the {endpoint_label} returned image details without an identifier.")]
@@ -1937,6 +2004,34 @@ impl EngineClient {
     #[cfg(target_os = "linux")]
     pub async fn open_image_pull(&self, reference: &str) -> Result<ImagePullStream, EngineError> {
         image_pull::open_image_pull(self, reference).await
+    }
+    /// Opens an anonymous push for one explicitly tagged local image.
+    ///
+    /// The target must be an existing repository:tag reference on the selected
+    /// image. Ferrum reinspects the image before pushing and refuses if the tag
+    /// no longer belongs to that image. The request includes the explicit tag,
+    /// so it never invokes Docker's all-tags push behavior. No registry
+    /// credential store or helper is read; the anonymous request omits
+    /// X-Registry-Auth and sends only an empty JSON auth fallback body.
+    /// Progress text is bounded and sanitized. Dropping the stream closes
+    /// Ferrum's response stream but does not guarantee the daemon-side transfer
+    /// stops.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidImageId` for an invalid image ID,
+    /// `ImagePushSourceUnavailable` or `ImagePushSourceChanged` when the
+    /// selected local source cannot be verified, or safe request/rejection
+    /// errors. `ImagePushTimedOut`, `ImagePushOutcomeUnknown`, and
+    /// `ImagePushStreamInterrupted` mean the registry outcome may be unknown;
+    /// callers must not assume that no layers were transferred.
+    #[cfg(target_os = "linux")]
+    pub async fn open_image_push(
+        &self,
+        image_id: &str,
+        target: &ImagePushTarget,
+    ) -> Result<ImagePushStream, EngineError> {
+        image_push::open_image_push(self, image_id, target).await
     }
 }
 impl EngineClient {

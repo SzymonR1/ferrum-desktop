@@ -314,6 +314,7 @@ pub(super) fn record_network_attachment_result(
 #[derive(Clone, Copy)]
 pub(super) enum ImageMutation {
     Pull,
+    Push,
     Tag,
     Remove,
 }
@@ -323,6 +324,7 @@ impl ImageMutation {
     fn label(self) -> &'static str {
         match self {
             Self::Pull => "pull",
+            Self::Push => "push",
             Self::Tag => "tag",
             Self::Remove => "remove",
         }
@@ -351,7 +353,9 @@ pub(super) fn record_image_mutation_result(
         Err(
             EngineError::InvalidImageId
             | EngineError::InvalidImageReference
-            | EngineError::InvalidImageTagTarget,
+            | EngineError::InvalidImageTagTarget
+            | EngineError::ImagePushSourceUnavailable { .. }
+            | EngineError::ImagePushSourceChanged { .. },
         ) => {
             tracing::warn!(
                 target: "ferrum::audit",
@@ -632,6 +636,13 @@ mod tests {
             endpoint_label: "local Docker Unix socket",
             status: 409,
         });
+        let rejected_push = Err(EngineError::ImagePushRejected {
+            endpoint_label: "local Docker Unix socket",
+            status: 401,
+        });
+        let unverified_push = Err(EngineError::ImagePushSourceChanged {
+            endpoint_label: "local Docker Unix socket",
+        });
 
         tracing::dispatcher::with_default(&dispatcher, || {
             record_image_mutation_result(ImageMutation::Pull, &succeeded);
@@ -643,6 +654,9 @@ mod tests {
             record_image_mutation_result(ImageMutation::Remove, &succeeded);
             record_image_mutation_result(ImageMutation::Remove, &invalid_remove);
             record_image_mutation_result(ImageMutation::Remove, &rejected_remove);
+            record_image_mutation_result(ImageMutation::Push, &succeeded);
+            record_image_mutation_result(ImageMutation::Push, &rejected_push);
+            record_image_mutation_result(ImageMutation::Push, &unverified_push);
         });
 
         let captured = match writer.0.lock() {
@@ -661,6 +675,9 @@ mod tests {
             ("remove", "success"),
             ("remove", "not_submitted"),
             ("remove", "request_error"),
+            ("push", "success"),
+            ("push", "request_error"),
+            ("push", "not_submitted"),
         ];
         assert_eq!(events.len(), expected.len());
         for (line, (action, outcome)) in events.iter().zip(expected) {
@@ -884,6 +901,16 @@ mod tests {
             )
             .await
             .unwrap();
+        store
+            .persist(record_image_mutation_result(
+                ImageMutation::Push,
+                &Err(EngineError::ImagePushRejected {
+                    endpoint_label: "push-endpoint-SENTINEL",
+                    status: 401,
+                }),
+            ))
+            .await
+            .unwrap();
 
         let log_path = root.join("audit.jsonl");
         let contents = fs::read_to_string(&log_path).unwrap();
@@ -895,7 +922,7 @@ mod tests {
         let file_mode = fs::metadata(&log_path).unwrap().permissions().mode() & 0o777;
         let _ = fs::remove_dir_all(&root);
 
-        assert_eq!(records.len(), 6);
+        assert_eq!(records.len(), 7);
         assert!(contents.ends_with('\n'));
         assert_eq!(directory_mode, 0o700);
         assert_eq!(file_mode, 0o600);
@@ -953,6 +980,9 @@ mod tests {
         assert_eq!(records[5]["network_id"], network_id);
         assert_eq!(records[5]["action"], "disconnect");
         assert_eq!(records[5]["outcome"], "request_error");
+        assert_eq!(records[6]["event"], "image_mutation");
+        assert_eq!(records[6]["action"], "push");
+        assert_eq!(records[6]["outcome"], "request_error");
         for sentinel in [
             invalid_id,
             "endpoint-SENTINEL",
@@ -961,6 +991,7 @@ mod tests {
             "volume-scope-SENTINEL",
             "volume-time-SENTINEL",
             "/volume/path-SENTINEL",
+            "push-endpoint-SENTINEL",
             "SECRET",
         ] {
             assert!(

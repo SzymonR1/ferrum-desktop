@@ -27,30 +27,31 @@ be changing. Raw errors, endpoints, names, and daemon response bodies are
 excluded. These events are not a persistent or tamper-proof audit store.
 
 The **Images** page provides image listing and inspection, anonymous public
-pulls, local image tagging, and confirmed local image removal through the Linux
-local Docker Unix socket. Every tag request requires explicit confirmation
-because Docker Engine v1.56 may reassign an existing `repository:tag`; the
-image data remains. Removal confirmation snapshots the selected image ID and
-known repository tags and warns that removing the final reference can delete
-image data. Removal does not force the engine: it may reject images used by
-containers or with other tags. The request sets `noprune=true` to preserve
-untagged parent images, omits `force`, and sends no registry credentials or
-authentication. Ferrum holds one image-mutation gate for pull, tag, or removal.
-**Hide progress** suppresses pull updates but keeps draining the bounded Engine
-response, so the gate remains closed until the pull reaches a terminal response.
-Leaving Images or switching context hides stale updates without aborting the
-reader; closing Ferrum does not guarantee that the daemon stops its pull. A
-timeout or request error does not prove that engine state stayed unchanged.
-Invalidating the page ignores stale UI results but does not abort or claim to
-undo a submitted removal; successful removal refreshes inventory only when
-Images remains current. Build and push remain unavailable. This sub-slice is
-not a release and issue
-[#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) remains open.
-Podman/rootless and remote image endpoints remain unsupported or unvalidated;
-broader endpoint validation remains tracked by the still-open
-[#10](https://github.com/SzymonR1/ferrum-desktop/issues/10). No live image
-pull, tag, or removal operation or test that mutates image resources is claimed;
-native image-page visual validation is not claimed. See the [Images guide](docs/src/user-guide/images.md).
+pulls, local tagging/removal, and anonymous push of one existing local
+`repository:tag` through the Linux local Docker Unix socket. Tagging requires
+confirmation because Docker Engine v1.56 may reassign an existing
+`repository:tag`; the image data remains. Removal confirmation snapshots the
+selected image ID and known tags, warns that removing the final reference can
+delete image data, and uses `noprune=true` without `force`. Push reinspects the
+selected image ID and tag before submission and requires confirmation warning
+that image layers and metadata are sent and may contain secrets. Ferrum does
+not read stored credentials; registries requiring authentication reject the
+push. Ferrum holds one image-mutation gate for pull, push, tag, and removal.
+Hiding pull/push progress or invalidating Images/context suppresses stale
+updates while draining a live response. If a push request/stream ends
+ambiguously without a terminal response, Ferrum keeps the image-mutation gate
+latched for the rest of the session; verify registry state before restarting
+or using another client. Closing Ferrum does not guarantee daemon-side transfer
+cancellation. A timeout or request error does not prove engine or registry
+state remained unchanged.
+Confirmed local Docker Buildx builds are available on Linux as described in
+the Images guide; private-registry authentication remains unavailable. Issue
+[#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) is partial and
+remains open. Dependency [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10)
+remains blocked and open; Podman/rootless and remote image endpoints remain
+unsupported or unvalidated. No live build or image mutation is claimed by tests;
+native image-page visual validation is not claimed. See the
+[Images guide](docs/src/user-guide/images.md).
 
 The **Networks** page lists, inspects, creates, and removes networks through the
 selected local Docker Unix socket on Linux. Creation sends only `Name` and uses
@@ -119,9 +120,10 @@ cargo test -p ferrum-engine --test live_engine local_engine_returns_a_well_forme
 It reads version and inventory and may inspect one existing container; it does not mutate resources.
 The ignored local image list/inspect smoke test is read-only and requires
 `FERRUM_TEST_IMAGE` to name an image already installed locally; it does not pull
-or modify images. Pull, tag, and removal behavior is covered only by fake-socket
-contract tests and headless UI tests; no live image mutation is performed. The
-ignored opt-in volume list/inspect/usage test requires `FERRUM_TEST_VOLUME` to
+or modify images. Pull, push, tag, and removal behavior is covered only by
+fake-socket contract tests and headless UI tests; no live image mutation is
+performed.
+The ignored opt-in volume list/inspect/usage test requires `FERRUM_TEST_VOLUME` to
 name an existing volume on the selected local Docker Unix socket on Linux. It
 lists and inspects the volume, then reads its matching usage data; it remains
 read-only and never mutates or cleans up resources. The ignored read-only
