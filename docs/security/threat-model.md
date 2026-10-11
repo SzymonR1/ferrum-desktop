@@ -13,26 +13,44 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 - Keep direct remote `DOCKER_HOST` TCP/HTTP/HTTPS/SSH and remote Docker context transports disabled. Return typed unsupported errors without fallback to local discovery, and do not read remote TLS/SSH credentials.
 - Do not log or display raw `DOCKER_HOST` values, which may contain sensitive endpoint data.
 - Keep Docker CLI context selection session-only; do not log or display raw context endpoints. Linux `EngineClient::local_socket_path` exposes the already-connected local socket only so trusted local tooling can target the same daemon; it does not change socket permissions and must not be logged or displayed.
-- Keep Compose discovery read-only. `docker compose version --short` detects
-  the installed CLI version without targeting an engine; the project listing
-  alone uses `docker compose ls --all --format json` with Docker global
-  `--host unix://...` pinned to `EngineClient::local_socket_path()`. Run each
-  CLI process with a private isolated Docker config/HOME and a cleared
-  allowlisted environment. If the Compose plugin is in the standard per-user
-  directory, link only its `docker-compose` executable into the private
-  config. Custom `cliPluginsExtraDirs` from the saved config are not loaded;
-  do not copy or load user `config.json`, credentials, or proxy settings. Bound
-  each command to eight seconds and 1 MiB of stdout. Retain/display only
-  escaped project Name and Status; reject malformed or duplicate Name/Status
-  fields and duplicate project identities. Ignore ConfigFiles, paths, raw
-  stderr, and daemon errors. Do not implement Compose-file validation/import,
-  project start/stop/restart, build/pull, logs, or project mutations. Only
-  Linux local Docker was validated; the native page visual check is unavailable.
-  Issue #18 remains open and #10 remains blocked.
-  The Docker CLI and Compose plugin execute with the logged-in Ferrum user's
-  normal filesystem and network permissions; private config/environment
-  isolation is not a sandbox. Treat the installed binaries as trusted local
-  code.
+- Keep Compose discovery read-only. `docker compose version --short` detects the
+installed CLI version without targeting an engine; the project listing alone
+uses `docker compose ls --all --format json` with Docker global
+`--host unix://...` pinned to `EngineClient::local_socket_path()`. Run each CLI
+process with a private isolated Docker config/HOME and a cleared allowlisted
+environment. If the Compose plugin is in the standard per-user directory, link
+only its `docker-compose` executable into the private config. Custom
+`cliPluginsExtraDirs` from the saved config are not loaded; do not copy or load
+user `config.json`, credentials, or proxy settings. Bound each command to eight
+seconds and 1 MiB of stdout. Retain/display only escaped project Name and
+Status; reject malformed or duplicate Name/Status fields and duplicate project
+identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
+
+- Allow an explicit structural validation action for one user-selected local
+`.yaml` or `.yml` file. First preflight the Compose CLI with
+`docker compose version --short` through the private isolated Docker config;
+distinguish a failed preflight from a Compose config-validation failure. Run
+`docker compose --project-directory <parent> --file <selected-file> config
+--quiet --no-interpolate --no-env-resolution` with
+`COMPOSE_DISABLE_ENV_FILE=1`, a cleared allowlisted environment, and the same
+eight-second/1 MiB bounds. Validation is read-only, requires no engine socket,
+and does not mutate project files. Success means structural validation only:
+interpolation and service `env_file` resolution are skipped.
+
+- Treat Compose file references as untrusted filesystem reads. Compose may
+  recursively read local Compose files referenced by `include` or service
+  `extends.file`, including paths outside the selected Compose file's
+  directory, under the logged-in user's permissions. The selected file is not
+  a path-containment boundary. The CLI and plugin are trusted local code, and
+  private config/environment isolation is not a sandbox. Users must validate
+  only trusted Compose files. Keep selected paths and raw diagnostics private;
+  display only a bounded escaped basename and a static result.
+- Defer multiple-file merge, profiles, `.env`/service `env_file` resolution,
+  remote OCI/Git inputs, file import, project start/stop/restart, build/pull,
+  logs, and project mutations. Only Linux local Docker was validated;
+  validation uses no engine, and the native page visual check is unavailable.
+  Issue #18 remains open and #10 remains blocked; no release/support expansion
+  is claimed.
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
 - Escape selected control, bidi, zero-width, invisible-format, Hangul-filler,
   and Unicode-tag characters in engine-provided container inventory/inspection
@@ -173,7 +191,9 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 
 - Remote TCP/HTTP/TLS/SSH transport trust, credentials, and identity validation.
 - Podman API compatibility and rootless endpoint discovery; issue #10 remains open for these and the broader engine matrix.
-- Terminal streams beyond this bounded local exec session, Compose files, external process invocation, archive extraction, and file paths.
+- Compose features not implemented in this slice: multi-file merges, profile
+  selection, `.env`/service `env_file` resolution, remote OCI/Git inputs, file
+  import, project lifecycle actions, build/pull/logs, and project mutations.
 - Credential stores, registry authentication, managed engines, and update delivery.
 
 These surfaces must receive explicit design and tests before their implementation. Engine access should be treated as privileged throughout; API version negotiation is not a security boundary. UI state gating and confirmation reduce accidental destructive operations but cannot constrain a compromised or malicious engine endpoint.
@@ -187,6 +207,11 @@ matching listed ID. The separate ignored network create/remove test preflights
 a generated name, verifies the returned full ID against the exact inventory
 name before arming cleanup, removes only that ID, and confirms its absence.
 Ownership uncertainty never triggers name-based cleanup or prune.
+
+The optional ignored Compose-validation smoke uses a controlled temporary
+project and the installed CLI to exercise relative-path resolution without
+contacting an engine or modifying user project files. The default Compose tests
+use controlled subprocess fixtures and headless UI state coverage.
 
 The opt-in network connect/disconnect smoke test requires the current local
 Unix Docker context and a preinstalled `FERRUM_TEST_IMAGE` containing

@@ -291,16 +291,36 @@ The engine integration targets Linux local Unix sockets. Podman/rootless
 behavior remains unvalidated, remote transports remain unsupported, and Windows
 named pipes and macOS remain deferred to issue #21/M8.
 
-Default Compose discovery tests use controlled CLI fixtures and headless UI
-state; they do not contact a live engine or mutate projects. The subprocess
-seam checks `docker compose version --short` and
-`docker compose ls --all --format json`. The version probe does not target an
-engine; only the listing is pinned with Docker global `--host unix://...` to
-the selected `EngineClient::local_socket_path()`. Tests verify private Docker
-config/HOME, the cleared allowlisted environment, plugin-only linking without
-saved config, refusal to import custom `cliPluginsExtraDirs`, bounded output
-and deadlines, escaped Name/Status, duplicate rejection, static errors, and
-accessible loading/empty/error/refresh states.
+Default Compose discovery and validation tests use controlled CLI fixtures and
+headless UI state; they do not contact a live engine or mutate project files.
+Discovery fixtures check `docker compose version --short` and
+`docker compose ls --all --format json`, with only the listing pinned to the
+selected `EngineClient::local_socket_path()`. Validation preflights
+`docker compose version --short` through the private isolated Docker config;
+preflight failure is distinct from config-validation failure. Validation
+fixtures check the single selected local file passed as an argument to
+`docker compose --project-directory <parent> --file <file> config --quiet
+--no-interpolate --no-env-resolution`, including parent-directory path
+resolution and `COMPOSE_DISABLE_ENV_FILE=1`. Success is structural validation
+only, with interpolation and service `env_file` resolution skipped. The
+fixture also verifies private Docker config/HOME, a cleared environment with
+no inherited engine or credential/proxy settings, and no user config copied
+into the child config. Failure diagnostics and selected paths are not exposed;
+output and subprocess deadlines are bounded.
+
+Headless AccessKit coverage verifies the local file-selection action without
+engine access; the recursive `include`/`extends.file` trusted-file disclosure;
+success wording; validation failure, missing-plugin, and cancelled states;
+bounded escaped basename display; and stale-result rejection. Controlled CLI
+fixtures verify version-probe and config arguments, the same private
+configuration across both commands, selected file/parent paths, a cleared
+environment without inherited engine or credential/proxy settings, plugin-
+unavailable classification before config invocation, redaction, output bounds,
+and deadline cancellation. Run the Compose tests with:
+
+```sh
+cargo test -p ferrum-app --bin ferrum compose::tests::
+```
 
 The optional ignored app-level live smoke requires a local Docker-compatible
 Unix socket and Compose CLI. It only discovers the caller-selected engine's
@@ -311,9 +331,31 @@ starts, stops, or removes projects:
 cargo test -p ferrum-app --bin ferrum compose::tests::local_compose_discovery_smoke_is_read_only -- --exact --ignored
 ```
 
-Only Linux local Docker was validated; Podman/rootless and remote transports
-remain unsupported or unvalidated. The native Compose page visual check is
-unavailable.
+The separate optional ignored validation smoke requires Docker CLI/Compose but
+does not use an engine. It creates a controlled temporary Compose YAML and a
+relative `./data` directory, then runs the isolated CLI config-validation path;
+it does not touch user project files or mutate engine resources:
+
+```sh
+cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_validation_reads_a_controlled_relative_path_project -- --exact --ignored
+```
+
+Validation uses the official [Compose `config` reference](https://docs.docker.com/reference/cli/docker/compose/config),
+[Compose CLI semantics](https://docs.docker.com/reference/cli/docker/compose),
+and [Compose environment-variable guide](https://docs.docker.com/compose/how-tos/environment-variables/envvars/).
+`.env` interpolation and service `env_file` resolution are deliberately
+skipped. Compose may still recursively read local Compose files referenced by
+`include` or service `extends.file`, including paths outside the selected
+file's directory, under the logged-in user's permissions; selection is not a
+containment boundary. The Docker CLI and Compose plugin are trusted local code;
+isolated config is not a sandbox. Validate only trusted files. Multi-file merge,
+profiles, `.env`/service `env_file` resolution, remote OCI/Git inputs, import,
+lifecycle/build/pull/logs, and project mutations remain unsupported.
+
+Only Linux local Docker discovery was validated; validation uses no engine. The
+native Compose page visual check is unavailable, and Podman/rootless and remote
+transports remain unsupported or unvalidated. Issue #18 remains open and #10
+remains blocked; no release/support expansion is claimed.
 
 The `audit::tests` module captures lifecycle trace events in memory and checks
 action/outcome fields, full-ID validation, and omission of untrusted identifiers.

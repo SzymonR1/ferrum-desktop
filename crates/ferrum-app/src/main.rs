@@ -156,6 +156,10 @@ enum EngineEvent {
         generation: u64,
         result: Result<compose::ComposeDiscovery, compose::ComposeError>,
     },
+    ComposeValidationFinished {
+        generation: u64,
+        result: Result<(), compose::ComposeValidationError>,
+    },
     NetworkCreated {
         generation: u64,
         name: String,
@@ -803,6 +807,7 @@ struct FerrumApp {
     resource_read_task: Option<JoinHandle<()>>,
     pending_resource_read: Option<PendingResourceRead>,
     compose_task: Option<JoinHandle<()>>,
+    compose_validation_task: Option<JoinHandle<()>>,
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
     // Hold the reader until the terminal response event releases the mutation gate.
@@ -994,6 +999,7 @@ impl FerrumApp {
             resource_read_task: None,
             pending_resource_read: None,
             compose_task: None,
+            compose_validation_task: None,
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
@@ -1172,7 +1178,55 @@ impl FerrumApp {
         if let Some(task) = self.compose_task.take() {
             task.abort();
         }
+        if let Some(task) = self.compose_validation_task.take() {
+            task.abort();
+        }
         self.compose.invalidate();
+    }
+
+    fn cancel_compose_validation(&mut self, context: egui::Context) {
+        if let Some(task) = self.compose_validation_task.take() {
+            task.abort();
+        }
+        self.compose.cancel_validation();
+        context.request_repaint();
+    }
+
+    fn select_compose_file(&mut self, context: egui::Context) {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Compose YAML files", &["yaml", "yml"])
+                .pick_file()
+            {
+                self.start_compose_validation(path, context);
+            } else {
+                self.compose.cancel_file_selection();
+                context.request_repaint();
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (self, context);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_compose_validation(&mut self, file: std::path::PathBuf, context: egui::Context) {
+        context.request_repaint();
+        if let Some(task) = self.compose_validation_task.take() {
+            task.abort();
+        }
+        let generation = self.compose.begin_validation(&file);
+        let sender = self.sender.clone();
+        self.compose_validation_task = Some(self.runtime.spawn(async move {
+            let result = compose::validate_compose_file(&file).await;
+            if sender
+                .send(EngineEvent::ComposeValidationFinished { generation, result })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
     }
     fn load_compose(&mut self, context: egui::Context) {
         #[cfg(target_os = "linux")]
@@ -2122,6 +2176,11 @@ impl FerrumApp {
                         self.compose_task = None;
                     }
                 }
+                EngineEvent::ComposeValidationFinished { generation, result } => {
+                    if self.compose.finish_validation(generation, result) {
+                        self.compose_validation_task = None;
+                    }
+                }
                 EngineEvent::VolumeInspected {
                     generation,
                     inspection_generation,
@@ -2903,7 +2962,7 @@ impl FerrumApp {
             &self.containers,
         )
     }
-    fn draw_compose(&mut self, ui: &mut egui::Ui) -> bool {
+    fn draw_compose(&mut self, ui: &mut egui::Ui) -> compose::ComposeActions {
         if self.loading {
             ui.spinner();
             ui.heading("Waiting for the engine context");
@@ -2912,6 +2971,7 @@ impl FerrumApp {
                 false,
                 "Compose projects will load when the engine context change finishes.",
                 false,
+                cfg!(target_os = "linux"),
             );
         }
         let engine_selected = self.engine.is_some();
@@ -2943,6 +3003,7 @@ impl FerrumApp {
             available,
             message,
             cfg!(target_os = "linux") && !self.loading,
+            cfg!(target_os = "linux"),
         )
     }
     fn draw_images(&mut self, ui: &mut egui::Ui) -> Option<images::ImageInspectionRequest> {
@@ -3915,7 +3976,7 @@ impl eframe::App for FerrumApp {
         let mut image_inspection = None;
         let mut volume_action = None;
         let mut network_action = None;
-        let mut compose_refresh = false;
+        let mut compose_actions = compose::ComposeActions::default();
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 18)))
             .show(ui, |ui| match self.page {
@@ -3923,9 +3984,15 @@ impl eframe::App for FerrumApp {
                 images::AppPage::Images => image_inspection = self.draw_images(ui),
                 images::AppPage::Volumes => volume_action = self.draw_volumes(ui),
                 images::AppPage::Networks => network_action = self.draw_networks(ui),
-                images::AppPage::Compose => compose_refresh = self.draw_compose(ui),
+                images::AppPage::Compose => compose_actions = self.draw_compose(ui),
             });
-        if compose_refresh {
+        if compose_actions.cancel_validation {
+            self.cancel_compose_validation(context.clone());
+        }
+        if compose_actions.select_file {
+            self.select_compose_file(context.clone());
+        }
+        if compose_actions.refresh {
             self.refresh(context.clone());
         }
         if let Some(index) = inspect_index {
@@ -4430,6 +4497,7 @@ mod event_reconciliation_tests {
             volume_remove_task: None,
             resource_read_task: None,
             compose_task: None,
+            compose_validation_task: None,
             pending_resource_read: None,
             image_list_task: None,
             image_inspection_task: None,
@@ -6283,25 +6351,35 @@ mod event_reconciliation_tests {
     }
 
     #[test]
-    fn leaving_compose_aborts_its_read_and_invalidates_late_results() {
+    fn leaving_compose_aborts_its_reads_and_invalidates_late_results() {
         let (mut app, _) = app_with_open_inspection();
         app.page = images::AppPage::Compose;
         let generation = app.compose.begin_load();
+        let validation_generation = app
+            .compose
+            .begin_validation(std::path::Path::new("/private/compose.yaml"));
         let task = app.runtime.spawn(std::future::pending::<()>());
         let abort = task.abort_handle();
         app.compose_task = Some(task);
+        let validation_task = app.runtime.spawn(std::future::pending::<()>());
+        let validation_abort = validation_task.abort_handle();
+        app.compose_validation_task = Some(validation_task);
 
         app.set_page(images::AppPage::Containers, egui::Context::default());
         app.runtime.block_on(tokio::task::yield_now());
 
         assert!(abort.is_finished());
+        assert!(validation_abort.is_finished());
         assert!(app.compose_task.is_none());
+        assert!(app.compose_validation_task.is_none());
         assert!(!app.compose.is_loading());
         assert!(!app.compose.has_loaded());
+        assert!(!app.compose.is_validation_running());
         assert!(
             !app.compose
                 .finish_load(generation, Err(compose::ComposeError::DockerCliMissing),)
         );
+        assert!(!app.compose.finish_validation(validation_generation, Ok(())));
     }
     #[test]
     fn refreshing_disconnected_volumes_retries_engine_connection() {

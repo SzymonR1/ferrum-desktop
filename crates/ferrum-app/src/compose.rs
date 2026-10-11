@@ -1,5 +1,6 @@
 #[cfg(target_os = "linux")]
 use crate::display::escape_untrusted_display_text;
+use crate::display::escape_untrusted_display_text_with_limit;
 use eframe::egui;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
@@ -12,6 +13,7 @@ const MAX_PROJECTS: usize = 4096;
 const MAX_PROJECT_FIELD_BYTES: usize = 256;
 #[cfg(target_os = "linux")]
 const MAX_VERSION_BYTES: usize = 64;
+const MAX_COMPOSE_FILENAME_DISPLAY_BYTES: usize = 128;
 #[cfg(target_os = "linux")]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -62,6 +64,70 @@ impl ComposeError {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ComposeValidationError {
+    DockerCliMissing,
+    ComposePluginUnavailable,
+    PrivateConfigSetupFailed,
+    InvalidSelectedFile,
+    ValidationFailed,
+}
+
+impl ComposeValidationError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::DockerCliMissing => {
+                "Docker CLI is unavailable. Install Docker CLI to validate Compose files."
+            }
+            Self::ComposePluginUnavailable => {
+                "Docker Compose is unavailable. Install the Docker Compose plugin to validate Compose files."
+            }
+            Self::PrivateConfigSetupFailed => {
+                "Compose validation could not start safely. Try again later."
+            }
+            Self::InvalidSelectedFile => "The selected Compose file could not be validated.",
+            Self::ValidationFailed => "Compose file validation failed.",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum ComposeValidationState {
+    #[default]
+    Idle,
+    Validating {
+        file_name: String,
+    },
+    Succeeded {
+        file_name: String,
+    },
+    Failed {
+        file_name: String,
+        error: ComposeValidationError,
+    },
+    Cancelled {
+        file_name: String,
+    },
+    SelectionCancelled,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ComposeActions {
+    pub(super) refresh: bool,
+    pub(super) select_file: bool,
+    pub(super) cancel_validation: bool,
+}
+
+fn display_compose_basename(path: &std::path::Path) -> String {
+    let Some(file_name) = path.file_name() else {
+        return "[name omitted]".to_owned();
+    };
+    escape_untrusted_display_text_with_limit(
+        file_name.to_string_lossy().into_owned(),
+        MAX_COMPOSE_FILENAME_DISPLAY_BYTES,
+    )
+    .unwrap_or_else(|| "[name omitted]".to_owned())
+}
 
 #[derive(Default)]
 pub(super) struct ComposeView {
@@ -71,6 +137,8 @@ pub(super) struct ComposeView {
     loaded: bool,
     error: Option<ComposeError>,
     generation: u64,
+    validation_generation: u64,
+    validation: ComposeValidationState,
 }
 
 impl ComposeView {
@@ -117,6 +185,53 @@ impl ComposeView {
         true
     }
 
+    pub(super) fn begin_validation(&mut self, path: &std::path::Path) -> u64 {
+        self.validation_generation = self.validation_generation.wrapping_add(1);
+        self.validation = ComposeValidationState::Validating {
+            file_name: display_compose_basename(path),
+        };
+        self.validation_generation
+    }
+
+    pub(super) fn finish_validation(
+        &mut self,
+        generation: u64,
+        result: Result<(), ComposeValidationError>,
+    ) -> bool {
+        if generation != self.validation_generation
+            || !matches!(&self.validation, ComposeValidationState::Validating { .. })
+        {
+            return false;
+        }
+        let ComposeValidationState::Validating { file_name } = std::mem::take(&mut self.validation)
+        else {
+            unreachable!("the validation state was checked above");
+        };
+        self.validation = match result {
+            Ok(()) => ComposeValidationState::Succeeded { file_name },
+            Err(error) => ComposeValidationState::Failed { file_name, error },
+        };
+        true
+    }
+
+    pub(super) fn is_validation_running(&self) -> bool {
+        matches!(&self.validation, ComposeValidationState::Validating { .. })
+    }
+
+    pub(super) fn cancel_validation(&mut self) {
+        if let ComposeValidationState::Validating { file_name } =
+            std::mem::take(&mut self.validation)
+        {
+            self.validation_generation = self.validation_generation.wrapping_add(1);
+            self.validation = ComposeValidationState::Cancelled { file_name };
+        }
+    }
+
+    pub(super) fn cancel_file_selection(&mut self) {
+        self.validation_generation = self.validation_generation.wrapping_add(1);
+        self.validation = ComposeValidationState::SelectionCancelled;
+    }
+
     pub(super) fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.loading = false;
@@ -124,6 +239,8 @@ impl ComposeView {
         self.version = None;
         self.projects.clear();
         self.error = None;
+        self.validation_generation = self.validation_generation.wrapping_add(1);
+        self.validation = ComposeValidationState::Idle;
     }
 
     pub(super) fn show(
@@ -132,17 +249,72 @@ impl ComposeView {
         available: bool,
         unavailable_message: &str,
         refresh_enabled: bool,
-    ) -> bool {
-        let refresh_requested = ui
-            .add_enabled(
-                refresh_enabled && !self.loading,
-                egui::Button::new("Refresh Compose projects"),
-            )
-            .clicked();
+        validation_enabled: bool,
+    ) -> ComposeActions {
+        let mut actions = ComposeActions::default();
+        ui.group(|ui| {
+            ui.colored_label(
+                egui::Color32::from_rgb(224, 174, 109),
+                concat!(
+                    "Security notice: validate only trusted Compose files. ",
+"Docker Compose may recursively read local Compose files referenced by include ",
+"or service extends.file, including files outside the selected file's directory, ",
+"using the logged-in user's permissions. The selected file is not a path ",
+"containment boundary. Validation is read-only, but it is not sandboxed."
+                ),
+            );
+        });
+        ui.horizontal(|ui| {
+            actions.refresh = ui
+                .add_enabled(
+                    refresh_enabled && !self.loading,
+                    egui::Button::new("Refresh Compose projects"),
+                )
+                .clicked();
+            actions.select_file = ui
+                .add_enabled(
+                    validation_enabled && !self.is_validation_running(),
+                    egui::Button::new("Validate Compose file"),
+                )
+                .clicked();
+            if self.is_validation_running() {
+                actions.cancel_validation = ui.button("Cancel validation").clicked();
+            }
+        });
+
+        match &self.validation {
+            ComposeValidationState::Idle => {
+                ui.label("Select one local Compose YAML file to validate its structure.");
+            }
+            ComposeValidationState::Validating { file_name } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Validating Compose file:");
+                    ui.label(file_name);
+                });
+            }
+            ComposeValidationState::Succeeded { file_name } => {
+                ui.label(file_name);
+                ui.label(
+                    "Structural validation succeeded. Environment interpolation and service env_file resolution were skipped.",
+                );
+            }
+            ComposeValidationState::Failed { file_name, error } => {
+                ui.label(file_name);
+                ui.colored_label(egui::Color32::from_rgb(224, 174, 109), error.message());
+            }
+            ComposeValidationState::Cancelled { file_name } => {
+                ui.label(file_name);
+                ui.label("Compose file validation cancelled.");
+            }
+            ComposeValidationState::SelectionCancelled => {
+                ui.label("File selection cancelled.");
+            }
+        }
 
         if !available {
             ui.label(unavailable_message);
-            return refresh_requested;
+            return actions;
         }
         if !unavailable_message.is_empty() {
             ui.label(unavailable_message);
@@ -152,7 +324,7 @@ impl ComposeView {
                 ui.spinner();
                 ui.label("Loading Compose projects…");
             });
-            return refresh_requested;
+            return actions;
         }
         if let Some(error) = &self.error {
             if let Some(version) = &self.version {
@@ -166,11 +338,11 @@ impl ComposeView {
                 "Compose projects unavailable",
             );
             ui.label(error.message());
-            return refresh_requested;
+            return actions;
         }
         if !self.loaded {
             ui.label("Compose projects have not been loaded.");
-            return refresh_requested;
+            return actions;
         }
 
         if let Some(version) = &self.version {
@@ -181,7 +353,7 @@ impl ComposeView {
         }
         if self.projects.is_empty() {
             ui.label("No Compose projects found.");
-            return refresh_requested;
+            return actions;
         }
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -198,8 +370,23 @@ impl ComposeView {
                     }
                 });
         });
-        refresh_requested
+        actions
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn probe_compose_version(
+    binary: &std::path::Path,
+    isolated: &PrivateDockerConfig,
+    search_path: &std::ffi::OsStr,
+    deadline: Duration,
+) -> Result<Vec<u8>, CommandFailure> {
+    use tokio::process::Command;
+
+    let mut command = Command::new(binary);
+    isolated.configure(&mut command, search_path);
+    command.args(["compose", "version", "--short"]);
+    run_command_with_timeout(&mut command, deadline).await
 }
 
 #[cfg(target_os = "linux")]
@@ -213,10 +400,7 @@ async fn discover_with_binary(
 
     let isolated = PrivateDockerConfig::new(user_compose_plugin)
         .map_err(|_| ComposeError::PrivateConfigSetupFailed)?;
-    let mut version_command = Command::new(binary);
-    isolated.configure(&mut version_command, search_path);
-    version_command.args(["compose", "version", "--short"]);
-    let version_output = run_command_with_timeout(&mut version_command, COMMAND_TIMEOUT)
+    let version_output = probe_compose_version(binary, &isolated, search_path, COMMAND_TIMEOUT)
         .await
         .map_err(|failure| match failure {
             CommandFailure::Launch => ComposeError::DockerCliMissing,
@@ -225,7 +409,9 @@ async fn discover_with_binary(
             | CommandFailure::OutputLimit
             | CommandFailure::Io => ComposeError::ComposePluginUnavailable,
         })?;
-    let version = parse_version(&version_output).ok_or(ComposeError::ComposePluginUnavailable)?;
+    let version = parse_version(&version_output)
+        .ok_or(ComposeError::ComposePluginUnavailable)?
+        .to_owned();
     let socket_path = match socket_path.to_str() {
         Some(path) => path,
         None => {
@@ -259,7 +445,7 @@ async fn discover_with_binary(
 }
 
 #[cfg(target_os = "linux")]
-fn parse_version(output: &[u8]) -> Option<String> {
+fn parse_version(output: &[u8]) -> Option<&str> {
     if output.len() > MAX_VERSION_BYTES + 1 {
         return None;
     }
@@ -272,7 +458,7 @@ fn parse_version(output: &[u8]) -> Option<String> {
     {
         return None;
     }
-    Some(output.to_owned())
+    Some(output)
 }
 
 #[cfg(target_os = "linux")]
@@ -589,13 +775,8 @@ fn user_compose_plugin() -> Option<std::path::PathBuf> {
         .flatten()
 }
 #[cfg(target_os = "linux")]
-pub(super) async fn discover_projects(
-    socket_path: &std::path::Path,
-) -> Result<ComposeDiscovery, ComposeError> {
-    use std::env;
-
-    let search_path = env::var_os("PATH").ok_or(ComposeError::DockerCliMissing)?;
-    let binary = env::split_paths(&search_path)
+fn docker_binary(search_path: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    std::env::split_paths(search_path)
         .map(|directory| directory.join("docker"))
         .find_map(|candidate| {
             candidate
@@ -603,7 +784,95 @@ pub(super) async fn discover_projects(
                 .then(|| candidate.canonicalize().ok())
                 .flatten()
         })
-        .ok_or(ComposeError::DockerCliMissing)?;
+}
+
+#[cfg(target_os = "linux")]
+pub(super) async fn validate_compose_file(
+    file: &std::path::Path,
+) -> Result<(), ComposeValidationError> {
+    use std::env;
+
+    let search_path = env::var_os("PATH").ok_or(ComposeValidationError::DockerCliMissing)?;
+    let binary = docker_binary(&search_path).ok_or(ComposeValidationError::DockerCliMissing)?;
+    let user_compose_plugin = user_compose_plugin();
+    validate_with_binary(
+        &binary,
+        file,
+        &search_path,
+        user_compose_plugin.as_deref(),
+        COMMAND_TIMEOUT,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn validate_with_binary(
+    binary: &std::path::Path,
+    file: &std::path::Path,
+    search_path: &std::ffi::OsStr,
+    user_compose_plugin: Option<&std::path::Path>,
+    deadline: Duration,
+) -> Result<(), ComposeValidationError> {
+    use tokio::process::Command;
+
+    if !file.is_absolute() || !file.is_file() {
+        return Err(ComposeValidationError::InvalidSelectedFile);
+    }
+    let parent = file
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .ok_or(ComposeValidationError::InvalidSelectedFile)?;
+    if !parent.is_dir() {
+        return Err(ComposeValidationError::InvalidSelectedFile);
+    }
+
+    let isolated = PrivateDockerConfig::new(user_compose_plugin)
+        .map_err(|_| ComposeValidationError::PrivateConfigSetupFailed)?;
+    let version_output = probe_compose_version(binary, &isolated, search_path, deadline)
+        .await
+        .map_err(|failure| match failure {
+            CommandFailure::Launch => ComposeValidationError::DockerCliMissing,
+            CommandFailure::Rejected
+            | CommandFailure::TimedOut
+            | CommandFailure::OutputLimit
+            | CommandFailure::Io => ComposeValidationError::ComposePluginUnavailable,
+        })?;
+    parse_version(&version_output).ok_or(ComposeValidationError::ComposePluginUnavailable)?;
+    let mut command = Command::new(binary);
+    isolated.configure(&mut command, search_path);
+    command
+        .env("COMPOSE_DISABLE_ENV_FILE", "1")
+        .args(["compose"])
+        .arg("--project-directory")
+        .arg(parent)
+        .arg("--file")
+        .arg(file)
+        .args([
+            "config",
+            "--quiet",
+            "--no-interpolate",
+            "--no-env-resolution",
+        ]);
+    match run_command_with_timeout(&mut command, deadline).await {
+        Ok(_) => Ok(()),
+        Err(CommandFailure::Launch) => Err(ComposeValidationError::DockerCliMissing),
+        Err(
+            CommandFailure::Rejected
+            | CommandFailure::TimedOut
+            | CommandFailure::OutputLimit
+            | CommandFailure::Io,
+        ) => Err(ComposeValidationError::ValidationFailed),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) async fn discover_projects(
+    socket_path: &std::path::Path,
+) -> Result<ComposeDiscovery, ComposeError> {
+    use std::env;
+
+    let search_path = env::var_os("PATH").ok_or(ComposeError::DockerCliMissing)?;
+    let binary = docker_binary(&search_path).ok_or(ComposeError::DockerCliMissing)?;
     let user_compose_plugin = user_compose_plugin();
     discover_with_binary(
         &binary,
@@ -681,9 +950,259 @@ mod tests {
                 .expect("fixture CLI should be executable");
             path
         }
+        struct ValidationFixtureOptions<'a> {
+            version_exit_code: u8,
+            version_output: &'a str,
+            exit_code: u8,
+            diagnostic: &'a str,
+            stdout_chunks: usize,
+            hang: bool,
+        }
+
+        impl Default for ValidationFixtureOptions<'_> {
+            fn default() -> Self {
+                Self {
+                    version_exit_code: 0,
+                    version_output: "v5.6.0\n",
+                    exit_code: 0,
+                    diagnostic: "",
+                    stdout_chunks: 0,
+                    hang: false,
+                }
+            }
+        }
+
+        fn validation_fixture_cli(
+            directory: &FixtureDirectory,
+            expected_project_directory: &std::path::Path,
+            expected_file: &std::path::Path,
+            options: ValidationFixtureOptions<'_>,
+        ) -> PathBuf {
+            let ValidationFixtureOptions {
+                version_exit_code,
+                version_output,
+                exit_code,
+                diagnostic,
+                stdout_chunks,
+                hang,
+            } = options;
+            let stdout = if stdout_chunks == 0 {
+                String::new()
+            } else {
+                format!(
+                    "i=0\nwhile [ \"$i\" -lt {stdout_chunks} ]; do\n  printf '%4097s' ''\n  i=$((i + 1))\ndone\n"
+                )
+            };
+            let hang = if hang { "while :; do :; done\n" } else { "" };
+            let version_config_marker = directory.path().join("validation-version-config");
+            let validation_marker = directory.path().join("validation-command-invoked");
+            let script = format!(
+                "#!/bin/sh\n\
+                 if [ \"$#\" -eq 3 ]; then\n\
+                   [ \"$1\" = compose ] && [ \"$2\" = version ] && [ \"$3\" = --short ] || exit 79\n\
+                   [ -n \"$PATH\" ] && [ -d \"$HOME\" ] && [ -d \"$DOCKER_CONFIG\" ] || exit 86\n\
+                   [ \"$HOME\" != \"$DOCKER_CONFIG\" ] && [ ! -e \"$DOCKER_CONFIG/config.json\" ] || exit 87\n\
+                   [ -z \"${{COMPOSE_DISABLE_ENV_FILE+x}}\" ] || exit 90\n\
+                   env | while IFS='=' read -r name value; do\n\
+                     case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|PWD|SHLVL|_) : ;; *) exit 89 ;; esac\n\
+                   done || exit 89\n\
+                   printf '%s\\n%s' \"$DOCKER_CONFIG\" \"$HOME\" > {}\n\
+                   printf '%s' {}\n\
+                   exit {}\n\
+                 fi\n\
+                 [ \"$#\" -eq 9 ] || exit 80\n\
+                 [ \"$1\" = compose ] && [ \"$2\" = --project-directory ] || exit 81\n\
+                 [ \"$3\" = {} ] && [ \"$4\" = --file ] && [ \"$5\" = {} ] || exit 82\n\
+                 [ \"$6\" = config ] && [ \"$7\" = --quiet ] || exit 83\n\
+                 [ \"$8\" = --no-interpolate ] && [ \"$9\" = --no-env-resolution ] || exit 84\n\
+                 [ \"$COMPOSE_DISABLE_ENV_FILE\" = 1 ] || exit 85\n\
+                 [ -n \"$PATH\" ] && [ -d \"$HOME\" ] && [ -d \"$DOCKER_CONFIG\" ] || exit 86\n\
+                 [ \"$HOME\" != \"$DOCKER_CONFIG\" ] && [ ! -e \"$DOCKER_CONFIG/config.json\" ] || exit 87\n\
+                 [ \"$(cat {})\" = \"$(printf '%s\\n%s' \"$DOCKER_CONFIG\" \"$HOME\")\" ] || exit 90\n\
+                 if [ -n \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{DOCKER_API_VERSION+x}}${{DOCKER_CERT_PATH+x}}${{DOCKER_TLS+x}}${{DOCKER_TLS_VERIFY+x}}${{DOCKER_CUSTOM_HEADERS+x}}${{DOCKER_DEFAULT_PLATFORM+x}}${{HTTP_PROXY+x}}${{HTTPS_PROXY+x}}${{NO_PROXY+x}}${{ALL_PROXY+x}}${{FTP_PROXY+x}}${{http_proxy+x}}${{https_proxy+x}}${{no_proxy+x}}${{all_proxy+x}}${{ftp_proxy+x}}${{COMPOSE_FILE+x}}${{COMPOSE_ENV_FILES+x}}${{COMPOSE_PROFILES+x}}${{COMPOSE_PROJECT_NAME+x}}${{COMPOSE_PATH_SEPARATOR+x}}\" ]; then exit 88; fi\n\
+                 env | while IFS='=' read -r name value; do\n\
+                   case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_DISABLE_ENV_FILE|PWD|SHLVL|_) : ;; *) exit 89 ;; esac\n\
+                 done || exit 89\n\
+                 : > {}\n\
+                 {}\n\
+                 {}\n\
+                 printf '%s' {} >&2\n\
+                 exit {}\n",
+                shell_quote(&version_config_marker.to_string_lossy()),
+                shell_quote(version_output),
+                version_exit_code,
+                shell_quote(&expected_project_directory.to_string_lossy()),
+                shell_quote(&expected_file.to_string_lossy()),
+                shell_quote(&version_config_marker.to_string_lossy()),
+                shell_quote(&validation_marker.to_string_lossy()),
+                stdout,
+                hang,
+                shell_quote(diagnostic),
+                exit_code,
+            );
+            let path = directory.path().join("docker-validation-fixture");
+            fs::write(&path, script).expect("validation CLI fixture should be written");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("validation CLI fixture should be executable");
+            path
+        }
 
         fn search_path() -> std::ffi::OsString {
             std::env::var_os("PATH").unwrap_or_else(|| OsStr::new("/usr/bin:/bin").to_owned())
+        }
+        #[tokio::test]
+        async fn validation_uses_the_selected_local_file_parent_and_isolated_environment() {
+            let directory = FixtureDirectory::new();
+            let project_directory = directory.path().join("project with spaces");
+            fs::create_dir(&project_directory).expect("the local project directory should exist");
+            let file = project_directory.join("compose 'selected'.yaml");
+            fs::write(&file, "services: {}\n").expect("the selected fixture should exist");
+            let binary = validation_fixture_cli(
+                &directory,
+                &project_directory,
+                &file,
+                ValidationFixtureOptions::default(),
+            );
+
+            validate_with_binary(&binary, &file, &search_path(), None, COMMAND_TIMEOUT)
+                .await
+                .expect("the controlled Compose validation should succeed");
+        }
+        #[tokio::test]
+        async fn validation_reports_missing_compose_plugin_before_running_config() {
+            let directory = FixtureDirectory::new();
+            let project_directory = directory.path().join("private project");
+            fs::create_dir(&project_directory).expect("the local project directory should exist");
+            let file = project_directory.join("compose.yaml");
+            fs::write(&file, "services: {}\n").expect("the selected fixture should exist");
+            let binary = validation_fixture_cli(
+                &directory,
+                &project_directory,
+                &file,
+                ValidationFixtureOptions {
+                    version_exit_code: 1,
+                    version_output: "Compose plugin missing",
+                    ..ValidationFixtureOptions::default()
+                },
+            );
+
+            let error = validate_with_binary(&binary, &file, &search_path(), None, COMMAND_TIMEOUT)
+                .await
+                .expect_err("a missing Compose plugin should fail the version preflight");
+
+            assert_eq!(error, ComposeValidationError::ComposePluginUnavailable);
+            assert_eq!(
+                error.message(),
+                "Docker Compose is unavailable. Install the Docker Compose plugin to validate Compose files."
+            );
+            assert!(!error.message().contains("private project"));
+            assert!(!error.message().contains("Compose plugin missing"));
+            assert!(!directory.path().join("validation-command-invoked").exists());
+        }
+
+        #[tokio::test]
+        async fn validation_failure_discards_cli_diagnostics_and_selected_paths() {
+            let directory = FixtureDirectory::new();
+            let project_directory = directory.path().join("private project");
+            fs::create_dir(&project_directory).expect("the local project directory should exist");
+            let file = project_directory.join("compose.yaml");
+            fs::write(&file, "services: {}\n").expect("the selected fixture should exist");
+            let diagnostic = format!("{}: private CLI diagnostic marker", file.display());
+            let binary = validation_fixture_cli(
+                &directory,
+                &project_directory,
+                &file,
+                ValidationFixtureOptions {
+                    exit_code: 1,
+                    diagnostic: &diagnostic,
+                    ..ValidationFixtureOptions::default()
+                },
+            );
+
+            let error = validate_with_binary(&binary, &file, &search_path(), None, COMMAND_TIMEOUT)
+                .await
+                .expect_err("the controlled CLI failure should be reported");
+
+            assert_eq!(error, ComposeValidationError::ValidationFailed);
+            assert_eq!(error.message(), "Compose file validation failed.");
+            let selected_path = file.display().to_string();
+            assert!(!error.message().contains(selected_path.as_str()));
+            assert!(!error.message().contains("private CLI diagnostic marker"));
+        }
+
+        #[tokio::test]
+        async fn validation_rejects_output_over_the_shared_subprocess_limit() {
+            let directory = FixtureDirectory::new();
+            let project_directory = directory.path().join("project");
+            fs::create_dir(&project_directory).expect("the local project directory should exist");
+            let file = project_directory.join("compose.yaml");
+            fs::write(&file, "services: {}\n").expect("the selected fixture should exist");
+            let binary = validation_fixture_cli(
+                &directory,
+                &project_directory,
+                &file,
+                ValidationFixtureOptions {
+                    stdout_chunks: 257,
+                    ..ValidationFixtureOptions::default()
+                },
+            );
+
+            let error = validate_with_binary(&binary, &file, &search_path(), None, COMMAND_TIMEOUT)
+                .await
+                .expect_err("oversized validation output should be rejected");
+
+            assert_eq!(error, ComposeValidationError::ValidationFailed);
+        }
+
+        #[tokio::test]
+        async fn validation_deadline_stops_a_controlled_cli_fixture() {
+            let directory = FixtureDirectory::new();
+            let project_directory = directory.path().join("project");
+            fs::create_dir(&project_directory).expect("the local project directory should exist");
+            let file = project_directory.join("compose.yaml");
+            fs::write(&file, "services: {}\n").expect("the selected fixture should exist");
+            let binary = validation_fixture_cli(
+                &directory,
+                &project_directory,
+                &file,
+                ValidationFixtureOptions {
+                    hang: true,
+                    ..ValidationFixtureOptions::default()
+                },
+            );
+
+            let error = validate_with_binary(
+                &binary,
+                &file,
+                &search_path(),
+                None,
+                Duration::from_millis(500),
+            )
+            .await
+            .expect_err("the controlled CLI should exceed the short deadline");
+
+            assert_eq!(error, ComposeValidationError::ValidationFailed);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker CLI and Compose; validates an owned temporary file and contacts no engine"]
+        async fn local_compose_validation_reads_a_controlled_relative_path_project() {
+            let directory = FixtureDirectory::new();
+            let project_directory = directory.path().join("project with spaces");
+            fs::create_dir(&project_directory)
+                .expect("the temporary project directory should be created");
+            fs::create_dir(project_directory.join("data"))
+                .expect("the relative data directory should be created");
+            let file = project_directory.join("compose.yaml");
+            fs::write(
+                &file,
+                "services:\n  app:\n    image: busybox:latest\n    volumes:\n      - ./data:/data\n",
+            )
+            .expect("the controlled Compose file should be written");
+
+            validate_compose_file(&file)
+                .await
+                .expect("the local Compose CLI should validate the temporary project");
         }
 
         #[test]
@@ -879,23 +1398,39 @@ mod tests {
             available: bool,
             message: &'static str,
             refresh_enabled: bool,
-            refresh_requested: bool,
+            validation_enabled: bool,
+            actions: ComposeActions,
         }
 
         fn harness_for(view: ComposeView) -> Harness<'static, ComposeUi> {
+            harness_for_availability(view, true)
+        }
+
+        fn harness_for_availability(
+            view: ComposeView,
+            available: bool,
+        ) -> Harness<'static, ComposeUi> {
             Harness::new_ui_state(
                 |ui, state: &mut ComposeUi| {
-                    state.refresh_requested =
-                        state
-                            .view
-                            .show(ui, state.available, state.message, state.refresh_enabled);
+                    state.actions = state.view.show(
+                        ui,
+                        state.available,
+                        state.message,
+                        state.refresh_enabled,
+                        state.validation_enabled,
+                    );
                 },
                 ComposeUi {
                     view,
-                    available: true,
-                    message: "",
+                    available,
+                    message: if available {
+                        ""
+                    } else {
+                        "The local Docker Engine is unavailable."
+                    },
                     refresh_enabled: true,
-                    refresh_requested: false,
+                    validation_enabled: true,
+                    actions: ComposeActions::default(),
                 },
             )
         }
@@ -934,7 +1469,161 @@ mod tests {
                 .get_by_role_and_label(Role::Button, "Refresh Compose projects")
                 .click_accesskit();
             harness.step();
-            assert!(harness.state().refresh_requested);
+            assert!(harness.state().actions.refresh);
+        }
+        #[test]
+        fn compose_file_selection_is_accessible_without_an_engine_connection() {
+            let mut harness = harness_for_availability(ComposeView::default(), false);
+            harness.run();
+
+            let _security_disclosure = harness.get_by_role_and_label(
+                Role::Label,
+"Security notice: validate only trusted Compose files. Docker Compose may recursively read local Compose files referenced by include or service extends.file, including files outside the selected file's directory, using the logged-in user's permissions. The selected file is not a path containment boundary. Validation is read-only, but it is not sandboxed.",
+            );
+            assert!(
+                !harness
+                    .get_by_role_and_label(Role::Button, "Validate Compose file")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            harness
+                .get_by_role_and_label(Role::Button, "Validate Compose file")
+                .click_accesskit();
+            harness.step();
+            assert!(harness.state().actions.select_file);
+        }
+
+        #[test]
+        fn validation_states_are_accessible_and_show_only_safe_file_names() {
+            let selected_file = std::path::Path::new("/private/project/compose\u{202e}.yaml");
+            let safe_name = "compose\\u{202e}.yaml";
+
+            let mut validating = ComposeView::default();
+            validating.begin_validation(selected_file);
+            assert!(
+                !format!("{:?}", validating.validation).contains("/private/project"),
+                "the view must retain only a bounded basename"
+            );
+            let mut harness = harness_for(validating);
+            harness.step();
+            {
+                let _validating =
+                    harness.get_by_role_and_label(Role::Label, "Validating Compose file:");
+                let _name = harness.get_by_role_and_label(Role::Label, safe_name);
+            }
+            drop(harness);
+            let overlong_file_name = format!(
+                "/private/project/{}.yaml",
+                "x".repeat(MAX_COMPOSE_FILENAME_DISPLAY_BYTES),
+            );
+            let mut bounded = ComposeView::default();
+            bounded.begin_validation(std::path::Path::new(&overlong_file_name));
+            assert!(matches!(
+                &bounded.validation,
+                ComposeValidationState::Validating { file_name } if file_name == "[name omitted]"
+            ));
+            let mut harness = harness_for(bounded);
+            harness.step();
+            let _bounded_name = harness.get_by_role_and_label(Role::Label, "[name omitted]");
+            drop(harness);
+
+            let mut succeeded = ComposeView::default();
+            let generation = succeeded.begin_validation(selected_file);
+            assert!(succeeded.finish_validation(generation, Ok(())));
+            let mut harness = harness_for(succeeded);
+            harness.run();
+            {
+                let _name = harness.get_by_role_and_label(Role::Label, safe_name);
+                let _success = harness.get_by_role_and_label(
+                    Role::Label,
+                    "Structural validation succeeded. Environment interpolation and service env_file resolution were skipped.",
+                );
+            }
+            drop(harness);
+
+            let mut failed = ComposeView::default();
+            let generation = failed.begin_validation(selected_file);
+            assert!(
+                failed
+                    .finish_validation(generation, Err(ComposeValidationError::ValidationFailed),)
+            );
+            let mut harness = harness_for(failed);
+            harness.run();
+            {
+                let _name = harness.get_by_role_and_label(Role::Label, safe_name);
+                let _static_error =
+                    harness.get_by_role_and_label(Role::Label, "Compose file validation failed.");
+            }
+            drop(harness);
+
+            let mut unavailable = ComposeView::default();
+            let generation = unavailable.begin_validation(selected_file);
+            assert!(unavailable.finish_validation(
+                generation,
+                Err(ComposeValidationError::ComposePluginUnavailable),
+            ));
+            let mut harness = harness_for(unavailable);
+            harness.run();
+            let _plugin_error = harness.get_by_role_and_label(
+                Role::Label,
+                "Docker Compose is unavailable. Install the Docker Compose plugin to validate Compose files.",
+            );
+        }
+
+        #[test]
+        fn validation_cancel_and_stale_results_do_not_replace_current_state() {
+            let stale_file = std::path::Path::new("/private/stale/old.yaml");
+            let current_file = std::path::Path::new("/private/current/compose.yaml");
+            let mut view = ComposeView::default();
+            let stale_generation = view.begin_validation(stale_file);
+            let current_generation = view.begin_validation(current_file);
+            assert!(!view.finish_validation(stale_generation, Ok(())));
+            assert!(view.is_validation_running());
+            assert!(view.finish_validation(current_generation, Ok(())));
+            assert!(matches!(
+                &view.validation,
+                ComposeValidationState::Succeeded { file_name } if file_name == "compose.yaml"
+            ));
+            let mut harness = harness_for(view);
+            harness.run();
+            {
+                let _name = harness.get_by_role_and_label(Role::Label, "compose.yaml");
+                let _success = harness.get_by_role_and_label(
+                    Role::Label,
+                    "Structural validation succeeded. Environment interpolation and service env_file resolution were skipped.",
+                );
+            }
+            drop(harness);
+
+            let mut cancellable = ComposeView::default();
+            cancellable.begin_validation(current_file);
+            let mut harness = harness_for(cancellable);
+            harness.step();
+            harness
+                .get_by_role_and_label(Role::Button, "Cancel validation")
+                .click_accesskit();
+            harness.step();
+            assert!(harness.state().actions.cancel_validation);
+            drop(harness);
+
+            let mut cancelled = ComposeView::default();
+            cancelled.begin_validation(current_file);
+            cancelled.cancel_validation();
+            let mut harness = harness_for(cancelled);
+            harness.run();
+            {
+                let _name = harness.get_by_role_and_label(Role::Label, "compose.yaml");
+                let _cancelled = harness
+                    .get_by_role_and_label(Role::Label, "Compose file validation cancelled.");
+            }
+            drop(harness);
+
+            let mut selection_cancelled = ComposeView::default();
+            selection_cancelled.cancel_file_selection();
+            let mut harness = harness_for(selection_cancelled);
+            harness.run();
+            let _cancelled =
+                harness.get_by_role_and_label(Role::Label, "File selection cancelled.");
         }
 
         #[test]
