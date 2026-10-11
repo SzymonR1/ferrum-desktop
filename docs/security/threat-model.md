@@ -24,10 +24,16 @@ uncertain. Build traces contain only static action and outcome, excluding
 context path, tag, and output; they are ephemeral process logs, not durable
 audit history.
 
-Compose support is not provided. Podman/rootless and broader endpoint/platform
-compatibility remain unvalidated under issue #10, which remains open and
-blocked. Issues #16 and #19 remain open and ready; no release or broader
-support claim is made.
+Compose support is limited to read-only Docker CLI version and project discovery
+and explicitly selected, single-file structural validation on Linux. It does
+not provide import, multi-file or profile support; interpolation or environment
+file resolution; project lifecycle actions, service logs, builds, pulls, or
+project mutations. Validation runs as the logged-in user and is not sandboxed;
+local `include` and `extends` references may read files outside the selected
+path under that user's permissions. Remote Git and OCI loaders are disabled.
+Validate only trusted files. Issue #18 remains partial and open; issue #10
+remains blocked and open. Issues #16 and #19 remain open and ready; no release
+or broader support claim is made.
 
 
 ## Trust boundaries
