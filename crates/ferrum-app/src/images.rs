@@ -792,7 +792,9 @@ impl ImagesView {
     }
 
     fn select_image(&mut self, id: String) -> Option<ImageInspectionRequest> {
-        let id = self.images.iter().find(|image| image.id == id)?.id.clone();
+        if !self.images.iter().any(|image| image.id == id) {
+            return None;
+        }
         self.selected_id = Some(id.clone());
         self.details = None;
         self.detail_error = None;
