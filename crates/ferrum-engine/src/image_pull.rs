@@ -75,9 +75,10 @@ impl ImageProgressStream {
                         return Err(ImageProgressStreamError::Malformed);
                     }
                     self.pending.extend_from_slice(&remaining[..newline]);
-                    let result = parse_line(&self.pending).map_err(Self::parse_error)?;
+                    let result = parse_line(&self.pending);
                     self.frame_offset += newline + 1;
                     self.pending.clear();
+                    let result = result.map_err(Self::parse_error)?;
                     if let Some(progress) = result {
                         return Ok(Some(progress));
                     }

@@ -37,10 +37,13 @@ selected image ID and tag before submission and requires confirmation warning
 that layers and metadata may contain secrets. It sends no stored credentials;
 registries requiring authentication reject it. Ferrum holds one image-mutation
 gate for pull, push, tag, and removal. Hiding pull/push progress or invalidating
-Images/context keeps response readers draining until a terminal event, without
-promising daemon-side cancellation. A timeout or request error does not prove
-that engine or registry state remained unchanged. Build/Buildx and
-private-registry authentication remain unavailable. Issue
+Images/context suppresses stale updates while draining a live response. If a
+push request/stream ends ambiguously without a terminal response, Ferrum keeps
+the image-mutation gate latched for the rest of the session; verify registry
+state before restarting or using another client. Closing Ferrum does not
+guarantee daemon-side transfer cancellation. A timeout or request error does
+not prove engine or registry state remained unchanged.
+Build/Buildx and private-registry authentication remain unavailable. Issue
 [#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) remains open;
 Podman/rootless and remote image endpoints remain unsupported or unvalidated
 under the still-open [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10).

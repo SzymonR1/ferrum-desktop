@@ -317,7 +317,7 @@ rejection, and successful-inventory-refresh state. Push UI coverage checks that
 the selected image owns the existing local tag, the confirmation snapshots the
 image ID and target, cancel submits nothing, anonymous disclosure is explicit,
 and hidden or invalidated progress retains the mutation gate until a terminal
-event. Removal UI coverage checks the accessible confirmation with a snapshot
+response; ambiguous outcomes latch it for the application session. Removal UI
 of the selected image ID and known tags, final-reference warning, non-force/
 in-use and multi-tag warnings, `noprune=true` parent preservation,
 Cancel-without-request, success/error display, and stale invalidation. These
@@ -335,12 +335,12 @@ success response, omitted force/auth fields, invalid input without a
 connection, and safe typed status rejection. Pull cases cover query encoding,
 chunked progress, response/event errors, malformed or oversized input, and
 invalid references. Push cases cover the image-ID/tag preflight, exact explicit
-tag path, empty anonymous JSON body with no `X-Registry-Auth` header, bounded
-progress, tag reassignment before submission, authentication rejection, and
-daemon error redaction. Removal cases cover the encoded image ID, DELETE with
-`noprune=true`, omitted force/auth fields, success, invalid input without a
-connection, and safe rejection/status without response body exposure. Run the
-protocol tests with:
+tag path, empty anonymous JSON body with no X-Registry-Auth header, bounded
+progress, reassignment before submission, HTTP rejection, transport loss after
+submission as unknown, error-record draining to EOF, and daemon-text redaction.
+Removal cases cover exact-ID DELETE with noprune=true, no force/auth fields,
+success, invalid input without a connection, and safe status rejection without
+response-body exposure. Run the protocol tests with:
 
 ```sh
 cargo test -p ferrum-engine image_pull::tests

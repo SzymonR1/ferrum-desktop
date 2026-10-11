@@ -56,8 +56,10 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   never the daemon's all-tags behavior. Use bounded, sanitized progress and
   discard daemon error details and response bodies. Hiding progress or
   invalidating the page suppresses UI updates but continues draining until a
-  terminal event, keeping the image-mutation gate closed. An interrupted push
-  may have transferred layers; closing Ferrum does not guarantee daemon-side
+  terminal event, keeping the image-mutation gate closed. If the request or
+  stream fails ambiguously without a terminal response, latch the image-mutation
+  gate for the rest of the application session. An interrupted push may have
+  transferred layers; closing/restarting Ferrum does not guarantee daemon-side
   work stops.
 - Send image-tag requests only to the selected local Docker Unix-socket engine
   using the negotiated API version and the bounded 8-second request timeout.
@@ -215,7 +217,7 @@ Fake-Unix-socket image protocol tests and headless Images UI tests cover
 tag/removal and anonymous push request/confirmation behavior without contacting
 a real engine or registry, and without mutating image resources. Push tests
 verify exact image/tag preflight, one explicit target tag, the empty anonymous
-JSON body with no auth header, bounded progress, safe auth rejection, and
+JSON body with no auth header, bounded progress, safe HTTP rejection, and
 daemon error redaction. No live image push, deletion, or other image mutation
 test is claimed.
 Separate opt-in ignored lifecycle, logs, and terminal tests mutate engine state

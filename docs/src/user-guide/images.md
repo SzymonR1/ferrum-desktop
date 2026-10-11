@@ -65,6 +65,13 @@ the response and keeps the image-mutation gate closed until a terminal event.
 Leaving Images or changing context hides stale progress without aborting the
 reader. Closing Ferrum does not guarantee that daemon-side push work stops.
 
+If the request or progress stream ends without a terminal response, the push
+outcome is unknown. Ferrum keeps image mutations blocked for the current
+application session and shows the unresolved target. Verify registry state
+before restarting Ferrum or using another image client; restarting does not
+guarantee that Docker stopped the transfer. Ferrum does not automatically retry
+or unlock an ambiguous push.
+
 
 ## Tagging a local image
 

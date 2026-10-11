@@ -405,8 +405,9 @@ mod tests {
             endpoint_label: "local Docker Unix socket",
             status: 409,
         });
-        let rejected_push = Err(EngineError::ImagePushAuthenticationRequired {
+        let rejected_push = Err(EngineError::ImagePushRejected {
             endpoint_label: "local Docker Unix socket",
+            status: 401,
         });
         let unverified_push = Err(EngineError::ImagePushSourceChanged {
             endpoint_label: "local Docker Unix socket",

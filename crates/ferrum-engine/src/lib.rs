@@ -1024,19 +1024,21 @@ pub enum EngineError {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
     },
+    /// The push connection failed after the request may have reached the daemon.
+    #[cfg(target_os = "linux")]
+    #[error(
+        "The image push connection to the {endpoint_label} failed; the registry transfer outcome is unknown."
+    )]
+    ImagePushOutcomeUnknown {
+        /// Non-secret description of the endpoint kind.
+        endpoint_label: &'static str,
+    },
     /// Opening the push stream timed out; the registry transfer may have started.
     #[cfg(target_os = "linux")]
     #[error(
         "Opening image push at the {endpoint_label} timed out; the registry transfer may have started."
     )]
     ImagePushTimedOut {
-        /// Non-secret description of the endpoint kind.
-        endpoint_label: &'static str,
-    },
-    /// The registry rejected the anonymous push request.
-    #[cfg(target_os = "linux")]
-    #[error("The registry requires authentication for this image push at the {endpoint_label}.")]
-    ImagePushAuthenticationRequired {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
     },
@@ -1317,8 +1319,10 @@ impl EngineClient {
     ///
     /// Returns `InvalidImageId` for an invalid image ID,
     /// `ImagePushSourceUnavailable` or `ImagePushSourceChanged` when the
-    /// selected local source cannot be verified, or safe request, registry,
-    /// progress, and timeout errors.
+    /// selected local source cannot be verified, or safe request/rejection
+    /// errors. `ImagePushTimedOut`, `ImagePushOutcomeUnknown`, and
+    /// `ImagePushStreamInterrupted` mean the registry outcome may be unknown;
+    /// callers must not assume that no layers were transferred.
     #[cfg(target_os = "linux")]
     pub async fn open_image_push(
         &self,

@@ -39,12 +39,14 @@ external Docker clients. Confirmation names the image and target and warns that
 layers/metadata may contain secrets. Push reads no registry credentials and
 does not send `X-Registry-Auth`; registries requiring credentials reject the
 request. Only one image mutation (pull/push/tag/remove) is active at a time.
-Hiding pull/push progress or invalidating the Images page/context suppresses
-stale UI updates but keeps the response reader and mutation gate active until a
-terminal event. Closing Ferrum does not guarantee daemon-side transfer work
-stops. No live image push, pull, tag, or removal request is claimed; tests do
-not mutate images, and native Images-page visual validation remains outstanding.
-Build/Buildx and private-registry authentication remain unavailable. Issues
+Hiding pull/push progress or invalidating Images/page context suppresses stale
+updates while draining a live response. If a push request/stream ends
+ambiguously without a terminal response, Ferrum keeps the image-mutation gate
+latched for the rest of the application session. Closing Ferrum does not
+guarantee daemon-side transfer work stops. No live image push, pull, tag, or
+removal request is claimed; tests do not mutate images, and native Images-page
+visual validation remains outstanding. Build/Buildx and private-registry
+authentication remain unavailable. Issues
 [#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) and
 [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) remain open.
 Network listing, inspection, name-only default-bridge creation, guarded unused

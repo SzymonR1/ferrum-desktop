@@ -22,6 +22,7 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(8);
 pub struct ImagePushStream {
     inner: ImageProgressStream,
     endpoint_label: &'static str,
+    daemon_failure_seen: bool,
 }
 
 impl ImagePushStream {
@@ -32,18 +33,30 @@ impl ImagePushStream {
     /// Returns a safe typed error if the daemon rejects the push, the response
     /// is malformed, oversized, interrupted, or idle for 60 seconds.
     pub async fn next_progress(&mut self) -> Result<Option<ImagePushProgress>, EngineError> {
-        match self.inner.next_record().await {
-            Ok(Some(progress)) => Ok(Some(ImagePushProgress {
-                status: progress.status,
-                current_bytes: progress.current_bytes,
-                total_bytes: progress.total_bytes,
-            })),
-            Ok(None) => Ok(None),
-            Err(ImageProgressStreamError::DaemonFailure) => Err(EngineError::ImagePushFailed),
-            Err(ImageProgressStreamError::Malformed | ImageProgressStreamError::Interrupted) => {
-                Err(EngineError::ImagePushStreamInterrupted {
-                    endpoint_label: self.endpoint_label,
-                })
+        loop {
+            match self.inner.next_record().await {
+                Ok(Some(progress)) if !self.daemon_failure_seen => {
+                    return Ok(Some(ImagePushProgress {
+                        status: progress.status,
+                        current_bytes: progress.current_bytes,
+                        total_bytes: progress.total_bytes,
+                    }));
+                }
+                Ok(Some(_)) => {}
+                Ok(None) if self.daemon_failure_seen => {
+                    return Err(EngineError::ImagePushFailed);
+                }
+                Ok(None) => return Ok(None),
+                Err(ImageProgressStreamError::DaemonFailure) => {
+                    self.daemon_failure_seen = true;
+                }
+                Err(
+                    ImageProgressStreamError::Malformed | ImageProgressStreamError::Interrupted,
+                ) => {
+                    return Err(EngineError::ImagePushStreamInterrupted {
+                        endpoint_label: self.endpoint_label,
+                    });
+                }
             }
         }
     }
@@ -82,26 +95,21 @@ pub(crate) async fn open_image_push(
     }
     path.push_str("/push?tag=");
     path.push_str(target.tag());
-    let response = timeout(OPEN_TIMEOUT, async {
-        let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
-        // Match Moby's anonymous ImagePush client path: no auth header, but
-        // an empty JSON auth object prevents older daemon EOF fallback errors.
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri(Uri::new(&engine.socket_path, &path))
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from_static(b"{}")))
-            .map_err(|_| ())?;
-        client.request(request).await.map_err(|_| ())
-    })
-    .await
-    .map_err(|_| EngineError::ImagePushTimedOut { endpoint_label })?
-    .map_err(|_| EngineError::ImagePushUnavailable { endpoint_label })?;
+    let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
+    // Match Moby's anonymous ImagePush client path: no auth header, but
+    // an empty JSON auth object prevents older daemon EOF fallback errors.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(Uri::new(&engine.socket_path, &path))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from_static(b"{}")))
+        .map_err(|_| EngineError::ImagePushUnavailable { endpoint_label })?;
+    let response = timeout(OPEN_TIMEOUT, client.request(request))
+        .await
+        .map_err(|_| EngineError::ImagePushTimedOut { endpoint_label })?
+        .map_err(|_| EngineError::ImagePushOutcomeUnknown { endpoint_label })?;
 
     if !response.status().is_success() {
-        if matches!(response.status().as_u16(), 401 | 403) {
-            return Err(EngineError::ImagePushAuthenticationRequired { endpoint_label });
-        }
         return Err(EngineError::ImagePushRejected {
             endpoint_label,
             status: response.status().as_u16(),
@@ -111,6 +119,7 @@ pub(crate) async fn open_image_push(
     Ok(ImagePushStream {
         inner: ImageProgressStream::new(response.into_body()),
         endpoint_label,
+        daemon_failure_seen: false,
     })
 }
 
@@ -364,7 +373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reports_anonymous_auth_rejection_without_response_body() {
+    async fn reports_http_rejection_without_response_body() {
         let (socket, directory) = temporary_socket();
         let listener = UnixListener::bind(&socket).expect("fake engine socket should bind");
         let server = tokio::spawn(async move {
@@ -404,10 +413,10 @@ mod tests {
             .open_image_push("sha256:source-id", &target)
             .await
             .err()
-            .expect("unauthenticated private-registry push should be rejected");
+            .expect("HTTP rejection should be safe");
         assert!(matches!(
             error,
-            EngineError::ImagePushAuthenticationRequired { .. }
+            EngineError::ImagePushRejected { status: 401, .. }
         ));
         assert!(!error.to_string().contains("SECRET"));
 
@@ -438,7 +447,7 @@ mod tests {
             read_request_with_body(&mut push).await;
             write_chunked(
                 &mut push,
-                b"{\"errorDetail\":{\"message\":\"SECRET registry credentials\"}}\n",
+                b"{\"errorDetail\":{\"message\":\"SECRET registry credentials\"}}\n{\"status\":\"still draining\"}\n",
             )
             .await;
         });
@@ -455,6 +464,43 @@ mod tests {
             .expect_err("daemon error record should fail the push");
         assert!(matches!(error, EngineError::ImagePushFailed));
         assert!(!error.to_string().contains("SECRET"));
+
+        server.await.expect("fake engine server should finish");
+        cleanup(&socket, &directory);
+    }
+    #[tokio::test]
+    async fn classifies_connection_loss_after_push_submission_as_unknown() {
+        let (socket, directory) = temporary_socket();
+        let listener = UnixListener::bind(&socket).expect("fake engine socket should bind");
+        let server = tokio::spawn(async move {
+            let (mut inspect, _) = listener
+                .accept()
+                .await
+                .expect("image preflight request should arrive");
+            read_request(&mut inspect).await;
+            write_response(
+                &mut inspect,
+                "200 OK",
+                br#"{"Id":"sha256:source-id","RepoTags":["registry.example/team/app:stable"]}"#,
+            )
+            .await;
+
+            let (mut push, _) = listener
+                .accept()
+                .await
+                .expect("push request should follow a successful preflight");
+            read_request_with_body(&mut push).await;
+            drop(push);
+        });
+
+        let target = ImagePushTarget::parse("registry.example/team/app:stable")
+            .expect("local repository tag should parse");
+        let error = engine(socket.clone())
+            .open_image_push("sha256:source-id", &target)
+            .await
+            .err()
+            .expect("lost response should return an error");
+        assert!(matches!(error, EngineError::ImagePushOutcomeUnknown { .. }));
 
         server.await.expect("fake engine server should finish");
         cleanup(&socket, &directory);

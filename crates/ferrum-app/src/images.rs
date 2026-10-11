@@ -105,6 +105,8 @@ pub(super) struct ImagesView {
     push_loading: bool,
     push_progress_hidden: bool,
     push_complete: bool,
+    // An ambiguous push result keeps the mutation gate latched for this session.
+    push_outcome_uncertain: bool,
     push_progress: Option<ImagePushProgress>,
     push_error: Option<String>,
     push_result_image_id: Option<String>,
@@ -167,6 +169,10 @@ impl ImagesView {
     #[cfg(test)]
     pub(super) fn is_push_complete(&self) -> bool {
         self.push_complete
+    }
+    #[cfg(test)]
+    pub(super) fn is_push_outcome_uncertain(&self) -> bool {
+        self.push_outcome_uncertain
     }
     pub(super) fn has_mutation_in_flight(&self) -> bool {
         self.active_pull_generation.is_some()
@@ -566,6 +572,7 @@ impl ImagesView {
         self.push_loading = true;
         self.push_progress_hidden = false;
         self.push_complete = false;
+        self.push_outcome_uncertain = false;
         self.push_progress = None;
         self.push_error = None;
         self.push_result_image_id = Some(image_id.clone());
@@ -586,20 +593,41 @@ impl ImagesView {
     }
 
     pub(super) fn finish_push(&mut self, generation: u64, result: Result<(), String>) -> bool {
-        if self.active_push_generation != Some(generation) {
+        if self.active_push_generation != Some(generation) || self.push_outcome_uncertain {
             return false;
         }
         self.active_push_generation = None;
         if generation != self.push_generation || (!self.push_loading && !self.push_progress_hidden)
         {
+            self.push_loading = false;
+            self.push_progress_hidden = false;
+            self.push_progress = None;
+            self.push_complete = false;
+            self.push_error = None;
+            self.push_result_image_id = None;
+            self.push_result_target = None;
             return false;
         }
         self.push_loading = false;
         self.push_progress_hidden = false;
+        self.push_outcome_uncertain = false;
         match result {
             Ok(()) => self.push_complete = true,
             Err(error) => self.push_error = Some(error),
         }
+        true
+    }
+
+    pub(super) fn finish_push_uncertain(&mut self, generation: u64, error: String) -> bool {
+        if self.active_push_generation != Some(generation) {
+            return false;
+        }
+        self.push_loading = false;
+        self.push_progress_hidden = false;
+        self.push_complete = false;
+        self.push_progress = None;
+        self.push_error = Some(error);
+        self.push_outcome_uncertain = true;
         true
     }
 
@@ -611,18 +639,21 @@ impl ImagesView {
         self.push_complete = false;
     }
 
-    // Invalidate only the displayed generation; the active push still owns the mutation gate.
+    // Invalidate only the displayed generation; an active/uncertain push keeps the mutation gate.
     fn invalidate_push_view(&mut self) {
+        let push_is_active = self.active_push_generation.is_some();
         self.push_generation = self.push_generation.wrapping_add(1);
         self.push_loading = false;
-        self.push_progress_hidden = false;
+        self.push_progress_hidden = push_is_active && !self.push_outcome_uncertain;
         self.push_complete = false;
         self.push_progress = None;
-        self.push_error = None;
         self.push_requested = false;
         self.hide_push_progress_requested = false;
-        self.push_result_image_id = None;
-        self.push_result_target = None;
+        if !push_is_active && !self.push_outcome_uncertain {
+            self.push_error = None;
+            self.push_result_image_id = None;
+            self.push_result_target = None;
+        }
         self.push_confirmation_open = false;
         self.push_confirmation_image_id = None;
         self.push_confirmation_target = None;
@@ -1091,7 +1122,20 @@ impl ImagesView {
                     self.cancel_push_confirmation();
                 }
             }
-            if self.push_loading {
+            if self.push_outcome_uncertain {
+                ui.colored_label(
+                    egui::Color32::from_rgb(224, 174, 109),
+                    "Push outcome is unknown. The daemon may still be transferring layers; Ferrum keeps image mutations blocked for this session.",
+                );
+                if let Some(target) = self.push_result_target.as_deref() {
+                    let safe_target = escape_untrusted_display_text(target);
+                    ui.label(format!("Unresolved push target: {safe_target}"));
+                }
+                ui.label("Verify registry state before using another image client. Closing Ferrum does not guarantee the transfer stopped.");
+                if let Some(error) = &self.push_error {
+                    ui.label(error);
+                }
+            } else if self.push_loading {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     if let Some(target) = self.push_result_target.as_deref() {
@@ -2310,5 +2354,37 @@ mod tests {
         assert!(!view.finish_push(request.generation, Err("stale push result".to_owned())));
         assert!(!view.has_mutation_in_flight());
         assert!(view.push_error.is_none());
+    }
+    #[test]
+    fn uncertain_push_outcome_latches_the_gate_and_displays_recovery_warning() {
+        let mut view = pushable_view();
+        view.begin_push_confirmation();
+        view.confirm_push();
+        let request = view.begin_push().unwrap();
+        assert!(view.finish_push_uncertain(
+            request.generation,
+            "push connection outcome is unknown".to_owned()
+        ));
+        assert!(view.is_push_outcome_uncertain());
+        assert!(view.has_mutation_in_flight());
+
+        let mut harness = Harness::new_ui_state(
+            |ui, view: &mut ImagesView| {
+                let mutation_busy = view.has_mutation_in_flight();
+                view.show(ui, true, "", true, mutation_busy);
+            },
+            view,
+        );
+        harness.run();
+        let _warning = harness.get_by_role_and_label(
+            Role::Label,
+            "Push outcome is unknown. The daemon may still be transferring layers; Ferrum keeps image mutations blocked for this session.",
+        );
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, "Push image")
+                .accesskit_node()
+                .is_disabled()
+        );
     }
 }

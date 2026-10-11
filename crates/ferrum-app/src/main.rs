@@ -1884,6 +1884,27 @@ impl FerrumApp {
         succeeded && self.page == images::AppPage::Images
     }
     fn finish_image_push(&mut self, generation: u64, result: Result<(), EngineError>) -> bool {
+        let outcome_unknown = matches!(
+            &result,
+            Err(EngineError::ImagePushOutcomeUnknown { .. }
+                | EngineError::ImagePushTimedOut { .. }
+                | EngineError::ImagePushStreamInterrupted { .. })
+        );
+        if outcome_unknown {
+            if let Err(error) = result {
+                // Do not unlock other image mutations when the daemon may still
+                // be pushing and Ferrum did not receive a terminal response.
+                self.images
+                    .finish_push_uncertain(generation, error.to_string());
+            }
+            self.image_push_task = None;
+            #[cfg(target_os = "linux")]
+            {
+                self.image_push_progress_reporting = None;
+            }
+            return false;
+        }
+
         let succeeded = result.is_ok();
         let applied = self
             .images
@@ -6384,6 +6405,60 @@ mod event_reconciliation_tests {
         assert!(task_finish.send(()).is_ok());
         app.runtime.block_on(tokio::task::yield_now());
         assert!(push_abort.is_finished());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ambiguous_push_completion_keeps_image_mutations_locked() {
+        let (mut app, sender) = app_with_open_inspection();
+        app.page = images::AppPage::Images;
+        let mut view = images::ImagesView::default();
+        let list_generation = view.begin_load();
+        assert!(view.complete_load(
+            list_generation,
+            Ok::<_, &str>(vec![ImageSummary {
+                id: "sha256:image".to_owned(),
+                repo_tags: vec!["registry.example/team/app:stable".to_owned()],
+                created_unix_seconds: None,
+                size_bytes: None,
+            }]),
+        ));
+        view.set_push_source_for_test("sha256:image", "registry.example/team/app:stable");
+        view.begin_push_confirmation();
+        view.confirm_push();
+        let request = view.begin_push().expect("confirmed push should start");
+        app.images = view;
+        app.image_push_task = Some(app.runtime.spawn(std::future::pending()));
+        app.image_push_progress_reporting = Some(Arc::new(AtomicBool::new(true)));
+
+        assert!(
+            sender
+                .try_send(EngineEvent::ImagePushFinished {
+                    generation: request.generation,
+                    result: Err(EngineError::ImagePushTimedOut {
+                        endpoint_label: "local Docker socket",
+                    }),
+                })
+                .is_ok()
+        );
+        app.receive_events(egui::Context::default());
+
+        assert!(app.image_push_task.is_none());
+        assert!(app.image_push_progress_reporting.is_none());
+        assert!(app.images.is_push_outcome_uncertain());
+        assert!(app.images.has_mutation_in_flight());
+        assert!(app.image_mutation_busy());
+        assert!(app.image_list_task.is_none());
+
+        let context = egui::Context::default();
+        app.start_image_pull(context.clone());
+        app.start_image_push(context.clone());
+        app.start_image_tag(context.clone());
+        app.start_image_remove(context);
+        assert!(app.image_pull_task.is_none());
+        assert!(app.image_push_task.is_none());
+        assert!(app.image_tag_task.is_none());
+        assert!(app.image_remove_task.is_none());
+        assert!(app.image_mutation_busy());
     }
     #[test]
     fn refreshing_disconnected_volumes_retries_engine_connection() {

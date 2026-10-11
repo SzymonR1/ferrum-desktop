@@ -54,12 +54,14 @@ push all tags. See the [Moby image-push client](https://github.com/moby/moby/blo
 
 Pull, push, tag, and removal use only the selected local Linux Docker Unix
 socket. Push/pull progress is bounded and sanitized; daemon response bodies are
-not displayed. Hiding progress or invalidating the Images page/context stops
-forwarding stale updates but keeps the response reader and mutation gate active
-until a terminal event. Closing Ferrum does not guarantee that daemon-side
-transfer work stops. A timeout or interrupted push stream does not prove that no
-layers reached the registry. Image mutation traces record only static action
-and outcome; they are local process traces, not persistent or tamper-proof.
+not displayed. Hiding progress or page/context invalidation suppresses stale UI
+updates but lets Ferrum drain a live response while keeping the mutation gate
+closed through its terminal event. If a push request/stream ends ambiguously,
+Ferrum latches the image-mutation gate for the rest of the application session
+and shows the unresolved target; it does not retry or unlock automatically.
+A timeout/interruption does not prove no layers were uploaded, and closing or
+restarting Ferrum does not guarantee daemon-side transfer stops. Image mutation
+traces record only static action/outcome; they are not persistent or tamper-proof.
 Image removal and push have fake-socket/headless coverage only; tests do not
 delete, push, or otherwise mutate real image resources.
 
