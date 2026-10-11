@@ -1888,8 +1888,8 @@ impl EngineClient {
                         .ok_or(EngineError::VolumeInventoryUnavailable { endpoint_label })?;
                     Ok(VolumeSummary {
                         name,
-                        driver: volume.driver.map(escape_volume_display_text),
-                        scope: volume.scope.map(escape_volume_display_text),
+                        driver: volume.driver.and_then(escape_volume_display_text),
+                        scope: volume.scope.and_then(escape_volume_display_text),
                     })
                 })
                 .collect()
@@ -1934,10 +1934,10 @@ impl EngineClient {
                 .ok_or(EngineError::VolumeInspectionUnavailable { endpoint_label })?;
             Ok(VolumeDetails {
                 name,
-                driver: response.driver.map(escape_volume_display_text),
-                scope: response.scope.map(escape_volume_display_text),
-                created_at: response.created_at.map(escape_volume_display_text),
-                mountpoint: response.mountpoint.map(escape_volume_display_text),
+                driver: response.driver.and_then(escape_volume_display_text),
+                scope: response.scope.and_then(escape_volume_display_text),
+                created_at: response.created_at.and_then(escape_volume_display_text),
+                mountpoint: response.mountpoint.and_then(escape_volume_display_text),
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -2004,10 +2004,10 @@ impl EngineClient {
                     .ok_or(EngineError::VolumeCreationUnavailable { endpoint_label })?;
                 Ok(VolumeDetails {
                     name,
-                    driver: response.driver.map(escape_volume_display_text),
-                    scope: response.scope.map(escape_volume_display_text),
-                    created_at: response.created_at.map(escape_volume_display_text),
-                    mountpoint: response.mountpoint.map(escape_volume_display_text),
+                    driver: response.driver.and_then(escape_volume_display_text),
+                    scope: response.scope.and_then(escape_volume_display_text),
+                    created_at: response.created_at.and_then(escape_volume_display_text),
+                    mountpoint: response.mountpoint.and_then(escape_volume_display_text),
                 })
             })
             .await
@@ -2735,16 +2735,39 @@ fn volume_name_path_safe(name: &str) -> bool {
         && !name.chars().any(is_untrusted_display_character)
 }
 #[cfg(target_os = "linux")]
-fn escape_volume_display_text(value: String) -> String {
-    let escape_count = value
-        .chars()
-        .filter(|character| is_untrusted_display_character(*character))
-        .count();
-    if escape_count == 0 {
-        return value;
+const MAX_VOLUME_DISPLAY_TEXT_BYTES: usize = 4 * 1024;
+
+#[cfg(target_os = "linux")]
+fn escape_volume_display_text(value: String) -> Option<String> {
+    if value.len() > MAX_VOLUME_DISPLAY_TEXT_BYTES {
+        return None;
     }
-    let capacity = value.len().saturating_add(escape_count.saturating_mul(7));
-    let mut escaped = String::with_capacity(capacity);
+
+    let mut escaped_len = 0usize;
+    let mut needs_escape = false;
+    for character in value.chars() {
+        let character_len = if is_untrusted_display_character(character) {
+            needs_escape = true;
+            let mut code = character as u32;
+            let mut digits = 1usize;
+            while code >= 0x10 {
+                code >>= 4;
+                digits += 1;
+            }
+            4 + digits
+        } else {
+            character.len_utf8()
+        };
+        escaped_len = escaped_len.checked_add(character_len)?;
+        if escaped_len > MAX_VOLUME_DISPLAY_TEXT_BYTES {
+            return None;
+        }
+    }
+    if !needs_escape {
+        return Some(value);
+    }
+
+    let mut escaped = String::with_capacity(escaped_len);
     for character in value.chars() {
         if is_untrusted_display_character(character) {
             let mut code = character as u32;
@@ -2767,7 +2790,7 @@ fn escape_volume_display_text(value: String) -> String {
             escaped.push(character);
         }
     }
-    escaped
+    Some(escaped)
 }
 
 #[cfg(target_os = "linux")]
@@ -3804,6 +3827,29 @@ mod volume_api_tests {
         assert!(!format!("{volumes:?}").contains("secret"));
         cleanup(&socket, &directory);
     }
+    #[tokio::test]
+    async fn volume_list_omits_control_expanded_metadata_over_display_limit() {
+        let control_heavy = "\n".repeat(1_000);
+        let encoded_driver =
+            serde_json::to_string(&control_heavy).expect("metadata should be valid JSON");
+        let body = format!(
+            r#"{{"Volumes":[{{"Name":"data","Driver":{encoded_driver},"Scope":"local"}}]}}"#
+        );
+        let (socket, directory, server) = fixture(response("200 OK", body.as_bytes())).await;
+
+        let volumes = client(socket.clone())
+            .list_volumes()
+            .await
+            .expect("volume listing should remain available");
+        server.await.expect("server should finish");
+        assert_eq!(volumes.len(), 1);
+        assert!(
+            volumes[0].driver.is_none(),
+            "control-heavy metadata beyond the display bound must be omitted"
+        );
+        assert_eq!(volumes[0].scope.as_deref(), Some("local"));
+        cleanup(&socket, &directory);
+    }
 
     #[tokio::test]
     async fn creates_volume_with_name_only_on_versioned_endpoint_and_maps_allowlisted_fields() {
@@ -4089,6 +4135,30 @@ mod volume_api_tests {
         assert!(!error.to_string().contains("other-volume"));
         cleanup(&socket, &directory);
     }
+    #[tokio::test]
+    async fn volume_inspection_omits_raw_and_escaped_metadata_over_display_limit() {
+        let control_heavy = "\n".repeat(1_000);
+        let encoded_mountpoint =
+            serde_json::to_string(&control_heavy).expect("metadata should be valid JSON");
+        let oversized_created =
+            serde_json::to_string(&"x".repeat(4097)).expect("metadata should be valid JSON");
+        let body = format!(
+            r#"{{"Name":"data","Driver":"local","Scope":"local","CreatedAt":{oversized_created},"Mountpoint":{encoded_mountpoint}}}"#
+        );
+        let (socket, directory, server) = fixture(response("200 OK", body.as_bytes())).await;
+
+        let details = client(socket.clone())
+            .inspect_volume("data")
+            .await
+            .expect("volume inspection should remain available");
+        server.await.expect("server should finish");
+        assert_eq!(details.driver.as_deref(), Some("local"));
+        assert_eq!(details.scope.as_deref(), Some("local"));
+        assert!(details.created_at.is_none());
+        assert!(details.mountpoint.is_none());
+        cleanup(&socket, &directory);
+    }
+
     #[tokio::test]
     async fn rejects_whitespace_only_inspection_names_before_connecting() {
         let directory = temporary_directory();
