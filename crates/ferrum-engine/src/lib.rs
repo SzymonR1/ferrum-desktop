@@ -18,7 +18,7 @@ pub use image_pull::ImagePullStream;
 #[cfg(target_os = "linux")]
 pub use logs::{ContainerLogStream, ContainerLogsOptions};
 #[cfg(target_os = "linux")]
-use std::{env, path::PathBuf, time::Duration};
+use std::{borrow::Cow, env, path::PathBuf, time::Duration};
 
 #[cfg(target_os = "linux")]
 use http_body_util::{BodyExt, Empty, Full, Limited};
@@ -552,6 +552,39 @@ fn set_unique_network_metadata<T>(
 }
 
 #[cfg(target_os = "linux")]
+struct NetworkMapKey<'de>(Cow<'de, str>);
+
+#[cfg(target_os = "linux")]
+impl<'de> Deserialize<'de> for NetworkMapKey<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct KeyVisitor;
+        impl<'de> Visitor<'de> for KeyVisitor {
+            type Value = NetworkMapKey<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a map key string")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+                Ok(NetworkMapKey(Cow::Borrowed(value)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(NetworkMapKey(Cow::Owned(value.to_owned())))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(NetworkMapKey(Cow::Owned(value)))
+            }
+        }
+        deserializer.deserialize_str(KeyVisitor)
+    }
+}
+
+#[cfg(target_os = "linux")]
 struct NetworkInspectResponse {
     network: NetworkResponse,
     containers: Option<NetworkContainerMembership>,
@@ -593,8 +626,8 @@ impl<'de> Deserialize<'de> for NetworkInspectResponse {
                 let mut ipam_usage = NetworkIpamUsage::default();
                 let mut status_seen = false;
                 let mut status_ambiguous = false;
-                while let Some(field) = map.next_key::<String>()? {
-                    match field.as_str() {
+                while let Some(field) = map.next_key::<NetworkMapKey<'de>>()? {
+                    match field.0.as_ref() {
                         "Id" => set_unique_network_metadata(
                             &mut network.id,
                             &mut metadata_seen,
@@ -710,8 +743,8 @@ impl<'de> Deserialize<'de> for NetworkStatusUsage {
                 let mut usage = NetworkIpamUsage::default();
                 let mut ipam_seen = false;
                 let mut ambiguous = false;
-                while let Some(field) = map.next_key::<String>()? {
-                    if field == "IPAM" {
+                while let Some(field) = map.next_key::<NetworkMapKey<'de>>()? {
+                    if field.0.as_ref() == "IPAM" {
                         let value = map.next_value::<NetworkIpamStatus>()?.0;
                         if ipam_seen {
                             ambiguous = true;
@@ -794,8 +827,8 @@ impl<'de> Deserialize<'de> for NetworkIpamStatus {
                 let mut usage = NetworkIpamUsage::default();
                 let mut subnets_seen = false;
                 let mut ambiguous = false;
-                while let Some(field) = map.next_key::<String>()? {
-                    if field == "Subnets" {
+                while let Some(field) = map.next_key::<NetworkMapKey<'de>>()? {
+                    if field.0.as_ref() == "Subnets" {
                         let value = map.next_value::<NetworkSubnetUsageMap>()?.0;
                         if subnets_seen {
                             ambiguous = true;
@@ -919,8 +952,8 @@ impl<'de> Deserialize<'de> for NetworkSubnetUsageMap {
                 let mut ambiguous_subnet = false;
                 let mut malformed_subnet = false;
                 let mut count = 0usize;
-                while let Some(cidr) = map.next_key::<String>()? {
-                    let Some(normalized_cidr) = normalize_ipam_subnet_cidr(&cidr) else {
+                while let Some(cidr) = map.next_key::<NetworkMapKey<'de>>()? {
+                    let Some(normalized_cidr) = normalize_ipam_subnet_cidr(cidr.0.as_ref()) else {
                         malformed_subnet = true;
                         map.next_value::<IgnoredAny>()?;
                         continue;
@@ -1017,8 +1050,8 @@ impl<'de> Deserialize<'de> for NetworkSubnetUsage {
                 let mut dynamic_ips_available = None;
                 let mut ips_seen = false;
                 let mut dynamic_seen = false;
-                while let Some(field) = map.next_key::<String>()? {
-                    match field.as_str() {
+                while let Some(field) = map.next_key::<NetworkMapKey<'de>>()? {
+                    match field.0.as_ref() {
                         "IPsInUse" => {
                             let value = map.next_value::<NetworkUsageMetric>()?.0;
                             if ips_seen {
@@ -6491,6 +6524,17 @@ mod network_api_tests {
     }
 
     #[test]
+    fn network_ipam_usage_accepts_escaped_json_keys() {
+        let usage = serde_json::from_str::<NetworkStatusUsage>(
+            r#"{"\u0049PAM":{"\u0053ubnets":{"192.0.2.0\u002f24":{"\u0049PsInUse":3,"\u0044ynamicIPsAvailable":8}}}}"#,
+        )
+        .expect("escaped map keys retain their decoded values")
+        .0;
+        assert_eq!(usage.ips_in_use, Some(3));
+        assert_eq!(usage.dynamic_ips_available, Some(8));
+    }
+
+    #[test]
     fn network_ipam_usage_missing_invalid_ambiguous_and_overflowing_values_fail_closed() {
         for status in [
             r#"{}"#,
@@ -6505,6 +6549,7 @@ mod network_api_tests {
             r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":18446744073709551615,"DynamicIPsAvailable":18446744073709551615},"2001:db8::/64":{"IPsInUse":1,"DynamicIPsAvailable":1}}}}"#,
             r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"IPsInUse":2,"DynamicIPsAvailable":8,"DynamicIPsAvailable":9}}}}"#,
             r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"DynamicIPsAvailable":8}}},"IPAM":{"Subnets":{}}}"#,
+            r#"{"IPAM":{"Subnets":{"192.0.2.0/24":{"IPsInUse":1,"DynamicIPsAvailable":8}}},"\u0049PAM":{"Subnets":{}}}"#,
         ] {
             let usage = serde_json::from_str::<NetworkStatusUsage>(status)
                 .expect("malformed usage fields stay isolated")
