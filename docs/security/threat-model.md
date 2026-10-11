@@ -1,6 +1,6 @@
 # Ferrum threat model
 
-**Status:** Initial scope documented; this is not a security audit. Ferrum provides container inventory and inspection, volume list/inspect/usage with name-only creation and dependency-gated removal, image tagging/removal, scoped container lifecycle actions, network list/inspect/create/removal/connect/disconnect on the Linux local-engine path, logs, and an experimental embedded terminal.
+**Status:** Initial scope documented; this is not a security audit. Ferrum provides container inventory and inspection, volume list/inspect/usage with name-only creation and dependency-gated removal, image list/inspect, anonymous pulls, local tagging/removal, and anonymous push of an existing local tag, scoped container lifecycle actions, network list/inspect/create/removal/connect/disconnect on the Linux local-engine path, logs, and an experimental embedded terminal.
 
 
 ## Trust boundaries
@@ -42,6 +42,23 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   the response until a terminal event, keeping the image-mutation gate closed.
   Page/context invalidation hides stale progress without aborting the reader.
   Closing Ferrum still does not guarantee that daemon-side pull work stops.
+
+- Anonymous image push is limited to one existing `repository:tag` on the
+  selected image and the selected Linux local Docker Unix socket. Ferrum
+  reinspects the selected ID and verifies that tag before submitting the push;
+  this point-in-time check is not atomic with another Docker client. Require
+  confirmation naming the image ID and target, and warn that layers and
+  metadata may contain secrets. Never read Docker config, credential helpers,
+  or stored credentials. The generated API schema marks `X-Registry-Auth`
+  required, but the Docker/Moby client omits it for anonymous access and sends
+  an empty JSON object body; Ferrum follows that path without credentials. A
+  registry requiring auth rejects the operation. Always pass one explicit tag,
+  never the daemon's all-tags behavior. Use bounded, sanitized progress and
+  discard daemon error details and response bodies. Hiding progress or
+  invalidating the page suppresses UI updates but continues draining until a
+  terminal event, keeping the image-mutation gate closed. An interrupted push
+  may have transferred layers; closing Ferrum does not guarantee daemon-side
+  work stops.
 - Send image-tag requests only to the selected local Docker Unix-socket engine
   using the negotiated API version and the bounded 8-second request timeout.
   Validate the image ID and bound the combined `repository:tag` target to 512
@@ -65,7 +82,7 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   platform parameters, and never read or expose response bodies. Typed errors
   expose only safe endpoint/status information; timeout errors must explain
   that state may have changed. Only one image mutation may be active across
-  pull/tag/remove. Page/context invalidation ignores stale UI results but does
+  pull/push/tag/remove. Page/context invalidation ignores stale UI results but does
   not abort or claim to undo a possibly submitted removal; refresh inventory
   after success only while Images is current.
 
@@ -77,13 +94,13 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   events use the configured process logger; they are not a persistent or
   tamper-proof audit store.
 - Emit a structured local tracing event when any network mutation returns. Record only the static create/remove/connect/disconnect action, `success` or `request_error`, and validated full network IDs when available; connect/disconnect events include a container ID only when it is also a full 64-character hexadecimal ID. Do not log network/container names, endpoints, raw errors, or daemon response bodies. A request error does not prove engine state remained unchanged. These events use the configured process logger; they are not a persistent or tamper-proof audit store.
-- Emit local structured tracing events when image pull, tag, or removal requests
-  return, containing only the static action and `success`, `not_submitted`, or
-  `request_error` outcome. `not_submitted` identifies local validation rejection
-  before HTTP submission. Do not log image IDs, references, repository tags,
-  endpoints, raw errors, or daemon bodies. A `request_error` does not prove that
-  engine state remained unchanged. These events are not persistent or
-  tamper-proof.
+- Emit local structured tracing events when image pull, push, tag, or removal
+  requests return, containing only the static action and `success`,
+  `not_submitted`, or `request_error` outcome. `not_submitted` identifies local
+  validation or preflight rejection before push submission. Do not log image
+  IDs, references, repository tags, endpoints, raw errors, or daemon bodies. A
+  `request_error` does not prove that engine state remained unchanged. These
+  events are not persistent or tamper-proof.
 - Keep historical/live container logs restricted to the selected local Unix-socket engine. Use the negotiated API version and streaming response body; accept only json-file/journald drivers. TTY is read from allowlisted `Config.Tty`: TTY output is raw and combined, while non-TTY output is decoded from Docker's 8-byte multiplex frames. Render logs as plain text, never as a terminal. Bound frames to 1 MiB, lines to 64 KiB, retention to 8 MiB or 10,000 lines, and delivery to a dedicated 16-message channel; discard oldest retained lines with a visible count. Pause suspends UI draining, applying bounded backpressure to producer reads without unbounded memory or dropped lines; Resume continues delivery. Copy and Export include only currently visible, retained rows and escape terminal control characters as `\xNN`.
 - Escape untrusted container-log text once when adding rows to `LogBuffer`:
   C0/C1 controls become visible `\xNN` text and selected bidi, zero-width, and
@@ -154,7 +171,7 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 - Remote TCP/HTTP/TLS/SSH transport trust, credentials, and identity validation.
 - Podman API compatibility and rootless endpoint discovery; issue #10 remains open for these and the broader engine matrix.
 - Terminal streams beyond this bounded local exec session, Compose files, external process invocation, archive extraction, and file paths.
-- Credential stores, registry authentication, managed engines, and update delivery.
+- Credential stores and private-registry authentication, managed engines, and update delivery.
 
 These surfaces must receive explicit design and tests before their implementation. Engine access should be treated as privileged throughout; API version negotiation is not a security boundary. UI state gating and confirmation reduce accidental destructive operations but cannot constrain a compromised or malicious engine endpoint.
 
@@ -194,14 +211,17 @@ single-flight/context-switch gates. They do not contact a live engine; native
 UI click/visual validation remains unverified. Network usage is not implemented.
 Issues #17 and #10 remain open; Podman/rootless and remote behavior are not
 claimed.
-Fake-Unix-socket image protocol tests and headless Images UI tests cover tag
-and removal request/confirmation behavior without contacting a real engine or
-mutating images. There is no live image deletion or other live image-mutation
-test.
+Fake-Unix-socket image protocol tests and headless Images UI tests cover
+tag/removal and anonymous push request/confirmation behavior without contacting
+a real engine or registry, and without mutating image resources. Push tests
+verify exact image/tag preflight, one explicit target tag, the empty anonymous
+JSON body with no auth header, bounded progress, safe auth rejection, and
+daemon error redaction. No live image push, deletion, or other image mutation
+test is claimed.
 Separate opt-in ignored lifecycle, logs, and terminal tests mutate engine state
 using one uniquely named disposable container and only its validated full ID as
 cleanup authority. Logs and terminal tests require locally installed images and
-never pull, tag, or delete images. See
+never pull, tag, push, or delete images. See
 [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
 
 The optional ignored volume create/remove test uses the current local Docker

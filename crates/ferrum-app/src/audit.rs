@@ -131,6 +131,7 @@ pub(super) fn record_network_attachment_result(
 #[derive(Clone, Copy)]
 pub(super) enum ImageMutation {
     Pull,
+    Push,
     Tag,
     Remove,
 }
@@ -140,6 +141,7 @@ impl ImageMutation {
     fn label(self) -> &'static str {
         match self {
             Self::Pull => "pull",
+            Self::Push => "push",
             Self::Tag => "tag",
             Self::Remove => "remove",
         }
@@ -169,7 +171,9 @@ pub(super) fn record_image_mutation_result(
         Err(
             EngineError::InvalidImageId
             | EngineError::InvalidImageReference
-            | EngineError::InvalidImageTagTarget,
+            | EngineError::InvalidImageTagTarget
+            | EngineError::ImagePushSourceUnavailable { .. }
+            | EngineError::ImagePushSourceChanged { .. },
         ) => {
             tracing::warn!(
                 target: "ferrum::audit",
@@ -401,6 +405,12 @@ mod tests {
             endpoint_label: "local Docker Unix socket",
             status: 409,
         });
+        let rejected_push = Err(EngineError::ImagePushAuthenticationRequired {
+            endpoint_label: "local Docker Unix socket",
+        });
+        let unverified_push = Err(EngineError::ImagePushSourceChanged {
+            endpoint_label: "local Docker Unix socket",
+        });
 
         tracing::dispatcher::with_default(&dispatcher, || {
             record_image_mutation_result(ImageMutation::Pull, &succeeded);
@@ -412,6 +422,9 @@ mod tests {
             record_image_mutation_result(ImageMutation::Remove, &succeeded);
             record_image_mutation_result(ImageMutation::Remove, &invalid_remove);
             record_image_mutation_result(ImageMutation::Remove, &rejected_remove);
+            record_image_mutation_result(ImageMutation::Push, &succeeded);
+            record_image_mutation_result(ImageMutation::Push, &rejected_push);
+            record_image_mutation_result(ImageMutation::Push, &unverified_push);
         });
 
         let captured = match writer.0.lock() {
@@ -430,6 +443,9 @@ mod tests {
             ("remove", "success"),
             ("remove", "not_submitted"),
             ("remove", "request_error"),
+            ("push", "success"),
+            ("push", "request_error"),
+            ("push", "not_submitted"),
         ];
         assert_eq!(events.len(), expected.len());
         for (line, (action, outcome)) in events.iter().zip(expected) {

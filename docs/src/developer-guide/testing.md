@@ -311,47 +311,53 @@ The Images page has headless `egui_kittest` coverage for navigation, searchable
 and virtualized rows, image selection/details, loading/error/empty states,
 keyboard interaction, and stale-result rejection. Tag UI coverage checks the
 accessible repository/tag fields, bounded target validation, disabled invalid
-targets, explicit confirmation because Docker Engine v1.56 may reassign an
-existing `repository:tag` while image data remains, cancel-without-request
-behavior, loading, safe success/error display, single-request gating, stale
-generation rejection, and successful-inventory-refresh state. Removal UI
-coverage checks the accessible confirmation with a snapshot of the selected
-image ID and known tags, final-reference warning, non-force/in-use and
-multi-tag warnings, `noprune=true` parent preservation, Cancel-without-request,
-successful request state, safe errors, stale invalidation, and one-mutation-at-
-a-time gating across pull/tag/remove. Hidden-progress coverage verifies the
-reader and gate stay active until a terminal event; invalidation hides late
-events without releasing the gate early. These tests use fixed image data and
-local state/events only; they never contact an engine or delete an image.
+targets, explicit reassignment confirmation, cancel-without-request behavior,
+loading, safe success/error display, single-request gating, stale generation
+rejection, and successful-inventory-refresh state. Push UI coverage checks that
+the selected image owns the existing local tag, the confirmation snapshots the
+image ID and target, cancel submits nothing, anonymous disclosure is explicit,
+and hidden or invalidated progress retains the mutation gate until a terminal
+event. Removal UI coverage checks the accessible confirmation with a snapshot
+of the selected image ID and known tags, final-reference warning, non-force/
+in-use and multi-tag warnings, `noprune=true` parent preservation,
+Cancel-without-request, success/error display, and stale invalidation. These
+tests use fixed image data and local state/events only; they never contact an
+engine or registry or mutate images.
 
-Pull presentation tests use fixed progress values. Tag and removal tests
-exercise fake completion events only; they do not send requests or mutate image
-resources. No live pull, tag, or image-removal operation is claimed. Tests must
-not pull, tag, delete, or otherwise mutate user images or engines.
+Pull presentation tests use fixed progress values. Tag, push, and removal tests
+use fake completion events and do not mutate image resources. No live pull,
+tag, removal, or registry-push operation is claimed. Tests must not pull, tag,
+push, delete, or otherwise mutate user images or engines.
 
-Engine image pull, tag, and removal contract tests use fake Unix sockets, not a
-Docker engine or registry, and never pull, tag, or delete an image. Tag cases
-cover encoded request paths/queries, success response, omitted force/auth
-fields, invalid input without a connection, and safe typed status rejection.
-Pull cases cover query encoding, chunked progress, response/event errors,
-malformed or oversized input, and invalid references. Removal cases cover the
-encoded image ID, DELETE with `noprune=true`, omitted force/auth fields, success,
-invalid input without a connection, and safe rejection/status without response
-body exposure. Run the image protocol tests with:
+Engine image pull, push, tag, and removal contract tests use fake Unix sockets,
+not a Docker engine or registry. Tag cases cover encoded request paths/queries,
+success response, omitted force/auth fields, invalid input without a
+connection, and safe typed status rejection. Pull cases cover query encoding,
+chunked progress, response/event errors, malformed or oversized input, and
+invalid references. Push cases cover the image-ID/tag preflight, exact explicit
+tag path, empty anonymous JSON body with no `X-Registry-Auth` header, bounded
+progress, tag reassignment before submission, authentication rejection, and
+daemon error redaction. Removal cases cover the encoded image ID, DELETE with
+`noprune=true`, omitted force/auth fields, success, invalid input without a
+connection, and safe rejection/status without response body exposure. Run the
+protocol tests with:
 
 ```sh
 cargo test -p ferrum-engine image_pull::tests
+cargo test -p ferrum-engine image_push::tests
 cargo test -p ferrum-engine image_api_tests
+cargo test -p ferrum-core image_push_target_tests
 ```
 
 The separate opt-in ignored
 `local_engine_lists_and_inspects_preinstalled_image_read_only` test exercises
 image list and inspect requests against the local Docker Unix socket. It is
-read-only and does not tag, pull, or modify images. No live image tag, pull, or
-removal request or image mutation test is provided.
+read-only and does not tag, pull, push, or modify images. There is no live
+registry push or other live image-mutation test.
 
-Image pull, tag, and removal requests use the validated local Docker Unix-socket
-endpoint; private-registry authentication is not implemented.
+Image pull, push, tag, and removal use the validated local Docker Unix-socket
+endpoint. Push is anonymous-only: Ferrum reads no saved registry credentials
+or credential-helper output; registries requiring authentication reject it.
 
 
 Manual release-mode performance samples are opt-in and have no timing

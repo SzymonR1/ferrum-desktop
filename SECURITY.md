@@ -22,19 +22,46 @@ Please use the private vulnerability-reporting feature for this repository in Gi
 
 ## Current scope
 
-The Linux application provides container inventory, inspection, bounded historical/live logs, state-gated lifecycle actions, image listing, inspection, anonymous public pulls, tagging, confirmed image removal, and an experimental embedded exec terminal over the selected local Docker-compatible Unix socket. Container Remove requires explicit confirmation and does not force-remove containers or remove volumes. Every image-tag request requires explicit confirmation because Docker Engine v1.56 may reassign an existing `repository:tag`; the image data remains. Image removal confirmation snapshots the selected image ID and known tags, warns that removal of the final reference may delete image data, and explains that the non-force request may be rejected for images used by containers or with other tags. The request sets `noprune=true` to preserve untagged parent images, omits `force`, and does not send registry credentials or authentication. A bounded 30-second removal timeout does not prove that engine state remained unchanged; invalidating the page ignores stale results without aborting or claiming to undo a submitted request. Only one image mutation is allowed at a time. Image pull, tag, and removal operate only through the selected local Linux Docker Unix socket; remote engine connections, credentials, Compose, archive handling, managed engines, and release updates are not implemented. The terminal does not launch an external terminal; closing its exec session does not stop or remove the container. Issue #10 remains open for Podman/rootless and remote compatibility. Image removal has fake-socket and headless UI coverage only; tests do not delete a real image or mutate image resources. See [`docs/security/threat-model.md`](docs/security/threat-model.md) for current risks and controls.
-Hiding image-pull progress or invalidating the Images page/context does not abort
-an active pull reader: Ferrum drains the response and keeps the mutation gate
-closed until a terminal event. Closing Ferrum does not guarantee that the
-daemon-side pull stops.
+The Linux application provides container inventory, inspection, bounded
+historical/live logs, state-gated lifecycle actions, image list/inspect, anonymous
+public pulls, local image tagging/removal, anonymous push of an existing local
+image tag, and an experimental embedded exec terminal over the selected local
+Docker-compatible Unix socket. Windows/macOS engine integration, remote
+transports, Podman/rootless, registry credential stores, Compose, archive
+handling, managed engines, and release updates are not implemented or validated.
+Issue #10 remains open for Podman/rootless and endpoint compatibility.
 
-Image pull, tag, and removal requests emit local structured process traces with
-only the static action and a `success`, `not_submitted`, or `request_error`
-outcome. `not_submitted` identifies local image ID, reference, or tag validation
-that occurs before HTTP submission. Image IDs, references, repository tags,
-endpoints, error text, and daemon response bodies are not logged. These events
-are not persistent or tamper-proof; `request_error` does not establish that
-engine state remained unchanged.
+Container Remove and image tag, removal, and push operations require explicit
+confirmation. Container removal is non-forced and does not remove volumes.
+Image-tag confirmation is required because Docker Engine v1.56 may reassign an
+existing `repository:tag`; the image data remains. Image-removal confirmation
+snapshots the ID and known tags, warns that removing the final reference may
+delete image data, and explains possible engine rejection. Removal sets
+`noprune=true`, omits `force`, and uses a bounded 30-second wait.
+
+Image push sends layers and metadata for one selected image ID and explicit
+existing `repository:tag`; confirmation names both and warns that image content
+may disclose secrets. Ferrum reinspects the selected image and verifies that the
+target tag is still reported for that image before submitting the push. This
+point-in-time check is not atomic with concurrent external Docker clients.
+Push is anonymous-only: Ferrum never reads Docker config, saved credentials, or
+credential-helper output. The generated API schema marks `X-Registry-Auth`
+required, but the Docker/Moby anonymous client path omits that header when no
+auth value is provided and sends an empty JSON object body; Ferrum mirrors that
+behavior. Registries requiring credentials reject the request, with no fallback
+to credentials. The request always names one tag and never asks the daemon to
+push all tags. See the [Moby image-push client](https://github.com/moby/moby/blob/master/client/image_push.go).
+
+Pull, push, tag, and removal use only the selected local Linux Docker Unix
+socket. Push/pull progress is bounded and sanitized; daemon response bodies are
+not displayed. Hiding progress or invalidating the Images page/context stops
+forwarding stale updates but keeps the response reader and mutation gate active
+until a terminal event. Closing Ferrum does not guarantee that daemon-side
+transfer work stops. A timeout or interrupted push stream does not prove that no
+layers reached the registry. Image mutation traces record only static action
+and outcome; they are local process traces, not persistent or tamper-proof.
+Image removal and push have fake-socket/headless coverage only; tests do not
+delete, push, or otherwise mutate real image resources.
 
 The Volumes page is available only for the selected local Docker Unix socket
 on Linux. Creation sends only `Name` to the negotiated volume-create endpoint

@@ -9,7 +9,7 @@ exercised.
 | Linux Wayland session (Fedora 44, KDE Plasma) | Engine integration tested; surface not visually verified | With `WAYLAND_DISPLAY` present, Winit selects Wayland. The app process loaded 15 containers, matching `docker ps -aq`; a missing local socket produced a connection error. The local desktop inspection provider does not support screenshots or accessibility, so the Wayland surface was not visually captured. |
 | Linux X11 through XWayland | Smoke-tested | On 2026-10-08, the X11 backend opened a Ferrum window. A window-only capture displayed the real Docker Engine version/API and 15 live container rows (names, images, states, and statuses), matching `docker ps -aq` (15). A second capture showed the disconnected state with a safe socket diagnostic. This is XWayland, not a separate pure X11 session. |
 | Linux Docker CLI contexts with local Unix sockets | Implemented; deterministic coverage added and live coverage is opt-in | Context enumeration/switching requires the Docker CLI. Without it, direct `DOCKER_HOST` and automatic local socket discovery remain available. Only local Unix-socket endpoints are selectable; the ignored live test reads version and inventory without modifying resources. |
-| Linux local Docker Unix-socket image listing, inspection, anonymous public pull, tagging, and removal | Engine API/UI scope implemented; headless tests only; no live image mutation or native image-page visual validation | Listing, inspection, pull, tag, and removal use the validated local Docker Unix socket. Pull, tag, and removal send no registry authentication or stored credentials. Tagging requires confirmation on every request because Docker Engine v1.56 may reassign an existing `repository:tag`; the image data remains. Removal snapshots the selected ID and known tags, warns about last-reference data deletion and possible non-force rejection, and uses `noprune=true` without `force`. Fake-socket and headless UI tests do not contact a real engine or mutate images; no live pull/tag/removal operation is claimed; issues #16 and #10 remain open. |
+| Linux local Docker Unix-socket image listing, inspection, anonymous pull/push, tagging, and removal | Scoped API/UI implemented; fake-socket and headless tests; no live registry push or native Images-page visual validation | Push accepts one explicit `repository:tag` already reported for the selected image, reinspects the image ID before submission, and requires confirmation warning about layer/metadata disclosure. It sends no stored credentials or `X-Registry-Auth`; the empty JSON body follows Docker/Moby's anonymous client path. Registries requiring auth reject the request. Pull/tag/removal/push tests do not mutate real images. Build/Buildx, private-registry authentication, Podman/rootless, and remote support remain unavailable or unvalidated; issues #16 and #10 remain open. |
 
 | Linux local Docker Unix-socket volume list/inspect/usage/name-only creation and guarded removal | Scoped API/UI slice; fake-socket and headless tests, opt-in owned-volume live test; native page not visually validated | List/inspect retains allowlisted metadata; usage reports `Size` and point-in-time `RefCount` only for exact inventory matches (`-1`, negative, or missing values are unavailable), with a 30-second/16 MiB usage bound. List, inspect, create, and removal use eight-second request bounds. Creation sends only `Name` and uses Docker's default local driver. Removal requires exact listed/inspected identity, `RefCount == 0`, and explicit confirmation; DELETE omits `force`, and a changing dependency may make Docker reject it. Optional driver/scope/time/mountpoint fields escape selected unsafe text; mountpoints are never accessed. Context switching is blocked and inventory refreshes after every mutation result. No pruning, modification, connection, disconnection, or filesystem browsing is offered. Podman/rootless is unvalidated; remote, Windows, and macOS support is not implemented. Issues #17 and #10 remain open. |
 | Linux local Docker Unix-socket network list/inspect/create/remove/connect/disconnect | Scoped Linux API/UI slice; fake-socket/headless coverage; opt-in live attachment smoke passed 2026-10-10 on Docker Engine 29.9.0/API 1.56; native page not visually validated | Creation sends only `Name`; removal requires a fresh zero-reference inspection and exact-ID confirmation without force/prune. Attachment controls require complete validated membership IDs and an exact current-inventory container ID in `Running` state, plus confirmation. Requests send only `Container`, omit endpoint configuration/Force, use an eight-second deadline, and are not retried. The live smoke uses preinstalled `FERRUM_TEST_IMAGE`, `--pull never`, and exact-ID cleanup without force/prune. No usage, Podman/rootless, or remote support is claimed. |
@@ -32,23 +32,19 @@ platform scope. Windows named pipes and macOS remain deferred to
 [#21](https://github.com/SzymonR1/ferrum-desktop/issues/21) and M8.
 
 Image inventory, inspection, anonymous public-image pulls, local image tagging,
-and image removal are limited to Linux local Docker Unix sockets. Each tag
-request requires confirmation because Docker Engine v1.56 may reassign an
-existing `repository:tag`; the image data remains. Image-removal confirmation
-snapshots the selected ID and known tags and warns that removing the last
-reference can delete image data. Removal omits `force` and sets `noprune=true`
-to preserve untagged parent images; the engine may refuse images used by
-containers or with other tags. Only one image mutation (pull/tag/remove) is in
-flight at a time. A timeout or request error does not prove removal had no
-effect; stale UI results are ignored without aborting or claiming to undo a
-submitted request. Inventory refresh after success occurs only when Images is
-current. No live pull, tag, or removal operation is claimed, and tests do not
-mutate images. **Hide progress** suppresses pull updates but keeps Ferrum draining
-the response and the image-mutation gate closed until a terminal event.
-Page/context invalidation hides stale updates without aborting the reader;
-closing Ferrum does not guarantee that daemon-side pull work stops.
-Private-registry authentication, Podman/rootless behavior, and remote endpoints
-remain unsupported or unvalidated. Issues
+removal, and anonymous push are limited to Linux local Docker Unix sockets.
+Push accepts only one explicit tag already reported for the selected image;
+Ferrum reinspects that ID before submitting, but the check is not atomic with
+external Docker clients. Confirmation names the image and target and warns that
+layers/metadata may contain secrets. Push reads no registry credentials and
+does not send `X-Registry-Auth`; registries requiring credentials reject the
+request. Only one image mutation (pull/push/tag/remove) is active at a time.
+Hiding pull/push progress or invalidating the Images page/context suppresses
+stale UI updates but keeps the response reader and mutation gate active until a
+terminal event. Closing Ferrum does not guarantee daemon-side transfer work
+stops. No live image push, pull, tag, or removal request is claimed; tests do
+not mutate images, and native Images-page visual validation remains outstanding.
+Build/Buildx and private-registry authentication remain unavailable. Issues
 [#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) and
 [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) remain open.
 Network listing, inspection, name-only default-bridge creation, guarded unused

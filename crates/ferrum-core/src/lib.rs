@@ -111,6 +111,16 @@ pub struct ImagePullProgress {
     /// Total number of bytes reported for the current progress item, if provided.
     pub total_bytes: Option<u64>,
 }
+/// A bounded progress update reported while an image is being pushed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImagePushProgress {
+    /// Sanitized status text suitable for display.
+    pub status: String,
+    /// Number of bytes reported as uploaded, if provided by the engine.
+    pub current_bytes: Option<u64>,
+    /// Total number of bytes reported for the current upload item, if provided.
+    pub total_bytes: Option<u64>,
+}
 
 /// A container lifecycle change reported by the engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,6 +205,87 @@ pub struct ImageSummary {
     /// Image size in bytes, when reported by the engine.
     pub size_bytes: Option<u64>,
 }
+
+/// A validated, explicitly tagged local image reference selected for pushing.
+///
+/// The parser accepts a bounded lowercase-ASCII repository-name subset and
+/// Docker tag syntax; the engine still validates full repository semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImagePushTarget {
+    reference: String,
+    tag_offset: usize,
+}
+
+impl ImagePushTarget {
+    /// Parses a local repository:tag reference suitable for an explicit push.
+    ///
+    /// Digest-only references, untagged names, and references containing
+    /// whitespace, controls, or URI delimiters are rejected.
+    #[must_use]
+    pub fn parse(reference: &str) -> Option<Self> {
+        if !Self::is_valid_reference(reference) {
+            return None;
+        }
+        let tag_offset = reference.rfind(':')?.checked_add(1)?;
+        Some(Self {
+            reference: reference.to_owned(),
+            tag_offset,
+        })
+    }
+
+    /// Returns whether `reference` has the bounded syntax accepted by `parse`.
+    #[must_use]
+    pub fn is_valid_reference(reference: &str) -> bool {
+        if reference.is_empty() || reference.len() > 512 || reference.contains('@') {
+            return false;
+        }
+        let Some(colon) = reference.rfind(':') else {
+            return false;
+        };
+        let repository = &reference[..colon];
+        let tag = &reference[colon + 1..];
+        if repository.is_empty()
+            || repository.starts_with('/')
+            || repository.ends_with('/')
+            || repository
+                .split('/')
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+            || !repository.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'-' | b'_' | b':' | b'/' | b'[' | b']')
+            })
+        {
+            return false;
+        }
+        let tag = tag.as_bytes();
+        !tag.is_empty()
+            && tag.len() <= 128
+            && (tag[0].is_ascii_alphanumeric() || tag[0] == b'_')
+            && tag
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    }
+
+    /// Returns the exact local repository:tag reference.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.reference
+    }
+
+    /// Returns the registry/repository portion without the selected tag.
+    #[must_use]
+    pub fn repository(&self) -> &str {
+        &self.reference[..self.tag_offset - 1]
+    }
+
+    /// Returns the selected Docker tag.
+    #[must_use]
+    pub fn tag(&self) -> &str {
+        &self.reference[self.tag_offset..]
+    }
+}
+
 /// Engine-independent information about one local volume.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VolumeSummary {
@@ -375,4 +466,54 @@ pub struct ContainerMount {
     pub mode: Option<String>,
     /// Whether the mount is writable, when reported.
     pub read_write: Option<bool>,
+}
+
+#[cfg(test)]
+mod image_push_target_tests {
+    use super::ImagePushTarget;
+
+    #[test]
+    fn parses_explicit_tag_without_confusing_registry_port() {
+        let target = ImagePushTarget::parse("registry.example.com:5000/team/app:RC_1")
+            .expect("tagged local image reference should parse");
+
+        assert_eq!(target.repository(), "registry.example.com:5000/team/app");
+        assert_eq!(target.tag(), "RC_1");
+        assert_eq!(target.as_str(), "registry.example.com:5000/team/app:RC_1");
+        assert!(ImagePushTarget::parse("[::1]:5000/team/app:latest").is_some());
+    }
+
+    #[test]
+    fn rejects_untagged_digest_or_unsafe_references() {
+        for reference in [
+            "",
+            "registry.example.com:5000/team/app",
+            "repo@sha256:012345",
+            "repo:tag/extra",
+            "repo:bad tag",
+            "repo:tag?query",
+            "repo:tag#fragment",
+            "Repo:tag",
+            "repo//child:tag",
+            "repo/../child:tag",
+            "repo:\u{7f}",
+        ] {
+            assert!(
+                ImagePushTarget::parse(reference).is_none(),
+                "{reference:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_maximum_reference_length_and_rejects_one_byte_over() {
+        let repository = "a".repeat(508);
+        let accepted = format!("{repository}:tag");
+        assert_eq!(accepted.len(), 512);
+        assert!(ImagePushTarget::parse(&accepted).is_some());
+
+        let rejected = format!("{repository}:tagx");
+        assert_eq!(rejected.len(), 513);
+        assert!(ImagePushTarget::parse(&rejected).is_none());
+    }
 }
