@@ -394,17 +394,97 @@ The engine integration targets Linux local Unix sockets. Podman/rootless
 behavior remains unvalidated, remote transports remain unsupported, and Windows
 named pipes and macOS remain deferred to issue #21/M8.
 
+Default Compose discovery and validation tests use controlled CLI fixtures and
+headless UI state; they do not contact a live engine or mutate project files.
+Discovery fixtures check `docker compose version --short` and
+`docker compose ls --all --format json`, with only the listing pinned to the
+selected `EngineClient::local_socket_path()`. Validation preflights
+`docker compose version --short` through the private isolated Docker config;
+preflight failure is distinct from config-validation failure. Validation
+fixtures check the single selected local file passed as an argument to
+`docker compose --project-directory <parent> --file <file> config --quiet
+--no-interpolate --no-env-resolution`, including parent-directory path
+resolution and `COMPOSE_DISABLE_ENV_FILE=1`. Success is structural validation
+only, with interpolation and service `env_file` resolution skipped. The
+fixture also verifies private Docker config/HOME, a cleared environment with
+no inherited engine or credential/proxy settings, and no user config copied
+into the child config. Failure diagnostics and selected paths are not exposed;
+output and subprocess deadlines are bounded.
+
+Headless AccessKit coverage verifies the file-selection action and its
+asynchronous pending/cancelled states without engine access; stale chooser
+results are rejected, while the native chooser itself is not exercised
+headlessly. The same UI tests cover the recursive `include`/`extends.file`
+trusted-file disclosure, success wording, validation failure, missing-plugin,
+bounded escaped basename display, and validation cancellation.
+
+The controlled CLI fixtures verify version-probe and config arguments, the same
+private configuration across both commands, selected file/parent paths, a
+cleared environment without inherited engine or credential/proxy settings, and
+explicitly disabled Git/OCI remote loaders. They also cover plugin-unavailable
+classification before config invocation, redaction, output bounds, and
+deadline cancellation. Run the Compose tests with:
+
+```sh
+cargo test -p ferrum-app --bin ferrum compose::tests::
+```
+
+The optional ignored app-level live smoke requires a local Docker-compatible
+Unix socket and Compose CLI. It only discovers the caller-selected engine's
+Compose version/projects and checks bounded, escaped output; it never creates,
+starts, stops, or removes projects:
+
+```sh
+cargo test -p ferrum-app --bin ferrum compose::tests::local_compose_discovery_smoke_is_read_only -- --exact --ignored
+```
+
+The separate optional ignored validation smoke requires Docker CLI/Compose but
+does not use an engine. It creates a controlled temporary Compose YAML and a
+relative `./data` directory, then runs the isolated CLI config-validation path;
+it does not touch user project files or mutate engine resources:
+
+```sh
+cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_validation_reads_a_controlled_relative_path_project -- --exact --ignored
+```
+
+The optional ignored remote-loader safety smoke uses only a `127.0.0.1`
+listener and Git/OCI-shaped `include` references. It passes only when Compose
+rejects the references without making a local connection; it contacts no
+external host and uses no engine:
+
+```sh
+cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_validation_rejects_remote_includes_without_network_access -- --exact --ignored
+```
+
+Validation uses the official [Compose `config` reference](https://docs.docker.com/reference/cli/docker/compose/config),
+[Compose CLI semantics](https://docs.docker.com/reference/cli/docker/compose),
+and [Compose environment-variable guide](https://docs.docker.com/compose/how-tos/environment-variables/envvars/).
+The selected project's `.env` interpolation and service `env_file` resolution
+are skipped. However, Compose may still read each included project's default
+`.env` or explicit `include.env_file`, including paths outside the selected
+directory, under the logged-in user's permissions; the no-interpolate and
+no-env-resolution options do not confine those reads. Remote Git and OCI
+loaders are explicitly disabled, so remote include/extends references fail
+without fetching. The CLI/plugin remains unsandboxed; validate only trusted
+files. Multi-file merge, profiles, import, lifecycle/build/pull/logs, and
+project mutations remain unsupported.
+
+Only Linux local Docker discovery was validated; validation uses no engine. The
+native Compose page visual check is unavailable, and Podman/rootless and remote
+transports remain unsupported or unvalidated. Issue #18 remains open and #10
+remains blocked; no release/support expansion is claimed.
+
 The mutation audit tests verify redacted JSONL records for lifecycle, image,
 volume, and network outcomes; they also check the 16 MiB hard cap and that
 audit files are created privately and reject symlink, hard-link, and non-regular
 targets.
 Lock-contention coverage holds the audit file lock through a separate open file
 descriptor and verifies persistence fails within the bounded wait. No real
-engine resource is used.
-
-The records are a local Ferrum-request history, not tamper-proof and not proof
-of final engine state; they do not capture external engine actions. Run the
-focused tests directly:
+engine resource is used. The records are a local Ferrum-request history, not
+tamper-proof or proof of final engine state, and do not capture external engine
+actions. Separate in-memory lifecycle trace tests check action/outcome fields,
+full-ID validation, and omission of untrusted identifiers.
+Run the focused audit tests directly:
 
 ```sh
 cargo test -p ferrum-app --bin ferrum audit::tests

@@ -204,3 +204,64 @@ credential access is not provided. Podman/rootless and remote endpoints remain
 unsupported or unvalidated. Issues #17, #19, and #10 remain open; no release is
 claimed.
 
+The Compose page keeps read-only project discovery for the selected Linux local
+Docker Unix socket. It detects the installed CLI version with
+`docker compose version --short` and lists projects with
+`docker compose ls --all --format json`, pinning the listing to
+`EngineClient::local_socket_path()` through Docker global `--host unix://...`.
+
+An explicit validation action uses an asynchronous native file picker to accept
+one local `.yaml` or `.yml` file without blocking the app update thread.
+Before config validation, Ferrum runs
+`docker compose version --short` through the private isolated Docker config;
+a failed CLI preflight is distinct from config-validation failure. It passes
+the selected path as an argument to
+`docker compose --project-directory <parent> --file <selected-file> config
+--quiet --no-interpolate --no-env-resolution` with
+`COMPOSE_DISABLE_ENV_FILE=1`. `--project-directory` is the selected file's
+parent, so relative paths use Compose's documented behavior.
+
+Validation is read-only, does not contact or require an engine socket, and
+Ferrum does not write, modify, delete, or extract project files. A successful
+result means structural validation only; interpolation and service `env_file`
+resolution are skipped. Only a bounded escaped basename and a static result
+are displayed; paths are session-only and raw diagnostics are discarded.
+Compose can recursively read local Compose files referenced by `include` or
+service `extends.file`, plus the included project's default `.env` and explicit
+`include.env_file` paths. These files can be outside the selected Compose file's
+directory and are opened with the logged-in user's permissions.
+`COMPOSE_DISABLE_ENV_FILE=1` disables only the selected project's default `.env`;
+`--no-interpolate` and `--no-env-resolution` do not confine included-project
+file reads. Remote Git and OCI loaders are explicitly disabled during
+validation, so remote `include`/`extends.file` references fail without a fetch.
+The selected file is not a path-containment boundary. CLI/plugin code is trusted
+local code and config isolation is not a sandbox; users should validate only
+trusted Compose files.
+
+Ferrum clears inherited environment values, sets `COMPOSE_DISABLE_ENV_FILE=1`,
+and sets `COMPOSE_EXPERIMENTAL_GIT_REMOTE=false` and
+`COMPOSE_EXPERIMENTAL_OCI_REMOTE=false`. This prevents remote Compose sources
+from making Git or registry requests during config validation. It does not pass
+user environment files. Multi-file merge, profiles, `.env`/service `env_file`
+resolution, remote Git/OCI references, file import, lifecycle actions,
+build/pull/logs, and project mutations are unsupported. Each CLI command has an
+eight-second deadline and a 1 MiB stdout cap.
+
+CLI processes use a private isolated Docker config/HOME and a cleared
+allowlisted environment. If Compose is installed in the standard per-user CLI
+plugin directory, only the `docker-compose` executable is linked into the
+private config; custom `cliPluginsExtraDirs` from saved config are not loaded.
+The saved `config.json` is not loaded, so Docker credentials and proxy settings
+from that config are not read or passed to the CLI. Compose-declared local
+environment files may still be read as described above.
+
+For the command and environment contract, see Docker's [Compose `config`
+reference](https://docs.docker.com/reference/cli/docker/compose/config),
+[Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose),
+and [Compose environment-variable guide](https://docs.docker.com/compose/how-tos/environment-variables/envvars/).
+No file import, start/stop/restart, build/pull, logs, or other project mutation
+is implemented. Podman/rootless, remote Docker, Windows, and macOS are not in
+scope; issue #10 remains blocked. Only Linux local Docker discovery was
+validated; validation uses no engine. The native page visual check is
+unavailable. Issue #18 remains open.
+
