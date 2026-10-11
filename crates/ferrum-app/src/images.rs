@@ -1,13 +1,51 @@
 use crate::{display::escape_untrusted_display_text, search::CaseInsensitiveQuery};
 
+#[cfg(target_os = "linux")]
+use crate::image_build::{ImageBuildError, ImageBuildRequest};
 use eframe::egui;
 use ferrum_core::{
-    ImageDetails, ImagePullProgress, ImagePushProgress, ImagePushTarget, ImageSummary,
+    ImageDetails, ImageHistoryEntry, ImagePullProgress, ImagePushProgress, ImagePushTarget,
+    ImageSummary,
 };
 use std::fmt::Display;
+#[cfg(target_os = "linux")]
+use std::{collections::VecDeque, path::PathBuf};
+
+#[cfg(target_os = "linux")]
+const BUILD_OUTPUT_MAX_BYTES: usize = 2 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const BUILD_OUTPUT_MAX_LINES: usize = 10_000;
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+pub(super) struct BuildOutputBuffer {
+    pub(super) lines: VecDeque<String>,
+    pub(super) retained_bytes: usize,
+    pub(super) dropped_lines: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl BuildOutputBuffer {
+    fn push(&mut self, line: String) {
+        let line = crate::display::escape_untrusted_display_text_with_limit(line, 16 * 1024)
+            .unwrap_or_else(|| "[build output omitted]".to_owned());
+        self.retained_bytes = self.retained_bytes.saturating_add(line.len());
+        self.lines.push_back(line);
+        while self.lines.len() > BUILD_OUTPUT_MAX_LINES
+            || self.retained_bytes > BUILD_OUTPUT_MAX_BYTES
+        {
+            if let Some(removed) = self.lines.pop_front() {
+                self.retained_bytes = self.retained_bytes.saturating_sub(removed.len());
+                self.dropped_lines = self.dropped_lines.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+    }
+}
 
 const IMAGE_ROW_HEIGHT: f32 = 34.0;
 const IMAGE_CELL_HEIGHT: f32 = 32.0;
+const IMAGE_HISTORY_ROW_HEIGHT: f32 = 30.0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum AppPage {
@@ -76,6 +114,9 @@ pub(super) struct ImagesView {
     details: Option<ImageDetails>,
     detail_error: Option<String>,
     inspection_loading: bool,
+    history: Vec<ImageHistoryEntry>,
+    history_error: Option<String>,
+    history_loading: bool,
     loading: bool,
     loaded: bool,
     error: Option<String>,
@@ -131,7 +172,38 @@ pub(super) struct ImagesView {
     remove_complete: bool,
     remove_error: Option<String>,
     remove_result_image_id: Option<String>,
+    #[cfg(target_os = "linux")]
+    pub(super) build_context: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
+    pub(super) build_repository: String,
+    #[cfg(target_os = "linux")]
+    pub(super) build_tag: String,
+    #[cfg(target_os = "linux")]
+    pub(super) build_output: BuildOutputBuffer,
+    #[cfg(target_os = "linux")]
+    pub(super) build_complete: bool,
+    #[cfg(target_os = "linux")]
+    pub(super) build_error: Option<String>,
+    #[cfg(target_os = "linux")]
+    build_confirmation_context_label: Option<String>,
+    #[cfg(target_os = "linux")]
+    build_generation: u64,
+    #[cfg(target_os = "linux")]
+    active_build_generation: Option<u64>,
+    #[cfg(target_os = "linux")]
+    build_confirmation_open: bool,
+    #[cfg(target_os = "linux")]
+    build_confirmed: bool,
+    #[cfg(target_os = "linux")]
+    build_requested: bool,
+    #[cfg(target_os = "linux")]
+    build_cancel_requested: bool,
+    #[cfg(target_os = "linux")]
+    build_loading: bool,
+    #[cfg(target_os = "linux")]
+    build_cancel_enabled: bool,
 }
+
 impl ImagesView {
     pub(super) fn is_loading(&self) -> bool {
         self.loading
@@ -141,6 +213,110 @@ impl ImagesView {
     }
     pub(super) fn is_tagging(&self) -> bool {
         self.tag_loading
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn build_target_valid(&self) -> bool {
+        crate::image_build::valid_target(&self.build_repository, &self.build_tag)
+            && self.build_context.is_some()
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn build_blocks_context_switch(&self) -> bool {
+        self.build_confirmation_open
+            || self.build_confirmed
+            || self.build_requested
+            || self.build_loading
+            || self.active_build_generation.is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn begin_build_confirmation(&mut self, context_label: &str) -> bool {
+        if self.build_target_valid() && !self.has_mutation_in_flight() && !self.build_loading {
+            self.build_confirmation_open = true;
+            self.build_confirmation_context_label =
+                Some(escape_untrusted_display_text(context_label).into_owned());
+            self.build_complete = false;
+            self.build_error = None;
+            return true;
+        }
+        false
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn cancel_build_confirmation(&mut self) {
+        self.build_confirmation_open = false;
+        self.build_confirmed = false;
+        self.build_requested = false;
+        self.build_confirmation_context_label = None;
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn confirm_build(&mut self) {
+        if self.build_confirmation_open && self.build_target_valid() && !self.build_loading {
+            self.build_confirmation_open = false;
+            self.build_confirmed = true;
+            self.build_requested = true;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn take_build_requested(&mut self) -> bool {
+        std::mem::take(&mut self.build_requested)
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn begin_build(&mut self) -> Option<(u64, ImageBuildRequest)> {
+        if !std::mem::take(&mut self.build_confirmed) || self.has_mutation_in_flight() {
+            return None;
+        }
+        let context = self.build_context.clone()?;
+        let request = ImageBuildRequest::unchecked(
+            context,
+            self.build_repository.clone(),
+            self.build_tag.clone(),
+        );
+        self.build_generation = self.build_generation.wrapping_add(1);
+        self.active_build_generation = Some(self.build_generation);
+        self.build_loading = true;
+        self.build_cancel_enabled = true;
+        self.build_cancel_requested = false;
+        self.build_complete = false;
+        self.build_error = None;
+        self.build_output = BuildOutputBuffer::default();
+        Some((self.build_generation, request))
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn update_build_output(&mut self, generation: u64, line: String) -> bool {
+        if self.active_build_generation != Some(generation) || !self.build_loading {
+            return false;
+        }
+        self.build_output.push(line);
+        true
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn request_cancel_build(&mut self) {
+        if self.build_loading && self.build_cancel_enabled {
+            self.build_cancel_requested = true;
+            self.build_cancel_enabled = false;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn take_build_cancel_requested(&mut self) -> bool {
+        std::mem::take(&mut self.build_cancel_requested)
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn finish_build(
+        &mut self,
+        generation: u64,
+        result: Result<(), ImageBuildError>,
+    ) -> bool {
+        if self.active_build_generation != Some(generation) {
+            return false;
+        }
+        self.active_build_generation = None;
+        self.build_loading = false;
+        self.build_cancel_enabled = false;
+        self.build_cancel_requested = false;
+        match result {
+            Ok(()) => self.build_complete = true,
+            Err(error) => self.build_error = Some(error.to_string()),
+        }
+        true
     }
 
     pub(super) fn is_pulling(&self) -> bool {
@@ -174,11 +350,119 @@ impl ImagesView {
     pub(super) fn is_push_outcome_uncertain(&self) -> bool {
         self.push_outcome_uncertain
     }
+    #[cfg(target_os = "linux")]
+    fn draw_build_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        allowed: bool,
+        mutation_busy: bool,
+        context_label: &str,
+    ) {
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.heading("Build local image");
+            if (self.build_confirmation_open || self.build_loading)
+                && let Some(context) = &self.build_confirmation_context_label
+            {
+                ui.horizontal(|ui| {
+                    ui.label("Selected engine source:");
+                    ui.label(context);
+                });
+            }
+            ui.label("Saved registry credentials are not read or sent; private base images may fail.");
+            if let Some(context) = &self.build_context {
+                let context = context.display().to_string();
+                let safe = escape_untrusted_display_text(&context);
+                ui.label(format!("Build context: {safe}"));
+            } else {
+                ui.label("Choose a local directory containing a regular root-level Dockerfile.");
+            }
+            if ui.add_enabled(allowed && !self.build_loading && !self.build_confirmation_open && !mutation_busy, egui::Button::new("Choose build context")).clicked()
+                && let Some(context) = rfd::FileDialog::new().pick_folder()
+            {
+                self.build_context = Some(context);
+            }
+            ui.add_enabled_ui(!self.build_loading && !self.build_confirmation_open, |ui| {
+                ui.horizontal(|ui| {
+                    let label = ui.label("Build repository");
+                    ui.text_edit_singleline(&mut self.build_repository).labelled_by(label.id);
+                });
+                ui.horizontal(|ui| {
+                    let label = ui.label("Build tag");
+                    ui.text_edit_singleline(&mut self.build_tag).labelled_by(label.id);
+                });
+            });
+            let target_valid = self.build_target_valid();
+            if !target_valid {
+                ui.label("Choose a local build context and enter a valid repository/tag target (512-byte combined limit).");
+            }
+            if ui.add_enabled(
+                allowed && target_valid && !self.build_loading && !mutation_busy && !self.build_confirmation_open,
+                egui::Button::new("Build image"),
+            ).clicked() {
+                self.begin_build_confirmation(context_label);
+            }
+            if self.build_confirmation_open {
+                let target = format!("{}:{}", self.build_repository, self.build_tag);
+                let target = escape_untrusted_display_text(&target);
+                ui.group(|ui| {
+                    ui.heading("Confirm image build");
+                    ui.label(format!(
+                        "Build {target} from this context? Docker CLI sends the selected context to the local Docker engine after applying .dockerignore. Dockerfile commands can execute arbitrary code, and Docker may assign this tag to a different image. Confirm to run Buildx."
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("Confirm build").clicked() { self.confirm_build(); }
+                        if ui.button("Cancel").clicked() { self.cancel_build_confirmation(); }
+                    });
+                });
+            }
+            if self.build_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Building image…");
+                    if ui.add_enabled(self.build_cancel_enabled, egui::Button::new("Cancel build")).clicked() {
+                        self.request_cancel_build();
+                    }
+                });
+            } else if self.build_complete {
+                ui.label("Image build complete.");
+            } else if let Some(error) = &self.build_error {
+                ui.label(error);
+            }
+            if self.build_output.dropped_lines > 0 {
+                ui.label(format!("{} older build output lines dropped.", self.build_output.dropped_lines));
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("image-build-output")
+                .max_height(220.0)
+                .show_rows(ui, 18.0, self.build_output.lines.len(), |ui, rows| {
+                    for row in rows {
+                        ui.add_sized(
+                            [ui.available_width(), 18.0],
+                            egui::Label::new(&self.build_output.lines[row]).truncate(),
+                        );
+                    }
+                });
+        });
+    }
     pub(super) fn has_mutation_in_flight(&self) -> bool {
-        self.active_pull_generation.is_some()
+        let mut busy = self.active_pull_generation.is_some()
             || self.active_push_generation.is_some()
+            || self.push_confirmation_open
+            || self.push_confirmed
+            || self.push_requested
             || self.tag_loading
             || self.remove_loading
+            || self.tag_confirmation_open
+            || self.remove_confirmation_open;
+        #[cfg(target_os = "linux")]
+        {
+            busy |= self.active_build_generation.is_some()
+                || self.build_confirmation_open
+                || self.build_confirmed
+                || self.build_requested;
+        }
+        busy
     }
     pub(super) fn take_pull_requested(&mut self) -> bool {
         std::mem::take(&mut self.pull_requested)
@@ -209,6 +493,14 @@ impl ImagesView {
         self.reset_inventory();
         self.invalidate_pull_view();
         self.invalidate_push_view();
+        #[cfg(target_os = "linux")]
+        {
+            self.build_confirmation_open = false;
+            self.build_confirmed = false;
+            self.build_requested = false;
+            self.build_cancel_requested = false;
+            self.build_confirmation_context_label = None;
+        }
         self.tag_generation = self.tag_generation.wrapping_add(1);
         self.tag_confirmation_open = false;
         self.tag_confirmation_image_id = None;
@@ -298,6 +590,7 @@ impl ImagesView {
     pub(super) fn begin_tag_confirmation(&mut self) {
         if self.tag_target_valid()
             && !self.tag_loading
+            && !self.has_mutation_in_flight()
             && let Some(image_id) = &self.selected_id
         {
             self.tag_confirmation_image_id = Some(image_id.clone());
@@ -310,6 +603,7 @@ impl ImagesView {
     pub(super) fn begin_remove_confirmation(&mut self) {
         if !self.remove_loading
             && !self.remove_confirmation_open
+            && !self.has_mutation_in_flight()
             && let Some(image_id) = &self.selected_id
         {
             self.remove_confirmation_image_id = Some(image_id.clone());
@@ -534,7 +828,6 @@ impl ImagesView {
         if self.push_confirmation_open
             && self.push_confirmation_image_id.is_some()
             && self.push_confirmation_target.is_some()
-            && !self.has_mutation_in_flight()
         {
             self.push_confirmation_open = false;
             self.push_confirmed = true;
@@ -717,6 +1010,33 @@ impl ImagesView {
         }
         true
     }
+    pub(super) fn complete_history<E: Display>(
+        &mut self,
+        list_generation: u64,
+        inspection_generation: u64,
+        id: &str,
+        result: Result<Vec<ImageHistoryEntry>, E>,
+    ) -> bool {
+        if self.generation != list_generation
+            || self.inspection_generation != inspection_generation
+            || self.selected_id.as_deref() != Some(id)
+            || !self.images.iter().any(|image| image.id == id)
+        {
+            return false;
+        }
+        self.history_loading = false;
+        match result {
+            Ok(history) => {
+                self.history = history;
+                self.history_error = None;
+            }
+            Err(error) => {
+                self.history.clear();
+                self.history_error = Some(error.to_string());
+            }
+        }
+        true
+    }
 
     pub(super) fn show(
         &mut self,
@@ -725,6 +1045,7 @@ impl ImagesView {
         connection_message: &str,
         operations_allowed: bool,
         mutation_busy: bool,
+        build_context_label: &str,
     ) -> Option<ImageInspectionRequest> {
         ui.group(|ui| {
             ui.heading("Pull public image");
@@ -734,8 +1055,10 @@ impl ImagesView {
             }
             ui.horizontal(|ui| {
                 let label = ui.label("Image reference");
-                ui.text_edit_singleline(&mut self.pull_reference)
-                    .labelled_by(label.id);
+                ui.add_enabled(
+                    !mutation_busy || self.pull_loading,
+                    egui::TextEdit::singleline(&mut self.pull_reference),
+                ).labelled_by(label.id);
                 if ui
                     .add_enabled(
                         connected
@@ -774,6 +1097,10 @@ impl ImagesView {
                 ui.label(error);
             }
         });
+        #[cfg(target_os = "linux")]
+        if operations_allowed || self.build_loading {
+            self.draw_build_controls(ui, operations_allowed, mutation_busy, build_context_label);
+        }
         if !connected {
             ui.heading("Image list unavailable");
             ui.label(connection_message);
@@ -815,8 +1142,9 @@ impl ImagesView {
             selected_id = self.draw_image_list(ui);
         }
 
-        let request = selected_id.map(|id| self.select_image(id));
+        let request = selected_id.and_then(|id| self.select_image(id));
         self.draw_details(ui);
+        self.draw_history(ui);
         self.draw_tag_controls(ui, connected, operations_allowed, mutation_busy);
         self.draw_push_controls(ui, connected, operations_allowed, mutation_busy);
         self.draw_remove_controls(ui, connected, operations_allowed, mutation_busy);
@@ -920,30 +1248,101 @@ impl ImagesView {
             image_detail(ui, "Author", details.author.as_deref());
         }
     }
+    fn draw_history(&self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.separator();
+        ui.heading("Image layer history");
+        if self.selected_id.is_none() {
+            ui.label("Select an image to load its read-only layer history.");
+        } else if self.history_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading image history…");
+            });
+        } else if let Some(error) = &self.history_error {
+            ui.colored_label(
+                egui::Color32::from_rgb(227, 113, 102),
+                "Image history unavailable",
+            );
+            ui.label(error);
+        } else if self.history.is_empty() {
+            ui.label("No safe image history fields were reported.");
+        } else {
+            let width = ui.available_width();
+            let layer_width = width * 0.52;
+            let created_width = width * 0.24;
+            let size_width = width - layer_width - created_width;
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [layer_width, IMAGE_CELL_HEIGHT],
+                    egui::Label::new("Layer ID"),
+                );
+                ui.add_sized(
+                    [created_width, IMAGE_CELL_HEIGHT],
+                    egui::Label::new("Created (Unix seconds)"),
+                );
+                ui.add_sized([size_width, IMAGE_CELL_HEIGHT], egui::Label::new("Size"));
+            });
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .id_salt("image-history")
+                .max_height(180.0)
+                .show_rows(
+                    ui,
+                    IMAGE_HISTORY_ROW_HEIGHT,
+                    self.history.len(),
+                    |ui, rows| {
+                        for row in rows {
+                            let entry = &self.history[row];
+                            let layer_id = entry.layer_id.as_deref().unwrap_or("Not reported");
+                            let created = entry.created_unix_seconds.map_or_else(
+                                || "Not reported".to_owned(),
+                                |value| value.to_string(),
+                            );
+                            let size = format_size(entry.size_bytes);
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [layer_width, IMAGE_HISTORY_ROW_HEIGHT],
+                                    egui::Label::new(layer_id)
+                                        .truncate()
+                                        .show_tooltip_when_elided(true),
+                                );
+                                ui.add_sized(
+                                    [created_width, IMAGE_HISTORY_ROW_HEIGHT],
+                                    egui::Label::new(created),
+                                );
+                                ui.add_sized(
+                                    [size_width, IMAGE_HISTORY_ROW_HEIGHT],
+                                    egui::Label::new(size),
+                                );
+                            });
+                        }
+                    },
+                );
+        }
+    }
 
-    fn select_image(&mut self, id: String) -> ImageInspectionRequest {
-        self.push_target_reference = self
-            .images
+    fn select_image(&mut self, id: String) -> Option<ImageInspectionRequest> {
+        let image = self.images.iter().find(|image| image.id == id)?;
+        self.push_target_reference = image
+            .repo_tags
             .iter()
-            .find(|image| image.id == id)
-            .and_then(|image| {
-                image
-                    .repo_tags
-                    .iter()
-                    .find(|tag| ImagePushTarget::is_valid_reference(tag))
-            })
+            .find(|tag| ImagePushTarget::is_valid_reference(tag))
             .cloned()
             .unwrap_or_default();
         self.selected_id = Some(id.clone());
         self.details = None;
         self.detail_error = None;
         self.inspection_loading = true;
+        self.history.clear();
+        self.history_error = None;
+        self.history_loading = true;
         self.inspection_generation = self.inspection_generation.wrapping_add(1);
-        ImageInspectionRequest {
+        Some(ImageInspectionRequest {
             list_generation: self.generation,
             inspection_generation: self.inspection_generation,
             id,
-        }
+        })
     }
 
     fn clear_selection(&mut self) {
@@ -952,6 +1351,9 @@ impl ImagesView {
         self.detail_error = None;
         self.inspection_loading = false;
         self.push_target_reference.clear();
+        self.history.clear();
+        self.history_error = None;
+        self.history_loading = false;
     }
 
     fn rebuild_visible(&mut self) {
@@ -981,7 +1383,7 @@ impl ImagesView {
             if !operations_allowed && connected && !mutation_busy {
                 ui.label("Image tagging is available only through the local Docker Unix socket on Linux.");
             }
-            ui.add_enabled_ui(!self.tag_loading && !self.tag_confirmation_open, |ui| {
+            ui.add_enabled_ui(!self.tag_loading && !self.tag_confirmation_open && !mutation_busy, |ui| {
                 ui.horizontal(|ui| {
                     let label = ui.label("Repository");
                     ui.text_edit_singleline(&mut self.tag_repository)
@@ -1244,7 +1646,7 @@ impl ImagesView {
     }
 }
 
-fn valid_docker_tag(tag: &str) -> bool {
+pub(super) fn valid_docker_tag(tag: &str) -> bool {
     let bytes = tag.as_bytes();
     let Some((&first, rest)) = bytes.split_first() else {
         return false;
@@ -1301,7 +1703,11 @@ mod tests {
     fn harness_for(view: ImagesView) -> Harness<'static, ImagesUi> {
         Harness::new_ui_state(
             |ui, state: &mut ImagesUi| {
-                if let Some(request) = state.view.show(ui, true, "", true, false) {
+                if let Some(request) =
+                    state
+                        .view
+                        .show(ui, true, "", true, false, "Automatic local discovery")
+                {
                     state.inspection = Some(request);
                 }
             },
@@ -1357,6 +1763,174 @@ mod tests {
         view.tag_repository = "example/image".to_owned();
         view.tag_name = "release-1".to_owned();
         view
+    }
+
+    #[cfg(target_os = "linux")]
+    fn build_view() -> ImagesView {
+        ImagesView {
+            build_context: Some(std::path::PathBuf::from("/synthetic/context")),
+            build_repository: "example/service".to_owned(),
+            build_tag: "release-1".to_owned(),
+            ..ImagesView::default()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_target_is_bounded_and_rejects_invalid_controls() {
+        let mut view = build_view();
+        assert!(view.build_target_valid());
+        view.build_tag = "bad tag".to_owned();
+        assert!(!view.build_target_valid());
+        view.build_tag = "x".repeat(129);
+        assert!(!view.build_target_valid());
+        view.build_tag = "latest".to_owned();
+        view.build_repository = "example\nservice".to_owned();
+        assert!(!view.build_target_valid());
+        view.build_repository = "r".repeat(509);
+        assert!(!view.build_target_valid());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_confirmation_requires_explicit_acceptance_and_cancel_submits_nothing() {
+        let mut view = build_view();
+        assert!(view.begin_build_confirmation("Automatic local discovery"));
+        assert!(!view.take_build_requested());
+        view.cancel_build_confirmation();
+        assert!(!view.take_build_requested());
+        assert!(view.begin_build().is_none());
+
+        assert!(view.begin_build_confirmation("Automatic local discovery"));
+        view.confirm_build();
+        assert!(view.take_build_requested());
+        assert!(view.begin_build().is_some());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_confirmation_names_the_selected_engine_source() {
+        let mut view = build_view();
+        assert!(view.begin_build_confirmation("development"));
+        let mut harness = Harness::new_ui_state(
+            |ui, view: &mut ImagesView| {
+                view.show(ui, true, "", true, false, "development");
+            },
+            view,
+        );
+        harness.run();
+        let _heading = harness.get_by_role_and_label(Role::Label, "Selected engine source:");
+        let _context = harness.get_by_role_and_label(Role::Label, "development");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_confirmation_gates_other_image_mutations() {
+        let mut view = taggable_view();
+        view.build_context = Some(std::path::PathBuf::from("/synthetic/context"));
+        view.build_repository = "example/service".to_owned();
+        view.build_tag = "release-1".to_owned();
+        assert!(view.begin_build_confirmation("Automatic local discovery"));
+        view.pull_reference = "alpine:3.20".to_owned();
+        assert!(view.begin_pull().is_none());
+        view.begin_tag_confirmation();
+        assert!(!view.tag_confirmation_open);
+        view.begin_remove_confirmation();
+        assert!(!view.remove_confirmation_open);
+        view.tag_confirmed = true;
+        view.tag_confirmation_image_id = Some("sha256:image".to_owned());
+        assert!(view.begin_tag().is_none());
+        view.remove_confirmed = true;
+        view.remove_confirmation_image_id = Some("sha256:image".to_owned());
+        assert!(view.begin_remove().is_none());
+        view.confirm_build();
+        assert!(view.take_build_requested());
+        let (generation, _request) = view.begin_build().expect("confirmed build starts");
+
+        assert!(view.has_mutation_in_flight());
+        view.pull_reference = "alpine:3.20".to_owned();
+        assert!(view.begin_pull().is_none());
+        view.tag_confirmed = true;
+        view.tag_confirmation_image_id = Some("sha256:image".to_owned());
+        assert!(view.begin_tag().is_none());
+        view.remove_confirmed = true;
+        view.remove_confirmation_image_id = Some("sha256:image".to_owned());
+        assert!(view.begin_remove().is_none());
+
+        assert!(view.finish_build(generation, Ok(())));
+        assert!(!view.has_mutation_in_flight());
+        assert!(view.begin_pull().is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_start_progress_success_error_and_cancel_have_terminal_transitions() {
+        let mut view = build_view();
+        assert!(view.begin_build_confirmation("Automatic local discovery"));
+        view.confirm_build();
+        assert!(view.take_build_requested());
+        let (generation, _) = view.begin_build().expect("confirmed build starts");
+        assert!(view.has_mutation_in_flight());
+        assert!(view.update_build_output(generation, "Step 1/1 : FROM scratch".to_owned()));
+        assert!(view.finish_build(generation, Ok(())));
+        assert!(!view.has_mutation_in_flight());
+        assert!(view.build_complete);
+
+        assert!(view.begin_build_confirmation("Automatic local discovery"));
+        view.confirm_build();
+        assert!(view.take_build_requested());
+        let (failed_generation, _) = view.begin_build().expect("next confirmed build starts");
+        assert!(view.finish_build(
+            failed_generation,
+            Err(crate::image_build::ImageBuildError::Failed)
+        ));
+        assert!(!view.has_mutation_in_flight());
+        assert!(view.build_error.is_some());
+
+        assert!(view.begin_build_confirmation("Automatic local discovery"));
+        view.confirm_build();
+        assert!(view.take_build_requested());
+        let (cancel_generation, _) = view.begin_build().expect("third confirmed build starts");
+        view.request_cancel_build();
+        assert!(view.take_build_cancel_requested());
+        assert!(view.finish_build(
+            cancel_generation,
+            Err(crate::image_build::ImageBuildError::Cancelled)
+        ));
+        assert!(!view.has_mutation_in_flight());
+        assert!(view.build_error.is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_output_is_bounded_and_escaped() {
+        let mut view = build_view();
+        assert!(view.begin_build_confirmation("Automatic local discovery"));
+        view.confirm_build();
+        assert!(view.take_build_requested());
+        let (generation, _) = view.begin_build().expect("confirmed build starts");
+        for _ in 0..10_050 {
+            assert!(view.update_build_output(generation, "line".to_owned()));
+        }
+        assert!(view.build_output.lines.len() <= 10_000);
+        let long_line = "x".repeat(512);
+        for _ in 0..5_000 {
+            assert!(view.update_build_output(generation, long_line.clone()));
+        }
+        assert!(view.update_build_output(generation, "escape\u{1b}[31m bidi\u{202e}".to_owned(),));
+        let output = view
+            .build_output
+            .lines
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(view.build_output.retained_bytes <= 2 * 1024 * 1024);
+        assert!(view.build_output.lines.len() <= 10_000);
+        assert!(view.build_output.dropped_lines > 0);
+        assert!(!output.contains('\u{1b}'));
+        assert!(!output.contains('\u{202e}'));
+        assert!(output.contains("\\x1b"));
+        assert!(output.contains("\\u{202e}"));
     }
 
     #[test]
@@ -1426,7 +2000,7 @@ mod tests {
     fn outstanding_tag_request_disables_a_second_request() {
         let mut harness = Harness::new_ui_state(
             |ui, view: &mut ImagesView| {
-                view.show(ui, true, "", true, true);
+                view.show(ui, true, "", true, true, "Automatic local discovery");
             },
             taggable_view(),
         );
@@ -1449,7 +2023,7 @@ mod tests {
         view.pull_reference = "alpine:3.20".to_owned();
         let mut harness = Harness::new_ui_state(
             |ui, view: &mut ImagesView| {
-                view.show(ui, true, "", true, true);
+                view.show(ui, true, "", true, true, "Automatic local discovery");
             },
             view,
         );
@@ -1774,7 +2348,7 @@ mod tests {
         row.focus();
         harness.run();
         harness.key_down(egui::Key::Space);
-        harness.run();
+        harness.step();
         let _loading = harness.get_by_role_and_label(Role::Label, "Loading image details…");
         let request = harness.state_mut().inspection.take().unwrap();
         assert!(harness.state_mut().view.complete_inspection(
@@ -1782,6 +2356,12 @@ mod tests {
             request.inspection_generation,
             &request.id,
             Ok::<_, &str>(details("sha256:alpine", "alpine:3.20")),
+        ));
+        assert!(harness.state_mut().view.complete_history(
+            request.list_generation,
+            request.inspection_generation,
+            &request.id,
+            Ok::<_, &str>(Vec::new()),
         ));
         harness.run();
         let _os = harness.get_by_role_and_label(Role::Label, "linux");
@@ -1802,7 +2382,7 @@ mod tests {
             Some(safe_tag)
         );
         image_row.click_accesskit();
-        harness.run();
+        harness.step();
         let request = harness.state_mut().inspection.take().unwrap();
         let mut details = details(&request.id, tag);
         details.author = Some("author\u{e0001}text\u{200b}".to_owned());
@@ -1811,6 +2391,12 @@ mod tests {
             request.inspection_generation,
             &request.id,
             Ok::<_, &str>(details),
+        ));
+        assert!(harness.state_mut().view.complete_history(
+            request.list_generation,
+            request.inspection_generation,
+            &request.id,
+            Ok::<_, &str>(Vec::new()),
         ));
         harness.run();
 
@@ -1838,13 +2424,19 @@ mod tests {
         harness
             .get_by_role_and_label(Role::Button, "private:latest")
             .click_accesskit();
-        harness.run();
+        harness.step();
         let request = harness.state_mut().inspection.take().unwrap();
         assert!(harness.state_mut().view.complete_inspection(
             request.list_generation,
             request.inspection_generation,
             &request.id,
             Err::<ImageDetails, _>("inspection denied"),
+        ));
+        assert!(harness.state_mut().view.complete_history(
+            request.list_generation,
+            request.inspection_generation,
+            &request.id,
+            Ok::<_, &str>(Vec::new()),
         ));
         harness.run();
         let _error = harness.get_by_role_and_label(Role::Label, "Image inspection unavailable");
@@ -1918,7 +2510,7 @@ mod tests {
         harness
             .get_by_role_and_label(Role::Button, "current:tag")
             .click_accesskit();
-        harness.run();
+        harness.step();
         let stale_inspection = harness.state_mut().inspection.take().unwrap();
 
         let next_generation = harness.state_mut().view.begin_load();
@@ -1932,7 +2524,7 @@ mod tests {
         harness
             .get_by_role_and_label(Role::Button, "fresh:tag")
             .click_accesskit();
-        harness.run();
+        harness.step();
         let current_inspection = harness.state_mut().inspection.take().unwrap();
 
         harness.state_mut().view.complete_inspection(
@@ -1941,7 +2533,7 @@ mod tests {
             &stale_inspection.id,
             Ok::<_, &str>(details("current", "current:tag")),
         );
-        harness.run();
+        harness.step();
         let _loading = harness.get_by_role_and_label(Role::Label, "Loading image details…");
 
         harness.state_mut().view.complete_inspection(
@@ -1950,8 +2542,108 @@ mod tests {
             &current_inspection.id,
             Ok::<_, &str>(details("fresh", "fresh:tag")),
         );
+        assert!(harness.state_mut().view.complete_history(
+            current_inspection.list_generation,
+            current_inspection.inspection_generation,
+            &current_inspection.id,
+            Ok::<_, &str>(Vec::new()),
+        ));
         harness.run();
         let _fresh_tag = harness.get_by_role_and_label(Role::Label, "fresh:tag");
+    }
+    #[test]
+    fn selected_image_history_shows_loading_empty_and_error_states() {
+        let mut harness = harness_for(loaded_view(vec![image(
+            "sha256:history-image",
+            "history:latest",
+            1024,
+        )]));
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "history:latest")
+            .click_accesskit();
+        harness.step();
+        let request = harness.state_mut().inspection.take().unwrap();
+        let _loading = harness.get_by_role_and_label(Role::Label, "Loading image history…");
+
+        assert!(harness.state_mut().view.complete_history(
+            request.list_generation,
+            request.inspection_generation,
+            &request.id,
+            Ok::<_, &str>(Vec::new()),
+        ));
+        harness.run();
+        let _empty = harness
+            .get_by_role_and_label(Role::Label, "No safe image history fields were reported.");
+
+        harness
+            .get_by_role_and_label(Role::Button, "history:latest")
+            .click_accesskit();
+        harness.step();
+        let request = harness.state_mut().inspection.take().unwrap();
+        assert!(harness.state_mut().view.complete_history(
+            request.list_generation,
+            request.inspection_generation,
+            &request.id,
+            Err::<Vec<ferrum_core::ImageHistoryEntry>, _>("history denied"),
+        ));
+        harness.run();
+        let _error = harness.get_by_role_and_label(Role::Label, "Image history unavailable");
+        let _message = harness.get_by_role_and_label(Role::Label, "history denied");
+    }
+
+    #[test]
+    fn image_history_results_for_stale_or_noninventory_ids_are_ignored() {
+        let mut harness = harness_for(loaded_view(vec![
+            image("sha256:first", "first:latest", 1024),
+            image("sha256:current", "current:latest", 2048),
+        ]));
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "first:latest")
+            .click_accesskit();
+        harness.step();
+        let stale = harness.state_mut().inspection.take().unwrap();
+        harness
+            .get_by_role_and_label(Role::Button, "current:latest")
+            .click_accesskit();
+        harness.step();
+        let current = harness.state_mut().inspection.take().unwrap();
+
+        assert!(!harness.state_mut().view.complete_history(
+            stale.list_generation,
+            stale.inspection_generation,
+            &stale.id,
+            Ok::<_, &str>(vec![ferrum_core::ImageHistoryEntry {
+                layer_id: Some(format!("sha256:{}", "a".repeat(64))),
+                created_unix_seconds: Some(1),
+                size_bytes: Some(1),
+            }]),
+        ));
+        assert!(!harness.state_mut().view.complete_history(
+            current.list_generation,
+            current.inspection_generation,
+            "sha256:not-in-inventory",
+            Ok::<_, &str>(Vec::new()),
+        ));
+        harness.step();
+        let _loading = harness.get_by_role_and_label(Role::Label, "Loading image history…");
+
+        assert!(harness.state_mut().view.complete_history(
+            current.list_generation,
+            current.inspection_generation,
+            &current.id,
+            Ok::<_, &str>(vec![ferrum_core::ImageHistoryEntry {
+                layer_id: Some(format!("sha256:{}", "b".repeat(64))),
+                created_unix_seconds: Some(1_720_000_000),
+                size_bytes: Some(4096),
+            }]),
+        ));
+        harness.run();
+        let _layer =
+            harness.get_by_role_and_label(Role::Label, &format!("sha256:{}", "b".repeat(64)));
+        let _created = harness.get_by_role_and_label(Role::Label, "1720000000");
+        let _size = harness.get_by_role_and_label(Role::Label, "4096 bytes");
     }
 
     fn progress(
@@ -2020,7 +2712,14 @@ mod tests {
     fn disconnected_view_disables_pull_without_engine_access() {
         let mut harness = Harness::new_ui_state(
             |ui, view: &mut ImagesView| {
-                view.show(ui, false, "offline", false, false);
+                view.show(
+                    ui,
+                    false,
+                    "offline",
+                    false,
+                    false,
+                    "Automatic local discovery",
+                );
             },
             ImagesView::default(),
         );
@@ -2071,7 +2770,7 @@ mod tests {
         view.pull_reference = "x".repeat(513);
         let mut invalid_harness = Harness::new_ui_state(
             |ui, view: &mut ImagesView| {
-                view.show(ui, true, "", true, false);
+                view.show(ui, true, "", true, false, "Automatic local discovery");
             },
             view,
         );
@@ -2089,7 +2788,7 @@ mod tests {
         };
         let mut boundary_harness = Harness::new_ui_state(
             |ui, view: &mut ImagesView| {
-                view.show(ui, true, "", true, false);
+                view.show(ui, true, "", true, false, "Automatic local discovery");
             },
             boundary_view,
         );
@@ -2138,7 +2837,14 @@ mod tests {
         let mut harness = Harness::new_ui_state(
             |ui, state: &mut ImagesUi| {
                 let mutation_busy = state.view.has_mutation_in_flight();
-                if let Some(request) = state.view.show(ui, true, "", true, mutation_busy) {
+                if let Some(request) = state.view.show(
+                    ui,
+                    true,
+                    "",
+                    true,
+                    mutation_busy,
+                    "Automatic local discovery",
+                ) {
                     state.inspection = Some(request);
                 }
             },
@@ -2277,6 +2983,31 @@ mod tests {
         assert!(!harness.state().view.push_loading);
     }
     #[test]
+    fn headless_push_confirmation_accepts_request_and_starts_snapshotted_push() {
+        let view = pushable_view();
+        let mut harness = harness_for(view);
+        harness.run();
+
+        harness
+            .get_by_role_and_label(Role::Button, "Push image")
+            .click_accesskit();
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Confirm push")
+            .click_accesskit();
+        harness.run();
+
+        assert!(harness.state().view.push_requested);
+        assert!(harness.state_mut().view.take_push_requested());
+        let request = harness
+            .state_mut()
+            .view
+            .begin_push()
+            .expect("confirmed push should start");
+        assert_eq!(request.image_id, "sha256:image");
+        assert_eq!(request.target.as_str(), "registry.example/team/app:stable");
+    }
+    #[test]
     fn image_push_button_requires_a_tag_owned_by_the_selected_image() {
         let mut view = pushable_view();
         view.push_target_reference = "registry.example/other:stable".to_owned();
@@ -2334,6 +3065,7 @@ mod tests {
         let mut view = pushable_view();
         view.begin_push_confirmation();
         view.confirm_push();
+        assert!(view.take_push_requested());
         let request = view.begin_push().unwrap();
         view.hide_push_progress();
         assert!(view.push_progress_hidden);
@@ -2360,6 +3092,7 @@ mod tests {
         let mut view = pushable_view();
         view.begin_push_confirmation();
         view.confirm_push();
+        assert!(view.take_push_requested());
         let request = view.begin_push().unwrap();
         assert!(view.finish_push_uncertain(
             request.generation,
@@ -2371,7 +3104,7 @@ mod tests {
         let mut harness = Harness::new_ui_state(
             |ui, view: &mut ImagesView| {
                 let mutation_busy = view.has_mutation_in_flight();
-                view.show(ui, true, "", true, mutation_busy);
+                view.show(ui, true, "", true, mutation_busy, "");
             },
             view,
         );

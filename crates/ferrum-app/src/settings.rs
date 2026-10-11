@@ -58,7 +58,7 @@ impl SettingsStore {
     }
 
     #[cfg(test)]
-    fn at(path: PathBuf) -> Self {
+    pub(super) fn at(path: PathBuf) -> Self {
         Self {
             location: Some(SettingsLocation::resolve(&path)),
         }
@@ -115,6 +115,21 @@ impl SettingsStore {
             }
             _ => (Settings::default(), Some(SettingsError::Invalid)),
         }
+    }
+
+    pub(super) fn open_audit_file(&self) -> std::io::Result<File> {
+        let location = self
+            .location
+            .as_ref()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?
+            .as_ref()
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::Other))?;
+        let directory = open_settings_directory(location, true)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::PermissionDenied))?
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        let name = c"audit.jsonl";
+        open_audit_file(&directory, name)
     }
 
     pub(super) fn save(&self, settings: &Settings) -> Result<(), SettingsError> {
@@ -365,6 +380,58 @@ fn open_settings_file(directory: &File, name: &CStr) -> Result<Option<File>, Set
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|_| SettingsError::Read)?;
     Ok(Some(file))
+}
+
+fn open_audit_file(directory: &File, name: &CStr) -> std::io::Result<File> {
+    // SAFETY: `directory` is open and `name` is one NUL-terminated component.
+    let create = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR
+                | libc::O_APPEND
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC,
+            0o600 as libc::mode_t,
+        )
+    };
+    let (file, created) = if create >= 0 {
+        // SAFETY: successful openat returned a newly owned descriptor.
+        (unsafe { File::from_raw_fd(create) }, true)
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+        // SAFETY: `directory` is open and `name` is one NUL-terminated component.
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_APPEND
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: successful openat returned a newly owned descriptor.
+        (unsafe { File::from_raw_fd(descriptor) }, false)
+    };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    if created {
+        directory.sync_all()?;
+    }
+    Ok(file)
 }
 fn validate_settings_save_target(directory: &File, name: &CStr) -> Result<(), SettingsError> {
     let mut metadata = MaybeUninit::<libc::stat>::uninit();
@@ -1482,5 +1549,68 @@ mod tests {
         assert_eq!(store.load(), (Settings::default(), None));
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         let _ = fs::remove_dir_all(dir);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn audit_file_is_created_with_private_permissions() {
+        let (dir, store) = store();
+
+        let file = store.open_audit_file().expect("audit file should open");
+        let metadata = file.metadata().unwrap();
+        let file_mode = metadata.permissions().mode() & 0o777;
+        let directory_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        drop(file);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(directory_mode, 0o700);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn audit_file_rejects_symlink_and_hardlink_targets() {
+        let (dir, store) = store();
+        fs::create_dir_all(&dir).unwrap();
+        let sibling = dir.join("sibling");
+        let contents = b"preserve this file";
+        fs::write(&sibling, contents).unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let audit_path = dir.join("audit.jsonl");
+        std::os::unix::fs::symlink(&sibling, &audit_path).unwrap();
+        let symlink_result = store.open_audit_file();
+        let symlink_target_contents = fs::read(&sibling).unwrap();
+        let symlink_target_mode = fs::metadata(&sibling).unwrap().permissions().mode() & 0o777;
+        fs::remove_file(&audit_path).unwrap();
+        fs::hard_link(&sibling, &audit_path).unwrap();
+        let hardlink_result = store.open_audit_file();
+        let hardlink_sibling_contents = fs::read(&sibling).unwrap();
+        let hardlink_sibling_mode = fs::metadata(&sibling).unwrap().permissions().mode() & 0o777;
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(symlink_result.is_err());
+        assert_eq!(symlink_target_contents, contents);
+        assert_eq!(symlink_target_mode, 0o644);
+        assert!(hardlink_result.is_err());
+        assert_eq!(hardlink_sibling_contents, contents);
+        assert_eq!(hardlink_sibling_mode, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_file_rejects_non_regular_targets() {
+        let (dir, store) = store();
+        fs::create_dir_all(&dir).unwrap();
+        let audit_path = dir.join("audit.jsonl");
+        fs::create_dir(&audit_path).unwrap();
+
+        let result = store.open_audit_file();
+        let remains_directory = fs::symlink_metadata(&audit_path)
+            .unwrap()
+            .file_type()
+            .is_dir();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(result.is_err());
+        assert!(remains_directory);
     }
 }

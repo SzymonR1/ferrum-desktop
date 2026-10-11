@@ -25,8 +25,24 @@ fn available_container_actions(state: Option<&ContainerState>) -> &'static [Cont
 fn action_requires_confirmation(action: ContainerAction) -> bool {
     action.is_destructive()
 }
+fn build_engine_source_label<'a>(
+    selected_context: Option<&'a str>,
+    endpoint_label: Option<&'static str>,
+) -> &'a str {
+    if let Some(context) = selected_context {
+        return context;
+    }
+    match endpoint_label {
+        Some("configured Unix socket") => "Configured local Docker socket",
+        Some("configured endpoint") => "Configured Docker endpoint",
+        Some(label) => label,
+        None => "Automatic local discovery",
+    }
+}
 mod audit;
 mod display;
+#[cfg(target_os = "linux")]
+mod image_build;
 mod images;
 mod inventory;
 mod logs;
@@ -56,7 +72,7 @@ use eframe::egui::{self, Color32, RichText};
 use ferrum_core::ContainerLogLine;
 use ferrum_core::{
     ContainerAction, ContainerDetails, ContainerState, ContainerSummary, ImageDetails,
-    ImagePullProgress, ImagePushProgress, ImageSummary,
+    ImageHistoryEntry, ImagePullProgress, ImagePushProgress, ImageSummary,
 };
 #[cfg(target_os = "linux")]
 use ferrum_engine::ContainerLogsOptions;
@@ -70,7 +86,11 @@ use retry::RetryBudget;
 use terminal::TerminalModel;
 #[cfg(target_os = "linux")]
 use tokio::sync::watch;
-use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};
+use tokio::{
+    runtime::Runtime,
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use tracing_subscriber::EnvFilter;
 
 const EVENT_CHANNEL_CAPACITY: usize = 4;
@@ -207,12 +227,23 @@ enum EngineEvent {
         generation: u64,
         result: Result<(), EngineError>,
     },
+    #[cfg(target_os = "linux")]
+    ImageBuildOutput {
+        generation: u64,
+        line: String,
+    },
+    #[cfg(target_os = "linux")]
+    ImageBuildFinished {
+        generation: u64,
+        result: Result<(), image_build::ImageBuildError>,
+    },
 
     ImageInspected {
         generation: u64,
         inspection_generation: u64,
         id: String,
         result: Result<ImageDetails, EngineError>,
+        history_result: Result<Vec<ImageHistoryEntry>, EngineError>,
     },
     ActionFinished {
         generation: u64,
@@ -779,6 +810,16 @@ struct CachedDroppedLogNotice {
     galley: std::sync::Arc<egui::Galley>,
 }
 
+#[cfg(target_os = "linux")]
+async fn persist_audit_record(store: &audit::AuditStore, record: audit::AuditRecord) {
+    if store.persist(record).await.is_err() {
+        tracing::warn!("Could not persist local audit record");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn persist_audit_record(_store: &audit::AuditStore, _record: audit::AuditRecord) {}
+
 struct FerrumApp {
     runtime: Runtime,
     sender: mpsc::Sender<EngineEvent>,
@@ -821,6 +862,10 @@ struct FerrumApp {
     // A submitted removal may already have reached Docker; never abort it as
     // though that could roll back the mutation.
     image_remove_task: Option<JoinHandle<()>>,
+    #[cfg(target_os = "linux")]
+    image_build_task: Option<JoinHandle<()>>,
+    #[cfg(target_os = "linux")]
+    image_build_cancel: Option<oneshot::Sender<()>>,
 
     loading: bool,
     refresh_error: Option<String>,
@@ -884,7 +929,8 @@ struct FerrumApp {
     terminal_shell: String,
     #[cfg(target_os = "linux")]
     terminal_notice: Option<String>,
-    settings_store: settings::SettingsStore,
+    settings_store: Arc<settings::SettingsStore>,
+    audit_store: audit::AuditStore,
     settings: settings::Settings,
     settings_draft: settings::Settings,
     settings_open: bool,
@@ -903,8 +949,12 @@ impl FerrumApp {
         visuals.widgets.hovered.bg_fill = Color32::from_rgb(59, 73, 84);
         creation_context.egui_ctx.set_visuals(visuals);
 
-        let settings_store = settings::SettingsStore::new();
+        let settings_store = Arc::new(settings::SettingsStore::new());
         let (settings, settings_error) = settings_store.load();
+        #[cfg(target_os = "linux")]
+        let audit_store = audit::AuditStore::new(Arc::clone(&settings_store));
+        #[cfg(not(target_os = "linux"))]
+        let audit_store = audit::AuditStore::disabled();
         if settings_error.is_some() {
             tracing::warn!(
                 error_kind = "settings",
@@ -1008,6 +1058,10 @@ impl FerrumApp {
             image_push_progress_reporting: None,
             image_tag_task: None,
             image_remove_task: None,
+            #[cfg(target_os = "linux")]
+            image_build_task: None,
+            #[cfg(target_os = "linux")]
+            image_build_cancel: None,
             loading: false,
             refresh_error: None,
 
@@ -1023,6 +1077,7 @@ impl FerrumApp {
             action_task: None,
             event_warning: None,
             event_refresh_pending: false,
+            audit_store,
             settings_store,
             settings_draft: settings.clone(),
             settings,
@@ -1239,10 +1294,11 @@ impl FerrumApp {
             return;
         };
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.volume_create_task = Some(self.runtime.spawn(async move {
             let result = engine.create_volume(&name).await;
             #[cfg(target_os = "linux")]
-            audit::record_volume_create_result(&result);
+            persist_audit_record(&audit_store, audit::record_volume_create_result(&result)).await;
             if sender
                 .send(EngineEvent::VolumeCreated {
                     generation,
@@ -1291,10 +1347,11 @@ impl FerrumApp {
             return;
         };
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.volume_remove_task = Some(self.runtime.spawn(async move {
             let result = engine.remove_volume(&name).await;
             #[cfg(target_os = "linux")]
-            audit::record_volume_remove_result(&result);
+            persist_audit_record(&audit_store, audit::record_volume_remove_result(&result)).await;
             if sender
                 .send(EngineEvent::VolumeRemoved {
                     generation,
@@ -1367,13 +1424,18 @@ impl FerrumApp {
             return;
         };
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.network_create_task = Some(self.runtime.spawn(async move {
             let result = engine.create_network(&name).await;
-            audit::record_network_mutation_result(
-                result.as_deref().ok(),
-                audit::NetworkMutation::Create,
-                result.is_ok(),
-            );
+            persist_audit_record(
+                &audit_store,
+                audit::record_network_mutation_result(
+                    result.as_deref().ok(),
+                    audit::NetworkMutation::Create,
+                    result.is_ok(),
+                ),
+            )
+            .await;
             if sender
                 .send(EngineEvent::NetworkCreated {
                     generation,
@@ -1417,13 +1479,18 @@ impl FerrumApp {
             return;
         };
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.network_remove_task = Some(self.runtime.spawn(async move {
             let result = engine.remove_network(&id).await;
-            audit::record_network_mutation_result(
-                Some(&id),
-                audit::NetworkMutation::Remove,
-                result.is_ok(),
-            );
+            persist_audit_record(
+                &audit_store,
+                audit::record_network_mutation_result(
+                    Some(&id),
+                    audit::NetworkMutation::Remove,
+                    result.is_ok(),
+                ),
+            )
+            .await;
             if sender
                 .send(EngineEvent::NetworkRemoved {
                     generation,
@@ -1467,6 +1534,7 @@ impl FerrumApp {
         };
         let container_generation = self.container_inventory_generation;
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.network_attachment_task = Some(self.runtime.spawn(async move {
             let mutation_result = if operation.connect {
                 engine
@@ -1480,7 +1548,7 @@ impl FerrumApp {
                     )
                     .await
             };
-            audit::record_network_attachment_result(
+            if let Some(record) = audit::record_network_attachment_result(
                 &operation.network_id,
                 &operation.container_id,
                 if operation.connect {
@@ -1489,7 +1557,9 @@ impl FerrumApp {
                     audit::NetworkMutation::Disconnect
                 },
                 mutation_result.is_ok(),
-            );
+            ) {
+                persist_audit_record(&audit_store, record).await;
+            }
             let refreshed = async {
                 let networks = engine.list_networks().await?;
                 let containers = engine.list_containers().await?;
@@ -1689,6 +1759,192 @@ impl FerrumApp {
             || self.image_remove_task.is_some()
             || self.images.has_mutation_in_flight()
     }
+    fn image_build_busy(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.image_build_task.is_some() || self.images.build_blocks_context_switch()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_image_build(&mut self, context: egui::Context) {
+        if self.image_mutation_busy() {
+            self.images.cancel_build_confirmation();
+            return;
+        }
+        let Some(engine) = self.engine.as_ref() else {
+            self.images.cancel_build_confirmation();
+            return;
+        };
+        let socket = engine.local_socket_path().to_path_buf();
+        let Some((generation, draft)) = self.images.begin_build() else {
+            return;
+        };
+        let (output_sender, mut output_receiver) = mpsc::channel(32);
+        let (cancel_sender, mut cancel_receiver) = oneshot::channel();
+        self.image_build_cancel = Some(cancel_sender);
+        let sender = self.sender.clone();
+        let repaint = context.clone();
+        self.image_build_task = Some(self.runtime.spawn(async move {
+            let preparation = tokio::task::spawn_blocking(move || {
+                let request = draft.validate()?;
+                let config = image_build::create_private_config()?;
+                let command = image_build::build_command(
+                    std::ffi::OsStr::new("docker"),
+                    &request,
+                    &socket,
+                    config.path(),
+                )?;
+                Ok::<_, image_build::ImageBuildError>((command, config))
+            })
+            .await;
+            let (command, config) = match preparation {
+                Ok(Ok(prepared)) => prepared,
+                Ok(Err(error)) => {
+                    audit::record_image_build_result(audit::ImageBuildOutcome::NotSubmitted);
+                    if sender
+                        .send(EngineEvent::ImageBuildFinished {
+                            generation,
+                            result: Err(error),
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        repaint.request_repaint();
+                    }
+                    return;
+                }
+                Err(_) => {
+                    let error = image_build::ImageBuildError::DockerUnavailable;
+                    audit::record_image_build_result(audit::ImageBuildOutcome::NotSubmitted);
+                    if sender
+                        .send(EngineEvent::ImageBuildFinished {
+                            generation,
+                            result: Err(error),
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        repaint.request_repaint();
+                    }
+                    return;
+                }
+            };
+            if !matches!(
+                cancel_receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ) {
+                drop(command);
+                drop(config);
+                let error = image_build::ImageBuildError::Cancelled;
+                audit::record_image_build_result(audit::ImageBuildOutcome::NotSubmitted);
+                if sender
+                    .send(EngineEvent::ImageBuildFinished {
+                        generation,
+                        result: Err(error),
+                    })
+                    .await
+                    .is_ok()
+                {
+                    repaint.request_repaint();
+                }
+                return;
+            }
+            let (probe_sender, mut probe_receiver) = mpsc::channel(8);
+            let (_probe_cancel_sender, probe_cancel_receiver) = oneshot::channel();
+            let probe_result =
+                match image_build::version_command(std::ffi::OsStr::new("docker"), config.path()) {
+                    Ok(probe) => {
+                        let probe = async {
+                            let runner = image_build::run_command(
+                                probe,
+                                probe_cancel_receiver,
+                                probe_sender,
+                            );
+                            tokio::pin!(runner);
+                            loop {
+                                tokio::select! {
+                                    result = &mut runner => return result,
+                                    line = probe_receiver.recv() => {
+                                        if line.is_none() {
+                                            return runner.await;
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        matches!(
+                            tokio::time::timeout(Duration::from_secs(5), probe).await,
+                            Ok(Ok(()))
+                        )
+                    }
+                    Err(_) => false,
+                };
+            let cancelled_before_submit = !matches!(
+                cancel_receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            );
+            let result = if cancelled_before_submit {
+                drop(output_sender);
+                Err(image_build::ImageBuildError::Cancelled)
+            } else if probe_result {
+                let runner = tokio::spawn(image_build::run_command(
+                    command,
+                    cancel_receiver,
+                    output_sender,
+                ));
+                while let Some(line) = output_receiver.recv().await {
+                    if sender
+                        .send(EngineEvent::ImageBuildOutput { generation, line })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    repaint.request_repaint();
+                }
+                runner
+                    .await
+                    .unwrap_or(Err(image_build::ImageBuildError::Failed))
+            } else {
+                drop(output_sender);
+                Err(image_build::ImageBuildError::DockerUnavailable)
+            };
+            let outcome = if cancelled_before_submit {
+                audit::ImageBuildOutcome::NotSubmitted
+            } else {
+                match result {
+                    Ok(()) => audit::ImageBuildOutcome::Success,
+                    Err(
+                        image_build::ImageBuildError::DockerUnavailable
+                        | image_build::ImageBuildError::InvalidContext
+                        | image_build::ImageBuildError::InvalidTarget,
+                    ) => audit::ImageBuildOutcome::NotSubmitted,
+                    Err(_) => audit::ImageBuildOutcome::RequestError,
+                }
+            };
+            audit::record_image_build_result(outcome);
+            if sender
+                .send(EngineEvent::ImageBuildFinished { generation, result })
+                .await
+                .is_ok()
+            {
+                repaint.request_repaint();
+            }
+            drop(config);
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cancel_image_build(&mut self) {
+        if let Some(cancel) = self.image_build_cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
 
     #[cfg(target_os = "linux")]
     fn start_image_pull(&mut self, context: egui::Context) {
@@ -1703,6 +1959,7 @@ impl FerrumApp {
             return;
         };
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         let progress_reporting = Arc::new(AtomicBool::new(true));
         self.image_pull_progress_reporting = Some(Arc::clone(&progress_reporting));
         self.image_pull_task = Some(self.runtime.spawn(async move {
@@ -1728,7 +1985,11 @@ impl FerrumApp {
                 Ok::<(), EngineError>(())
             }
             .await;
-            audit::record_image_mutation_result(audit::ImageMutation::Pull, &result);
+            persist_audit_record(
+                &audit_store,
+                audit::record_image_mutation_result(audit::ImageMutation::Pull, &result),
+            )
+            .await;
             if sender
                 .send(EngineEvent::ImagePullFinished { generation, result })
                 .await
@@ -1740,7 +2001,12 @@ impl FerrumApp {
     }
     #[cfg(target_os = "linux")]
     fn start_image_push(&mut self, context: egui::Context) {
-        if self.image_mutation_busy() {
+        if self.image_pull_task.is_some()
+            || self.image_push_task.is_some()
+            || self.image_tag_task.is_some()
+            || self.image_remove_task.is_some()
+            || self.image_build_task.is_some()
+        {
             self.images.cancel_push_confirmation();
             return;
         }
@@ -1752,6 +2018,7 @@ impl FerrumApp {
             return;
         };
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         let progress_reporting = Arc::new(AtomicBool::new(true));
         self.image_push_progress_reporting = Some(Arc::clone(&progress_reporting));
         self.image_push_task = Some(self.runtime.spawn(async move {
@@ -1779,7 +2046,11 @@ impl FerrumApp {
                 Ok::<(), EngineError>(())
             }
             .await;
-            audit::record_image_mutation_result(audit::ImageMutation::Push, &result);
+            persist_audit_record(
+                &audit_store,
+                audit::record_image_mutation_result(audit::ImageMutation::Push, &result),
+            )
+            .await;
             if sender
                 .send(EngineEvent::ImagePushFinished {
                     generation: request.generation,
@@ -1811,11 +2082,16 @@ impl FerrumApp {
         };
 
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.image_tag_task = Some(self.runtime.spawn(async move {
             let result = engine
                 .tag_image(&request.image_id, &request.repository, &request.tag)
                 .await;
-            audit::record_image_mutation_result(audit::ImageMutation::Tag, &result);
+            persist_audit_record(
+                &audit_store,
+                audit::record_image_mutation_result(audit::ImageMutation::Tag, &result),
+            )
+            .await;
             if sender
                 .send(EngineEvent::ImageTagged {
                     generation: request.generation,
@@ -1846,9 +2122,14 @@ impl FerrumApp {
             return;
         };
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.image_remove_task = Some(self.runtime.spawn(async move {
             let result = engine.remove_image(&request.image_id).await;
-            audit::record_image_mutation_result(audit::ImageMutation::Remove, &result);
+            persist_audit_record(
+                &audit_store,
+                audit::record_image_mutation_result(audit::ImageMutation::Remove, &result),
+            )
+            .await;
             if sender
                 .send(EngineEvent::ImageRemoved {
                     generation: request.generation,
@@ -1925,13 +2206,17 @@ impl FerrumApp {
         }
         let sender = self.sender.clone();
         self.image_inspection_task = Some(self.runtime.spawn(async move {
-            let result = engine.inspect_image(&request.id).await;
+            let (result, history_result) = tokio::join!(
+                engine.inspect_image(&request.id),
+                engine.image_history(&request.id),
+            );
             if sender
                 .send(EngineEvent::ImageInspected {
                     generation: request.list_generation,
                     inspection_generation: request.inspection_generation,
                     id: request.id,
                     result,
+                    history_result,
                 })
                 .await
                 .is_ok()
@@ -2009,6 +2294,7 @@ impl FerrumApp {
             || self.action_busy()
             || self.network_mutation_busy()
             || self.volume_mutation_busy()
+            || self.image_build_busy()
         {
             return;
         }
@@ -2337,6 +2623,22 @@ impl FerrumApp {
                         );
                     }
                 }
+                #[cfg(target_os = "linux")]
+                EngineEvent::ImageBuildOutput { generation, line } => {
+                    if self.images.update_build_output(generation, line) {
+                        context.request_repaint();
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                EngineEvent::ImageBuildFinished { generation, result } => {
+                    self.images.finish_build(generation, result);
+                    self.image_build_task = None;
+                    self.image_build_cancel = None;
+                    self.invalidate_images();
+                    if self.engine.is_some() {
+                        self.load_images(context.clone());
+                    }
+                }
                 EngineEvent::ImagesListed { generation, result } => {
                     if self.images.complete_load(generation, result) {
                         self.image_list_task = None;
@@ -2393,13 +2695,21 @@ impl FerrumApp {
                     inspection_generation,
                     id,
                     result,
+                    history_result,
                 } => {
-                    if self.images.complete_inspection(
+                    let details_applied = self.images.complete_inspection(
                         generation,
                         inspection_generation,
                         &id,
                         result,
-                    ) {
+                    );
+                    let history_applied = self.images.complete_history(
+                        generation,
+                        inspection_generation,
+                        &id,
+                        history_result,
+                    );
+                    if details_applied || history_applied {
                         self.image_inspection_task = None;
                     }
                 }
@@ -2749,9 +3059,14 @@ impl FerrumApp {
         let id = inspection.container_id.clone();
         let generation = inspection.generation;
         let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
         self.action_task = Some(self.runtime.spawn(async move {
             let result = engine.perform_container_action(&id, action).await;
-            audit::record_container_action_result(&id, action, result.is_ok());
+            persist_audit_record(
+                &audit_store,
+                audit::record_container_action_result(&id, action, result.is_ok()),
+            )
+            .await;
             if sender
                 .send(EngineEvent::ActionFinished {
                     generation,
@@ -2994,13 +3309,34 @@ impl FerrumApp {
             ConnectionState::Connected => (true, ""),
         };
         let mutation_busy = self.image_mutation_busy();
+        let build_context_label = build_engine_source_label(
+            self.selected_context.as_deref(),
+            self.engine_info.as_ref().map(|info| info.endpoint_label),
+        );
+        let operations_allowed = cfg!(target_os = "linux")
+            && connected
+            && self
+                .engine
+                .as_ref()
+                .is_some_and(|engine| !engine.local_socket_path().as_os_str().is_empty());
         let inspection = self.images.show(
             ui,
             connected,
             message,
-            cfg!(target_os = "linux") && connected,
+            operations_allowed,
             mutation_busy,
+            build_context_label,
         );
+
+        #[cfg(target_os = "linux")]
+        {
+            if self.images.take_build_requested() {
+                self.start_image_build(ui.ctx().clone());
+            }
+            if self.images.take_build_cancel_requested() {
+                self.cancel_image_build();
+            }
+        }
 
         if self.images.take_pull_requested() {
             #[cfg(target_os = "linux")]
@@ -3036,6 +3372,7 @@ impl FerrumApp {
         settings_requested: &mut bool,
         context_requested: &mut Option<Option<String>>,
     ) {
+        let image_build_busy = self.image_build_busy();
         let page_loading = self.loading
             || (self.page == images::AppPage::Images
                 && (self.images.is_loading()
@@ -3070,7 +3407,8 @@ impl FerrumApp {
                         !page_loading
                             && !self.action_busy()
                             && !network_mutation_in_flight
-                            && !volume_mutation_in_flight,
+                            && !volume_mutation_in_flight
+                            && !image_build_busy,
                         |ui| {
                             let selected_name = match self.selected_context.as_deref() {
                                 Some(name) => self
@@ -3134,6 +3472,11 @@ impl FerrumApp {
                     if volume_mutation_in_flight {
                         ui.label(
                             "A volume mutation is in progress; context switching is disabled.",
+                        );
+                    }
+                    if image_build_busy {
+                        ui.label(
+                            "An image build is awaiting confirmation or running; context switching is disabled.",
                         );
                     }
                     if let Some(info) = &self.engine_info {
@@ -3874,6 +4217,8 @@ impl Drop for FerrumApp {
         self.cancel_log_stream();
         #[cfg(target_os = "linux")]
         self.cancel_terminal_session();
+        #[cfg(target_os = "linux")]
+        self.cancel_image_build();
         self.cancel_image_read_tasks();
         self.pending_resource_read = None;
         if let Some(task) = self.resource_read_task.take() {
@@ -4383,6 +4728,25 @@ mod log_retry_budget_tests {
 #[cfg(test)]
 mod event_reconciliation_tests {
     use super::*;
+    #[test]
+    fn build_engine_source_label_distinguishes_configured_socket_from_discovery() {
+        assert_eq!(
+            build_engine_source_label(None, Some("configured Unix socket")),
+            "Configured local Docker socket"
+        );
+        assert_eq!(
+            build_engine_source_label(None, Some("system Docker socket")),
+            "system Docker socket"
+        );
+        assert_eq!(
+            build_engine_source_label(Some("development"), Some("selected Docker context")),
+            "development"
+        );
+        assert_eq!(
+            build_engine_source_label(None, None),
+            "Automatic local discovery"
+        );
+    }
     #[cfg(target_os = "linux")]
     use egui_kittest::kittest::NodeT;
     #[cfg(target_os = "linux")]
@@ -4457,6 +4821,10 @@ mod event_reconciliation_tests {
             network_remove_task: None,
             network_attachment_task: None,
             image_remove_task: None,
+            #[cfg(target_os = "linux")]
+            image_build_task: None,
+            #[cfg(target_os = "linux")]
+            image_build_cancel: None,
             loading: false,
             refresh_error: None,
             contexts: Vec::new(),
@@ -4530,7 +4898,8 @@ mod event_reconciliation_tests {
             log_stdout: true,
             #[cfg(target_os = "linux")]
             log_stderr: true,
-            settings_store: settings::SettingsStore::new(),
+            settings_store: Arc::new(settings::SettingsStore::new()),
+            audit_store: audit::AuditStore::disabled(),
             settings_draft: settings.clone(),
             settings,
             settings_open: false,
@@ -5688,6 +6057,88 @@ mod event_reconciliation_tests {
     }
     #[cfg(target_os = "linux")]
     #[test]
+    fn pending_image_build_confirmation_disables_context_switching() {
+        let (mut app, _) = app_with_open_inspection();
+        app.images.build_context = Some(std::path::PathBuf::from("/synthetic/context"));
+        app.images.build_repository = "example/service".to_owned();
+        app.images.build_tag = "release-1".to_owned();
+        assert!(
+            app.images
+                .begin_build_confirmation("Automatic local discovery")
+        );
+
+        app.switch_context(Some("other-context".to_owned()), egui::Context::default());
+
+        assert!(!app.loading);
+        assert_eq!(app.selected_context, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_image_build_disables_context_switching() {
+        let (mut app, _) = app_with_open_inspection();
+        app.images.build_context = Some(std::path::PathBuf::from("/synthetic/context"));
+        app.images.build_repository = "example/service".to_owned();
+        app.images.build_tag = "release-1".to_owned();
+        assert!(
+            app.images
+                .begin_build_confirmation("Automatic local discovery")
+        );
+        app.images.confirm_build();
+        assert!(app.images.take_build_requested());
+        assert!(app.images.begin_build().is_some());
+        app.image_build_task = Some(app.runtime.spawn(std::future::pending()));
+
+        app.switch_context(Some("other-context".to_owned()), egui::Context::default());
+
+        assert!(!app.loading);
+        assert_eq!(app.selected_context, None);
+        assert!(app.image_build_task.is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_image_build_disables_context_selector_accessibly() {
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let (mut app, _) = app_with_open_inspection();
+        app.images.build_context = Some(std::path::PathBuf::from("/synthetic/context"));
+        app.images.build_repository = "example/service".to_owned();
+        app.images.build_tag = "release-1".to_owned();
+        assert!(
+            app.images
+                .begin_build_confirmation("Automatic local discovery")
+        );
+
+        let mut harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| {
+                let mut refresh_requested = false;
+                let mut settings_requested = false;
+                let mut context_requested = None;
+                app.draw_header(
+                    ui,
+                    &mut refresh_requested,
+                    &mut settings_requested,
+                    &mut context_requested,
+                );
+            },
+            app,
+        );
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(Role::ComboBox, "Docker context")
+                .accesskit_node()
+                .is_disabled()
+        );
+        let _status = harness.get_by_role_and_label(
+            Role::Label,
+            "An image build is awaiting confirmation or running; context switching is disabled.",
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
     fn only_one_network_mutation_can_start_in_the_app() {
         let (mut app, _) = app_with_open_inspection();
         app.network_create_task = Some(app.runtime.spawn(std::future::pending()));
@@ -6316,6 +6767,7 @@ mod event_reconciliation_tests {
         view.set_push_source_for_test("sha256:image", "registry.example/team/app:stable");
         view.begin_push_confirmation();
         view.confirm_push();
+        assert!(view.take_push_requested());
         let request = view.begin_push().expect("confirmed push should start");
         app.images = view;
 
@@ -6424,6 +6876,7 @@ mod event_reconciliation_tests {
         view.set_push_source_for_test("sha256:image", "registry.example/team/app:stable");
         view.begin_push_confirmation();
         view.confirm_push();
+        assert!(view.take_push_requested());
         let request = view.begin_push().expect("confirmed push should start");
         app.images = view;
         app.image_push_task = Some(app.runtime.spawn(std::future::pending()));
