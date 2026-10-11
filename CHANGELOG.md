@@ -56,6 +56,7 @@ All notable project changes are documented here. The project has not published a
   order. The base parent is `--project-directory`, anchoring relative paths.
   The UI numbers files and allows removing overrides. Choosing a new base
   clears current overrides so relative-path semantics remain explicit.
+  `Validate selected files` reruns validation after an override is removed.
   See Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
   for ordered merge/path resolution and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
   for the validation flags. Private-config preflight, structural-only

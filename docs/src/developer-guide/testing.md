@@ -414,10 +414,11 @@ config. Failure diagnostics and selected paths are not exposed; output and
 subprocess deadlines are bounded.
 
 Headless AccessKit/state tests cover ordered base/override selection, removing
-overrides, replacing the base (which clears overrides), the 16-file limit,
-escaped basename display, pending/cancelled/stale selection, validation
-success/failure, the trusted-file notice, and cancellation. They do not open the
-native file chooser or claim native Compose-page visual validation.
+overrides and explicitly revalidating the remaining set, replacing the base
+(which clears overrides), the 16-file limit, escaped basename display,
+pending/cancelled/stale selection, validation success/failure, the trusted-file
+notice, and cancellation. They do not open the native file chooser or claim
+native Compose-page visual validation.
 
 Validation accepts one selected base Compose file followed by user-ordered
 local override files, using one-based order and a maximum of 16 total files.

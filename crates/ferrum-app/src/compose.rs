@@ -134,6 +134,7 @@ pub(super) struct ComposeActions {
     pub(super) select_base_file: bool,
     pub(super) add_override_file: bool,
     pub(super) remove_override: Option<usize>,
+    pub(super) validate_files: bool,
     pub(super) cancel_validation: bool,
 }
 
@@ -321,6 +322,19 @@ impl ComposeView {
             self.validation = ComposeValidationState::Idle;
         }
     }
+    pub(super) fn begin_validation(&mut self) -> Option<(u64, Vec<std::path::PathBuf>)> {
+        if self.selected_files.is_empty()
+            || self.is_file_selection_running()
+            || self.is_validation_running()
+        {
+            return None;
+        }
+        self.validation_generation = self.validation_generation.wrapping_add(1);
+        let generation = self.validation_generation;
+        let file_name = display_compose_file_list(&self.selected_files);
+        self.validation = ComposeValidationState::Validating { file_name };
+        Some((generation, self.selected_files.clone()))
+    }
 
     pub(super) fn cancel_validation(&mut self) {
         if let ComposeValidationState::Validating { file_name } =
@@ -391,6 +405,14 @@ impl ComposeView {
                     .add_enabled(
                         selection_enabled && self.selected_files.len() < MAX_COMPOSE_FILES,
                         egui::Button::new("Add override file"),
+                    )
+                    .clicked();
+            }
+            if !self.selected_files.is_empty() {
+                actions.validate_files = ui
+                    .add_enabled(
+                        selection_enabled,
+                        egui::Button::new("Validate selected files"),
                     )
                     .clicked();
             }
@@ -1916,6 +1938,12 @@ mod tests {
                 view.selected_files(),
                 &[base.to_path_buf(), second.to_path_buf()]
             );
+            let (generation, files) = view
+                .begin_validation()
+                .expect("the remaining ordered file set should be revalidatable");
+            assert_eq!(files, [base.to_path_buf(), second.to_path_buf()]);
+            assert!(view.is_validation_running());
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
 
             let mut harness = harness_for(view);
             harness.run();
@@ -1925,6 +1953,7 @@ mod tests {
             );
             let _base_name = harness.get_by_role_and_label(Role::Label, "base-compose.yaml");
             let _remaining_override = harness.get_by_role_and_label(Role::Label, "two.yaml");
+            let _validate = harness.get_by_role_and_label(Role::Button, "Validate selected files");
         }
         #[test]
         fn changing_base_replaces_previous_base_and_clears_overrides() {

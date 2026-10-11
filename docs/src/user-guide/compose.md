@@ -24,6 +24,8 @@ override earlier definitions. At most 16 files total are accepted.
 Use **Remove override N** to remove an override. **Change base file** replaces
 the current base and clears its overrides; add any needed overrides again in
 the intended order.
+Ferrum validates after each file selection. After removing an override, use
+**Validate selected files** to revalidate the remaining ordered set.
 
 Ferrum first preflights the installed Compose CLI with
 `docker compose version --short` through its private isolated Docker config.

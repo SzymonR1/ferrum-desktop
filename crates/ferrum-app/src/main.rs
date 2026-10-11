@@ -4523,6 +4523,10 @@ impl eframe::App for FerrumApp {
             self.select_compose_file(false, context.clone());
         } else if compose_actions.add_override_file {
             self.select_compose_file(true, context.clone());
+        } else if compose_actions.validate_files
+            && let Some((generation, files)) = self.compose.begin_validation()
+        {
+            self.start_compose_validation(files, generation, context.clone());
         }
         if compose_actions.refresh {
             self.refresh(context.clone());
