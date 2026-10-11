@@ -61,7 +61,7 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 - Treat duplicate/conflicting volume-usage `VolumeUsage`, `Items`, `Name`, or
   `UsageData` keys and repeated exact-name items as ambiguous; their usage is
   unavailable and cannot satisfy the `RefCount == 0` removal gate.
-- Emit local structured process traces for volume create/removal with only static action and `success`, `not_submitted`, or `request_error` outcome. Do not log volume names, mountpoints, endpoints, raw errors, or daemon bodies. A request error does not prove engine state remained unchanged; these are not a persistent or tamper-proof audit store.
+- Emit local structured process traces for volume create/removal with only static action and `success`, `not_submitted`, or `request_error` outcome. Do not log volume names, mountpoints, endpoints, raw errors, or daemon bodies. A request error does not prove engine state remained unchanged; the separate durable copy is described below.
 - Keep network listing and inspection allowlisted on the selected Linux local Docker Unix socket; create networks with bounded `POST /v{negotiated}/networks/create` containing only non-whitespace, at-most-255-byte `Name`, with no driver, IPAM, or options controls. Retain/display only allowlisted network metadata. From inspect, retain the point-in-time `Containers` count and its keys only when every key is a full 64-character hexadecimal ID; discard endpoint values. The UI permits connect/disconnect only for a selected local custom network with a fresh complete membership set and a target full ID in current inventory whose state is `Running`; stopped, paused, and unknown states are disabled. Container-change events invalidate cached state; Networks refreshes both inventories and disables attachment actions until container inventory is current. Require explicit confirmation naming the exact network and container; send only `Container`, no endpoint configuration or `Force`, with an eight-second deadline and no retry. Disconnect uses Docker's default `Force=false`. Refresh network/container inventory and re-inspect after every result; treat transport errors/timeouts as potentially state-changing and stale refresh as requiring new inspection. Removal excludes `bridge`, `host`, and `none`, requires fresh matching inspection with `Some(0)` attached containers and explicit full-ID confirmation, and sends an eight-second DELETE without force/prune. Counts are not atomic with mutations. Keep one mutation in flight and block context switching; Podman/rootless and remote support remain unvalidated.
 - Anonymous image pulls are restricted to the selected local Unix-socket Docker
   engine and send no `X-Registry-Auth` header or stored credentials. Progress
@@ -106,16 +106,39 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
   a container ID only when it is exactly 64 hexadecimal characters. A request
   error does not prove that the engine state remained unchanged. Do not log
   container names, endpoints, raw errors, or daemon response bodies. These
-  events use the configured process logger; they are not a persistent or
-  tamper-proof audit store.
-- Emit a structured local tracing event when any network mutation returns. Record only the static create/remove/connect/disconnect action, `success` or `request_error`, and validated full network IDs when available; connect/disconnect events include a container ID only when it is also a full 64-character hexadecimal ID. Do not log network/container names, endpoints, raw errors, or daemon response bodies. A request error does not prove engine state remained unchanged. These events use the configured process logger; they are not a persistent or tamper-proof audit store.
-- Emit local structured tracing events when image pull, tag, or removal requests
-  return, containing only the static action and `success`, `not_submitted`, or
-  `request_error` outcome. `not_submitted` identifies local validation rejection
-  before HTTP submission. Do not log image IDs, references, repository tags,
-  endpoints, raw errors, or daemon bodies. A `request_error` does not prove that
-  engine state remained unchanged. These events are not persistent or
-  tamper-proof.
+  events use the configured process logger; the durable copy is described
+  below.
+- Emit a structured local tracing event when any network mutation returns.
+  Record only the static create/remove/connect/disconnect action, `success` or
+  `request_error`, and validated full network IDs when available;
+  connect/disconnect events include a container ID only when it is also a full
+  64-character hexadecimal ID. Do not log network/container names, endpoints,
+  raw errors, or daemon response bodies. A request error does not prove engine
+  state remained unchanged; the durable copy is described below.
+- Emit local structured tracing events when image pull, tag, or removal
+  requests return, containing only the static action and `success`,
+  `not_submitted`, or `request_error` outcome. `not_submitted` identifies local
+  validation rejection before HTTP submission. Do not log image IDs,
+  references, repository tags, endpoints, raw errors, or daemon bodies. A
+  `request_error` does not prove that engine state remained unchanged; the
+  durable copy is described below.
+
+- Maintain a Linux-local bounded JSONL copy of Ferrum-originated mutation
+  outcomes for container lifecycle, image pull/tag/removal, volume
+  create/removal, and network create/removal/connect/disconnect. Lazily create
+  `audit.jsonl` in the descriptor-anchored Ferrum config directory, with
+  directory mode `0700` and file mode `0600`. Schema v1 contains a timestamp,
+  static event/action/outcome, and validated full resource IDs only where
+  existing traces permit. Exclude names, image references/tags, endpoints,
+  credentials, raw errors, daemon bodies, and terminal/log contents. Sync each
+  record; enforce a 16 MiB hard cap without automatic truncation or rotation.
+  Use nonblocking interprocess-lock attempts with a 250 ms deadline; continued
+  contention counts as a persistence failure.
+  At capacity or on persistence failure, emit a static process warning and do
+  not claim the event is durable; do not change the engine request outcome.
+  This is local Ferrum-request history, mutable by the same-UID user, not
+  tamper-proof, not proof of final engine state, and does not record external
+  engine actions.
 - Keep historical/live container logs restricted to the selected local Unix-socket engine. Use the negotiated API version and streaming response body; accept only json-file/journald drivers. TTY is read from allowlisted `Config.Tty`: TTY output is raw and combined, while non-TTY output is decoded from Docker's 8-byte multiplex frames. Render logs as plain text, never as a terminal. Bound frames to 1 MiB, lines to 64 KiB, retention to 8 MiB or 10,000 lines, and delivery to a dedicated 16-message channel; discard oldest retained lines with a visible count. Pause suspends UI draining, applying bounded backpressure to producer reads without unbounded memory or dropped lines; Resume continues delivery. Copy and Export include only currently visible, retained rows and escape terminal control characters as `\xNN`.
 - Escape untrusted container-log text once when adding rows to `LogBuffer`:
   C0/C1 controls become visible `\xNN` text and selected bidi, zero-width, and
