@@ -1877,13 +1877,37 @@ impl FerrumApp {
         }));
     }
 
-    fn image_mutation_busy(&self) -> bool {
+    fn image_mutation_tasks_busy(&self) -> bool {
         self.image_pull_task.is_some()
             || self.image_push_task.is_some()
             || self.image_tag_task.is_some()
             || self.image_remove_task.is_some()
-            || self.images.has_mutation_in_flight()
     }
+    fn image_mutation_busy(&self) -> bool {
+        self.image_mutation_tasks_busy() || self.images.has_mutation_in_flight()
+    }
+    #[cfg(target_os = "linux")]
+    fn image_build_start_blocked(&self) -> bool {
+        self.image_mutation_tasks_busy() || self.images.has_competing_mutation_in_flight()
+    }
+    #[cfg(target_os = "linux")]
+    fn record_unsubmitted_image_build(&self) {
+        let audit_store = self.audit_store.clone();
+        drop(self.runtime.spawn(async move {
+            Self::persist_image_build_outcome(&audit_store, audit::ImageBuildOutcome::NotSubmitted)
+                .await;
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn persist_image_build_outcome(
+        audit_store: &audit::AuditStore,
+        outcome: audit::ImageBuildOutcome,
+    ) {
+        persist_audit_record(audit_store, audit::record_image_build_result(outcome)).await;
+    }
+
+    #[cfg(target_os = "linux")]
     fn image_build_busy(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -1897,16 +1921,20 @@ impl FerrumApp {
 
     #[cfg(target_os = "linux")]
     fn start_image_build(&mut self, context: egui::Context) {
-        if self.image_mutation_busy() {
+        if self.image_build_start_blocked() {
             self.images.cancel_build_confirmation();
+            self.record_unsubmitted_image_build();
             return;
         }
         let Some(engine) = self.engine.as_ref() else {
             self.images.cancel_build_confirmation();
+            self.record_unsubmitted_image_build();
             return;
         };
         let socket = engine.local_socket_path().to_path_buf();
         let Some((generation, draft)) = self.images.begin_build() else {
+            self.images.cancel_build_confirmation();
+            self.record_unsubmitted_image_build();
             return;
         };
         let (output_sender, mut output_receiver) = mpsc::channel(32);
@@ -1931,9 +1959,9 @@ impl FerrumApp {
             let (command, config) = match preparation {
                 Ok(Ok(prepared)) => prepared,
                 Ok(Err(error)) => {
-                    persist_audit_record(
+                    Self::persist_image_build_outcome(
                         &audit_store,
-                        audit::record_image_build_result(audit::ImageBuildOutcome::NotSubmitted),
+                        audit::ImageBuildOutcome::NotSubmitted,
                     )
                     .await;
                     if sender
@@ -1950,9 +1978,9 @@ impl FerrumApp {
                 }
                 Err(_) => {
                     let error = image_build::ImageBuildError::DockerUnavailable;
-                    persist_audit_record(
+                    Self::persist_image_build_outcome(
                         &audit_store,
-                        audit::record_image_build_result(audit::ImageBuildOutcome::NotSubmitted),
+                        audit::ImageBuildOutcome::NotSubmitted,
                     )
                     .await;
                     if sender
@@ -1975,9 +2003,9 @@ impl FerrumApp {
                 drop(command);
                 drop(config);
                 let error = image_build::ImageBuildError::Cancelled;
-                persist_audit_record(
+                Self::persist_image_build_outcome(
                     &audit_store,
-                    audit::record_image_build_result(audit::ImageBuildOutcome::NotSubmitted),
+                    audit::ImageBuildOutcome::NotSubmitted,
                 )
                 .await;
                 if sender
@@ -2065,7 +2093,7 @@ impl FerrumApp {
                     Err(_) => audit::ImageBuildOutcome::RequestError,
                 }
             };
-            persist_audit_record(&audit_store, audit::record_image_build_result(outcome)).await;
+            Self::persist_image_build_outcome(&audit_store, outcome).await;
             if sender
                 .send(EngineEvent::ImageBuildFinished { generation, result })
                 .await
@@ -6331,6 +6359,111 @@ mod event_reconciliation_tests {
 
         assert!(!app.loading);
         assert_eq!(app.selected_context, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirmed_image_build_is_not_blocked_at_start_gate() {
+        let (mut app, _) = app_with_open_inspection();
+        app.images.build_context = Some(std::path::PathBuf::from("/synthetic/context"));
+        app.images.build_repository = "example/service".to_owned();
+        app.images.build_tag = "release-1".to_owned();
+        assert!(
+            app.images
+                .begin_build_confirmation("Automatic local discovery")
+        );
+        app.images.confirm_build();
+        assert!(app.images.take_build_requested());
+
+        assert!(!app.image_build_start_blocked());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn competing_image_mutation_blocks_image_build_start() {
+        let (mut app, _) = app_with_open_inspection();
+        app.images.build_context = Some(std::path::PathBuf::from("/synthetic/context"));
+        app.images.build_repository = "example/service".to_owned();
+        app.images.build_tag = "release-1".to_owned();
+        assert!(
+            app.images
+                .begin_build_confirmation("Automatic local discovery")
+        );
+        app.images.confirm_build();
+        assert!(app.images.take_build_requested());
+        app.image_pull_task = Some(app.runtime.spawn(std::future::pending()));
+
+        assert!(app.image_build_start_blocked());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejected_confirmed_build_persists_redacted_not_submitted_outcome() {
+        let (mut app, _) = app_with_open_inspection();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ferrum-build-audit-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        app.audit_store = audit::AuditStore::new(Arc::new(settings::SettingsStore::at(
+            root.join("settings.toml"),
+        )));
+        app.images.build_context = Some(std::path::PathBuf::from("/synthetic/context"));
+        app.images.build_repository = "example/service".to_owned();
+        app.images.build_tag = "release-1".to_owned();
+        assert!(
+            app.images
+                .begin_build_confirmation("Automatic local discovery")
+        );
+        app.images.confirm_build();
+        assert!(app.images.take_build_requested());
+        app.image_pull_task = Some(app.runtime.spawn(std::future::pending()));
+
+        app.start_image_build(egui::Context::default());
+
+        assert!(app.engine.is_none());
+        assert!(app.image_build_task.is_none());
+        app.image_pull_task.take().unwrap().abort();
+        let audit_path = root.join("audit.jsonl");
+        app.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if std::fs::read_to_string(&audit_path)
+                        .is_ok_and(|contents| !contents.trim().is_empty())
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the rejected build outcome should be persisted");
+        });
+        let contents = std::fs::read_to_string(&audit_path).unwrap();
+        let record = serde_json::from_str::<serde_json::Value>(&contents).unwrap();
+        assert_eq!(record["schema_version"], 1);
+        assert_eq!(record["event"], "image_mutation");
+        assert_eq!(record["action"], "build");
+        assert_eq!(record["outcome"], "not_submitted");
+        assert_eq!(
+            record
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "action",
+                "event",
+                "outcome",
+                "schema_version",
+                "timestamp_unix_ms"
+            ]
+            .into_iter()
+            .collect()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(target_os = "linux")]

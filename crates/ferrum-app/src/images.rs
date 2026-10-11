@@ -449,6 +449,16 @@ impl ImagesView {
         });
     }
     pub(super) fn has_mutation_in_flight(&self) -> bool {
+        let mut busy = self.has_competing_mutation_in_flight();
+        #[cfg(target_os = "linux")]
+        {
+            busy |= self.build_confirmed;
+        }
+        busy
+    }
+
+    /// Returns whether a mutation other than the accepted build blocks its start.
+    pub(super) fn has_competing_mutation_in_flight(&self) -> bool {
         let mut busy = self.active_pull_generation.is_some()
             || self.active_push_generation.is_some()
             || self.push_confirmation_open
@@ -462,7 +472,6 @@ impl ImagesView {
         {
             busy |= self.active_build_generation.is_some()
                 || self.build_confirmation_open
-                || self.build_confirmed
                 || self.build_requested;
         }
         busy
