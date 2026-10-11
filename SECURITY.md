@@ -231,6 +231,27 @@ the project directory to the base file's parent. See Docker's [Compose CLI refer
 for ordered merging and path resolution and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
 for the command flags.
 
+Before launching any Docker/Compose process, Ferrum rejects an aggregate
+selected base-and-override file size greater than 16 MiB; exactly 16 MiB is
+accepted. This is a point-in-time check, not atomic against same-UID changes:
+a same-UID process may change or replace a selected file after the check.
+After the Compose version preflight, Compose reopens the original selected
+paths for validation, so the contents read may differ from those measured.
+The size check covers only explicitly selected files. Local
+`include`/`extends.file` files may remain outside it and are read by the same
+limited CLI process under the logged-in user's permissions.
+
+On Linux, each Compose subprocess for version, discovery, and validation has
+`RLIMIT_AS` capped at 4 GiB and `RLIMIT_DATA` capped at 512 MiB, preserving any
+lower inherited limits. These per-process limits apply to selected and included
+file reads. Child processes inherit these limits, which bound each process,
+not aggregate process-tree RSS. The private child environment
+sets `GOMEMLIMIT=402653184` (384 MiB) for Go runtimes. This is a soft runtime
+target, not a hard cap: Go may exceed it to avoid excessive GC thrashing.
+Resource exhaustion can produce a generic validation failure. These limits and
+the point-in-time selected-file check do not make the trusted CLI a sandbox or
+confine local included-file reads.
+
 Validation is read-only, does not contact or require an engine socket, and
 Ferrum does not write, modify, delete, or extract project files. Success means
 structural validation only: interpolation and service `env_file` resolution
@@ -253,17 +274,19 @@ include/env reads described above. Private Docker config/HOME and environment
 isolation are not a sandbox, and the CLI/plugin is trusted local code. Validate
 only trusted Compose files.
 
-CLI processes use a private isolated Docker config/HOME and a cleared
+CLI processes use a private isolated Docker config and `HOME` with a cleared
 allowlisted environment. If Compose is installed in the standard per-user CLI
 plugin directory, only the `docker-compose` executable is linked into the
 private config; custom `cliPluginsExtraDirs` from saved config are not loaded.
 Saved `config.json` credentials and proxy settings are not read or passed.
-Each command has an eight-second deadline and a 1 MiB stdout cap.
+Each command has an eight-second deadline and a 1 MiB stdout cap. Process
+resource exhaustion may cause a generic validation failure.
 
 Linux local Compose discovery and single-file validation, loopback-loader, and
 ordered multi-file temporary-file smokes passed with Compose v5.6.0. The
 multi-file smoke used an owned base/override pair without an engine or user
 project access. The native page visual check remains unavailable.
-Issue #18 remains partial/open; issue #10 remains blocked/open. No full issue
-completion, release, or broader support claim is made.
+Issue #18 remains partial/open; issue #19 remains partial/open; issue #10
+remains blocked/open. No full issue completion, release, or broader support
+claim is made.
 

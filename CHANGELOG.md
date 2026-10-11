@@ -64,6 +64,21 @@ All notable project changes are documented here. The project has not published a
   `config --quiet --no-interpolate --no-env-resolution`, engine-independent
   The new multi-file CLI smoke uses a controlled temporary base/override pair;
   it passed with Compose v5.6.0 without an engine or user project mutation.
+- Bounded Linux Compose resource use: reject selected base-and-override files
+  above 16 MiB in aggregate before launching Docker/Compose (exactly 16 MiB is
+  accepted), using a point-in-time check that is not atomic against same-UID
+  changes. After version preflight, Compose reopens the original selected
+  paths for validation. Apply per-process 4 GiB `RLIMIT_AS` and 512 MiB
+  `RLIMIT_DATA` ceilings to Compose version, discovery, and validation
+  subprocesses, retaining lower inherited limits. These per-process limits
+  apply while reading selected and included files; they bound each process,
+  not aggregate process-tree RSS, and are not a sandbox. The child environment
+  sets Go's 384 MiB `GOMEMLIMIT`, a soft target that may be exceeded to avoid
+  GC thrashing. Included local `include`/`extends.file` reads remain outside
+  the selected-file size check and remain under the logged-in user's
+  permissions. Resource exhaustion can produce a generic validation failure.
+  Issues #18 and #19 remain partial/open; no full issue completion, release,
+  or broader support claim is made.
 - Clarified the Compose validation trust boundary: included projects may still
   read their default `.env` and explicit `include.env_file` paths outside the
   base directory despite `COMPOSE_DISABLE_ENV_FILE=1` and the
