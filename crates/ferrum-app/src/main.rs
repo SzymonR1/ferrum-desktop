@@ -2772,16 +2772,15 @@ impl FerrumApp {
                         .finish_file_selection(generation, file.as_deref())
                     {
                         self.compose_validation_task = None;
-                        if self.compose.is_validation_running() {
-                            if let Some(profiles) = self.compose.profiles_for_automatic_validation()
-                            {
-                                self.start_compose_validation(
-                                    self.compose.selected_files().to_vec(),
-                                    profiles,
-                                    generation,
-                                    context.clone(),
-                                );
-                            }
+                        if self.compose.is_validation_running()
+                            && let Some(profiles) = self.compose.profiles_for_automatic_validation()
+                        {
+                            self.start_compose_validation(
+                                self.compose.selected_files().to_vec(),
+                                profiles,
+                                generation,
+                                context.clone(),
+                            );
                         }
                     }
                 }

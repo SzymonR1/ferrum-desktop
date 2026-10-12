@@ -4070,8 +4070,10 @@ mod tests {
         }
         #[test]
         fn file_selection_with_invalid_profiles_skips_automatic_validation() {
-            let mut view = ComposeView::default();
-            view.profile_input = "api,,worker".to_owned();
+            let mut view = ComposeView {
+                profile_input: "api,,worker".to_owned(),
+                ..ComposeView::default()
+            };
             let generation = view.begin_file_selection();
             assert!(view.finish_file_selection(
                 generation,
