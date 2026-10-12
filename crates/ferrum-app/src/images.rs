@@ -1,4 +1,7 @@
-use crate::{display::escape_untrusted_display_text, search::CaseInsensitiveQuery};
+use crate::{
+    display::escape_untrusted_display_text, search::CaseInsensitiveQuery,
+    settings::RegistryCredentialHelper,
+};
 
 #[cfg(target_os = "linux")]
 use crate::image_build::{ImageBuildError, ImageBuildRequest};
@@ -101,10 +104,17 @@ pub(super) struct ImageTagRequest {
     pub(super) repository: String,
     pub(super) tag: String,
 }
+pub(super) struct ImagePullRequest {
+    pub(super) generation: u64,
+    pub(super) reference: String,
+    pub(super) use_registry_credentials: bool,
+}
+
 pub(super) struct ImagePushRequest {
     pub(super) generation: u64,
     pub(super) image_id: String,
     pub(super) target: ImagePushTarget,
+    pub(super) use_registry_credentials: bool,
 }
 
 #[derive(Default)]
@@ -135,6 +145,8 @@ pub(super) struct ImagesView {
     pull_progress: Option<ImagePullProgress>,
     pull_error: Option<String>,
     pull_requested: bool,
+    pull_auth_requested: bool,
+    registry_helper: RegistryCredentialHelper,
     hide_progress_requested: bool,
     push_generation: u64,
     // Survives view invalidation; only the matching terminal event releases it.
@@ -145,6 +157,7 @@ pub(super) struct ImagesView {
     push_confirmation_target: Option<ImagePushTarget>,
     push_confirmed: bool,
     push_requested: bool,
+    push_auth_requested: bool,
     hide_push_progress_requested: bool,
     push_loading: bool,
     push_progress_hidden: bool,
@@ -233,6 +246,7 @@ impl ImagesView {
 
     #[cfg(target_os = "linux")]
     pub(super) fn begin_build_confirmation(&mut self, context_label: &str) -> bool {
+        self.pull_auth_requested = false;
         if self.build_target_valid() && !self.has_mutation_in_flight() && !self.build_loading {
             self.build_confirmation_open = true;
             self.build_confirmation_context_label =
@@ -490,6 +504,9 @@ impl ImagesView {
     }
     #[cfg(test)]
     pub(super) fn set_pull_reference(&mut self, reference: String) {
+        if self.pull_reference != reference {
+            self.pull_auth_requested = false;
+        }
         self.pull_reference = reference;
     }
     #[cfg(test)]
@@ -552,6 +569,7 @@ impl ImagesView {
         self.push_confirmation_target = None;
         self.push_confirmed = false;
         self.push_requested = false;
+        self.push_auth_requested = false;
         self.hide_push_progress_requested = false;
         self.tag_confirmation_open = false;
         if !self.tag_loading {
@@ -600,6 +618,7 @@ impl ImagesView {
     }
 
     pub(super) fn begin_tag_confirmation(&mut self) {
+        self.pull_auth_requested = false;
         if self.tag_target_valid()
             && !self.tag_loading
             && !self.has_mutation_in_flight()
@@ -613,6 +632,7 @@ impl ImagesView {
         }
     }
     pub(super) fn begin_remove_confirmation(&mut self) {
+        self.pull_auth_requested = false;
         if !self.remove_loading
             && !self.remove_confirmation_open
             && !self.has_mutation_in_flight()
@@ -739,7 +759,20 @@ impl ImagesView {
         true
     }
 
-    pub(super) fn begin_pull(&mut self) -> Option<(u64, String)> {
+    pub(super) fn set_registry_helper(&mut self, helper: RegistryCredentialHelper) {
+        if self.registry_helper != helper {
+            self.pull_auth_requested = false;
+            self.push_auth_requested = false;
+        }
+        self.registry_helper = helper;
+        if helper == RegistryCredentialHelper::None {
+            self.pull_auth_requested = false;
+            self.push_auth_requested = false;
+        }
+    }
+
+    pub(super) fn begin_pull(&mut self) -> Option<ImagePullRequest> {
+        let use_registry_credentials = std::mem::take(&mut self.pull_auth_requested);
         if !self.pull_reference_valid() || self.has_mutation_in_flight() {
             return None;
         }
@@ -750,7 +783,11 @@ impl ImagesView {
         self.pull_complete = false;
         self.pull_progress = None;
         self.pull_error = None;
-        Some((self.pull_generation, self.pull_reference.clone()))
+        Some(ImagePullRequest {
+            generation: self.pull_generation,
+            reference: self.pull_reference.clone(),
+            use_registry_credentials,
+        })
     }
 
     pub(super) fn update_pull(&mut self, generation: u64, progress: ImagePullProgress) -> bool {
@@ -792,6 +829,7 @@ impl ImagesView {
         self.pull_complete = false;
         self.pull_progress = None;
         self.pull_error = None;
+        self.pull_auth_requested = false;
         self.pull_requested = false;
         self.hide_progress_requested = false;
     }
@@ -814,6 +852,8 @@ impl ImagesView {
     }
 
     pub(super) fn begin_push_confirmation(&mut self) {
+        self.pull_auth_requested = false;
+        self.push_auth_requested = false;
         if !self.push_target_valid()
             || self.push_loading
             || self.push_confirmation_open
@@ -853,9 +893,11 @@ impl ImagesView {
         self.push_confirmation_target = None;
         self.push_confirmed = false;
         self.push_requested = false;
+        self.push_auth_requested = false;
     }
 
     pub(super) fn begin_push(&mut self) -> Option<ImagePushRequest> {
+        let use_registry_credentials = std::mem::take(&mut self.push_auth_requested);
         if !std::mem::take(&mut self.push_confirmed) || self.has_mutation_in_flight() {
             self.cancel_push_confirmation();
             return None;
@@ -886,6 +928,7 @@ impl ImagesView {
             generation: self.push_generation,
             image_id,
             target,
+            use_registry_credentials,
         })
     }
 
@@ -953,6 +996,7 @@ impl ImagesView {
         self.push_complete = false;
         self.push_progress = None;
         self.push_requested = false;
+        self.push_auth_requested = false;
         self.hide_push_progress_requested = false;
         if !push_is_active && !self.push_outcome_uncertain {
             self.push_error = None;
@@ -1060,17 +1104,43 @@ impl ImagesView {
         build_context_label: &str,
     ) -> Option<ImageInspectionRequest> {
         ui.group(|ui| {
-            ui.heading("Pull public image");
-            ui.label("Anonymous pulls only; private registry authentication is not supported.");
+            ui.heading("Pull image");
+            if self.registry_helper != RegistryCredentialHelper::None {
+                if !connected || !operations_allowed {
+                    self.pull_auth_requested = false;
+                }
+                ui.add_enabled(
+                    connected && operations_allowed && !mutation_busy && !self.pull_loading,
+                    egui::Checkbox::new(
+                        &mut self.pull_auth_requested,
+                        "Use the configured credential helper for this pull only",
+                    ),
+                );
+                ui.label("When enabled, Ferrum invokes the selected host credential helper and sends its result to the currently selected local Docker Engine over its Unix socket for registry access. Ferrum does not persist credentials.");
+                ui.label("The Engine receives this credential and its registry-mirror configuration may forward it. Opt in only when you trust both the helper and Engine/mirror configuration.");
+            } else {
+                self.pull_auth_requested = false;
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(
+                        &mut self.pull_auth_requested,
+                        "Use a configured credential helper for this pull only",
+                    ),
+                );
+                ui.label("Select Secret Service or pass in Settings to enable private-registry authentication. Anonymous pulls remain the default.");
+            }
             if mutation_busy && !self.pull_loading {
                 ui.label("An image operation is in progress; wait for it to finish before starting another pull, push, tag, or removal.");
             }
             ui.horizontal(|ui| {
                 let label = ui.label("Image reference");
-                ui.add_enabled(
+                let response = ui.add_enabled(
                     !mutation_busy || self.pull_loading,
                     egui::TextEdit::singleline(&mut self.pull_reference),
                 ).labelled_by(label.id);
+                if response.changed() {
+                    self.pull_auth_requested = false;
+                }
                 if ui
                     .add_enabled(
                         connected
@@ -1521,8 +1591,21 @@ impl ImagesView {
                 let mut cancel_requested = false;
                 ui.group(|ui| {
                     ui.heading("Confirm image push");
+                    if self.registry_helper != RegistryCredentialHelper::None {
+                        ui.checkbox(
+                            &mut self.push_auth_requested,
+                            "Use the configured credential helper for this push only",
+                        );
+                    }
+                    let authentication_disclosure = if self.push_auth_requested {
+                        "The configured helper credential will be sent to the connected local Docker engine for registry authentication; the engine may forward it to configured registry mirrors."
+                    } else if self.registry_helper == RegistryCredentialHelper::None {
+                        "Only anonymous access is used; registries that require credentials will reject the push. Configure Secret Service or pass in Settings to enable optional authentication."
+                    } else {
+                        "Only anonymous access is used; registries that require credentials will reject the push."
+                    };
                     ui.label(format!(
-                        "Push image {safe_image_id} as {safe_target}? This sends image layers and metadata to the registry and may disclose secrets. Only anonymous access is used; registries that require credentials will reject the push. Confirm to send this request to the connected local Docker engine."
+                        "Push image {safe_image_id} as {safe_target}? This sends image layers and metadata to the registry and may disclose secrets. {authentication_disclosure} Confirm to send this request to the connected local Docker engine."
                     ));
                     ui.horizontal(|ui| {
                         confirm_requested = ui.button("Confirm push").clicked();
@@ -2080,7 +2163,7 @@ mod tests {
     fn an_active_pull_blocks_tag_and_remove_model_requests_until_terminal_event() {
         let mut view = taggable_view();
         view.set_pull_reference("alpine:3.20".to_owned());
-        let (generation, _) = view.begin_pull().unwrap();
+        let generation = view.begin_pull().unwrap().generation;
         view.tag_confirmed = true;
         view.tag_confirmation_image_id = Some("sha256:image".to_owned());
         view.remove_confirmed = true;
@@ -2704,8 +2787,10 @@ mod tests {
         harness.run();
         assert!(harness.state().view.pull_requested);
         assert!(harness.state_mut().view.take_pull_requested());
-        let (generation, reference) = harness.state_mut().view.begin_pull().unwrap();
-        assert_eq!(reference, "alpine:latest");
+        let request = harness.state_mut().view.begin_pull().unwrap();
+        let generation = request.generation;
+        assert_eq!(request.reference, "alpine:latest");
+        assert!(!request.use_registry_credentials);
         assert!(harness.state().view.pull_loading);
         assert!(
             harness
@@ -2738,6 +2823,70 @@ mod tests {
         harness.state_mut().view.finish_pull(generation, Ok(()));
         harness.run();
         let _complete = harness.get_by_role_and_label(Role::Label, "Image pull complete.");
+    }
+    #[test]
+    fn credential_checkbox_is_one_shot_and_cleared_on_helper_or_reference_change() {
+        let mut view = ImagesView::default();
+        view.set_registry_helper(RegistryCredentialHelper::SecretService);
+        view.set_pull_reference("private.example/team/app:latest".to_owned());
+        let mut harness = harness_for(view);
+        harness.run();
+        harness
+            .get_by_role_and_label(
+                Role::CheckBox,
+                "Use the configured credential helper for this pull only",
+            )
+            .click_accesskit();
+        harness.run();
+        assert!(harness.state().view.pull_auth_requested);
+        harness
+            .get_by_role_and_label(Role::Button, "Pull image")
+            .click_accesskit();
+        harness.run();
+        assert!(harness.state_mut().view.take_pull_requested());
+        let first = harness.state_mut().view.begin_pull().unwrap();
+        assert!(first.use_registry_credentials);
+        assert!(!harness.state().view.pull_auth_requested);
+        harness
+            .state_mut()
+            .view
+            .finish_pull(first.generation, Ok(()));
+
+        let second = harness.state_mut().view.begin_pull().unwrap();
+        assert!(!second.use_registry_credentials);
+        harness
+            .state_mut()
+            .view
+            .finish_pull(second.generation, Ok(()));
+
+        harness.state_mut().view.pull_auth_requested = true;
+        harness
+            .state_mut()
+            .view
+            .set_registry_helper(RegistryCredentialHelper::Pass);
+        assert!(!harness.state().view.pull_auth_requested);
+        harness.state_mut().view.pull_auth_requested = true;
+        harness
+            .state_mut()
+            .view
+            .set_pull_reference("another.example/team/app:latest".to_owned());
+        assert!(!harness.state().view.pull_auth_requested);
+        harness.state_mut().view.pull_auth_requested = true;
+        harness.state_mut().view.invalidate();
+        assert!(!harness.state().view.pull_auth_requested);
+    }
+
+    #[test]
+    fn explicit_pull_auth_is_not_downgraded_when_helper_is_missing() {
+        let mut view = ImagesView {
+            pull_reference: "private.example/team/app:latest".to_owned(),
+            pull_auth_requested: true,
+            ..ImagesView::default()
+        };
+
+        let request = view.begin_pull().unwrap();
+        assert!(request.use_registry_credentials);
+        assert!(!view.pull_auth_requested);
     }
 
     #[test]
@@ -2772,14 +2921,14 @@ mod tests {
             pull_reference: "alpine:latest".to_owned(),
             ..ImagesView::default()
         };
-        let (stale, _) = view.begin_pull().unwrap();
+        let stale = view.begin_pull().unwrap().generation;
         view.invalidate_pull_view();
         assert!(view.has_mutation_in_flight());
         assert!(!view.update_pull(stale, progress("stale", Some(1), Some(2))));
         assert!(!view.finish_pull(stale, Ok(())));
         assert!(!view.has_mutation_in_flight());
 
-        let (current, _) = view.begin_pull().unwrap();
+        let current = view.begin_pull().unwrap().generation;
         assert!(view.finish_pull(current, Err("Image pull failed safely.".to_owned())));
         let mut harness = harness_for(view);
         harness.run();
@@ -2840,7 +2989,7 @@ mod tests {
             pull_reference: "alpine:latest".to_owned(),
             ..ImagesView::default()
         };
-        let (generation, _) = view.begin_pull().unwrap();
+        let generation = view.begin_pull().unwrap().generation;
         assert!(view.finish_pull(generation, Ok(())));
         view.begin_load();
         let mut harness = harness_for(view);
@@ -2864,7 +3013,7 @@ mod tests {
     fn accessible_hide_progress_keeps_pull_mutation_active_until_completion() {
         let mut view = taggable_view();
         view.set_pull_reference("alpine:latest".to_owned());
-        let (generation, _) = view.begin_pull().unwrap();
+        let generation = view.begin_pull().unwrap().generation;
         view.update_pull(generation, progress("Downloading", Some(10), Some(100)));
         let mut harness = Harness::new_ui_state(
             |ui, state: &mut ImagesUi| {
@@ -2932,7 +3081,7 @@ mod tests {
     fn queued_success_after_hidden_progress_completes_and_remains_refreshable() {
         let mut view = ImagesView::default();
         view.set_pull_reference("alpine:latest".to_owned());
-        let (generation, _) = view.begin_pull().unwrap();
+        let generation = view.begin_pull().unwrap().generation;
         view.hide_pull_progress();
         assert!(view.is_pull_progress_hidden());
         assert!(view.has_mutation_in_flight());
@@ -2949,7 +3098,7 @@ mod tests {
     fn invalidation_hides_stale_pull_data_without_releasing_active_mutation() {
         let mut view = ImagesView::default();
         view.set_pull_reference("alpine:latest".to_owned());
-        let (generation, _) = view.begin_pull().unwrap();
+        let generation = view.begin_pull().unwrap().generation;
         view.update_pull(generation, progress("old context", Some(10), Some(100)));
 
         view.invalidate();
@@ -2968,13 +3117,13 @@ mod tests {
     fn a_new_pull_stays_blocked_after_hiding_until_previous_terminal_event() {
         let mut view = ImagesView::default();
         view.set_pull_reference("alpine:latest".to_owned());
-        let (previous_generation, _) = view.begin_pull().unwrap();
+        let previous_generation = view.begin_pull().unwrap().generation;
         view.hide_pull_progress();
         assert!(view.begin_pull().is_none());
         assert!(view.has_mutation_in_flight());
         assert!(view.finish_pull(previous_generation, Ok(())));
 
-        let (current_generation, _) = view.begin_pull().unwrap();
+        let current_generation = view.begin_pull().unwrap().generation;
         assert_ne!(previous_generation, current_generation);
         assert!(!view.finish_pull(previous_generation, Ok(())));
         assert!(!view.update_pull(
@@ -3003,7 +3152,7 @@ mod tests {
         let _heading = harness.get_by_role_and_label(Role::Label, "Confirm image push");
         let _warning = harness.get_by_role_and_label(
             Role::Label,
-            "Push image sha256:image as registry.example/team/app:stable? This sends image layers and metadata to the registry and may disclose secrets. Only anonymous access is used; registries that require credentials will reject the push. Confirm to send this request to the connected local Docker engine.",
+            "Push image sha256:image as registry.example/team/app:stable? This sends image layers and metadata to the registry and may disclose secrets. Only anonymous access is used; registries that require credentials will reject the push. Configure Secret Service or pass in Settings to enable optional authentication. Confirm to send this request to the connected local Docker engine.",
         );
         assert!(!harness.state().view.push_requested);
 
@@ -3013,6 +3162,84 @@ mod tests {
         harness.run();
         assert!(!harness.state_mut().view.take_push_requested());
         assert!(!harness.state().view.push_loading);
+    }
+    #[test]
+    fn push_credentials_are_an_explicit_one_operation_confirmation_choice() {
+        let mut view = pushable_view();
+        view.set_registry_helper(RegistryCredentialHelper::SecretService);
+        let mut harness = harness_for(view);
+        harness.run();
+
+        harness
+            .get_by_role_and_label(Role::Button, "Push image")
+            .click_accesskit();
+        harness.run();
+        harness
+            .get_by_role_and_label(
+                Role::CheckBox,
+                "Use the configured credential helper for this push only",
+            )
+            .click_accesskit();
+        harness.run();
+        assert!(harness.state().view.push_auth_requested);
+        harness
+            .get_by_role_and_label(Role::Button, "Cancel")
+            .click_accesskit();
+        harness.run();
+        assert!(!harness.state().view.push_auth_requested);
+        assert!(!harness.state_mut().view.take_push_requested());
+
+        harness
+            .get_by_role_and_label(Role::Button, "Push image")
+            .click_accesskit();
+        harness.run();
+        assert!(!harness.state().view.push_auth_requested);
+        harness
+            .get_by_role_and_label(
+                Role::CheckBox,
+                "Use the configured credential helper for this push only",
+            )
+            .click_accesskit();
+        harness.run();
+        let _auth_disclosure = harness.get_by_role_and_label(
+            Role::Label,
+            "Push image sha256:image as registry.example/team/app:stable? This sends image layers and metadata to the registry and may disclose secrets. The configured helper credential will be sent to the connected local Docker engine for registry authentication; the engine may forward it to configured registry mirrors. Confirm to send this request to the connected local Docker engine.",
+        );
+        harness
+            .get_by_role_and_label(Role::Button, "Confirm push")
+            .click_accesskit();
+        harness.run();
+
+        assert!(harness.state_mut().view.take_push_requested());
+        let first = harness
+            .state_mut()
+            .view
+            .begin_push()
+            .expect("confirmed authenticated push should start");
+        assert!(first.use_registry_credentials);
+        assert!(!harness.state().view.push_auth_requested);
+        harness
+            .state_mut()
+            .view
+            .finish_push(first.generation, Ok(()));
+        harness.run();
+
+        harness
+            .get_by_role_and_label(Role::Button, "Push image")
+            .click_accesskit();
+        harness.run();
+        assert!(!harness.state().view.push_auth_requested);
+        harness
+            .get_by_role_and_label(Role::Button, "Confirm push")
+            .click_accesskit();
+        harness.run();
+        assert!(harness.state_mut().view.take_push_requested());
+        let second = harness
+            .state_mut()
+            .view
+            .begin_push()
+            .expect("the next confirmed push should start");
+        assert!(!second.use_registry_credentials);
     }
     #[test]
     fn headless_push_confirmation_accepts_request_and_starts_snapshotted_push() {

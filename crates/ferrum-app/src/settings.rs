@@ -21,6 +21,15 @@ const SCHEMA_VERSION: u32 = 1;
 const MAX_SETTINGS_BYTES: u64 = 16 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RegistryCredentialHelper {
+    #[default]
+    None,
+    SecretService,
+    Pass,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Settings {
@@ -28,6 +37,8 @@ pub(super) struct Settings {
     schema_version: u32,
     #[serde(default = "default_auto_connect")]
     pub(super) auto_connect_on_startup: bool,
+    #[serde(default)]
+    pub(super) registry_credential_helper: RegistryCredentialHelper,
 }
 
 impl Default for Settings {
@@ -35,6 +46,7 @@ impl Default for Settings {
         Self {
             schema_version: SCHEMA_VERSION,
             auto_connect_on_startup: true,
+            registry_credential_helper: RegistryCredentialHelper::None,
         }
     }
 }
@@ -567,6 +579,27 @@ impl SettingsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn registry_credential_helper_setting_persists_only_the_selected_variant() {
+        let settings = Settings {
+            registry_credential_helper: RegistryCredentialHelper::Pass,
+            ..Settings::default()
+        };
+        let serialized = toml::to_string(&settings).unwrap();
+        assert!(serialized.contains("registry_credential_helper = \"pass\""));
+        assert!(!serialized.contains("Secret"));
+        let decoded: Settings = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            decoded.registry_credential_helper,
+            RegistryCredentialHelper::Pass
+        );
+        let legacy: Settings = toml::from_str("auto_connect_on_startup = true").unwrap();
+        assert_eq!(
+            legacy.registry_credential_helper,
+            RegistryCredentialHelper::None
+        );
+    }
+
     use std::{
         fs,
         path::PathBuf,
