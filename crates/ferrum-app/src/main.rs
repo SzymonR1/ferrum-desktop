@@ -48,6 +48,8 @@ mod images;
 mod inventory;
 mod logs;
 mod networks;
+#[cfg(target_os = "linux")]
+mod registry_auth;
 mod retry;
 mod search;
 mod volumes;
@@ -2020,6 +2022,25 @@ impl FerrumApp {
     ) {
         persist_audit_record(audit_store, audit::record_image_build_result(outcome)).await;
     }
+    #[cfg(target_os = "linux")]
+    fn image_build_audit_outcome(
+        result: &Result<(), image_build::ImageBuildError>,
+        cancelled_before_submit: bool,
+    ) -> audit::ImageBuildOutcome {
+        if cancelled_before_submit {
+            return audit::ImageBuildOutcome::NotSubmitted;
+        }
+        match result {
+            Ok(()) => audit::ImageBuildOutcome::Success,
+            Err(
+                image_build::ImageBuildError::DockerUnavailable
+                | image_build::ImageBuildError::InvalidContext
+                | image_build::ImageBuildError::InvalidTarget
+                | image_build::ImageBuildError::SpawnFailed,
+            ) => audit::ImageBuildOutcome::NotSubmitted,
+            Err(_) => audit::ImageBuildOutcome::RequestError,
+        }
+    }
 
     #[cfg(target_os = "linux")]
     fn image_build_busy(&self) -> bool {
@@ -2194,19 +2215,7 @@ impl FerrumApp {
                 drop(output_sender);
                 Err(image_build::ImageBuildError::DockerUnavailable)
             };
-            let outcome = if cancelled_before_submit {
-                audit::ImageBuildOutcome::NotSubmitted
-            } else {
-                match result {
-                    Ok(()) => audit::ImageBuildOutcome::Success,
-                    Err(
-                        image_build::ImageBuildError::DockerUnavailable
-                        | image_build::ImageBuildError::InvalidContext
-                        | image_build::ImageBuildError::InvalidTarget,
-                    ) => audit::ImageBuildOutcome::NotSubmitted,
-                    Err(_) => audit::ImageBuildOutcome::RequestError,
-                }
-            };
+            let outcome = Self::image_build_audit_outcome(&result, cancelled_before_submit);
             Self::persist_image_build_outcome(&audit_store, outcome).await;
             if sender
                 .send(EngineEvent::ImageBuildFinished { generation, result })
@@ -2235,16 +2244,28 @@ impl FerrumApp {
         let Some(engine) = self.engine.clone() else {
             return;
         };
-        let Some((generation, reference)) = self.images.begin_pull() else {
+        let Some(request) = self.images.begin_pull() else {
             return;
         };
+        let generation = request.generation;
+        let reference = request.reference;
+        let auth_opted_in = request.use_registry_credentials;
+        let credential_helper = self.settings.registry_credential_helper;
         let sender = self.sender.clone();
         let audit_store = self.audit_store.clone();
         let progress_reporting = Arc::new(AtomicBool::new(true));
         self.image_pull_progress_reporting = Some(Arc::clone(&progress_reporting));
         self.image_pull_task = Some(self.runtime.spawn(async move {
             let result = async {
-                let mut stream = engine.open_image_pull(&reference).await?;
+                let registry_auth = if auth_opted_in {
+                    Some(registry_auth::authorization(credential_helper, &reference).await?)
+                } else {
+                    None
+                };
+                let mut stream = engine
+                    .open_image_pull(&reference, registry_auth.as_ref())
+                    .await?;
+                drop(registry_auth);
                 // Progress reporting may stop, but the reader must drain through the terminal response.
                 while let Some(progress) = stream.next_progress().await? {
                     if progress_reporting.load(Ordering::Acquire) {
@@ -2297,15 +2318,28 @@ impl FerrumApp {
         let Some(request) = self.images.begin_push() else {
             return;
         };
+        let credential_helper = self.settings.registry_credential_helper;
         let sender = self.sender.clone();
         let audit_store = self.audit_store.clone();
         let progress_reporting = Arc::new(AtomicBool::new(true));
         self.image_push_progress_reporting = Some(Arc::clone(&progress_reporting));
         self.image_push_task = Some(self.runtime.spawn(async move {
             let result = async {
+                let registry_auth = if request.use_registry_credentials {
+                    Some(
+                        registry_auth::authorization_for_push(
+                            credential_helper,
+                            request.target.as_str(),
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
                 let mut stream = engine
-                    .open_image_push(&request.image_id, &request.target)
+                    .open_image_push(&request.image_id, &request.target, registry_auth.as_ref())
                     .await?;
+                drop(registry_auth);
                 // Stop rendering stale progress, but drain until a terminal response.
                 while let Some(progress) = stream.next_progress().await? {
                     if progress_reporting.load(Ordering::Acquire) {
@@ -3704,6 +3738,12 @@ impl FerrumApp {
                 .engine
                 .as_ref()
                 .is_some_and(|engine| !engine.local_socket_path().as_os_str().is_empty());
+        let configured_helper = if cfg!(target_os = "linux") {
+            self.settings.registry_credential_helper
+        } else {
+            settings::RegistryCredentialHelper::None
+        };
+        self.images.set_registry_helper(configured_helper);
         let inspection = self.images.show(
             ui,
             connected,
@@ -4561,7 +4601,29 @@ impl FerrumApp {
                     &mut self.settings_draft.auto_connect_on_startup,
                     "Connect automatically on startup",
                 );
-                ui.label("This setting applies the next time Ferrum starts.");
+                ui.label("The startup connection preference applies the next time Ferrum starts.");
+                #[cfg(target_os = "linux")]
+                {
+                    ui.label("Registry credential helper (Linux pulls and pushes)");
+                    ui.radio_value(
+                        &mut self.settings_draft.registry_credential_helper,
+                        settings::RegistryCredentialHelper::None,
+                        "None (anonymous pulls and pushes)",
+                    );
+                    ui.radio_value(
+                        &mut self.settings_draft.registry_credential_helper,
+                        settings::RegistryCredentialHelper::SecretService,
+                        "Secret Service",
+                    );
+                    ui.radio_value(
+                        &mut self.settings_draft.registry_credential_helper,
+                        settings::RegistryCredentialHelper::Pass,
+                        "pass",
+                    );
+                    ui.label("Ferrum invokes only the selected Docker credential-helper binary after you opt in for one pull or push. Install and configure the helper in your Linux user session. Credentials are never stored in Ferrum settings.");
+                }
+                #[cfg(not(target_os = "linux"))]
+                ui.label("Registry credential-helper authentication is not available on this platform.");
                 if let Some(error) = self.settings_error {
                     ui.colored_label(Color32::from_rgb(227, 113, 102), error.message());
                 }
@@ -4570,6 +4632,8 @@ impl FerrumApp {
                         match self.settings_store.save(&self.settings_draft) {
                             Ok(()) => {
                                 self.settings = self.settings_draft.clone();
+                                self.images
+                                    .set_registry_helper(self.settings.registry_credential_helper);
                                 self.settings_error = None;
                                 close_requested = true;
                             }
@@ -6613,6 +6677,67 @@ mod event_reconciliation_tests {
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_runner_spawn_failure_is_persisted_as_not_submitted() {
+        let (mut app, _) = app_with_open_inspection();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ferrum-build-spawn-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root).expect("create test-owned audit directory");
+        let unlaunchable = root.join("buildx-directory");
+        std::fs::create_dir(&unlaunchable).expect("create non-executable test path");
+        app.audit_store = audit::AuditStore::new(Arc::new(settings::SettingsStore::at(
+            root.join("settings.toml"),
+        )));
+
+        let (_cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+        let (output_sender, _output_receiver) = mpsc::channel(1);
+        let result = app.runtime.block_on(image_build::run_command(
+            tokio::process::Command::new(&unlaunchable),
+            cancel_receiver,
+            output_sender,
+        ));
+        assert!(result.is_err(), "a directory cannot be started as Buildx");
+        assert!(
+            matches!(result, Err(image_build::ImageBuildError::SpawnFailed)),
+            "the runner must distinguish a spawn failure from a started build"
+        );
+        let outcome = FerrumApp::image_build_audit_outcome(&result, false);
+        app.runtime.block_on(FerrumApp::persist_image_build_outcome(
+            &app.audit_store,
+            outcome,
+        ));
+
+        let contents = std::fs::read_to_string(root.join("audit.jsonl"))
+            .expect("the audit outcome should be persisted");
+        let record = serde_json::from_str::<serde_json::Value>(&contents).unwrap();
+        assert_eq!(
+            record["outcome"], "not_submitted",
+            "a failed Buildx process spawn cannot submit a build request"
+        );
+        let (_cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+        let (output_sender, _output_receiver) = mpsc::channel(1);
+        let mut started_command = tokio::process::Command::new("/bin/sh");
+        started_command.arg("-c").arg("exit 7");
+        let started_result = app.runtime.block_on(image_build::run_command(
+            started_command,
+            cancel_receiver,
+            output_sender,
+        ));
+        assert!(matches!(
+            started_result,
+            Err(image_build::ImageBuildError::Failed)
+        ));
+        assert!(matches!(
+            FerrumApp::image_build_audit_outcome(&started_result, false),
+            audit::ImageBuildOutcome::RequestError
+        ));
+        std::fs::remove_dir_all(root).expect("remove the test-owned audit directory");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -7087,7 +7212,7 @@ mod event_reconciliation_tests {
         let (mut app, sender) = app_with_open_inspection();
         app.page = images::AppPage::Images;
         app.images.set_pull_reference("alpine:latest".to_owned());
-        let (generation, _) = app.images.begin_pull().unwrap();
+        let generation = app.images.begin_pull().unwrap().generation;
         let (task_finish, task_wait) = tokio::sync::oneshot::channel();
         let (task_started, task_started_wait) = tokio::sync::oneshot::channel();
         let task = app.runtime.spawn(async move {
@@ -7205,7 +7330,7 @@ mod event_reconciliation_tests {
         let (mut app, sender) = app_with_open_inspection();
         app.page = images::AppPage::Images;
         app.images.set_pull_reference("alpine:latest".to_owned());
-        let (generation, _) = app.images.begin_pull().unwrap();
+        let generation = app.images.begin_pull().unwrap().generation;
         app.images.update_pull(
             generation,
             ImagePullProgress {
