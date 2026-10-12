@@ -29,22 +29,57 @@ Please use the private vulnerability-reporting feature for this repository in Gi
 
 ## Current scope
 
-The Linux application provides container inventory, inspection, bounded historical/live logs, state-gated lifecycle actions, image listing, inspection, anonymous public pulls, tagging, confirmed image removal, and an experimental embedded exec terminal over the selected local Docker-compatible Unix socket. Container Remove requires explicit confirmation and does not force-remove containers or remove volumes. Every image-tag request requires explicit confirmation because Docker Engine v1.56 may reassign an existing `repository:tag`; the image data remains. Image removal confirmation snapshots the selected image ID and known tags, warns that removal of the final reference may delete image data, and explains that the non-force request may be rejected for images used by containers or with other tags. The request sets `noprune=true` to preserve untagged parent images, omits `force`, and does not send registry credentials or authentication. A bounded 30-second removal timeout does not prove that engine state remained unchanged; invalidating the page ignores stale results without aborting or claiming to undo a submitted request. Only one image mutation is allowed at a time. Image pull, tag, and removal operate only through the selected local Linux Docker Unix socket; remote engine connections, credentials, Compose, archive handling, managed engines, and release updates are not implemented. The terminal does not launch an external terminal; closing its exec session does not stop or remove the container. Issue #10 remains open for Podman/rootless and remote compatibility. Image removal has fake-socket and headless UI coverage only; tests do not delete a real image or mutate image resources. See [`docs/security/threat-model.md`](docs/security/threat-model.md) for current risks and controls.
+The Linux application provides container inventory, inspection, bounded
+historical/live logs, state-gated lifecycle actions, image listing and
+inspection, anonymous-by-default pulls and pushes with opt-in Linux
+credential-helper authentication, local tagging, confirmed removal, and an
+experimental embedded exec terminal over the selected local Docker-compatible
+Unix socket. Container Remove requires confirmation and does not force-remove
+containers or remove volumes. Every image-tag request requires confirmation
+because Docker Engine v1.56 may reassign an existing `repository:tag`; the
+image data remains. Removal confirmation snapshots the selected ID and known
+tags, warns that removing the final reference may delete image data, and
+explains that the non-force request may be rejected for images used by
+containers or with other tags. Removal omits `force` and sets `noprune=true`.
+Image pull/push/tag/removal use only the selected local Linux Docker Unix socket;
+Buildx remains credential-free. Ferrum does not support remote engine
+connections or read Docker `config.json` credential entries.
+
+Pull and push authentication require both a configured `SecretService` or
+`pass` helper and a separate explicit one-operation checkbox; anonymous pulls
+and pushes remain the default. Ferrum invokes only the selected
+`docker-credential-secretservice` or `docker-credential-pass` binary with argv
+`get`, sends the normalized registry key on stdin, and uses bounded helper
+output/time. Helper stderr and error text are discarded; malformed results,
+helper failures, and exceeded bounds stop the selected operation before Engine
+submission without anonymous fallback. Only the helper enum is stored in
+settings; credential material is not persisted or logged.
+
+After opt-in, the selected local Engine receives the helper credential over
+its Unix socket for that pull or push. Treat the selected host helper and Engine
+as trusted. The Engine's registry-mirror configuration may forward credentials
+according to daemon behavior; Ferrum does not control or validate downstream
+routing. Opt in only when the Engine and its mirror configuration are trusted.
+The Engine AuthConfig and short-lived helper/serialization buffers are
+zeroized where supported; HTTP-stack `HeaderValue` copies cannot be guaranteed
+wiped. Helper-assisted pull/push integration has not been validated against a
+live engine or registry; issue #16 remains partial/open.
 Image layer history is read-only on the selected Linux local Docker socket and
 bounded to a 16 MiB response and 65,536 rows. Only validated full layer IDs and
 nonnegative creation times/sizes are retained; `CreatedBy` command text, tags,
 comments, and other daemon fields are discarded.
 
-Hiding image-pull progress or invalidating the Images page/context does not abort
-an active pull reader: Ferrum drains the response and keeps the mutation gate
-closed until a terminal event. Closing Ferrum does not guarantee that the
-daemon-side pull stops.
+Hiding image-pull or image-push progress or invalidating the Images
+page/context does not abort an active response reader: Ferrum drains the
+response and keeps the mutation gate closed until a terminal event. Closing
+Ferrum does not guarantee that daemon-side pull or push work stops.
 
 Image pull, push, tag, and removal requests emit local structured process traces
 with only the static action and a `success`, `not_submitted`, or `request_error`
-outcome. `not_submitted` identifies local validation rejection before HTTP
-submission. Image IDs, references, repository tags, endpoints, error text, and
-daemon response bodies are not included in those traces.
+outcome. `not_submitted` identifies local validation rejection or credential
+helper failure before Engine HTTP submission. Image IDs, references, repository
+tags, endpoints, error text, and daemon response bodies are not included in
+those traces.
 
 Ferrum also maintains a Linux-local, bounded JSONL copy of mutation outcomes
 for container lifecycle, image pull/push/tag/removal and Buildx image builds,
@@ -64,7 +99,7 @@ not claim the event was persisted; the engine request outcome is unchanged.
 This is local Ferrum-request history only, mutable by the same-UID user, not
 tamper-proof, and does not prove final engine state or record external engine
 actions.
-Issues #16, #17, and #19 remain open/ready; issue #10 remains open/blocked for
+Issues #16, #18, and #19 remain open/ready; issue #10 remains open/blocked for
 Podman/rootless and broader endpoint validation. No release or platform/endpoint
 support is claimed.
 
@@ -94,9 +129,11 @@ continue and image/tag state may be uncertain. Ferrum refreshes image inventory
 after every terminal result.
 Build traces contain only static `image_mutation` / `build` action and
 `success`, `not_submitted`, or `request_error` outcome; context path, tag, and
-output are excluded. These static outcomes are included in the existing
-best-effort durable redacted JSONL audit; build output remains transient and
-unpersisted.
+output are excluded. Failure to spawn Buildx is recorded as `not_submitted`;
+unsuccessful completion after the process starts is `request_error` because
+image/tag state may be uncertain. These static outcomes are included in the
+existing best-effort durable redacted JSONL audit; build output remains
+transient and unpersisted.
 
 Issues #16 and #19 remain open and ready. This partial slice is not a release
 or a support claim beyond local Linux Docker.
@@ -139,11 +176,14 @@ unknown counts disable it. Confirmation names the volume and warns that the
 snapshot can change before deletion. Ferrum sends the negotiated
 `DELETE /v{api}/volumes/{name}` without `force`, with an eight-second bound.
 Docker may reject removal if the volume becomes in use. A timeout or transport
-error can follow a successful deletion. Ferrum marks inventory stale after every
+error can follow a successful deletion. Volume deletion is name-addressed rather
+than bound to an immutable ID; a concurrent delete/recreate under the same name
+cannot be detected by the preflight/confirmation snapshot. These checks are
+not an atomic ownership guarantee. Ferrum marks inventory stale after every
 result and refreshes immediately if Volumes remains open, or when that page is
 opened again; a fresh inspection/usage snapshot is required before retrying.
-Only one volume mutation may be active and context switching is blocked while it is
-pending. Pruning, modification, connection, disconnection, and filesystem
+Only one volume mutation may be active and context switching is blocked while
+it is pending. Pruning, modification, connection, disconnection, and filesystem
 browsing are not offered. Podman/rootless behavior remains unvalidated; remote
 endpoints remain unsupported.
 
@@ -204,7 +244,7 @@ not persistent or tamper-proof; a separate durable redacted copy is described
 above. Only one network mutation may be active, and context switching is blocked
 until it returns. IPAM parsing and metric availability are as described above;
 credential access is not provided. Podman/rootless and remote endpoints remain
-unsupported or unvalidated. Issues #17, #19, and #10 remain open; no release is
+unsupported or unvalidated. Issue #10 remains open/blocked; no release is
 claimed.
 
 The Compose page keeps read-only project discovery for the selected Linux local
