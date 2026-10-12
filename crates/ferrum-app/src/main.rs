@@ -197,6 +197,11 @@ enum EngineEvent {
         generation: u64,
         result: compose::ComposeLogsResult,
     },
+    ComposeLifecycleFinished {
+        generation: u64,
+        selection: compose::ComposeLifecycleSelection,
+        result: compose::ComposeLifecycleResult,
+    },
     NetworkCreated {
         generation: u64,
         name: String,
@@ -876,6 +881,7 @@ struct FerrumApp {
     compose_validation_task: Option<JoinHandle<()>>,
     compose_status_task: Option<JoinHandle<()>>,
     compose_logs_task: Option<JoinHandle<()>>,
+    compose_lifecycle_task: Option<JoinHandle<()>>,
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
     // Hold the reader until the terminal response event releases the mutation gate.
@@ -1084,6 +1090,7 @@ impl FerrumApp {
             compose_validation_task: None,
             compose_status_task: None,
             compose_logs_task: None,
+            compose_lifecycle_task: None,
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
@@ -1452,6 +1459,81 @@ impl FerrumApp {
         }
         self.compose.cancel_service_logs();
         context.request_repaint();
+    }
+    #[cfg(target_os = "linux")]
+    fn start_compose_lifecycle(
+        &mut self,
+        task: compose::ComposeLifecycleTask,
+        context: egui::Context,
+    ) {
+        if let Some(task) = self.compose_status_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.compose_logs_task.take() {
+            task.abort();
+        }
+        let precondition_failed =
+            !matches!(&self.connection, ConnectionState::Connected) || self.compose.is_loading();
+        let socket_path = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.local_socket_path().to_path_buf());
+        let precondition_error = (precondition_failed || socket_path.is_none())
+            .then_some(compose::ComposeLifecycleError::EngineUnavailable);
+        let sender = self.sender.clone();
+        let audit_store = self.audit_store.clone();
+        let selection = task.selection.clone();
+        context.request_repaint();
+        self.compose_lifecycle_task = Some(self.runtime.spawn(async move {
+            let action = match task.action {
+                compose::ComposeLifecycleAction::Start => audit::ComposeMutationAction::Start,
+                compose::ComposeLifecycleAction::Stop => audit::ComposeMutationAction::Stop,
+            };
+            let started_record = audit::record_compose_mutation_result(
+                action,
+                audit::ComposeMutationOutcome::Started,
+            );
+            persist_audit_record(&audit_store, started_record).await;
+            let result = match (precondition_error, socket_path) {
+                (Some(error), _) => compose::ComposeLifecycleResult {
+                    outcome: Err(error),
+                    submitted: false,
+                },
+                (None, Some(socket_path)) => {
+                    compose::compose_lifecycle(
+                        &socket_path,
+                        &task.selection.files,
+                        &task.selection.profiles,
+                        task.action,
+                    )
+                    .await
+                }
+                (None, None) => compose::ComposeLifecycleResult {
+                    outcome: Err(compose::ComposeLifecycleError::EngineUnavailable),
+                    submitted: false,
+                },
+            };
+            let outcome = if result.outcome.is_ok() {
+                audit::ComposeMutationOutcome::Success
+            } else if result.submitted {
+                audit::ComposeMutationOutcome::RequestError
+            } else {
+                audit::ComposeMutationOutcome::NotSubmitted
+            };
+            let record = audit::record_compose_mutation_result(action, outcome);
+            persist_audit_record(&audit_store, record).await;
+            if sender
+                .send(EngineEvent::ComposeLifecycleFinished {
+                    generation: task.generation,
+                    selection,
+                    result,
+                })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
     }
 
     fn load_compose(&mut self, context: egui::Context) {
@@ -2624,6 +2706,7 @@ impl FerrumApp {
             || self.network_mutation_busy()
             || self.volume_mutation_busy()
             || self.image_build_busy()
+            || self.compose_lifecycle_task.is_some()
         {
             return;
         }
@@ -2831,6 +2914,23 @@ impl FerrumApp {
                 EngineEvent::ComposeLogsFinished { generation, result } => {
                     if self.compose.finish_service_logs(generation, result) {
                         self.compose_logs_task = None;
+                    }
+                }
+                EngineEvent::ComposeLifecycleFinished {
+                    generation,
+                    selection,
+                    result,
+                } => {
+                    if self.compose.current_lifecycle_selection_matches(&selection)
+                        && self.page == images::AppPage::Compose
+                    {
+                        // Refresh is started after the terminal event is accepted below.
+                        if self.compose.finish_lifecycle(generation, result) {
+                            self.compose_lifecycle_task = None;
+                            self.start_compose_status_refresh(context.clone());
+                        }
+                    } else if self.compose.finish_lifecycle(generation, result) {
+                        self.compose_lifecycle_task = None;
                     }
                 }
                 EngineEvent::VolumeInspected {
@@ -3841,7 +3941,8 @@ impl FerrumApp {
                             && !self.action_busy()
                             && !network_mutation_in_flight
                             && !volume_mutation_in_flight
-                            && !image_build_busy,
+                            && !image_build_busy
+                            && self.compose_lifecycle_task.is_none(),
                         |ui| {
                             let selected_name = match self.selected_context.as_deref() {
                                 Some(name) => self
@@ -4680,6 +4781,9 @@ impl Drop for FerrumApp {
         self.cancel_image_build();
         self.cancel_image_read_tasks();
         self.invalidate_compose();
+        if let Some(task) = self.compose_lifecycle_task.take() {
+            task.abort();
+        }
         self.pending_resource_read = None;
         if let Some(task) = self.resource_read_task.take() {
             task.abort();
@@ -4798,6 +4902,22 @@ impl eframe::App for FerrumApp {
         if let Some(service) = compose_actions.logs_service.as_deref() {
             #[cfg(target_os = "linux")]
             self.start_compose_service_logs(service, context.clone());
+        }
+        if compose_actions.start_imported {
+            self.compose
+                .request_lifecycle_confirmation(compose::ComposeLifecycleAction::Start);
+        } else if compose_actions.stop_imported {
+            self.compose
+                .request_lifecycle_confirmation(compose::ComposeLifecycleAction::Stop);
+        }
+        if compose_actions.cancel_lifecycle {
+            self.compose.cancel_lifecycle_confirmation();
+        }
+        if compose_actions.confirm_lifecycle {
+            #[cfg(target_os = "linux")]
+            if let Some(task) = self.compose.confirm_lifecycle() {
+                self.start_compose_lifecycle(task, context.clone());
+            }
         }
         if compose_actions.refresh {
             self.refresh(context.clone());
@@ -5326,6 +5446,7 @@ mod event_reconciliation_tests {
             compose_validation_task: None,
             compose_status_task: None,
             compose_logs_task: None,
+            compose_lifecycle_task: None,
             pending_resource_read: None,
             image_list_task: None,
             image_inspection_task: None,
@@ -6695,6 +6816,76 @@ mod event_reconciliation_tests {
             .into_iter()
             .collect()
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unavailable_compose_lifecycle_finishes_and_persists_not_submitted_outcome() {
+        let (mut app, _) = app_with_open_inspection();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-compose-lifecycle-audit-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        app.audit_store = audit::AuditStore::new(Arc::new(settings::SettingsStore::at(
+            root.join("settings.toml"),
+        )));
+        let generation = app.compose.begin_file_selection();
+        assert!(app.compose.finish_file_selection(
+            generation,
+            Some(std::path::Path::new("/private/compose.yaml")),
+        ));
+        assert!(app.compose.finish_validation(
+            generation,
+            compose::ComposeValidationResult {
+                version: None,
+                services: Vec::new(),
+                outcome: Ok(()),
+            },
+        ));
+        assert!(app.compose.import_current_project("Local label"));
+        assert!(
+            app.compose
+                .request_lifecycle_confirmation(compose::ComposeLifecycleAction::Start)
+        );
+        let lifecycle = app
+            .compose
+            .confirm_lifecycle()
+            .expect("the imported configuration should request a lifecycle action");
+        app.page = images::AppPage::Compose;
+        app.start_compose_lifecycle(lifecycle, egui::Context::default());
+
+        let worker = app
+            .compose_lifecycle_task
+            .take()
+            .expect("the unavailable operation should finish asynchronously");
+        app.runtime
+            .block_on(worker)
+            .expect("lifecycle task should complete");
+        app.receive_events(egui::Context::default());
+
+        assert!(
+            app.compose
+                .request_lifecycle_confirmation(compose::ComposeLifecycleAction::Stop),
+            "the rejected operation must not leave the UI stuck in a running state"
+        );
+        app.compose.cancel_lifecycle_confirmation();
+        let contents = std::fs::read_to_string(root.join("audit.jsonl")).unwrap();
+        let records = contents
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["event"], "compose_mutation");
+        assert_eq!(records[0]["action"], "start");
+        assert_eq!(records[0]["outcome"], "started");
+        assert_eq!(records[1]["outcome"], "not_submitted");
+        assert!(!contents.contains("/private/compose.yaml"));
         std::fs::remove_dir_all(&root).unwrap();
     }
     #[cfg(target_os = "linux")]

@@ -419,8 +419,8 @@ The engine integration targets Linux local Unix sockets. Podman/rootless
 behavior remains unvalidated, remote transports remain unsupported, and Windows
 named pipes and macOS remain deferred to issue #21/M8.
 
-Default Compose discovery and validation tests use controlled CLI fixtures and
-headless UI state; they do not contact a live engine or mutate project files.
+Default Compose discovery, validation, lifecycle, and headless UI tests use
+controlled CLI fixtures; they do not contact a live engine or mutate projects.
 Discovery fixtures check `docker compose version --short` and
 `docker compose ls --all --format json`, with only the listing pinned to the
 selected `EngineClient::local_socket_path()`. Validation preflights
@@ -461,14 +461,24 @@ gating, cancellation/stale results, revalidation, and keeping profile input
 disabled during asynchronous file selection. Preserve private Docker
 config/HOME, cleared environment, disabled selected-project `.env`, and
 disabled remote Git/OCI loaders. Transient imports use synthetic path state and
-headless UI only; they retain no file contents, persist no registry, and start
-no CLI/Engine operation. Tests cover validation gating, duplicate/name and
-32-entry bounds, ordered path/profile restoration, stale-generation rejection,
-and cancellation requests for in-flight validation/status/log tasks. Selecting
-clears stale results; persistent project registration and lifecycle/mutation
-operations remain out of scope. See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
+headless UI only; they retain no file contents and persist no registry. Tests
+cover validation gating, duplicate/name and 32-entry bounds, ordered path/profile
+restoration, stale-generation rejection, and cancellation requests for in-flight
+validation/status/log tasks. Lifecycle UI requires an imported, currently
+selected and explicitly revalidated configuration. Controlled CLI tests assert
+the pinned socket, ordered file/profile argv, `start`/`stop` command names,
+isolated environment, validation-before-mutation, static error redaction, and
+spawn/failure/timeout outcome classification.
+Headless tests cover imported-selection restoration through the UI, accessible
+actions, confirmation gating while the engine is unavailable, clearing
+unsubmitted confirmations on page invalidation, preventing status refresh during
+a running lifecycle command, preserving submitted results across page
+invalidation, and persisted redacted `started`/`not_submitted` audit outcomes
+for an unavailable-engine precondition. No live Compose lifecycle mutation test
+is run. Selecting an import clears stale read-only results; other lifecycle
+operations remain out of scope.
+See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
 and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
-
 Headless AccessKit/state tests cover ordered base/override selection, removing
 overrides and explicitly revalidating the remaining set, replacing the base
 (which clears overrides), the 16-file limit, escaped basename display,
@@ -551,11 +561,12 @@ selected project's default `.env`; `--no-interpolate` and
 loaders are explicitly disabled, so remote include/extends references fail
 without fetching. The CLI/plugin remains unsandboxed; validate only trusted
 files. Bounded profile selection applies to structural validation, read-only
-status, and one-shot service logs; the declared-service inventory is not
-profile-filtered and lists all declarations from selected files. Profiles are
-passed as explicit `--profile` arguments and are not inherited from the
-environment. Transient import is session-only; no persistent project registry,
-lifecycle, build/pull, live log follow, or project mutation is introduced.
+status, one-shot service logs, and imported-project start/stop; the declared-
+service inventory is not profile-filtered and lists all declarations from
+selected files. Profiles are passed as explicit `--profile` arguments and are
+not inherited from the environment. Transient import is session-only; no
+persistent project registry, build/pull, live log follow, or project-file
+mutation is introduced.
 The one-shot service logs are covered by fake-CLI and headless tests; no real
 service logs are read by default. A temporary-project profile-validation smoke
 verifies that `config --services` lists all declarations, including one in
