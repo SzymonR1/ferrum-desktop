@@ -28,16 +28,18 @@ the existing best-effort durable JSONL audit; only static event/action/outcome
 are persisted for builds. Build output remains bounded transient UI data and is
 never persisted.
 
-Compose support includes read-only Docker CLI version/project discovery and
+Compose support includes read-only Docker CLI version/project discovery,
 explicit structural validation of a user-selected local base file followed by
-ordered local overrides on Linux. It also supports read-only status for
-containers already associated with selected files. Files are numbered from 1
-(the base) and limited to 16 total. Docker merges `-f` files in supplied order;
-relative paths resolve from the first/base config or `--project-directory`,
-which Ferrum sets to the base file's parent. See Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
-for ordered merge and path semantics and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
-for validation flags.
-
+ordered local overrides, and a bounded declared-service inventory from the
+successful validation command on Linux. `config --services` includes every
+service declared in the selected files, including inactive profile-gated
+services; it is not filtered by selected profiles. It also supports read-only
+status for containers already associated with selected files. Files are limited
+to 16 total. Docker merges `-f` files in supplied order; relative paths resolve
+from the first/base config or `--project-directory`, which Ferrum sets to the
+base file's parent. See Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
+for ordered merge/path semantics and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
+for `config --no-interpolate --no-env-resolution --services`.
 On Linux, explicitly selected base and override files have a combined 16 MiB
 byte limit (exactly 16 MiB is accepted); larger selections are rejected before
 any Docker/Compose process is launched. This is a point-in-time check, not an
@@ -66,11 +68,22 @@ local `include`/`extends.file` Compose files and included projects' default
 `.env` and explicit `include.env_file` paths under the logged-in user's
 permissions, potentially outside the base directory. Remote Git/OCI loaders
 are disabled. The selected files and private CLI environment do not sandbox
-those reads; validate only trusted files. Explicit profiles apply only to
-structural validation, read-only status, and one-shot service logs. `.env` /
-service `env_file` resolution, import, lifecycle/build/pull, live log follow,
-and project mutations remain unsupported. Issues #18 and #19 remain
+those reads; validate only trusted files. Explicit profiles affect structural
+validation, read-only status, and one-shot service logs; the declared-service
+inventory includes all declarations in selected files regardless of profiles.
+`.env` / service `env_file` resolution, import, lifecycle/build/pull, live log
+follow, and project mutations remain unsupported. Issues #18 and #19 remain
 partial/open; issue #10 remains blocked/open.
+
+The service inventory comes from that same validation command, so no additional
+CLI process or Engine request is made. It accepts at most 128 KiB of service
+output, 1024 rows, and 128 bytes per name; malformed or duplicate output fails
+with a static error. Escaped service names are shown in a bounded virtualized
+list. This is a local CLI/file-derived list of every service declared in the
+selected files, including profile-gated services regardless of the active
+profile set; it is not container status. An empty list means no service names
+were returned for these selected files. It never triggers status/log queries or
+Engine requests.
 No release or broader support claim is made.
 
 Status is available only after selected files pass structural validation and a
@@ -144,11 +157,13 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   Preflight Compose with `docker compose version --short` through the private
   isolated Docker config and distinguish preflight failure from config failure.
   Invoke Compose with the base `--file` first and each override afterward,
-  plus `--project-directory <base-parent> config --quiet --no-interpolate
-  --no-env-resolution`. Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
+  plus `--project-directory <base-parent> config --no-interpolate
+  --no-env-resolution --services`. The same invocation returns declared
+  service names; it does not use `--quiet` or start a second service-listing
+  process. Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
   specifies ordered `-f` merge and path resolution relative to the first config
   or `--project-directory`; the [`config` reference](https://docs.docker.com/reference/cli/docker/compose/config)
-  documents the validation flags.
+  documents these options.
 
 - Keep validation read-only, engine-independent, and bounded to eight seconds
   and 1 MiB stdout per command. Before launching any Docker/Compose process,

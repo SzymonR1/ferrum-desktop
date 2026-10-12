@@ -1,8 +1,11 @@
 # Compose
 
 The Compose page provides read-only project discovery, structural validation of
-a local base file with ordered overrides, and read-only status for containers
-already associated with the selected files. It does not import or persist
+a local base file with ordered overrides, a list of every service declared in
+the selected files (including profile-gated services regardless of active
+profiles), and read-only status for existing containers. The declared-service
+list is local Compose CLI/file-derived and does not query an Engine; it is
+separate from running-container status. The page does not import or persist
 projects.
 Project discovery uses Docker's Compose CLI:
 
@@ -37,9 +40,8 @@ selected path as a separate argument, with the base first and each override
 following in the chosen order:
 
 ```text
-docker compose --project-directory <base-parent> --file <base-file> --file <override-2> ... config --quiet --no-interpolate --no-env-resolution
+docker compose --project-directory <base-parent> --file <base-file> --file <override-2> ... config --no-interpolate --no-env-resolution --services
 ```
-
 Docker Compose merges files in the order supplied with `-f`/`--file`, with
 later files overriding or extending earlier configuration. Compose resolves
 relative paths against the first/base configuration file; Ferrum explicitly
@@ -61,8 +63,17 @@ Engine socket, and Ferrum does not write, modify, delete, or extract project
 files. A successful result means structural validation only:
 `--no-interpolate` skips interpolation and `--no-env-resolution` skips service
 `env_file` resolution. The selected paths are held only for the current
-validation session; Ferrum displays only bounded, escaped basenames and a static
-result, never full paths or raw CLI diagnostics.
+validation session; Ferrum displays bounded, escaped basenames, a static
+validation result, and the bounded escaped service list, never full paths or
+raw CLI diagnostics.
+On successful validation, Ferrum retains and displays the bounded service names
+reported by the same `config --services` invocation. Names are escaped before
+display in a virtualized list. Compose returns every service declared in the
+selected files, including profile-gated services regardless of selected
+profiles. The list is local CLI/file-derived, not running-container status; it
+does not contact the Engine or trigger status/log operations. A later status
+snapshot separately reports existing containers and may be empty even when
+services are declared.
 On Linux, each Compose subprocess (version, discovery, validation, and status)
 runs with a 4 GiB `RLIMIT_AS` address-space ceiling and a 512 MiB `RLIMIT_DATA`
 ceiling, preserving lower inherited limits. These per-process limits apply to
@@ -194,22 +205,23 @@ selected service. Ferrum passes each selected profile as its own `--profile <nam
 argument before the Compose subcommand:
 
 ```text
-docker compose --profile <name> --file <base-file> ... config --quiet --no-interpolate --no-env-resolution
-docker --host unix://<selected-socket> compose --profile <name> --file <base-file> ... ps --all --format json
-docker --host unix://<selected-socket> compose --profile <name> --file <base-file> ... logs --tail 200 --no-color <service>
+docker compose --file <base-file> ... --profile <name> config --no-interpolate --no-env-resolution --services
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> ... --profile <name> ps --all --format json
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> ... --profile <name> logs --tail 200 --no-color <service>
 ```
 
-The same selection is used for structural validation, read-only status, and
-one-shot service logs. The status recheck immediately before logs uses the same
-profiles as the earlier status query. Profiles are separate argument-array
-entries, never an environment variable. CLI invocations retain Ferrum's
-private Docker config/HOME and cleared allowlisted environment, including
-disabling the selected project's default `.env` and remote Git/OCI loaders.
-Invalid profile input, or changing the selection, clears current
-validation/status/log state and cancels active Compose work; validate again
-before refreshing status or requesting logs. Profile selection does not import
-or persist projects and does not start, stop, restart, build, pull, or otherwise
-manage project lifecycle.
+Selected profiles are passed to structural validation, existing-container
+status, and one-shot service logs. The `config --services` inventory includes
+every service declared in the selected files regardless of the active profile
+set. The status recheck immediately before logs uses the same profiles as the
+earlier status query. Profile flags are separate argument-array entries, never
+environment variables. CLI invocations retain Ferrum's private Docker config/HOME and cleared
+allowlisted environment, including disabling the selected project's default
+`.env` and remote Git/OCI loaders. Invalid profile input, or changing the
+selection, clears validation, declared services, status, and logs and cancels
+active Compose work; validate again before refreshing status or requesting
+logs. Profile selection does not import or persist projects and does not start,
+stop, restart, build, pull, or otherwise manage project lifecycle.
 
 See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
 and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
@@ -218,23 +230,27 @@ Project import/persistence, start/stop/restart, build/pull, live log follow,
 and project mutations remain unsupported. Structural validation skips
 interpolation and service `env_file` resolution; status uses the isolated
 environment above and may differ from a normal shell invocation. Profile
-selection applies only to structural validation, status, and one-shot service
-logs.
-Status reports only existing containers; it does not enumerate declared
-services with no containers. Issue [#18](https://github.com/SzymonR1/ferrum-desktop/issues/18)
+selection applies to structural validation, status, and one-shot service logs.
+The declared-service inventory lists all services in the selected files,
+including services whose profiles are not selected.
+Status reports only existing containers; the separately shown declared-service
+inventory comes from local Compose configuration and does not query the Engine.
+Issue [#18](https://github.com/SzymonR1/ferrum-desktop/issues/18)
 remains open/partial; [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10)
 remains blocked. This is not a full-issue, release, or broader platform claim.
 
-For environment semantics, see Docker's [Compose environment variables guide](https://docs.docker.com/compose/how-tos/environment-variables/envvars/).
 The direct CLI probe and discovery smoke, single-file and ordered base/override
-temporary-file validation smokes, read-only temporary-project status smoke, and
-loopback remote-loader safety smoke passed with Compose v5.6.0. The status smoke
-used Docker Engine 29.9.0 and created no containers; all temporary project files
-were owned by the test. The validation smokes do not contact an engine and touch
-no user project. Discovery and status query the selected local engine read-only;
-the remote safety smoke verifies Git/OCI includes do not open a local connection
-or contact an external host. None of the smokes mutates projects. Linux local
-Docker discovery was validated; the native Compose page visual check is
-unavailable. For security implications of remote and local references, see
-Docker's [Compose trust model](https://docs.docker.com/compose/trust-model).
+temporary-file validation smokes, and loopback remote-loader safety smoke
+passed with Compose v5.6.0. The read-only temporary-project status smoke passed
+with Docker Engine 29.9.0 and created no containers. The ignored ordered
+profile-validation smoke asserts all declared service names, including one in
+inactive profile `other`; it passed with Compose v5.6.0 using temporary files
+and no Engine access. The opt-in profile-status smoke also passed using a unique
+temporary project and the selected local socket on Docker Engine 29.9.0/default
+context; `ps` returned no containers and the test created or changed no
+resources. All validation smokes use test-owned files only. Discovery and status
+query the selected local engine read-only; the remote-loader smoke verifies
+Git/OCI references do not open a local connection or contact an external host.
+The native Compose page visual check remains unavailable.
+For security implications of remote and local references, see Docker's [Compose trust model](https://docs.docker.com/compose/trust-model).
 This page does not claim full issue completion or a release.

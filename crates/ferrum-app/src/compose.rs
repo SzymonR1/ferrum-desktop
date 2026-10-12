@@ -15,6 +15,15 @@ const MAX_PROJECT_FIELD_BYTES: usize = 256;
 const MAX_VERSION_BYTES: usize = 64;
 const MAX_COMPOSE_FILENAME_DISPLAY_BYTES: usize = 128;
 #[cfg(target_os = "linux")]
+const MAX_COMPOSE_SERVICES: usize = 1024;
+#[cfg(target_os = "linux")]
+const MAX_COMPOSE_SERVICE_NAME_BYTES: usize = 128;
+#[cfg(target_os = "linux")]
+const MAX_COMPOSE_SERVICE_DISPLAY_BYTES: usize = 1024;
+#[cfg(target_os = "linux")]
+const MAX_COMPOSE_SERVICE_OUTPUT_BYTES: usize = 128 * 1024;
+const COMPOSE_SERVICE_ROW_HEIGHT: f32 = 24.0;
+#[cfg(target_os = "linux")]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(target_os = "linux")]
 const MAX_COMPOSE_INPUT_BYTES: u64 = 16 * 1024 * 1024;
@@ -104,7 +113,6 @@ const MAX_COMPOSE_CONTAINERS: usize = 4096;
 #[cfg(target_os = "linux")]
 const MAX_CONTAINER_FIELD_BYTES: usize = 256;
 const COMPOSE_CONTAINER_ROW_HEIGHT: f32 = 28.0;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ComposeStatusError {
     DockerCliMissing,
@@ -291,6 +299,7 @@ impl ComposeValidationError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ComposeValidationResult {
     pub(super) version: Option<String>,
+    pub(super) services: Vec<String>,
     pub(super) outcome: Result<(), ComposeValidationError>,
 }
 
@@ -298,6 +307,7 @@ impl ComposeValidationResult {
     fn failed(error: ComposeValidationError) -> Self {
         Self {
             version: None,
+            services: Vec::new(),
             outcome: Err(error),
         }
     }
@@ -373,6 +383,7 @@ pub(super) struct ComposeView {
     generation: u64,
     validation_generation: u64,
     validation: ComposeValidationState,
+    validated_services: Vec<String>,
     selected_files: Vec<std::path::PathBuf>,
     profile_input: String,
     status_generation: u64,
@@ -578,6 +589,7 @@ impl ComposeView {
     }
 
     fn begin_selection(&mut self, override_file: bool) -> u64 {
+        self.validated_services.clear();
         self.validation_generation = self.validation_generation.wrapping_add(1);
         self.invalidate_status();
         self.validation = ComposeValidationState::SelectingFile { override_file };
@@ -610,6 +622,7 @@ impl ComposeView {
     }
 
     pub(super) fn profiles_changed(&mut self) {
+        self.validated_services.clear();
         self.validation_generation = self.validation_generation.wrapping_add(1);
         self.invalidate_status();
         self.validation = ComposeValidationState::Idle;
@@ -638,6 +651,11 @@ impl ComposeView {
         if invalid_file_set {
             self.selected_files.clear();
         }
+        self.validated_services = if result.outcome.is_ok() {
+            result.services
+        } else {
+            Vec::new()
+        };
         self.validation = match result.outcome {
             Ok(()) => ComposeValidationState::Succeeded { file_name },
             Err(error) => ComposeValidationState::Failed { file_name, error },
@@ -696,6 +714,7 @@ impl ComposeView {
     pub(super) fn remove_override(&mut self, index: usize) {
         if index > 0 && index < self.selected_files.len() {
             self.invalidate_status();
+            self.validated_services.clear();
             self.validation_generation = self.validation_generation.wrapping_add(1);
             self.selected_files.remove(index);
             self.validation = ComposeValidationState::Idle;
@@ -710,6 +729,7 @@ impl ComposeView {
         {
             return None;
         }
+        self.validated_services.clear();
         let profiles = match self.selected_profiles() {
             Ok(profiles) => profiles,
             Err(()) => {
@@ -728,6 +748,7 @@ impl ComposeView {
     }
 
     pub(super) fn cancel_validation(&mut self) {
+        self.validated_services.clear();
         if let ComposeValidationState::Validating { file_name } =
             std::mem::take(&mut self.validation)
         {
@@ -737,6 +758,7 @@ impl ComposeView {
     }
 
     pub(super) fn invalidate(&mut self) {
+        self.validated_services.clear();
         self.generation = self.generation.wrapping_add(1);
         self.loading = false;
         self.loaded = false;
@@ -854,6 +876,42 @@ impl ComposeView {
             }
         } else {
             ui.label("Choose one local Compose YAML base file, then add overrides in order.");
+        }
+        ui.separator();
+        ui.heading("Declared services in selected files (all profiles, read-only)");
+        ui.label("Local Compose CLI/file-derived inventory includes every declared service, including profile-gated services even when their profiles are inactive. These are not running containers. Listing does not query Engine status or logs.");
+        match &self.validation {
+            ComposeValidationState::Validating { .. } => {
+                ui.spinner();
+                ui.label("Loading declared services…");
+            }
+            ComposeValidationState::Succeeded { .. } if self.validated_services.is_empty() => {
+                ui.label("No declared services were returned for the selected files.");
+            }
+            ComposeValidationState::Succeeded { .. } => {
+                egui::ScrollArea::vertical()
+                    .id_salt("compose-declared-services")
+                    .max_height(240.0)
+                    .show_rows(
+                        ui,
+                        COMPOSE_SERVICE_ROW_HEIGHT,
+                        self.validated_services.len(),
+                        |ui, rows| {
+                            for row in rows {
+                                ui.label(self.validated_services[row].as_str());
+                            }
+                        },
+                    );
+            }
+            ComposeValidationState::Failed { .. } => {
+                ui.label("Declared services are unavailable because validation failed.");
+            }
+            ComposeValidationState::Cancelled { .. } => {
+                ui.label("Declared-service inventory cleared because validation was cancelled.");
+            }
+            _ => {
+                ui.label("Validate the selected files to list all declared services.");
+            }
         }
 
         match &self.validation {
@@ -1147,6 +1205,44 @@ fn validate_service_selector(service: &str) -> Option<&str> {
         return None;
     }
     Some(service)
+}
+#[cfg(target_os = "linux")]
+fn parse_declared_services(output: &[u8]) -> Option<Vec<String>> {
+    use std::collections::HashSet;
+
+    if output.len() > MAX_COMPOSE_SERVICE_OUTPUT_BYTES {
+        return None;
+    }
+    if output.is_empty() {
+        return Some(Vec::new());
+    }
+    let output = std::str::from_utf8(output).ok()?;
+    let output = output.strip_suffix('\n').unwrap_or(output);
+    let row_count = output.split('\n').count();
+    if row_count > MAX_COMPOSE_SERVICES {
+        return None;
+    }
+    let mut services = Vec::with_capacity(row_count);
+    let mut identities = HashSet::with_capacity(row_count);
+    let mut display_names = HashSet::with_capacity(row_count);
+    for line in output.split('\n') {
+        let name = line.strip_suffix('\r').unwrap_or(line);
+        if name.is_empty()
+            || name.len() > MAX_COMPOSE_SERVICE_NAME_BYTES
+            || !identities.insert(name)
+        {
+            return None;
+        }
+        let display_name = escape_untrusted_display_text_with_limit(
+            name.to_owned(),
+            MAX_COMPOSE_SERVICE_DISPLAY_BYTES,
+        )?;
+        if !display_names.insert(display_name.clone()) {
+            return None;
+        }
+        services.push(display_name);
+    }
+    Some(services)
 }
 fn parse_containers(output: &[u8]) -> Option<Vec<ComposeContainer>> {
     use std::collections::HashSet;
@@ -1881,22 +1977,26 @@ async fn validate_with_profiles_report(
     }
     command.args([
         "config",
-        "--quiet",
         "--no-interpolate",
         "--no-env-resolution",
+        "--services",
     ]);
-    let outcome = match run_command_with_timeout(&mut command, deadline).await {
-        Ok(_) => Ok(()),
-        Err(CommandFailure::Launch) => Err(ComposeValidationError::DockerCliMissing),
+    let (services, outcome) = match run_command_with_timeout(&mut command, deadline).await {
+        Ok(output) => match parse_declared_services(&output) {
+            Some(services) => (services, Ok(())),
+            None => (Vec::new(), Err(ComposeValidationError::ValidationFailed)),
+        },
+        Err(CommandFailure::Launch) => (Vec::new(), Err(ComposeValidationError::DockerCliMissing)),
         Err(
             CommandFailure::Rejected
             | CommandFailure::TimedOut
             | CommandFailure::OutputLimit
             | CommandFailure::Io,
-        ) => Err(ComposeValidationError::ValidationFailed),
+        ) => (Vec::new(), Err(ComposeValidationError::ValidationFailed)),
     };
     ComposeValidationResult {
         version: Some(version),
+        services,
         outcome,
     }
 }
@@ -2184,6 +2284,45 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     #[test]
+    fn declared_service_output_is_bounded_unique_valid_and_display_escaped() {
+        assert_eq!(parse_declared_services(b""), Some(Vec::new()));
+        assert_eq!(
+            parse_declared_services(b"web\napi-v2\r\n"),
+            Some(vec!["web".to_owned(), "api-v2".to_owned()])
+        );
+        assert!(parse_declared_services(b"\napi\n").is_none());
+        let escaped = parse_declared_services("safe\u{202e}\n".as_bytes())
+            .expect("display controls should be retained as escaped labels");
+        assert!(escaped[0].contains(r"\u{202e}"));
+        assert!(parse_declared_services(b"api\napi\n").is_none());
+        assert!(parse_declared_services(b"api\n\n").is_none());
+        assert!(parse_declared_services(&[0xff]).is_none());
+        let at_limit = (0..MAX_COMPOSE_SERVICES)
+            .map(|index| format!("service-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            parse_declared_services(at_limit.as_bytes()).unwrap().len(),
+            MAX_COMPOSE_SERVICES
+        );
+        assert!(
+            parse_declared_services(
+                format!("{}\n", "a".repeat(MAX_COMPOSE_SERVICE_NAME_BYTES + 1)).as_bytes()
+            )
+            .is_none()
+        );
+        assert!(
+            parse_declared_services(
+                format!("{}\n", "service\n".repeat(MAX_COMPOSE_SERVICES + 1)).as_bytes()
+            )
+            .is_none()
+        );
+        assert!(
+            parse_declared_services(&vec![b'a'; MAX_COMPOSE_SERVICE_OUTPUT_BYTES + 1]).is_none()
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
     fn compose_profile_limits_accept_exact_name_and_count_bounds() {
         assert_eq!(
             parse_compose_profiles(&format!(
@@ -2286,6 +2425,7 @@ mod tests {
             exit_code: u8,
             diagnostic: &'a str,
             stdout_chunks: usize,
+            stdout_output: &'a str,
             hang: bool,
         }
 
@@ -2297,6 +2437,7 @@ mod tests {
                     exit_code: 0,
                     diagnostic: "",
                     stdout_chunks: 0,
+                    stdout_output: "",
                     hang: false,
                 }
             }
@@ -2314,10 +2455,11 @@ mod tests {
                 exit_code,
                 diagnostic,
                 stdout_chunks,
+                stdout_output,
                 hang,
             } = options;
             let stdout = if stdout_chunks == 0 {
-                String::new()
+                format!("printf '%s' {}\n", shell_quote(stdout_output))
             } else {
                 format!(
                     "i=0\nwhile [ \"$i\" -lt {stdout_chunks} ]; do\n  printf '%4097s' ''\n  i=$((i + 1))\ndone\n"
@@ -2345,8 +2487,7 @@ mod tests {
                  [ \"$#\" -eq 9 ] || exit 80\n\
                  [ \"$1\" = compose ] && [ \"$2\" = --project-directory ] || exit 81\n\
                  [ \"$3\" = {} ] && [ \"$4\" = --file ] && [ \"$5\" = {} ] || exit 82\n\
-                 [ \"$6\" = config ] && [ \"$7\" = --quiet ] || exit 83\n\
-                 [ \"$8\" = --no-interpolate ] && [ \"$9\" = --no-env-resolution ] || exit 84\n\
+                 [ \"$6\" = config ] && [ \"$7\" = --no-interpolate ] && [ \"$8\" = --no-env-resolution ] && [ \"$9\" = --services ] || exit 83\n\
                  [ \"$COMPOSE_DISABLE_ENV_FILE\" = 1 ] || exit 85\n\
                  [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = \"false\" ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = \"false\" ] || exit 91\n\
                  [ -n \"$PATH\" ] && [ -d \"$HOME\" ] && [ -d \"$DOCKER_CONFIG\" ] || exit 86\n\
@@ -2394,13 +2535,14 @@ mod tests {
                  [ \"$1\" = compose ] && [ \"$2\" = --project-directory ] && [ \"$3\" = {} ] || exit 72\n\
                  [ \"$4\" = --file ] && [ \"$5\" = {} ] && [ \"$6\" = --file ] && [ \"$7\" = {} ] && [ \"$8\" = --file ] && [ \"$9\" = {} ] || exit 73\n\
                  [ \"${{10}}\" = --profile ] && [ \"${{11}}\" = frontend ] && [ \"${{12}}\" = --profile ] && [ \"${{13}}\" = qa ] || exit 74\n\
-                 [ \"${{14}}\" = config ] && [ \"${{15}}\" = --quiet ] && [ \"${{16}}\" = --no-interpolate ] && [ \"${{17}}\" = --no-env-resolution ] || exit 75\n\
+                 [ \"${{14}}\" = config ] && [ \"${{15}}\" = --no-interpolate ] && [ \"${{16}}\" = --no-env-resolution ] && [ \"${{17}}\" = --services ] || exit 75\n\
                  [ \"$COMPOSE_DISABLE_ENV_FILE\" = 1 ] || exit 75\n\
                  [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = false ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = false ] || exit 76\n\
                  [ -n \"$PATH\" ] && [ -d \"$HOME\" ] && [ -d \"$DOCKER_CONFIG\" ] && [ \"$HOME\" != \"$DOCKER_CONFIG\" ] || exit 77\n\
                  if [ -n \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{DOCKER_API_VERSION+x}}${{DOCKER_CERT_PATH+x}}${{DOCKER_TLS+x}}${{DOCKER_TLS_VERIFY+x}}${{HTTP_PROXY+x}}${{HTTPS_PROXY+x}}${{NO_PROXY+x}}${{COMPOSE_FILE+x}}${{COMPOSE_ENV_FILES+x}}${{COMPOSE_PROFILES+x}}\" ]; then exit 78; fi\n\
                  env | while IFS='=' read -r name value; do case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_DISABLE_ENV_FILE|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|GOMEMLIMIT|PWD|SHLVL|_) : ;; *) exit 79 ;; esac; done || exit 79\n\
                  [ \"$GOMEMLIMIT\" = 402653184 ] || exit 79\n\
+                 printf 'app\\n'\n\
                  exit 0\n",
                 shell_quote(
                     &directory
@@ -2546,14 +2688,17 @@ mod tests {
                 &directory,
                 &project_directory,
                 &file,
-                ValidationFixtureOptions::default(),
+                ValidationFixtureOptions {
+                    stdout_output: "web\napi\u{001b}",
+                    ..ValidationFixtureOptions::default()
+                },
             );
-
             let result =
                 validate_with_binary_report(&binary, &file, &search_path(), None, COMMAND_TIMEOUT)
                     .await;
 
             assert_eq!(result.version.as_deref(), Some("v5.6.0"));
+            assert_eq!(result.services, ["web", "api\\x1b"]);
             assert!(result.outcome.is_ok());
         }
         #[tokio::test]
@@ -2586,7 +2731,8 @@ mod tests {
                 COMMAND_TIMEOUT,
             )
             .await;
-            assert!(result.outcome.is_ok());
+            assert_eq!(result.outcome, Ok(()));
+            assert_eq!(result.services, ["app"]);
         }
 
         #[tokio::test]
@@ -2735,6 +2881,35 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn validation_rejects_malformed_service_rows_without_exposing_output() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("project");
+            fs::create_dir(&project).expect("the project directory should exist");
+            let file = project.join("compose.yaml");
+            fs::write(&file, "services: {}\n").expect("the Compose file should exist");
+            let binary = validation_fixture_cli(
+                &directory,
+                &project,
+                &file,
+                ValidationFixtureOptions {
+                    stdout_output: "\nprivate-diagnostic",
+                    ..ValidationFixtureOptions::default()
+                },
+            );
+
+            let result =
+                validate_with_binary_report(&binary, &file, &search_path(), None, COMMAND_TIMEOUT)
+                    .await;
+
+            assert_eq!(
+                result.outcome,
+                Err(ComposeValidationError::ValidationFailed)
+            );
+            assert!(result.services.is_empty());
+            assert!(!format!("{result:?}").contains("private-diagnostic"));
+        }
+
+        #[tokio::test]
         async fn validation_rejects_output_over_the_shared_subprocess_limit() {
             let directory = FixtureDirectory::new();
             let project_directory = directory.path().join("project");
@@ -2801,7 +2976,7 @@ mod tests {
             let override_file = project_directory.join("compose.override.yaml");
             fs::write(
                 &base,
-                "services:\n  app:\n    image: busybox:latest\n    profiles: [smoke]\n    volumes:\n      - ./data:/data\n",
+                "services:\n  always:\n    image: busybox:latest\n  app:\n    image: busybox:latest\n    profiles: [smoke]\n    volumes:\n      - ./data:/data\n  hidden:\n    image: busybox:latest\n    profiles: [other]\n",
             )
             .expect("the controlled base Compose file should be written");
             fs::write(
@@ -2812,10 +2987,14 @@ mod tests {
 
             let files = [base, override_file];
             let profiles = ["smoke".to_owned()];
-            validate_compose_files(&files, &profiles)
-                .await
-                .outcome
-                .expect("the local Compose CLI should validate the temporary project without contacting an engine");
+            let result = validate_compose_files(&files, &profiles).await;
+            assert_eq!(result.version.as_deref(), Some("5.6.0"));
+            let mut declared_services = result.services.clone();
+            declared_services.sort();
+            assert_eq!(declared_services, ["always", "app", "hidden"]);
+            result.outcome.expect(
+                "the local Compose CLI should validate and list all declared services without contacting an engine",
+            );
         }
 
         #[tokio::test]
@@ -3404,8 +3583,8 @@ mod tests {
             assert!(!format!("{result:?}").contains("secret-diagnostic"));
         }
         #[tokio::test]
-        #[ignore = "requires a local Docker-compatible Unix socket and Compose; ps reads only an owned temporary project"]
-        async fn local_compose_status_reads_temporary_project_without_mutation() {
+        #[ignore = "requires a local Docker-compatible Unix socket and Compose; queries only a unique owned temporary project and creates no resources"]
+        async fn local_compose_profile_status_reads_temporary_project_without_mutation() {
             use std::time::{SystemTime, UNIX_EPOCH};
 
             let engine = ferrum_engine::EngineClient::connect_default()
@@ -3423,18 +3602,22 @@ mod tests {
             let file = project.join("compose.yaml");
             fs::write(
                 &file,
-                format!("name: {project_name}\nservices:\n  status-probe:\n    image: scratch\n"),
+                format!(
+                    "name: {project_name}\nservices:\n  always-probe:\n    image: scratch\n  status-probe:\n    image: scratch\n    profiles: [status-smoke]\n  hidden-probe:\n    image: scratch\n    profiles: [inactive-smoke]\n"
+                ),
             )
             .expect("the temporary Compose file should be written");
 
+            let files = [file];
+            let profiles = ["status-smoke".to_owned()];
             let status =
-                existing_compose_containers(engine.local_socket_path(), &[file], &[]).await;
+                existing_compose_containers(engine.local_socket_path(), &files, &profiles).await;
             status
                 .outcome
-                .expect("read-only status for the temporary project should succeed");
+                .expect("read-only profile status for the temporary project should succeed");
             assert!(
                 status.containers.is_empty(),
-                "the status query must not create Compose containers"
+                "status queries must not create Compose containers"
             );
         }
     }
@@ -3496,6 +3679,7 @@ mod tests {
         ) -> ComposeValidationResult {
             ComposeValidationResult {
                 version: None,
+                services: Vec::new(),
                 outcome,
             }
         }
@@ -3629,6 +3813,7 @@ mod tests {
                 generation,
                 ComposeValidationResult {
                     version: Some("v5.6.0".to_owned()),
+                    services: vec!["web".to_owned()],
                     outcome: Ok(()),
                 },
             ));
@@ -3848,6 +4033,89 @@ mod tests {
                 Role::Label,
                 "Docker Compose is unavailable. Install the Docker Compose plugin to validate Compose files.",
             );
+        }
+        #[test]
+        fn declared_service_inventory_renders_success_empty_error_loading_and_ignores_stale_results()
+         {
+            let file = std::path::Path::new("/private/project/compose.yaml");
+            let mut successful = ComposeView::default();
+            let generation = successful.begin_file_selection();
+            assert!(successful.finish_file_selection(generation, Some(file)));
+            assert!(successful.finish_validation(
+                generation,
+                ComposeValidationResult {
+                    version: None,
+                    services: vec!["web".to_owned(), "api\\u{202e}".to_owned()],
+                    outcome: Ok(()),
+                },
+            ));
+            let mut harness = harness_for(successful);
+            harness.run();
+            let _web = harness.get_by_role_and_label(Role::Label, "web");
+            let _escaped = harness.get_by_role_and_label(Role::Label, "api\\u{202e}");
+            let _declared_not_running = harness.get_by_role_and_label(
+                Role::Label,
+                "Local Compose CLI/file-derived inventory includes every declared service, including profile-gated services even when their profiles are inactive. These are not running containers. Listing does not query Engine status or logs.",
+            );
+            drop(harness);
+
+            let mut empty = ComposeView::default();
+            let generation = empty.begin_file_selection();
+            assert!(empty.finish_file_selection(generation, Some(file)));
+            assert!(empty.finish_validation(generation, validation_result(Ok(()))));
+            let mut harness = harness_for(empty);
+            harness.run();
+            let _empty = harness.get_by_role_and_label(
+                Role::Label,
+                "No declared services were returned for the selected files.",
+            );
+            drop(harness);
+
+            let mut failed = ComposeView::default();
+            let generation = failed.begin_file_selection();
+            assert!(failed.finish_file_selection(generation, Some(file)));
+            assert!(failed.finish_validation(
+                generation,
+                validation_result(Err(ComposeValidationError::ValidationFailed)),
+            ));
+            let mut harness = harness_for(failed);
+            harness.run();
+            let _error = harness.get_by_role_and_label(
+                Role::Label,
+                "Declared services are unavailable because validation failed.",
+            );
+            drop(harness);
+
+            let mut loading = ComposeView::default();
+            let generation = loading.begin_file_selection();
+            assert!(loading.finish_file_selection(generation, Some(file)));
+            let mut harness = harness_for(loading);
+            harness.step();
+            let _loading = harness.get_by_role_and_label(Role::Label, "Loading declared services…");
+            drop(harness);
+
+            let mut stale = ComposeView::default();
+            let generation = stale.begin_file_selection();
+            assert!(stale.finish_file_selection(generation, Some(file)));
+            assert!(stale.finish_validation(
+                generation,
+                ComposeValidationResult {
+                    version: None,
+                    services: vec!["current".to_owned()],
+                    outcome: Ok(()),
+                },
+            ));
+            let (stale_generation, _, _) = stale.begin_validation().unwrap();
+            stale.profiles_changed();
+            assert!(!stale.finish_validation(
+                stale_generation,
+                ComposeValidationResult {
+                    version: None,
+                    services: vec!["stale".to_owned()],
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(stale.validated_services.is_empty());
         }
 
         #[test]

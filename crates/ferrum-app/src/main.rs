@@ -7634,6 +7634,7 @@ mod event_reconciliation_tests {
             validation_generation,
             compose::ComposeValidationResult {
                 version: None,
+                services: Vec::new(),
                 outcome: Ok(()),
             },
         ));

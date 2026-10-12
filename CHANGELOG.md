@@ -18,6 +18,19 @@ All notable project changes are documented here. The project has not published a
   See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
   and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
   Issue #18 remains partial/open.
+- Added a bounded read-only declared-service inventory to successful Linux
+  Compose validation using the same `config --services` command, selected
+  ordered files/profile argv, and isolated CLI environment. The output includes
+  every service declared in the files, including profile-gated services
+  regardless of the active profile selection. Service data is capped by total
+  bytes, row count, and name size; malformed or duplicate output fails with a
+  static error, and display names are escaped. The virtualized list distinguishes
+  declarations from existing containers and never triggers Engine status/log
+  calls. File/profile changes, validation failure/cancellation, and stale
+  results cannot retain or restore an obsolete list. The ignored Compose v5.6.0
+  temporary-project smoke verifies all declared names, including a service in
+  an inactive profile, without Engine access or mutation. Issue #18 remains
+  open/partial.
 - Added a read-only one-shot Compose service-log snapshot for a listed service. Ferrum rechecks service membership with a fresh status query before logs; Compose `--tail 200` applies per container, while Ferrum keeps the first 200 combined lines/256 KiB without a global chronological merge. Escaped output is transient, cancellation/stale-state safe, and not persisted or audited. Live follow and project lifecycle operations remain unsupported; Issue #18 stays open/partial.
 
 - Added automatic Linux discovery of the documented rootless Podman user
