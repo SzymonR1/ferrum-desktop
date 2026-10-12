@@ -335,12 +335,16 @@ Read-only container status is available for selected files after structural
 validation. It pins `docker compose ps --all --format json` to the selected
 local Unix socket and does not create, start, stop, remove, or otherwise mutate
 containers or project files. `--all` includes stopped containers; the CLI's
-default orphan inclusion is preserved. Ferrum retains only bounded escaped
-container `Name`, `Service`, `State`, and optional `Health`; IDs, command text,
-published ports, project labels, exit codes, and other response fields are
-discarded. Empty output means no existing containers matched this isolated
-project selection, not that no services are declared. Status is a manually
-refreshed point-in-time snapshot.
+default orphan inclusion is preserved. Ferrum retains bounded escaped
+container `Name`, `Service`, optional per-container `Project`, `State`, and
+optional `Health`; missing project values render as `Not reported`, and rows may
+report different values. The project label is untrusted engine-reported
+metadata only: it does not establish file ownership, canonical identity,
+authentication, or authorization and has no lifecycle use. IDs, command text,
+published ports, exit codes, and other response fields are discarded. Empty
+output means no existing containers matched this isolated project selection,
+not that no services are declared. Status is a manually refreshed point-in-time
+snapshot.
 
 After structural validation and a successful status snapshot, a listed service
 may request a one-shot `docker compose logs --tail 200 --no-color` query.

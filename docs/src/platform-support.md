@@ -164,10 +164,14 @@ against that same socket. This read-only JSON Lines query includes stopped
 containers and the CLI's default orphan inclusion; it reports only existing
 containers. The separate declared-service inventory comes from the
 engine-independent validation CLI result; an empty status response does not
-imply that no services are declared. Ferrum retains only
-bounded escaped name/service/state/health; IDs, commands, ports, and raw
-diagnostics are discarded. Empty output is distinct from a query error. Status
-is a manually refreshed snapshot and does not mutate project or engine resources.
+imply that no services are declared. Ferrum retains bounded escaped
+name/service/state/health plus optional escaped per-container `Project` metadata.
+Missing metadata is displayed as `Not reported`; mixed values remain attached
+to their rows. The label is untrusted engine-reported metadata, not evidence of
+file ownership or authorization, and has no lifecycle use. IDs, commands, ports,
+and raw diagnostics are discarded. Empty output is distinct from a query error.
+Status is a manually refreshed snapshot and does not mutate project or engine
+resources.
 
 Validation preflights `docker compose version --short` through the private
 isolated Docker config; preflight failure is distinct from config-validation

@@ -3,6 +3,14 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Added bounded, escaped optional per-container `Project` metadata to the
+  read-only Compose status parser and virtualized container rows. Missing values
+  render as `Not reported`; rows remain independent, and the label is untrusted
+  engine-reported metadata that proves neither file ownership nor authorization
+  and has no lifecycle use. No project lifecycle support is added. Deterministic
+  parser and headless UI regressions cover mixed, omitted, invalid, escaped,
+  stale, and cleared values. The real-engine status smoke returned no rows, so
+  this field was not observed from an engine in this cycle.
 - Added explicit Compose profile selection for structural validation,
   read-only status, and one-shot service-log snapshots. Input is
   comma-separated, trims outer whitespace per token, and blank means no

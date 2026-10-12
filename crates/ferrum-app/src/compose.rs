@@ -104,6 +104,7 @@ fn valid_profile_list(profiles: &[String]) -> bool {
 pub(super) struct ComposeContainer {
     pub(super) name: String,
     pub(super) service: String,
+    pub(super) project: Option<String>,
     pub(super) state: String,
     pub(super) health: Option<String>,
 }
@@ -956,6 +957,10 @@ impl ComposeView {
             "project's default .env; environment-dependent project matching may ",
             "differ from a normal shell."
         ));
+        ui.label(concat!(
+            "Project is untrusted per-container metadata reported by Compose; it is not a canonical ",
+            "identity, does not establish file ownership or authorization, and has no lifecycle use.",
+        ));
         actions.refresh_containers = ui
             .add_enabled(
                 status_enabled
@@ -977,12 +982,13 @@ impl ComposeView {
                 ui.label("No existing containers for the selected Compose files.");
             }
             ComposeStatusState::Succeeded { .. } => {
-                ui.columns(5, |columns| {
+                ui.columns(6, |columns| {
                     columns[0].strong("Container");
                     columns[1].strong("Service");
-                    columns[2].strong("State");
-                    columns[3].strong("Health");
-                    columns[4].strong("Recent logs");
+                    columns[2].strong("Project");
+                    columns[3].strong("State");
+                    columns[4].strong("Health");
+                    columns[5].strong("Recent logs");
                 });
                 ui.separator();
                 egui::ScrollArea::vertical()
@@ -995,21 +1001,27 @@ impl ComposeView {
                         |ui, rows| {
                             for row in rows {
                                 let container = &self.containers[row];
-                                ui.columns(5, |columns| {
+                                ui.columns(6, |columns| {
                                     columns[0]
                                         .add(egui::Label::new(container.name.as_str()).truncate());
                                     columns[1].add(
                                         egui::Label::new(container.service.as_str()).truncate(),
                                     );
-                                    columns[2]
+                                    columns[2].add(
+                                        egui::Label::new(
+                                            container.project.as_deref().unwrap_or("Not reported"),
+                                        )
+                                        .truncate(),
+                                    );
+                                    columns[3]
                                         .add(egui::Label::new(container.state.as_str()).truncate());
-                                    columns[3].add(
+                                    columns[4].add(
                                         egui::Label::new(
                                             container.health.as_deref().unwrap_or("—"),
                                         )
                                         .truncate(),
                                     );
-                                    if columns[4]
+                                    if columns[5]
                                         .add_enabled(
                                             self.can_request_service_logs(&container.service),
                                             egui::Button::new(format!(
@@ -1269,6 +1281,10 @@ fn parse_containers(output: &[u8]) -> Option<Vec<ComposeContainer>> {
                 .health
                 .as_ref()
                 .is_some_and(|value| value.len() > MAX_CONTAINER_FIELD_BYTES)
+            || row
+                .project
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > MAX_CONTAINER_FIELD_BYTES)
             || !identities.insert(row.name.clone())
         {
             return None;
@@ -1280,6 +1296,13 @@ fn parse_containers(output: &[u8]) -> Option<Vec<ComposeContainer>> {
         let service =
             escape_untrusted_display_text_with_limit(row.service, MAX_CONTAINER_FIELD_BYTES)?;
         let state = escape_untrusted_display_text_with_limit(row.state, MAX_CONTAINER_FIELD_BYTES)?;
+        let project = match row.project {
+            Some(project) => Some(escape_untrusted_display_text_with_limit(
+                project,
+                MAX_CONTAINER_FIELD_BYTES,
+            )?),
+            None => None,
+        };
         let health = match row.health.filter(|health| !health.is_empty()) {
             Some(health) => Some(escape_untrusted_display_text_with_limit(
                 health,
@@ -1290,6 +1313,7 @@ fn parse_containers(output: &[u8]) -> Option<Vec<ComposeContainer>> {
         rows.push(ComposeContainer {
             name,
             service,
+            project,
             state,
             health,
         });
@@ -1304,6 +1328,7 @@ struct RawComposeContainer {
     service: String,
     state: String,
     health: Option<String>,
+    project: Option<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1329,6 +1354,7 @@ impl<'de> serde::Deserialize<'de> for RawComposeContainer {
                 let mut state = None;
                 let mut health = None;
                 let mut seen_health = false;
+                let mut project = None;
                 let mut seen_exit_code = false;
                 let mut seen_command = false;
                 let mut seen_id = false;
@@ -1394,7 +1420,7 @@ impl<'de> serde::Deserialize<'de> for RawComposeContainer {
                                 return Err(de::Error::duplicate_field("Project"));
                             }
                             seen_project = true;
-                            map.next_value::<IgnoredAny>()?;
+                            project = Some(map.next_value::<String>()?);
                         }
                         _ => {
                             map.next_value::<IgnoredAny>()?;
@@ -1406,6 +1432,7 @@ impl<'de> serde::Deserialize<'de> for RawComposeContainer {
                     service: service.ok_or_else(|| de::Error::missing_field("Service"))?,
                     state: state.ok_or_else(|| de::Error::missing_field("State"))?,
                     health,
+                    project,
                 })
             }
         }
@@ -3276,14 +3303,26 @@ mod tests {
             assert_eq!(rows[0].name, "api-1");
             assert_eq!(rows[0].service, "api");
             assert_eq!(rows[0].state, "running");
+            assert_eq!(rows[0].project.as_deref(), Some("private"));
             assert_eq!(rows[0].health.as_deref(), Some("healthy"));
             assert!(!format!("{rows:?}").contains("secret"));
+            assert!(!format!("{rows:?}").contains("sensitive"));
+            let omitted =
+                parse_containers(br#"{"Name":"worker-1","Service":"worker","State":"exited"}"#)
+                    .expect("missing Project remains compatible");
+            assert_eq!(omitted[0].project, None);
+            let mixed = parse_containers(
+                b"{\"Name\":\"api-1\",\"Service\":\"api\",\"State\":\"running\",\"Project\":\"alpha\"}\n\
+                  {\"Name\":\"worker-1\",\"Service\":\"worker\",\"State\":\"exited\"}",
+            )
+            .expect("each row may independently report Project");
+            assert_eq!(mixed[0].project.as_deref(), Some("alpha"));
+            assert_eq!(mixed[1].project, None);
             let no_health_reported = parse_containers(
                 br#"{"Name":"api-1","Service":"api","State":"running","Health":""}"#,
             )
             .expect("empty health is a valid unreported value");
             assert_eq!(no_health_reported[0].health, None);
-            assert!(!format!("{rows:?}").contains("sensitive"));
             assert!(parse_containers(b"").unwrap().is_empty());
             assert!(parse_containers(b"\n").unwrap().is_empty());
             assert_eq!(
@@ -3294,6 +3333,30 @@ mod tests {
             );
             assert!(parse_containers(br#"{"Name":"api","Service":"api","State":"running","Health":"bad","Health":"good"}"#).is_none());
             assert!(parse_containers(br#"{"Name":"api","Service":"api","State":"running","Command":"x","Command":"y"}"#).is_none());
+            assert!(parse_containers(br#"{"Name":"api","Service":"api","State":"running","Project":"one","Project":"two"}"#).is_none());
+            assert!(
+                parse_containers(
+                    br#"{"Name":"api","Service":"api","State":"running","Project":null}"#
+                )
+                .is_none()
+            );
+            assert!(
+                parse_containers(
+                    br#"{"Name":"api","Service":"api","State":"running","Project":7}"#
+                )
+                .is_none()
+            );
+            assert!(
+                parse_containers(
+                    br#"{"Name":"api","Service":"api","State":"running","Project":""}"#
+                )
+                .is_none()
+            );
+            assert!(parse_containers(
+                b"{\"Name\":\"first\",\"Service\":\"api\",\"State\":\"running\",\"Project\":\"ok\"}\n\
+                  {\"Name\":\"second\",\"Service\":\"api\",\"State\":\"running\",\"Project\":null}"
+            )
+            .is_none());
             assert!(parse_containers(br#"{"Name":"api","State":"running"}"#).is_none());
             assert!(
                 parse_containers(
@@ -3305,10 +3368,25 @@ mod tests {
                 )
                 .is_none()
             );
-            let escaped =
+            assert!(
+                parse_containers(
+                    format!(
+                        r#"{{"Name":"api","Service":"api","State":"running","Project":"{}"}}"#,
+                        "p".repeat(MAX_CONTAINER_FIELD_BYTES + 1)
+                    )
+                    .as_bytes()
+                )
+                .is_none()
+            );
+            let escaped = parse_containers(
+                br#"{"Name":"api","Service":"api","State":"running","Project":"team\u202e"}"#,
+            )
+            .expect("display controls should be escaped");
+            assert!(escaped[0].project.as_deref().unwrap().contains(r"\u{202e}"));
+            let escaped_name =
                 parse_containers(br#"{"Name":"api\u202e","Service":"api","State":"running"}"#)
                     .expect("display controls should be escaped");
-            assert!(escaped[0].name.contains(r"\u{202e}"));
+            assert!(escaped_name[0].name.contains(r"\u{202e}"));
         }
         #[test]
         fn compose_container_status_rejects_duplicate_rows_and_excessive_counts() {
@@ -4260,6 +4338,7 @@ mod tests {
                         name: "api-1".to_owned(),
                         service: "api".to_owned(),
                         state: "running".to_owned(),
+                        project: Some("profile-project".to_owned()),
                         health: None,
                     }],
                     outcome: Ok(()),
@@ -4287,6 +4366,7 @@ mod tests {
                     outcome: Ok(()),
                 },
             ));
+            assert!(view.logs_output.is_empty());
         }
 
         #[test]
@@ -4384,6 +4464,7 @@ mod tests {
                         name: "stale-1".to_owned(),
                         service: "stale".to_owned(),
                         state: "running".to_owned(),
+                        project: Some("stale-project".to_owned()),
                         health: None,
                     }],
                     outcome: Ok(()),
@@ -4441,12 +4522,14 @@ mod tests {
                         ComposeContainer {
                             name: "project-web-1".to_owned(),
                             service: "web".to_owned(),
+                            project: Some("alpha".to_owned()),
                             state: "running".to_owned(),
                             health: Some("healthy".to_owned()),
                         },
                         ComposeContainer {
                             name: "project-worker-1".to_owned(),
                             service: "worker".to_owned(),
+                            project: None,
                             state: "exited".to_owned(),
                             health: None,
                         },
@@ -4459,6 +4542,12 @@ mod tests {
             harness.run();
             let _container = harness.get_by_role_and_label(Role::Label, "project-web-1");
             let _service = harness.get_by_role_and_label(Role::Label, "web");
+            let _reported_project = harness.get_by_role_and_label(Role::Label, "alpha");
+            let _unreported_project = harness.get_by_role_and_label(Role::Label, "Not reported");
+            let _project_trust_note = harness.get_by_role_and_label(
+                Role::Label,
+                "Project is untrusted per-container metadata reported by Compose; it is not a canonical identity, does not establish file ownership or authorization, and has no lifecycle use.",
+            );
             let _state = harness.get_by_role_and_label(Role::Label, "running");
             let _stopped_state = harness.get_by_role_and_label(Role::Label, "exited");
             let _health = harness.get_by_role_and_label(Role::Label, "healthy");
@@ -4569,12 +4658,14 @@ mod tests {
                             name: "api-1".to_owned(),
                             service: "api".to_owned(),
                             state: "running".to_owned(),
+                            project: None,
                             health: None,
                         },
                         ComposeContainer {
                             name: "worker-1".to_owned(),
                             service: "worker".to_owned(),
                             state: "running".to_owned(),
+                            project: None,
                             health: None,
                         },
                     ],
@@ -4625,6 +4716,7 @@ mod tests {
                             name: "api-1".to_owned(),
                             service: "api".to_owned(),
                             state: "running".to_owned(),
+                            project: None,
                             health: None,
                         }],
                         outcome: Ok(()),
