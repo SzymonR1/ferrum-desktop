@@ -155,9 +155,12 @@ settings, build arguments, secrets, or SSH access.
 
 Output is streamed as sanitized plain text with bounded in-memory retention and
 is not persisted to logs or audit traces. Build outcome tracing records only a
-static action and result, remains process-local, and is not durable audit
-history. Cancellation is best effort: Ferrum terminates the Docker CLI process
-group, but cannot guarantee builder work stopped or determine whether the
-image/tag changed. Inventory refreshes after every terminal result, including
-cancellation, because the outcome may be uncertain.
+static action and result; when persistence succeeds, the redacted outcome is
+also included in the local durable audit. If Docker cannot start the Buildx
+process, Ferrum reports that the build was not submitted. A failed or cancelled
+build after process start is treated as potentially state-changing. Build
+output remains transient, bounded, and is never persisted. Cancellation is best
+effort: Ferrum terminates the Docker CLI process group, but cannot guarantee
+builder work stopped or determine whether the image/tag changed. Inventory
+refreshes after every terminal result, including cancellation.
 
