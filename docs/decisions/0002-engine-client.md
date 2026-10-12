@@ -41,6 +41,26 @@ Bollard exposes additional transports, but they are not needed for this local-on
 - Linux is the only implemented engine target. Windows/macOS runtime behavior and packaging are deferred to the cross-platform milestone.
 - A Podman endpoint discovered in a later milestone does not become supported until contract-tested; Bollard's Podman helper alone is not validation.
 
+## Implementation clarification (2026-10-12)
+
+Default Linux socket discovery now also checks the documented rootless Podman
+user endpoint, `$XDG_RUNTIME_DIR/podman/podman.sock`, after the Docker user
+socket and before `/var/run/docker.sock`. This is path discovery only, not
+Podman API compatibility evidence. No dedicated rootful Podman socket candidate
+is added. Ferrum does not invoke Podman or systemd, or enable a unit; connecting
+to an existing user socket may activate its user-configured systemd service.
+Socket permissions remain under operating-system control. No Podman CLI or user
+socket was available on the validation host; see issues
+[#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) and
+[#11](https://github.com/SzymonR1/ferrum-desktop/issues/11).
+
+This supersedes only the timing clause in the Consequences bullet above:
+discovery is implemented, but the no-support-before-contract-testing
+requirement remains unchanged.
+
+The official [Podman system-service documentation](https://docs.podman.io/en/latest/markdown/podman-system-service.1.html)
+documents the rootless endpoint under `XDG_RUNTIME_DIR`.
+
 ## References
 
 - [Bollard 0.21.1 Docker client](https://docs.rs/bollard/0.21.1/bollard/struct.Docker.html)

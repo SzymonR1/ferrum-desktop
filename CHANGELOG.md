@@ -4,6 +4,13 @@ All notable project changes are documented here. The project has not published a
 
 ## Unreleased
 
+- Added automatic Linux discovery of the documented rootless Podman user
+  socket at `$XDG_RUNTIME_DIR/podman/podman.sock`, after the XDG Docker socket
+  and before the system Docker socket. This is socket-path discovery only;
+  Podman/runtime compatibility remains unvalidated. Connecting may activate a
+  service through the user's existing systemd socket unit; Ferrum does not
+  enable or invoke units. Issues #10/#11 remain open.
+
 - Added confirmed Linux local Docker Buildx builds pinned to the selected Unix socket with an empty private CLI config. Confirmations name the selected context or a safe endpoint-source label and lock context switching until completion; no socket path is shown. Client validation rejects uppercase repository characters while Docker CLI validates complete repository grammar. Docker CLI handles `.dockerignore`; credentials, proxy settings, build args/secrets/SSH, push, and remote contexts are excluded, so private bases may fail. Build output is sanitized, bounded, transient, and never persisted; static build outcome metadata is included in the local durable redacted audit when persistence succeeds. Best-effort cancellation refreshes inventory. Issues #16/#19 remain open/ready, #10 open/blocked; no release or broader support claim.
 - Buildx confirmation no longer blocks its own start; other image mutations still gate start. Pre-submission rejected or failed starts record only static `not_submitted` outcomes in the existing best-effort audit.
 - Buildx process-spawn failures are now audited as `not_submitted`; failures after a child starts remain `request_error`.

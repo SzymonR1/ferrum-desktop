@@ -97,6 +97,13 @@ Ferrum runs as the logged-in desktop user and communicates with a Docker-compati
 ## Current mitigations
 
 - Do not elevate privileges, install services, change socket permissions, or start an engine automatically.
+- Default Linux discovery checks `$XDG_RUNTIME_DIR/docker.sock`,
+  `$XDG_RUNTIME_DIR/podman/podman.sock`, then `/var/run/docker.sock`. The
+  Podman path is a rootless user-socket discovery candidate only; no Podman API
+  compatibility is claimed. Ferrum does not add a dedicated rootful Podman
+  socket candidate or change socket permissions. Connecting to an existing
+  socket may trigger its user-configured systemd socket activation; Ferrum does
+  not invoke Podman or systemd, or enable a unit.
 - Keep direct remote `DOCKER_HOST` TCP/HTTP/HTTPS/SSH and remote Docker context transports disabled. Return typed unsupported errors without fallback to local discovery, and do not read remote TLS/SSH credentials.
 - Do not log or display raw `DOCKER_HOST` values, which may contain sensitive endpoint data.
 - Keep Docker CLI context selection session-only; do not log or display raw context endpoints. Linux `EngineClient::local_socket_path` exposes the already-connected local socket only so trusted local tooling can target the same daemon; it does not change socket permissions and must not be logged or displayed.

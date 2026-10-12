@@ -2142,7 +2142,10 @@ impl EngineClient {
     /// A non-empty `DOCKER_CONTEXT` takes precedence and must name a local
     /// Unix-socket context. Otherwise `DOCKER_HOST` retains its existing local
     /// Unix-socket behavior; absent that, a current non-default CLI context is
-    /// used before checking `$XDG_RUNTIME_DIR/docker.sock` and `/var/run/docker.sock`.
+    /// used before checking `$XDG_RUNTIME_DIR/docker.sock`,
+    /// `$XDG_RUNTIME_DIR/podman/podman.sock`, and `/var/run/docker.sock` in that
+    /// order. The Podman path is a discovery candidate only; compatibility is
+    /// unvalidated.
     /// Socket permissions are left to the operating system; this method never
     /// elevates privileges.
     ///
@@ -3507,11 +3510,22 @@ fn parse_container_event(line: &[u8]) -> Result<Option<ContainerChange>, ()> {
 
 #[cfg(target_os = "linux")]
 fn local_socket_candidates() -> Vec<(&'static str, PathBuf)> {
-    let mut candidates = Vec::with_capacity(2);
-    if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR") {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    local_socket_candidates_for(runtime_dir.as_deref())
+}
+#[cfg(target_os = "linux")]
+fn local_socket_candidates_for(
+    runtime_dir: Option<&std::path::Path>,
+) -> Vec<(&'static str, PathBuf)> {
+    let mut candidates = Vec::with_capacity(3);
+    if let Some(runtime_dir) = runtime_dir {
         candidates.push((
             "user runtime Docker socket",
-            PathBuf::from(runtime_dir).join("docker.sock"),
+            runtime_dir.join("docker.sock"),
+        ));
+        candidates.push((
+            "user runtime Podman socket",
+            runtime_dir.join("podman/podman.sock"),
         ));
     }
     candidates.push((
@@ -6578,6 +6592,105 @@ mod context_selection_tests {
                 .expect("a local Unix socket is supported"),
             PathBuf::from("/tmp/docker.sock")
         );
+    }
+    #[test]
+    fn local_discovery_prefers_the_documented_rootless_podman_user_socket_after_docker_user_socket()
+    {
+        let runtime_dir = std::path::Path::new("/run/user/1000");
+
+        assert_eq!(
+            local_socket_candidates_for(Some(runtime_dir)),
+            [
+                (
+                    "user runtime Docker socket",
+                    runtime_dir.join("docker.sock"),
+                ),
+                (
+                    "user runtime Podman socket",
+                    runtime_dir.join("podman/podman.sock"),
+                ),
+                (
+                    "system Docker socket",
+                    PathBuf::from("/var/run/docker.sock"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn local_discovery_without_runtime_dir_does_not_add_a_podman_system_socket() {
+        assert_eq!(
+            local_socket_candidates_for(None),
+            [(
+                "system Docker socket",
+                PathBuf::from("/var/run/docker.sock")
+            )]
+        );
+    }
+    #[tokio::test]
+    async fn podman_user_socket_candidate_reaches_the_version_endpoint() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::UnixListener,
+        };
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let runtime_dir =
+            std::env::temp_dir().join(format!("ferrum-podman-{}-{nonce}", std::process::id()));
+        let podman_directory = runtime_dir.join("podman");
+        std::fs::create_dir_all(&podman_directory).expect("runtime fixture should be created");
+        let socket_path = podman_directory.join("podman.sock");
+        let listener = UnixListener::bind(&socket_path).expect("fake API socket should bind");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 512];
+            loop {
+                let count = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("version request should be readable");
+                assert_ne!(count, 0, "client should send an HTTP request");
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(
+                request.starts_with(b"GET /version HTTP/1.1\r\n"),
+                "discovered socket should receive only the read-only API version request"
+            );
+            let body = br#"{"Version":"5.6.0","ApiVersion":"1.40"}"#;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("response headers should be writable");
+            stream
+                .write_all(body)
+                .await
+                .expect("version response should be writable");
+        });
+
+        let (endpoint_label, candidate_path) = local_socket_candidates_for(Some(&runtime_dir))
+            .into_iter()
+            .find(|(label, _)| *label == "user runtime Podman socket")
+            .expect("rootless Podman socket should be a discovery candidate");
+        assert_eq!(candidate_path, socket_path);
+        let client = EngineClient::connect_unix_socket(&candidate_path, endpoint_label)
+            .await
+            .expect("the candidate should use Ferrum's existing read-only version handshake");
+        assert_eq!(client.info.endpoint_label, "user runtime Podman socket");
+        assert_eq!(client.info.version, "5.6.0");
+
+        server.await.expect("fake API server should finish");
+        std::fs::remove_dir_all(&runtime_dir).expect("runtime fixture should be removed");
     }
 }
 #[cfg(all(test, target_os = "linux"))]
