@@ -1011,6 +1011,11 @@ impl ComposeView {
             });
         }
         if let Some(index) = imported_selection {
+            // FerrumApp owns the async task handles; return cancellations before switching state.
+            actions.cancel_validation |=
+                self.is_file_selection_running() || self.is_validation_running();
+            actions.cancel_status |= matches!(&self.status, ComposeStatusState::Loading { .. });
+            actions.cancel_logs |= matches!(&self.logs, ComposeLogsState::Loading { .. });
             self.select_imported_project(index);
         }
         ui.separator();
@@ -5097,6 +5102,57 @@ mod tests {
             ));
             assert!(!harness.state().actions.validate_files);
             assert!(!harness.state().actions.refresh_containers);
+        }
+        #[test]
+        fn selecting_import_requests_cancellation_for_in_flight_compose_work() {
+            let mut validation = validated_compose_view();
+            assert!(validation.import_current_project("Saved"));
+            validation.begin_override_selection();
+            let mut harness = harness_for(validation);
+            harness.step();
+            harness
+                .get_by_role_and_label(Role::Button, "Use imported configuration")
+                .click_accesskit();
+            harness.step();
+            assert!(harness.state().actions.cancel_validation);
+
+            let mut status = validated_compose_view();
+            assert!(status.import_current_project("Saved status"));
+            status.begin_status_refresh().expect("status can start");
+            let mut harness = harness_for(status);
+            harness.step();
+            harness
+                .get_by_role_and_label(Role::Button, "Use imported configuration")
+                .click_accesskit();
+            harness.step();
+            assert!(harness.state().actions.cancel_status);
+            assert!(!harness.state().actions.cancel_logs);
+
+            let mut logs = validated_compose_view();
+            assert!(logs.import_current_project("Saved logs"));
+            let (status_generation, _, _) = logs.begin_status_refresh().expect("status can start");
+            assert!(logs.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: vec![ComposeContainer {
+                        name: "api-1".to_owned(),
+                        service: "api".to_owned(),
+                        project: None,
+                        state: "running".to_owned(),
+                        health: None,
+                    }],
+                    outcome: Ok(()),
+                },
+            ));
+            logs.begin_service_logs("api").expect("logs can start");
+            let mut harness = harness_for(logs);
+            harness.step();
+            harness
+                .get_by_role_and_label(Role::Button, "Use imported configuration")
+                .click_accesskit();
+            harness.step();
+            assert!(!harness.state().actions.cancel_status);
+            assert!(harness.state().actions.cancel_logs);
         }
     }
 

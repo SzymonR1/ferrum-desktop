@@ -78,13 +78,14 @@ are shown separately from Engine-discovered Compose projects. The in-memory
 list is limited to 32 entries and each name to 256 UTF-8 bytes; duplicate or
 empty names are rejected.
 
-Selecting an imported entry restores its exact base/override paths and profile
-selection, then clears validation, declared services, container status, and
-logs. Explicitly choose **Validate selected files** before requesting status or
-logs. Importing or selecting an entry does not invoke the CLI, contact the
-Engine, or run Compose up/start/stop/restart/build/pull; it does not copy,
-write, or persist project files. Entries are lost when the application session
-ends. The selected paths remain subject to the trusted-file warning below:
+Selecting an imported entry cancels any in-flight validation, status, or log
+task, restores its exact base/override paths and profile selection, and clears
+validation, declared services, container status, and logs. Explicitly choose
+**Validate selected files** before requesting status or logs. Importing starts
+no CLI/Engine operation; selecting one cancels prior work but starts no new
+command or Engine request. Neither action copies, writes, or persists project
+files. Entries are lost when the application session ends. The selected paths
+remain subject to the trusted-file warning below:
 Compose can read local files referenced by `include` or service `extends.file`,
 including related environment files, under the logged-in user's permissions.
 

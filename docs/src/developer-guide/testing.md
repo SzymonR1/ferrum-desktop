@@ -436,12 +436,12 @@ gating, cancellation/stale results, revalidation, and keeping profile input
 disabled during asynchronous file selection. Preserve private Docker
 config/HOME, cleared environment, disabled selected-project `.env`, and
 disabled remote Git/OCI loaders. Transient imports use synthetic path state and
-headless UI only; they retain no file contents, persist no registry, and invoke
+headless UI only; they retain no file contents, persist no registry, and start
 no CLI/Engine operation. Tests cover validation gating, duplicate/name and
 32-entry bounds, ordered path/profile restoration, stale-generation rejection,
-result clearing, and no automatic validation/status action. Persistent project
-registration and lifecycle/mutation operations remain out of scope. See
-Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
+and cancellation requests for in-flight validation/status/log tasks. Selecting
+clears stale results; persistent project registration and lifecycle/mutation
+operations remain out of scope. See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
 and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
 
 Headless AccessKit/state tests cover ordered base/override selection, removing

@@ -10,12 +10,13 @@ All notable project changes are documented here. The project has not published a
   rejected. Imported configurations appear separately from Engine-discovered
   projects, and their labels or per-container `Project` metadata are not
   treated as canonical identity, file ownership, or authorization. Selecting
-  an import restores exact file order and profiles while invalidating validation,
-  declared services, status, and logs; explicit revalidation is required before
-  status/log queries. Import/selection runs no CLI or Engine operation and does
-  not mutate, copy, or persist files or manage project lifecycle. Documentation
-  preserves the warning that Compose `include` and `extends.file` can read
-  trusted local files outside the explicit selection.
+  an import cancels in-flight validation/status/log tasks, restores exact file
+  order and profiles, and invalidates old results; explicit revalidation is
+  required before status/log queries. Import starts no CLI/Engine operation;
+  selection starts no new command or Engine request. Neither action mutates,
+  copies, or persists files or manages project lifecycle. Documentation preserves
+  the warning that Compose `include` and `extends.file` can read trusted local
+  files outside the explicit selection.
 - Added bounded, escaped optional per-container `Project` metadata to the
   read-only Compose status parser and virtualized container rows. Missing values
   render as `Not reported`; rows remain independent, and the label is untrusted
