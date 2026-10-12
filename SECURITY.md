@@ -222,7 +222,7 @@ validation failure. It invokes Compose with the base and then each override as
 separate `--file` arguments:
 
 ```text
-docker compose --project-directory <base-parent> --file <base-file> --file <override-2> ... config --quiet --no-interpolate --no-env-resolution
+docker compose --project-directory <base-parent> --file <base-file> --file <override-2> ... config --no-interpolate --no-env-resolution --services
 ```
 
 Docker merges `-f`/`--file` inputs in the order supplied, and resolves relative
@@ -255,25 +255,35 @@ sandbox or confine local included-file reads.
 Validation is read-only, does not contact or require an engine socket, and
 Ferrum does not write, modify, delete, or extract project files. Success means
 structural validation only: interpolation and service `env_file` resolution
-are skipped. Only bounded escaped basenames and a static result are displayed;
-paths are session-only and raw diagnostics are discarded. Explicit profile
-selection is available for structural validation, read-only status, and
-one-shot service logs only; it does not add project import/persistence or
-lifecycle operations (start/stop/restart/build/pull), live log follow, or
-project mutation.
+are skipped. Ferrum displays bounded escaped basenames, static outcomes, and
+the bounded escaped declared-service rows returned on successful validation;
+Explicit profile selection affects structural validation, read-only status, and
+one-shot service logs only. The declared-service inventory includes every
+declaration in the selected files regardless of active profiles. It does not
+add project import/persistence or lifecycle operations (start/stop/restart/
+build/pull), live log follow, or project mutation.
 
+On successful validation the same bounded CLI invocation returns every
+declared service name via `config --services`, including services gated by
+inactive profiles. Ferrum caps stdout at 1 MiB, then accepts at most 128 KiB
+total service output, 1024 rows, and 128 bytes per name; malformed, duplicate,
+or excess output fails with a static error. Names are escaped and rendered in
+a virtualized list. This is a local CLI/file-derived inventory, not
+container-status data; listing does not call the Engine or trigger status/log
+operations. An empty result means no service names were returned for those
+selected files.
 The profile input is comma-separated, capped at 1024 UTF-8 bytes overall, 16
 profiles, and 64 UTF-8 bytes per name. Ferrum trims outer whitespace per token;
 blank input means no explicit profiles. Empty entries and duplicate names are
 rejected. Names must match `[A-Za-z0-9][A-Za-z0-9_.-]+`; standalone `*`
 enables every profile and is accepted only by itself. It does not start
-services; status still lists existing containers and each log query targets
-one selected service.
-Ferrum passes each profile through an individual
-`--profile <name>` argv pair before the Compose subcommand, never through an
-environment variable. The same profiles are used for the immediate status
-recheck before a one-shot log query. Invalid or changed selection clears prior
-validation/status/log state, cancels in-flight Compose work, and requires
+services; the inventory remains all declarations in the selected files
+regardless of active profiles or container state.
+Ferrum passes each profile through an individual `--profile <name>` argv pair
+before the Compose subcommand, never through an environment variable. The same
+profiles are used for the immediate status recheck before a one-shot log query.
+Invalid or changed selection clears prior validation, service inventory,
+status, and log state, cancels in-flight Compose work, and requires
 revalidation. Private Docker config/HOME and the cleared environment remain in
 effect, including disabling the selected project's default `.env` and remote
 Git/OCI loaders.

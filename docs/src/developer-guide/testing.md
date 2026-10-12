@@ -400,18 +400,21 @@ Discovery fixtures check `docker compose version --short` and
 `docker compose ls --all --format json`, with only the listing pinned to the
 selected `EngineClient::local_socket_path()`. Validation preflights
 `docker compose version --short` through the private isolated Docker config;
-preflight failure is distinct from config-validation failure. Existing
-controlled-file validation coverage checks a local Compose file passed as an
-argument to
-`docker compose --project-directory <parent> --file <file> config --quiet
---no-interpolate --no-env-resolution`, including parent-directory path
-resolution and `COMPOSE_DISABLE_ENV_FILE=1`. That fixture is not evidence of
-multi-file merge coverage. Success wording means structural validation only,
-with interpolation and service `env_file` resolution skipped. The fixture also
-verifies private Docker config/HOME, a cleared environment with no inherited
-engine or credential/proxy settings, and no user config copied into the child
-config. Failure diagnostics and selected paths are not exposed; output and
-subprocess deadlines are bounded.
+preflight failure is distinct from config-validation failure. The selected
+ordered files and repeated profile arguments feed one validation invocation:
+`docker compose --project-directory <parent> --file <file> ... config
+--no-interpolate --no-env-resolution --services`. Its bounded stdout is parsed
+as unique service-name rows; empty output is valid, while malformed, duplicate,
+overlong, and excess output fails statically. Fake CLI fixtures verify exact
+base/override/profile argument order and the private Docker config/HOME, cleared
+environment, disabled selected-project `.env`, and disabled remote loaders.
+Diagnostics and selected paths are not exposed. This same invocation supplies
+every declared service name from the selected files regardless of active
+profiles; no additional CLI process or Engine request is used. Service names
+are escaped and shown separately from container status in a virtualized list
+with success, empty, error, loading, and stale-result headless coverage. The
+inventory is not a running-container list and listing does not trigger status
+or logs.
 
 Compose profile coverage uses controlled CLI fixtures and headless state checks;
 it does not contact a live engine or user project. Unit tests cover blank input
@@ -419,14 +422,14 @@ as no explicit profiles, whitespace trimming, the 1024-byte input, 16-profile,
 and 64-byte/name limits, the allowed name grammar, and standalone `*` wildcard
 enabling all profiles; input is bounded before CLI launch. Fake CLI fixtures
 assert exact argument-array construction and repeated `--profile <name>` pairs
-before `config`, `ps`, and `logs`, with no profile environment variable. The
-logs fixture verifies that the status recheck reuses the selected profiles.
-Headless state tests cover profile-edit invalidation, invalid-profile gating,
-cancellation/stale results, revalidation, and keeping profile input disabled
-while asynchronous file selection is active. Preserve private Docker
-config/HOME, cleared environment, disabled selected-project `.env`, and disabled
-remote Git/OCI loaders. Do not add project
-import or lifecycle/mutation operations. See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
+before `config --services`, `ps`, and `logs`, with no profile environment
+variable. The logs fixture verifies that the status recheck reuses selected
+profiles. Headless state tests cover profile-edit invalidation, invalid-profile
+gating, cancellation/stale results, revalidation, and keeping profile input
+disabled during asynchronous file selection. Preserve private Docker
+config/HOME, cleared environment, disabled selected-project `.env`, and
+disabled remote Git/OCI loaders. Do not add project import or lifecycle/
+mutation operations. See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
 and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
 
 Headless AccessKit/state tests cover ordered base/override selection, removing
@@ -510,13 +513,16 @@ selected project's default `.env`; `--no-interpolate` and
 `--no-env-resolution` do not confine included-project reads. Remote Git and OCI
 loaders are explicitly disabled, so remote include/extends references fail
 without fetching. The CLI/plugin remains unsandboxed; validate only trusted
-files. Bounded profile selection applies only to structural validation,
-read-only status, and one-shot service logs; profiles are passed as explicit
-`--profile` arguments and are not inherited from the environment. Project
-import/persistence, lifecycle, build/pull, live log follow, and project
-mutations remain unsupported. The one-shot logs are covered by fake-CLI and
-headless tests; no real project logs are read by default. Profile validation
-smoke uses only a temporary project and no Engine.
+files. Bounded profile selection applies to structural validation, read-only
+status, and one-shot service logs; the declared-service inventory is not
+profile-filtered and lists all declarations from selected files. Profiles are
+passed as explicit `--profile` arguments and are not inherited from the
+environment. Project import/persistence, lifecycle, build/pull, live log
+follow, and project mutations remain unsupported.
+The one-shot logs are covered by fake-CLI and headless tests; no real project
+logs are read by default. A temporary-project profile smoke verifies that
+`config --services` lists all declarations, including one in inactive profile
+`other`, with Compose v5.6.0 and no Engine access.
 
 Only Linux local Docker discovery was validated; validation uses no engine.
 The native Compose page visual check is unavailable, and Podman/rootless and
