@@ -590,9 +590,11 @@ push, remove, or modify images. No live image mutation or registry contact is
 claimed.
 
 Image pull, push, tag, and removal use the validated local Docker Unix-socket
-endpoint. Push is anonymous-only: Ferrum reads no saved registry credentials
-or credential-helper output; registries requiring authentication reject it.
-
+endpoint. Pulls are anonymous by default; fake credential-helper and fake-engine
+tests cover opt-in protocol/header behavior without invoking a real helper or
+registry. No live helper-authenticated pull is claimed. Push remains
+anonymous-only: Ferrum reads no saved registry credentials or helper output,
+and registries requiring authentication reject it.
 
 Manual release-mode performance samples are opt-in and have no timing
 thresholds. See the [performance and accessibility evidence](../performance.md)

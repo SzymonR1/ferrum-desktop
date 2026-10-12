@@ -26,28 +26,33 @@ means Ferrum did not receive success confirmation; the engine state may still
 be changing. Raw errors, endpoints, names, and daemon response bodies are
 excluded. These events are not a persistent or tamper-proof audit store.
 
-The **Images** page provides image listing and inspection, anonymous public
-pulls, local tagging/removal, and anonymous push of one existing local
-`repository:tag` through the Linux local Docker Unix socket. Tagging requires
-confirmation because Docker Engine v1.56 may reassign an existing
+The **Images** page provides image listing and inspection, anonymous pulls by
+default with opt-in per-pull Secret Service/pass helper authentication, local
+tagging/removal, and anonymous push of one existing local `repository:tag`
+through the Linux local Docker Unix socket. Helper credentials are requested
+only after the per-pull opt-in, sent to the selected local Engine, and never
+persisted by Ferrum; push and Buildx remain credential-free. Treat the helper,
+Engine, and its mirror configuration as trusted because the Engine receives
+credentials and may forward them according to its configured mirrors. Tagging
+requires confirmation because Docker Engine v1.56 may reassign an existing
 `repository:tag`; the image data remains. Removal confirmation snapshots the
 selected image ID and known tags, warns that removing the final reference can
 delete image data, and uses `noprune=true` without `force`. Push reinspects the
 selected image ID and tag before submission and requires confirmation warning
-that image layers and metadata are sent and may contain secrets. Ferrum does
-not read stored credentials; registries requiring authentication reject the
-push. Ferrum holds one image-mutation gate for pull, push, tag, and removal.
-Hiding pull/push progress or invalidating Images/context suppresses stale
-updates while draining a live response. If a push request/stream ends
-ambiguously without a terminal response, Ferrum keeps the image-mutation gate
-latched for the rest of the session; verify registry state before restarting
-or using another client. Closing Ferrum does not guarantee daemon-side transfer
-cancellation. A timeout or request error does not prove engine or registry
-state remained unchanged.
-Confirmed local Docker Buildx builds are available on Linux as described in
-the Images guide; private-registry authentication remains unavailable. Issue
-[#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) is partial and
-remains open. Dependency [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10)
+that image layers and metadata are sent and may contain secrets. Ferrum holds
+one image-mutation gate for pull, push, tag, and removal. Hiding pull/push
+progress or invalidating Images/context suppresses stale updates while draining
+a live response. If a push request/stream ends ambiguously without a terminal
+response, Ferrum keeps the image-mutation gate latched for the rest of the
+session; verify registry state before restarting or using another client.
+Closing Ferrum does not guarantee daemon-side transfer cancellation. A timeout
+or request error does not prove engine or registry state remained unchanged.
+Local Docker Buildx builds remain available on Linux but do not use the registry
+credential helper; private base-image authentication is unsupported. See the
+Images guide for Buildx's isolated configuration and limitations.
+Issue [#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) is partial
+and remains open; helper-assisted pulls have not been live-engine/registry
+validated. Dependency [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10)
 remains blocked and open; Podman/rootless and remote image endpoints remain
 unsupported or unvalidated. No live build or image mutation is claimed by tests;
 native image-page visual validation is not claimed. See the
