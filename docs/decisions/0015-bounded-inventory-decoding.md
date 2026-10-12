@@ -5,29 +5,58 @@
 
 ## Context
 
-ADR 0004 bounds Linux local Engine JSON response bodies and request deadlines. A byte cap alone does not bound the memory used by an untrusted JSON array: many compact rows or nested string entries can amplify into large `Vec` allocations during deserialization. Container, image, network, and volume inventories are engine-controlled and feed UI state and destructive-operation guards.
+ADR 0004 bounds Linux local Engine JSON response bodies and request deadlines.
+A byte cap alone does not bound memory used by untrusted JSON arrays: compact
+rows and nested strings amplify into vector allocations. Per-array limits alone
+also fail to bound the product of row count and nested `Names`/`RepoTags` items.
+Container, image, network, and volume inventories are engine-controlled and
+feed UI state and destructive-operation guards.
 
 ## Decision
 
-Limit every array decoded by the container, image, network, and volume inventory DTOs to 65,536 elements. This includes top-level inventory rows and the retained per-container `Names` and per-image-list `RepoTags` arrays. The decoder reserves at most the lower of the sequence size hint and the cap, decodes no more than the cap as typed values, then probes one additional item as `IgnoredAny`. If any extra item exists, reject the complete inventory through its existing safe typed error; never truncate or expose a partial list.
+Cap each typed inventory sequence at 65,536 items. The bounded visitor reserves
+at most the lower of the sequence size hint and cap, and rejects one extra
+item rather than truncating or returning partial data.
 
-The 16 MiB inventory response-body cap and eight-second request timeout from ADR 0004 remain unchanged. Empty arrays remain successful empty inventories. Missing/null optional nested arrays remain absent, and missing/null `Volumes` remains an empty inventory as permitted by the Docker Engine schema. Inspection, history, usage, and mutation response contracts are unchanged.
+Before typed deserialization, a recursive streaming preflight counts every
+array item across the complete inventory JSON response. Reject more than
+262,144 total array items with the existing safe typed error. This response-wide
+budget prevents nested arrays from multiplying allocations across rows.
+
+The 16 MiB response-body cap and eight-second timeout from ADR 0004 remain
+unchanged. Empty arrays remain successful. Missing/null optional nested arrays
+remain absent, and missing/null `Volumes` remains an empty inventory as
+permitted by the Docker Engine schema. Inspection, history, usage, and mutation
+response contracts are unchanged.
 
 ## Alternatives
 
-- **Rely on the body-size cap alone:** rejected because a compact JSON body can contain many small rows whose vector and per-item allocation overhead substantially exceeds their encoded size.
-- **Truncate at the item limit:** rejected because incomplete inventories could mislead users and undermine dependency checks or action gating.
-- **Use an unbounded sequence and validate afterward:** rejected because allocation amplification occurs during deserialization, before a post-decode length check.
+- **Rely on the body-size cap alone:** rejected because compact rows can amplify
+  into much larger vector allocations.
+- **Apply only an independent per-array cap:** rejected because the same nested
+  cap can multiply across thousands of inventory rows.
+- **Truncate an over-limit inventory:** rejected because incomplete results
+  could mislead users and undermine dependency checks or action gating.
+- **Decode first and validate afterward:** rejected because allocation
+  amplification occurs during typed deserialization, before a length check.
 
 ## Rationale
 
-The 65,536-element cap matches the existing image-history bound and leaves ample headroom above the 1,000-record UI performance target. A shared bounded sequence decoder applies one fail-closed invariant consistently without changing DTO allowlists or public domain models. Probing the first excess value as ignored data detects overflow without materializing it as a typed row.
+The per-sequence bound preserves existing list behavior for ordinary responses;
+the response-wide preflight bounds nested fan-out before typed vectors exist.
+The 262,144-item budget is four times the existing sequence limit, while the
+16 MiB body cap still bounds scalar text. Both limits fail closed.
 
 ## Consequences
 
-- An inventory array containing more than 65,536 entries is unavailable rather than partially displayed; the application reports its existing static endpoint-specific error.
-- The same limit applies to nested `Names` and `RepoTags` arrays retained from list responses. Other response schemas and the history cap remain unchanged.
-- Deterministic fake-Unix tests cover exact-limit acceptance, over-limit rejection for each public list operation, and nested-array overflow. They do not require an Engine or mutate resources.
+- A sequence over 65,536 items or a response with over 262,144 total array
+  items is unavailable rather than partially displayed; errors remain static.
+- The response-wide count includes top-level rows and nested list data such as
+  container `Names` and image-list `RepoTags`; missing/null semantics are
+  unchanged.
+- Fake-Unix tests cover exact and over-limit sequence/aggregate cases, including
+  nested fan-out bodies below the existing response-byte limit. They require no
+  Engine and mutate no resources.
 - This decision adds no Podman/rootless or remote endpoint support. Existing platform and endpoint limitations remain as documented in ADR 0004 and Issue #10.
 
 ## Relationship to ADR 0004

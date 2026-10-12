@@ -120,12 +120,13 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   comparisons and requests; never access the mountpoint. This is display
   hardening, not secret detection or redaction.
 - Use private bounded request paths for version, API negotiation, inventory, inspection, lifecycle, volume usage, and network creation/removal. Version/inventory/inspection and event-subscription setup use an 8-second timeout; lifecycle requests use a bounded 30-second timeout for graceful Stop/Restart; only the filtered volume-usage request uses a 30-second timeout with a 16 MiB response limit. Network creation uses bounded JSON `POST /v{negotiated}/networks/create` with only `Name`, a 1 KiB request-body limit, a 64 KiB success-response limit, and a safe typed response/error path. Network removal uses a bounded eight-second `DELETE /v{negotiated}/networks/{id}` after validating a full 64-character hexadecimal ID; it has no force/prune parameters, does not consume daemon response bodies, and exposes only safe typed errors. Timed-out or transport-interrupted mutations may still change state; never log or expose raw response bodies. Container Remove requires confirmation and sends neither force nor volume-removal parameters.
-- Bound each decoded container, image, network, and volume inventory array to
-  65,536 items, including container `Names` and image `RepoTags`. Reserve vector
-  capacity no larger than the sequence hint or cap, and probe one excess item
-  as `IgnoredAny`; reject the entire inventory rather than truncate. The 16 MiB
-  body and eight-second request bounds remain in force. These controls limit
-  untrusted response allocation amplification without exposing raw data.
+- Limit each typed inventory sequence to 65,536 entries, reserving at most the
+  smaller of its size hint and cap. Before decoding a container, image,
+  network, or volume list into typed DTOs, count array entries recursively
+  across the response and reject totals above 262,144. This prevents per-row
+  `Names` and `RepoTags` arrays from multiplying the memory limit; do not
+  truncate. Keep the existing 16 MiB body and eight-second request limits.
+  Errors remain static and exclude response contents.
 - Restrict volume listing, inspection, and usage to the selected local Docker Unix socket on Linux. Retain/display only volume name, driver, scope, creation time, and mountpoint as untrusted plain text; never access the mountpoint. Apply the shared 4 KiB raw-or-escaped UI display bound to names and each optional driver, scope, creation-time, and host-mountpoint detail, showing `[display text omitted]` when over limit; preserve raw names for identity comparisons and API request values. The separate filtered read-only `GET /v{api}/system/df?verbose=true&type=volume` provides usage only for an exact inventory-matched volume; retain/display only `Size` in bytes and point-in-time `RefCount` when reported. Missing, negative, or unknown metric values remain unavailable, and usage failures appear separately while successful inspect metadata remains visible. Discard unknown daemon fields, labels, options, status, and raw response bodies. A reference count is not a deletion-safety guarantee.
   EngineClient also omits optional volume metadata above the same 4 KiB
   raw-or-escaped limit before retaining it, so the page shows those fields as

@@ -17,12 +17,12 @@ local-engine inventory test may inspect an existing container; these tests do
 not mutate resources.
 
 Fake-Unix Engine inventory tests exercise the public container, image, network,
-and volume list methods. Every decoded inventory array is capped at 65,536
-items; exact-limit arrays are accepted, while one extra row fails the entire
-inventory with the existing safe typed error. Additional cases cover nested
-container `Names` and image-list `RepoTags` arrays. Fixtures stay below the
-16 MiB body cap so they verify the item bound independently; the default suite
-does not contact a live Engine or mutate resources.
+and volume list methods. Each typed sequence is capped at 65,536 entries; a
+preflight counts array entries recursively across the complete response and
+rejects totals above 262,144 before DTO decoding. Tests cover exact and excess
+per-array limits, nested high-fan-out `Names`/`RepoTags` below the 16 MiB body
+cap, and exact/over aggregate-counter boundaries. The default suite does not
+contact a live Engine or mutate resources.
 
 Settings tests cover missing/corrupt settings, file-symlink rejection without
 changing target permissions, non-regular and hard-linked file rejection, and

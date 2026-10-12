@@ -84,6 +84,8 @@ const MAX_INSPECT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LIST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ENGINE_LIST_ITEMS: usize = 65_536;
 #[cfg(target_os = "linux")]
+const MAX_ENGINE_LIST_TOTAL_ITEMS: usize = MAX_ENGINE_LIST_ITEMS * 4;
+#[cfg(target_os = "linux")]
 const MAX_IMAGE_HISTORY_ROWS: usize = MAX_ENGINE_LIST_ITEMS;
 #[cfg(target_os = "linux")]
 const MAX_VERSION_RESPONSE_BYTES: usize = 64 * 1024;
@@ -163,6 +165,160 @@ where
     Option::<BoundedSequence<T>>::deserialize(deserializer)
         .map(|sequence| sequence.map(|sequence| sequence.0))
 }
+#[cfg(target_os = "linux")]
+struct JsonArrayItemCounter<'a>(&'a mut usize);
+
+#[cfg(target_os = "linux")]
+impl<'de> DeserializeSeed<'de> for JsonArrayItemCounter<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(JsonArrayItemCounterVisitor(self.0))
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct JsonArrayItemSeed<'a>(&'a mut usize);
+
+#[cfg(target_os = "linux")]
+impl<'de> DeserializeSeed<'de> for JsonArrayItemSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if *self.0 == 0 {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "too many engine inventory array items",
+            ));
+        }
+        *self.0 -= 1;
+        JsonArrayItemCounter(self.0).deserialize(deserializer)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct JsonArrayItemCounterVisitor<'a>(&'a mut usize);
+
+#[cfg(target_os = "linux")]
+impl<'de> Visitor<'de> for JsonArrayItemCounterVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let remaining = self.0;
+        while sequence
+            .next_element_seed(JsonArrayItemSeed(&mut *remaining))?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let remaining = self.0;
+        while map.next_key::<IgnoredAny>()?.is_some() {
+            map.next_value_seed(JsonArrayItemCounter(&mut *remaining))?;
+        }
+        Ok(())
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i128<E>(self, _value: i128) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u128<E>(self, _value: u128) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_borrowed_str<E>(self, _value: &'de str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn enforce_json_array_item_budget(body: &[u8], maximum: usize) -> Result<(), RequestJsonError> {
+    let mut remaining = maximum;
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    JsonArrayItemCounter(&mut remaining)
+        .deserialize(&mut deserializer)
+        .map_err(|_| RequestJsonError::JsonDecode)?;
+    deserializer.end().map_err(|_| RequestJsonError::JsonDecode)
+}
+
+#[cfg(target_os = "linux")]
+async fn request_bounded_inventory_json<T: DeserializeOwned>(
+    socket_path: &std::path::Path,
+    request_path: &str,
+) -> Result<T, RequestJsonError> {
+    request_json_with_decoder(
+        socket_path,
+        request_path,
+        MAX_LIST_RESPONSE_BYTES,
+        REQUEST_TIMEOUT,
+        |body| {
+            enforce_json_array_item_budget(body, MAX_ENGINE_LIST_TOTAL_ITEMS)?;
+            serde_json::from_slice(body).map_err(|_| RequestJsonError::JsonDecode)
+        },
+    )
+    .await
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod json_array_item_budget_tests {
+    use super::*;
+
+    #[test]
+    fn counts_nested_array_entries_and_rejects_the_first_excess_item() {
+        let body = br#"{"rows":[{"Names":["one","two"]}]}"#;
+        assert!(enforce_json_array_item_budget(body, 3).is_ok());
+        assert_eq!(
+            enforce_json_array_item_budget(body, 2),
+            Err(RequestJsonError::JsonDecode)
+        );
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 fn inventory_rows_json(count: usize, mut row: impl FnMut(usize) -> String) -> Vec<u8> {
     let mut body = Vec::with_capacity(count.saturating_mul(64).saturating_add(2));
@@ -2354,9 +2510,9 @@ impl EngineClient {
     /// Returns every container, including stopped containers, from the
     /// connected engine.
     ///
-    /// The 16 MiB response limit is combined with a 65,536-item cap on the
-    /// inventory and each retained `Names` array. Excess data rejects the
-    /// complete inventory; Ferrum does not return a partial list.
+    /// The 16 MiB response limit is combined with a 65,536-item cap per
+    /// array and a 262,144-item budget across the response. Excess data rejects
+    /// the complete inventory; Ferrum does not return a partial list.
     ///
     /// # Errors
     ///
@@ -2367,20 +2523,16 @@ impl EngineClient {
         {
             let endpoint_label = self.info.endpoint_label;
             let path = format!("/v{}/containers/json?all=true", self.api_version);
-            let containers: BoundedSequence<ContainerListItem> = request_json(
-                &self.socket_path,
-                &path,
-                MAX_LIST_RESPONSE_BYTES,
-                REQUEST_TIMEOUT,
-            )
-            .await
-            .map_err(|_| {
-                if self.selected_context.is_some() {
-                    EngineError::ContextInventoryRequest
-                } else {
-                    EngineError::InventoryRequest { endpoint_label }
-                }
-            })?;
+            let containers: BoundedSequence<ContainerListItem> =
+                request_bounded_inventory_json(&self.socket_path, &path)
+                    .await
+                    .map_err(|_| {
+                        if self.selected_context.is_some() {
+                            EngineError::ContextInventoryRequest
+                        } else {
+                            EngineError::InventoryRequest { endpoint_label }
+                        }
+                    })?;
             containers
                 .0
                 .into_iter()
@@ -2395,9 +2547,9 @@ impl EngineClient {
     /// Returns all images, including images unused by containers.
     ///
     /// Only the image identifier, repository tags, creation time, and size are
-    /// retained from the engine response. The 16 MiB response limit is
-    /// combined with a 65,536-item cap on the inventory and each `RepoTags`
-    /// array; excess data rejects the complete inventory.
+    /// retained from the engine response. The 16 MiB body limit is combined
+    /// with a 65,536-item cap per array and a 262,144-item response-wide budget;
+    /// excess data rejects the complete inventory.
     ///
     /// # Errors
     ///
@@ -2408,14 +2560,10 @@ impl EngineClient {
         {
             let endpoint_label = self.info.endpoint_label;
             let path = format!("/v{}/images/json?all=true", self.api_version);
-            let images: BoundedSequence<ImageListItem> = request_json(
-                &self.socket_path,
-                &path,
-                MAX_LIST_RESPONSE_BYTES,
-                REQUEST_TIMEOUT,
-            )
-            .await
-            .map_err(|_| EngineError::ImageInventoryUnavailable { endpoint_label })?;
+            let images: BoundedSequence<ImageListItem> =
+                request_bounded_inventory_json(&self.socket_path, &path)
+                    .await
+                    .map_err(|_| EngineError::ImageInventoryUnavailable { endpoint_label })?;
             images
                 .0
                 .into_iter()
@@ -2432,8 +2580,8 @@ impl EngineClient {
     /// Only identity and the allowlisted scalar network fields are retained.
     /// Attached-container counts are not provided by the network list endpoint
     /// and are available only as a point-in-time count from inspection. The
-    /// 16 MiB response limit is combined with a 65,536-item cap; excess rows
-    /// reject the complete inventory.
+    /// 16 MiB body limit is combined with a 65,536-item cap per array and a
+    /// 262,144-item response-wide array budget; excess data rejects the list.
     ///
     /// # Errors
     ///
@@ -2445,14 +2593,10 @@ impl EngineClient {
         {
             let endpoint_label = self.info.endpoint_label;
             let path = format!("/v{}/networks", self.api_version);
-            let networks: BoundedSequence<NetworkResponse> = request_json(
-                &self.socket_path,
-                &path,
-                MAX_LIST_RESPONSE_BYTES,
-                REQUEST_TIMEOUT,
-            )
-            .await
-            .map_err(|_| EngineError::NetworkInventoryUnavailable { endpoint_label })?;
+            let networks: BoundedSequence<NetworkResponse> =
+                request_bounded_inventory_json(&self.socket_path, &path)
+                    .await
+                    .map_err(|_| EngineError::NetworkInventoryUnavailable { endpoint_label })?;
             networks
                 .0
                 .into_iter()
@@ -2769,9 +2913,9 @@ impl EngineClient {
     /// Lists local volumes. Only name, driver, and scope are retained.
     ///
     /// A missing or null `Volumes` field is treated as an empty inventory, as
-    /// permitted by the Docker Engine API schema. The 16 MiB response limit is
-    /// combined with a 65,536-item cap on `Volumes`; excess data rejects the
-    /// complete inventory.
+    /// permitted by the Docker Engine API schema. The response has a 16 MiB
+    /// body cap, a 65,536-item per-array cap, and a 262,144-item aggregate
+    /// array-item budget; excess data rejects the complete inventory.
     ///
     /// # Errors
     ///
@@ -2783,14 +2927,10 @@ impl EngineClient {
         {
             let endpoint_label = self.info.endpoint_label;
             let path = format!("/v{}/volumes", self.api_version);
-            let response: VolumeListResponse = request_json(
-                &self.socket_path,
-                &path,
-                MAX_LIST_RESPONSE_BYTES,
-                REQUEST_TIMEOUT,
-            )
-            .await
-            .map_err(|_| EngineError::VolumeInventoryUnavailable { endpoint_label })?;
+            let response: VolumeListResponse =
+                request_bounded_inventory_json(&self.socket_path, &path)
+                    .await
+                    .map_err(|_| EngineError::VolumeInventoryUnavailable { endpoint_label })?;
             response
                 .volumes
                 .map(|volumes| volumes.0)
@@ -4478,6 +4618,22 @@ mod container_inventory_api_tests {
         assert!(request.starts_with("GET /v1.45/containers/json?all=true HTTP/1.1\r\n"));
         assert!(matches!(result, Err(EngineError::InventoryRequest { .. })));
     }
+    #[tokio::test]
+    async fn rejects_container_inventory_with_excessive_aggregate_nested_items() {
+        let names = std::iter::repeat_n("\"\"", 60)
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = inventory_rows_json(MAX_ENGINE_LIST_ITEMS, |index| {
+            format!(r#"{{"Id":"container-{index}","Names":[{names}]}}"#)
+        });
+        assert!(body.len() < MAX_LIST_RESPONSE_BYTES);
+        let (socket, directory, server) = fixture(response(&body)).await;
+
+        let result = client(socket.clone()).list_containers().await;
+        server.await.expect("fixture server should finish");
+        cleanup(&socket, &directory);
+        assert!(matches!(result, Err(EngineError::InventoryRequest { .. })));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -4650,6 +4806,25 @@ mod image_api_tests {
         let mut body = b"[{\"Id\":\"image-id\",\"RepoTags\":".to_vec();
         body.extend_from_slice(&repo_tags);
         body.extend_from_slice(b"}]");
+        assert!(body.len() < MAX_LIST_RESPONSE_BYTES);
+        let (socket, directory, server) = fixture(http_response("200 OK", &body)).await;
+
+        let result = client(socket.clone()).list_images().await;
+        server.await.expect("fixture server should finish");
+        cleanup(&socket, &directory);
+        assert!(matches!(
+            result,
+            Err(EngineError::ImageInventoryUnavailable { .. })
+        ));
+    }
+    #[tokio::test]
+    async fn rejects_image_inventory_with_excessive_aggregate_repo_tags() {
+        let tags = std::iter::repeat_n("\"\"", 60)
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = inventory_rows_json(MAX_ENGINE_LIST_ITEMS, |index| {
+            format!(r#"{{"Id":"image-{index}","RepoTags":[{tags}]}}"#)
+        });
         assert!(body.len() < MAX_LIST_RESPONSE_BYTES);
         let (socket, directory, server) = fixture(http_response("200 OK", &body)).await;
 
