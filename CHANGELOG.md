@@ -66,6 +66,12 @@ All notable project changes are documented here. The project has not published a
 - Buildx confirmation no longer blocks its own start; other image mutations still gate start. Pre-submission rejected or failed starts record only static `not_submitted` outcomes in the existing best-effort audit.
 - Buildx process-spawn failures are now audited as `not_submitted`; failures after a child starts remain `request_error`.
 
+- Bound typed Linux Engine inventory arrays to 65,536 items each and count all
+  array items in each inventory response against a 262,144-item aggregate
+  budget before typed decoding. Excess per-array or aggregate fan-out fails the
+  complete inventory without truncation. The 16 MiB body and eight-second
+  request limits remain unchanged.
+
 - Added a native Rust workspace with an eframe desktop entry point.
 - Added an asynchronous Linux local Docker-compatible inventory and typed inspection path using negotiated API requests.
 - Added state-gated container lifecycle actions and bounded Docker container-event synchronization with manual refresh fallback.

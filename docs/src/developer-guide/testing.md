@@ -15,6 +15,15 @@ The default suite does not require a host engine. Ignored live-engine tests for
 version, inventory, and Docker CLI contexts are read-only. The general
 local-engine inventory test may inspect an existing container; these tests do
 not mutate resources.
+
+Fake-Unix Engine inventory tests exercise the public container, image, network,
+and volume list methods. Each typed sequence is capped at 65,536 entries; a
+preflight counts array entries recursively across the complete response and
+rejects totals above 262,144 before DTO decoding. Tests cover exact and excess
+per-array limits, nested high-fan-out `Names`/`RepoTags` below the 16 MiB body
+cap, and exact/over aggregate-counter boundaries. The default suite does not
+contact a live Engine or mutate resources.
+
 Settings tests cover missing/corrupt settings, file-symlink rejection without
 changing target permissions, non-regular and hard-linked file rejection, and
 refusal to chmod or write through symlinked settings directories. The hard-link
