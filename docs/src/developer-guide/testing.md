@@ -494,8 +494,9 @@ selected project's default `.env`; `--no-interpolate` and
 `--no-env-resolution` do not confine included-project reads. Remote Git and OCI
 loaders are explicitly disabled, so remote include/extends references fail
 without fetching. The CLI/plugin remains unsandboxed; validate only trusted
-files. Profiles, import, lifecycle/build/pull/logs, and project mutations
-remain unsupported.
+files. Profiles, import, lifecycle/build/pull, live log follow, and project
+mutations remain unsupported. The one-shot service log snapshot is covered by
+fake-CLI and headless tests; no real project logs are read by default.
 
 Only Linux local Docker discovery was validated; validation uses no engine.
 The native Compose page visual check is unavailable, and Podman/rootless and

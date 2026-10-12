@@ -65,9 +65,10 @@ local `include`/`extends.file` Compose files and included projects' default
 permissions, potentially outside the base directory. Remote Git/OCI loaders
 are disabled. The selected files and private CLI environment do not sandbox
 those reads; validate only trusted files. Profiles, `.env`/service
-`env_file` resolution, import, lifecycle/build/pull/logs, and project mutations
-remain unsupported. Issues #18 and #19 remain partial/open; issue #10 remains
-blocked/open. No release or broader support claim is made.
+`env_file` resolution, import, lifecycle/build/pull, live log follow, and
+project mutations remain unsupported. One-shot service logs are described
+below. Issues #18 and #19 remain partial/open; issue #10 remains blocked/open.
+No release or broader support claim is made.
 
 Status is available only after selected files pass structural validation and a
 local Docker Unix socket is connected. Ferrum runs
@@ -87,8 +88,24 @@ resolve differently than a normal shell invocation. Compose may still read
 local includes and included-project environment sources under the logged-in
 user's permissions; validate only trusted files.
 
+One-shot Compose service logs are available only after structural validation
+and a successful status snapshot. Immediately before `logs`, Ferrum repeats a
+read-only `compose ps --all --format json` query with the same selected files
+and socket, and refuses if the service is no longer present. The `--tail 200`
+option is per container; Ferrum displays at most the first 200 combined CLI
+output lines and 256 KiB, so replicas may be truncated and output is not a
+global chronological tail. Only a bounded safe ASCII selector (1–128 bytes,
+letter/digit first, then ASCII letters/digits/`_`/`-`/`.`) is accepted.
 
-## Trust boundaries
+Logs may contain secrets and are displayed only after explicit user action.
+They are treated as untrusted text, escaped before rendering, and kept only in
+transient UI state; no log content enters tracing, audit, error strings, or
+disk. Each of the fresh status and logs subprocesses is bounded to eight
+seconds and 1 MiB stdout and inherits the private CLI environment and process
+resource limits above. The selected local files may change between the two
+calls, and local includes remain within the trusted-Compose caveat. The command
+does not follow logs or mutate project/engine state. Tests use fake CLI output;
+no real user project logs are read.
 
 Ferrum runs as the logged-in desktop user and communicates with a Docker-compatible engine through a local Linux Unix socket. Access to a Docker socket is effectively host-level control; UI action gating and confirmation do not make the endpoint unprivileged. Windows/macOS engine APIs are not implemented here. Engine responses, container names, image references, state strings, status text, and mount paths are untrusted input.
 
@@ -147,13 +164,14 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   diagnostics private; display only a bounded escaped basename and static result.
 
 - Keep profiles, `.env`/service `env_file` resolution, file import, project
-  start/stop/restart, build/pull/logs, and project mutations unsupported.
-  Remote references remain disabled and are not fetched. Linux local discovery,
-  single-file validation, ordered temporary base/override, and remote-loader
-  safety smokes passed with Compose v5.6.0; they do not validate arbitrary
-  projects or lifecycle behavior. The native page visual check is unavailable.
-  Issue #18 remains partial/open and #10 remains blocked/open; no release or
-  support expansion is claimed.
+  start/stop/restart, build/pull, live log follow, and project mutations
+  unsupported. One-shot read-only service logs are implemented as described
+  above. Remote references remain disabled and are not fetched. Linux local
+  discovery, single-file validation, ordered temporary base/override, and
+  remote-loader safety smokes passed with Compose v5.6.0; they do not validate
+  arbitrary projects or lifecycle behavior. The native page visual check is
+  unavailable. No full issue completion, release, or support expansion is
+  claimed.
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
 - Escape selected control, bidi, zero-width, invisible-format, Hangul-filler,
   and Unicode-tag characters in engine-provided container inventory/inspection
@@ -353,7 +371,8 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
 - Podman API compatibility and rootless endpoint discovery; issue #10 remains open for these and the broader engine matrix.
 - Compose profiles, `.env`/service `env_file` resolution, remote OCI/Git inputs
   (remote loaders are disabled during validation), file import, project
-  lifecycle actions, build/pull/logs, and project mutations.
+  lifecycle actions, build/pull, live log follow, and project mutations. The
+  bounded one-shot service log snapshot is implemented as described above.
 - The explicit local Docker CLI Buildx invocation is an added external build process. Other external process integrations, archive extraction, and file-path surfaces remain deferred.
 - Credential stores, registry authentication, managed engines, and update delivery.
 

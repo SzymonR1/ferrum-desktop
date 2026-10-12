@@ -142,12 +142,50 @@ sources under the logged-in user's permissions; validate only trusted files.
 The command uses the same subprocess timeout, output cap, and per-process
 resource limits described above.
 
-Profiles, project import/persistence, start/stop/restart, build/pull, logs, and
-project mutations remain unsupported. Structural validation skips environment
+## One-shot service log snapshot
+
+After structural validation and a successful status snapshot, use **Snapshot
+logs for SERVICE** beside a listed service. Immediately before requesting logs,
+Ferrum repeats a read-only status query with the same selected files and local
+socket. If the service is no longer present, Ferrum reports that the status
+should be refreshed.
+
+```text
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... logs --tail 200 --no-color <service>
+```
+
+This is a one-shot query, not live follow or polling. Compose's `--tail 200`
+asks for up to 200 recent lines **per container**. Ferrum keeps at most the
+first 200 lines of the combined CLI output and 256 KiB; a replicated service
+may be truncated, and Ferrum does not create a globally time-sorted last-200
+view. It accepts only bounded safe ASCII service selectors: 1–128 bytes,
+starting with an ASCII letter or digit and continuing with ASCII letters,
+digits, `_`, `-`, or `.`. Unsafe selectors are not passed to Compose. Output is
+escaped and transient in memory only; it is never written to files, durable
+audit, or tracing. Cancel aborts the subprocess; changing files, context, page,
+or status invalidates the result.
+
+The fresh status check and the log request are separate read-only CLI calls,
+each bounded to eight seconds and 1 MiB of stdout (up to 16 seconds total).
+Both use the selected local Docker Unix socket, selected ordered files, and
+`--project-directory` pinned to the base parent. They use Ferrum's private
+Docker config/HOME, cleared allowlisted environment, disabled selected-project
+default `.env` and remote Git/OCI loaders, and the existing per-process resource
+limits. As with validation and status, Compose remains trusted local code and
+may recursively read local `include`, `extends.file`, and included-project
+environment sources under the logged-in user's permissions. A file can still
+change between the status check and log request; use only trusted selected
+files.
+
+See Docker's [Compose `logs` reference](https://docs.docker.com/reference/cli/docker/compose/logs/)
+for CLI options and per-container tail semantics.
+
+Profiles, project import/persistence, start/stop/restart, build/pull, live log
+follow, and project mutations remain unsupported. Structural validation skips
 interpolation and service `env_file` resolution; status uses the isolated
-environment above and may differ from a normal shell invocation. Status reports
-only existing containers; it does not enumerate declared services with no
-containers. Issue [#18](https://github.com/SzymonR1/ferrum-desktop/issues/18)
+environment above and may differ from a normal shell invocation.
+Status reports only existing containers; it does not enumerate declared
+services with no containers. Issue [#18](https://github.com/SzymonR1/ferrum-desktop/issues/18)
 remains open/partial; [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10)
 remains blocked. This is not a full-issue, release, or broader platform claim.
 

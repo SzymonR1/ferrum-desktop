@@ -191,6 +191,10 @@ enum EngineEvent {
         generation: u64,
         result: compose::ComposeStatusResult,
     },
+    ComposeLogsFinished {
+        generation: u64,
+        result: compose::ComposeLogsResult,
+    },
     NetworkCreated {
         generation: u64,
         name: String,
@@ -869,6 +873,7 @@ struct FerrumApp {
     compose_task: Option<JoinHandle<()>>,
     compose_validation_task: Option<JoinHandle<()>>,
     compose_status_task: Option<JoinHandle<()>>,
+    compose_logs_task: Option<JoinHandle<()>>,
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
     // Hold the reader until the terminal response event releases the mutation gate.
@@ -1076,6 +1081,7 @@ impl FerrumApp {
             compose_task: None,
             compose_validation_task: None,
             compose_status_task: None,
+            compose_logs_task: None,
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
@@ -1275,6 +1281,9 @@ impl FerrumApp {
         if let Some(task) = self.compose_status_task.take() {
             task.abort();
         }
+        if let Some(task) = self.compose_logs_task.take() {
+            task.abort();
+        }
         self.compose.invalidate();
     }
 
@@ -1296,6 +1305,9 @@ impl FerrumApp {
                 task.abort();
             }
             if let Some(task) = self.compose_status_task.take() {
+                task.abort();
+            }
+            if let Some(task) = self.compose_logs_task.take() {
                 task.abort();
             }
             let generation = if override_file {
@@ -1339,6 +1351,9 @@ impl FerrumApp {
         if let Some(task) = self.compose_status_task.take() {
             task.abort();
         }
+        if let Some(task) = self.compose_logs_task.take() {
+            task.abort();
+        }
         self.compose_validation_task = Some(self.runtime.spawn(async move {
             let result = compose::validate_compose_files(&files).await;
             if sender
@@ -1369,6 +1384,9 @@ impl FerrumApp {
         if let Some(task) = self.compose_status_task.take() {
             task.abort();
         }
+        if let Some(task) = self.compose_logs_task.take() {
+            task.abort();
+        }
         context.request_repaint();
         let sender = self.sender.clone();
         self.compose_status_task = Some(self.runtime.spawn(async move {
@@ -1388,6 +1406,45 @@ impl FerrumApp {
             task.abort();
         }
         self.compose.cancel_status_refresh();
+        context.request_repaint();
+    }
+    #[cfg(target_os = "linux")]
+    fn start_compose_service_logs(&mut self, service: &str, context: egui::Context) {
+        if !matches!(&self.connection, ConnectionState::Connected) || self.compose.is_loading() {
+            return;
+        }
+        let Some(socket_path) = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.local_socket_path().to_path_buf())
+        else {
+            return;
+        };
+        let Some((generation, files, service)) = self.compose.begin_service_logs(service) else {
+            return;
+        };
+        if let Some(task) = self.compose_logs_task.take() {
+            task.abort();
+        }
+        let sender = self.sender.clone();
+        context.request_repaint();
+        self.compose_logs_task = Some(self.runtime.spawn(async move {
+            let result = compose::compose_service_logs(&socket_path, &files, &service).await;
+            if sender
+                .send(EngineEvent::ComposeLogsFinished { generation, result })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
+
+    fn cancel_compose_service_logs(&mut self, context: egui::Context) {
+        if let Some(task) = self.compose_logs_task.take() {
+            task.abort();
+        }
+        self.compose.cancel_service_logs();
         context.request_repaint();
     }
 
@@ -2728,6 +2785,11 @@ impl FerrumApp {
                 EngineEvent::ComposeStatusFinished { generation, result } => {
                     if self.compose.finish_status_refresh(generation, result) {
                         self.compose_status_task = None;
+                    }
+                }
+                EngineEvent::ComposeLogsFinished { generation, result } => {
+                    if self.compose.finish_service_logs(generation, result) {
+                        self.compose_logs_task = None;
                     }
                 }
                 EngineEvent::VolumeInspected {
@@ -4624,8 +4686,14 @@ impl eframe::App for FerrumApp {
         if compose_actions.cancel_status {
             self.cancel_compose_status_refresh(context.clone());
         }
+        if compose_actions.cancel_logs {
+            self.cancel_compose_service_logs(context.clone());
+        }
         if let Some(index) = compose_actions.remove_override {
             self.compose.remove_override(index);
+            if let Some(task) = self.compose_logs_task.take() {
+                task.abort();
+            }
             if let Some(task) = self.compose_status_task.take() {
                 task.abort();
             }
@@ -4642,6 +4710,10 @@ impl eframe::App for FerrumApp {
         if compose_actions.refresh_containers {
             #[cfg(target_os = "linux")]
             self.start_compose_status_refresh(context.clone());
+        }
+        if let Some(service) = compose_actions.logs_service.as_deref() {
+            #[cfg(target_os = "linux")]
+            self.start_compose_service_logs(service, context.clone());
         }
         if compose_actions.refresh {
             self.refresh(context.clone());
@@ -5169,6 +5241,7 @@ mod event_reconciliation_tests {
             compose_task: None,
             compose_validation_task: None,
             compose_status_task: None,
+            compose_logs_task: None,
             pending_resource_read: None,
             image_list_task: None,
             image_inspection_task: None,

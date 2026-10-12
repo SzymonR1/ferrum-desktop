@@ -241,14 +241,14 @@ The size check covers only explicitly selected files. Local
 `include`/`extends.file` files may remain outside it and are read by the same
 limited CLI process under the logged-in user's permissions.
 
-On Linux, each Compose subprocess for version, discovery, validation, and status
-has `RLIMIT_AS` capped at 4 GiB and `RLIMIT_DATA` capped at 512 MiB, preserving
-lower inherited limits. The per-process limits apply while Compose reads
+On Linux, each Compose subprocess for version, discovery, validation, status,
+and one-shot logs has `RLIMIT_AS` capped at 4 GiB and `RLIMIT_DATA` capped at
+512 MiB, preserving lower inherited limits. The per-process limits apply while
 selected and included files; child processes inherit them, so they bound each
 process, not aggregate process-tree RSS. The private child environment
 sets `GOMEMLIMIT=402653184` (384 MiB) for Go runtimes. This is a soft runtime
 target, not a hard cap: Go may exceed it to avoid excessive GC thrashing.
-Resource exhaustion can produce generic validation or status failures. These
+Resource exhaustion can produce generic validation, status, or log-query failures. These
 limits and the point-in-time selected-file check do not make the trusted CLI a
 sandbox or confine local included-file reads.
 
@@ -258,7 +258,8 @@ structural validation only: interpolation and service `env_file` resolution
 are skipped. Only bounded escaped basenames and a static result are displayed;
 paths are session-only and raw diagnostics are discarded. Profiles,
 `.env`/service `env_file` resolution, remote Git/OCI references, file import,
-lifecycle actions, build/pull/logs, and project mutations are unsupported.
+project lifecycle, build/pull, live log follow, and project mutations remain
+unsupported. One-shot service logs are described below.
 
 Read-only container status is available for selected files after structural
 validation. It pins `docker compose ps --all --format json` to the selected
@@ -270,6 +271,25 @@ published ports, project labels, exit codes, and other response fields are
 discarded. Empty output means no existing containers matched this isolated
 project selection, not that no services are declared. Status is a manually
 refreshed point-in-time snapshot.
+
+After structural validation and a successful status snapshot, a listed service
+may request a one-shot `docker compose logs --tail 200 --no-color` query.
+Immediately before logs, Ferrum reruns a read-only status query with the same
+selected files and socket and refuses if the service is absent. `--tail 200`
+applies per container; Ferrum keeps at most the first 200 lines of combined
+CLI output and 256 KiB, so replicated output may omit some containers and is
+not a global chronological tail. Only bounded safe ASCII service selectors
+from current status rows are accepted. Output is escaped, transient, and never
+persisted or sent to tracing/audit/errors. Cancellation and file/context/page/
+status invalidation abort the owned query and reject stale results. Both CLI
+calls use the selected local socket and ordered files with the base parent as
+`--project-directory`, private Docker config/HOME, cleared allowlisted
+environment, disabled selected-project `.env` and remote Git/OCI loaders,
+per-process resource limits, an eight-second deadline, and a 1 MiB stdout cap
+per call. A selected local file may still change between the status and logs
+calls; the trusted CLI may read includes and included-project environment
+sources under the logged-in user's permissions. This is not a sandbox or an
+engine lifecycle operation.
 
 Status uses the private cleared environment described below and disables the
 selected project's default `.env`; environment-dependent projects may fail or
