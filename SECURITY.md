@@ -94,9 +94,11 @@ continue and image/tag state may be uncertain. Ferrum refreshes image inventory
 after every terminal result.
 Build traces contain only static `image_mutation` / `build` action and
 `success`, `not_submitted`, or `request_error` outcome; context path, tag, and
-output are excluded. These static outcomes are included in the existing
-best-effort durable redacted JSONL audit; build output remains transient and
-unpersisted.
+output are excluded. Failure to spawn Buildx is recorded as `not_submitted`;
+unsuccessful completion after the process starts is `request_error` because
+image/tag state may be uncertain. These static outcomes are included in the
+existing best-effort durable redacted JSONL audit; build output remains
+transient and unpersisted.
 
 Issues #16 and #19 remain open and ready. This partial slice is not a release
 or a support claim beyond local Linux Docker.

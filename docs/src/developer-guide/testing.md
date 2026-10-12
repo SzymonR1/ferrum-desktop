@@ -104,13 +104,13 @@ The 2026-10-11 read-only history smoke passed against Docker Engine 29.9.0/API
 1.56 using the preinstalled `ghcr.io/catthehacker/ubuntu:rust-latest` image
 and current local Unix context; it read history without mutating the image.
 
-Image-build regressions exercise only temporary files and a controlled helper
-process. They do not invoke Docker or Buildx against an engine, build an image,
+Image-build regressions exercise only temporary files and controlled helper
+processes. They do not invoke Docker or Buildx against an engine, build an image,
 or mutate image resources. Tests cover local-context and target validation,
 private config permissions and cleanup, socket-pinned command construction,
-credential isolation, bounded and escaped output, process failure/cancellation,
-explicit confirmation, context-switch gating, and static non-persistent build
-outcome tracing.
+credential isolation, bounded and escaped output, process spawn failure versus
+post-start failure/cancellation, explicit confirmation, context-switch gating,
+and static durable build-outcome classification.
 
 The named tests are:
 
@@ -128,6 +128,7 @@ The named tests are:
 - `build_start_progress_success_error_and_cancel_have_terminal_transitions`
 - `build_output_is_bounded_and_escaped`
 - `records_static_image_build_outcomes`
+- `event_reconciliation_tests::build_runner_spawn_failure_is_persisted_as_not_submitted`
 - `event_reconciliation_tests::pending_image_build_confirmation_disables_context_switching`
 - `event_reconciliation_tests::pending_image_build_disables_context_selector_accessibly`
 - `event_reconciliation_tests::active_image_build_disables_context_switching`

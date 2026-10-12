@@ -21,9 +21,11 @@ or build is active. Stream only sanitized bounded plain text in memory; do not
 persist output. Best-effort cancellation terminates the CLI process group;
 refresh inventory after every terminal/cancel result because state may be
 uncertain. Build traces contain only static action and outcome, excluding
-context path, tag, and output. Their redacted outcome is also written to the
-existing best-effort durable JSONL audit; only static event/action/outcome are
-persisted for builds. Build output remains bounded transient UI data and is
+context path, tag, and output. A Buildx spawn failure is `not_submitted`;
+an unsuccessful outcome after a child starts is `request_error` because
+builder-side state may be uncertain. The redacted outcome is also written to
+the existing best-effort durable JSONL audit; only static event/action/outcome
+are persisted for builds. Build output remains bounded transient UI data and is
 never persisted.
 
 Compose support includes read-only Docker CLI version/project discovery and
