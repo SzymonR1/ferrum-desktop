@@ -519,15 +519,21 @@ profile-filtered and lists all declarations from selected files. Profiles are
 passed as explicit `--profile` arguments and are not inherited from the
 environment. Project import/persistence, lifecycle, build/pull, live log
 follow, and project mutations remain unsupported.
-The one-shot logs are covered by fake-CLI and headless tests; no real project
-logs are read by default. A temporary-project profile smoke verifies that
-`config --services` lists all declarations, including one in inactive profile
-`other`, with Compose v5.6.0 and no Engine access.
+The one-shot service logs are covered by fake-CLI and headless tests; no real
+service logs are read by default. A temporary-project profile-validation smoke
+verifies that `config --services` lists all declarations, including one in
+inactive profile `other`, with Compose v5.6.0 and no Engine access. An ignored
+profile status smoke uses a unique temporary project and the selected local
+socket to run `ps` with a selected profile on Docker Engine 29.9.0/default
+context; it reads only that project, asserts an empty container list, and
+creates or changes no resources. Run it with
+`cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_profile_status_reads_temporary_project_without_mutation -- --exact --ignored --nocapture`.
 
-Only Linux local Docker discovery was validated; validation uses no engine.
-The native Compose page visual check is unavailable, and Podman/rootless and
-remote transports remain unsupported or unvalidated. Issue #18 remains open
-(partial); #10 remains blocked. No release/support expansion is claimed.
+Compose validation and service listing use no Engine; the opt-in status smoke
+is local Docker-only. The native Compose page visual check is unavailable, and
+Podman/rootless and remote transports remain unsupported or unvalidated. Issue
+#18 remains open/partial; #10 remains blocked. No release/support expansion is
+claimed.
 
 The mutation audit tests verify redacted JSONL records for lifecycle, image,
 volume, and network outcomes; they also check the 16 MiB hard cap and that

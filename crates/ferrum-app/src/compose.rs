@@ -3583,8 +3583,8 @@ mod tests {
             assert!(!format!("{result:?}").contains("secret-diagnostic"));
         }
         #[tokio::test]
-        #[ignore = "requires a local Docker-compatible Unix socket and Compose; ps reads only an owned temporary project"]
-        async fn local_compose_status_reads_temporary_project_without_mutation() {
+        #[ignore = "requires a local Docker-compatible Unix socket and Compose; queries only a unique owned temporary project and creates no resources"]
+        async fn local_compose_profile_status_reads_temporary_project_without_mutation() {
             use std::time::{SystemTime, UNIX_EPOCH};
 
             let engine = ferrum_engine::EngineClient::connect_default()
@@ -3602,18 +3602,22 @@ mod tests {
             let file = project.join("compose.yaml");
             fs::write(
                 &file,
-                format!("name: {project_name}\nservices:\n  status-probe:\n    image: scratch\n"),
+                format!(
+                    "name: {project_name}\nservices:\n  always-probe:\n    image: scratch\n  status-probe:\n    image: scratch\n    profiles: [status-smoke]\n  hidden-probe:\n    image: scratch\n    profiles: [inactive-smoke]\n"
+                ),
             )
             .expect("the temporary Compose file should be written");
 
+            let files = [file];
+            let profiles = ["status-smoke".to_owned()];
             let status =
-                existing_compose_containers(engine.local_socket_path(), &[file], &[]).await;
+                existing_compose_containers(engine.local_socket_path(), &files, &profiles).await;
             status
                 .outcome
-                .expect("read-only status for the temporary project should succeed");
+                .expect("read-only profile status for the temporary project should succeed");
             assert!(
                 status.containers.is_empty(),
-                "the status query must not create Compose containers"
+                "status queries must not create Compose containers"
             );
         }
     }

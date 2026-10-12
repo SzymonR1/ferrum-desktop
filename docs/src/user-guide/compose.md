@@ -239,19 +239,18 @@ Issue [#18](https://github.com/SzymonR1/ferrum-desktop/issues/18)
 remains open/partial; [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10)
 remains blocked. This is not a full-issue, release, or broader platform claim.
 
-For environment semantics, see Docker's [Compose environment variables guide](https://docs.docker.com/compose/how-tos/environment-variables/envvars/).
 The direct CLI probe and discovery smoke, single-file and ordered base/override
-temporary-file validation smokes, read-only temporary-project status smoke, and
-loopback remote-loader safety smoke passed with Compose v5.6.0. The status smoke
-used Docker Engine 29.9.0 and created no containers; all temporary project files
-were owned by the test. The ignored ordered profile-validation smoke asserts all
-declared service names from the selected files, including one assigned to the
-inactive `other` profile. It passed with Compose v5.6.0 using temporary files
-only, without contacting an Engine or mutating project resources. All validation
-smokes use test-owned files only. Discovery and status query the selected local
-engine read-only; the remote-loader smoke verifies Git/OCI references do not
-open a local connection or contact an external host. None of the smokes mutates
-projects. Linux local Docker discovery was validated, but native Compose-page
-visual validation is unavailable.
+temporary-file validation smokes, and loopback remote-loader safety smoke
+passed with Compose v5.6.0. The read-only temporary-project status smoke passed
+with Docker Engine 29.9.0 and created no containers. The ignored ordered
+profile-validation smoke asserts all declared service names, including one in
+inactive profile `other`; it passed with Compose v5.6.0 using temporary files
+and no Engine access. The opt-in profile-status smoke also passed using a unique
+temporary project and the selected local socket on Docker Engine 29.9.0/default
+context; `ps` returned no containers and the test created or changed no
+resources. All validation smokes use test-owned files only. Discovery and status
+query the selected local engine read-only; the remote-loader smoke verifies
+Git/OCI references do not open a local connection or contact an external host.
+The native Compose page visual check remains unavailable.
 For security implications of remote and local references, see Docker's [Compose trust model](https://docs.docker.com/compose/trust-model).
 This page does not claim full issue completion or a release.
