@@ -13,6 +13,17 @@ The `ContainerAction` set is Start, Stop, Restart, Pause, Unpause, and Remove. T
 
 External synchronization consumes Docker container-only JSONL events. Each event line is capped at 64 KiB and each transport data frame at 1 MiB; changes are delivered to the UI through its existing bounded channel and backpressure behavior. A fresh inventory snapshot is fetched after initial subscription and reconnect, and any open inspection is reloaded so state-gated actions do not remain stale. The event task is cancelled when the engine context changes or the application tears down. Each outage gets at most three retries, with waits of 250 ms, 500 ms, and 1 s; a successful subscription resets the retry budget. Once retries are exhausted, the UI reports event synchronization unavailable. Manual inventory refresh also revalidates any open inspection.
 
+### Implementation clarification (2026-10-12)
+
+Each local Docker event subscription now includes a `since` timestamp captured
+at subscription time. A read-only Docker Engine 29.9.0/API 1.56 probe returned
+256 retained container-event rows when `since` was omitted, even though no live
+container events occurred during the application startup interval. Ferrum relies
+on its inventory snapshot after initial subscription and reconnect to cover
+earlier state, while the event stream carries only subsequent changes. The same
+cutoff is applied on reconnect; no event history is required to reconstruct
+current inventory.
+
 This decision applies only to the existing Linux local Unix-socket engine path. Remote transports, Podman/rootless behavior, Windows, and macOS are not enabled or validated by lifecycle support.
 
 ## Alternatives considered
