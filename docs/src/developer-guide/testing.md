@@ -544,10 +544,11 @@ loading, safe success/error display, single-request gating, stale generation
 rejection, and successful-inventory-refresh state. Push UI coverage checks that
 the selected image owns the existing local tag, the confirmation snapshots the
 image ID and target, cancel submits nothing, anonymous disclosure is explicit,
-and hidden or invalidated progress retains the mutation gate until a terminal
-response; ambiguous outcomes latch it for the application session. Removal UI
-of the selected image ID and known tags, final-reference warning, non-force/
-in-use and multi-tag warnings, `noprune=true` parent preservation,
+and the configured-helper checkbox is a one-operation opt-in cleared by cancel
+and after the request snapshot. Hidden or invalidated progress retains the
+mutation gate until a terminal response; ambiguous outcomes latch it for the
+application session. Removal UI checks the selected image ID and known tags,
+final-reference and dependency warnings, `noprune=true` parent preservation,
 Cancel-without-request, success/error display, and stale invalidation. These
 tests use fixed image data and local state/events only; they never contact an
 engine or registry or mutate images.
@@ -565,10 +566,11 @@ paths/queries, success response, omitted force/auth fields, invalid input
 without a connection, and safe typed status rejection. Pull cases cover query
 encoding, chunked progress, response/event errors, malformed or oversized input,
 and invalid references. Push cases cover the image-ID/tag preflight, exact
-explicit tag path, empty anonymous JSON body with no X-Registry-Auth header,
-bounded progress, reassignment before submission, HTTP rejection, transport
-loss after submission as unknown, error-record draining to EOF, and daemon-text
-redaction. Removal cases cover exact-ID DELETE with noprune=true, no force/auth
+explicit tag path, empty anonymous JSON body without `X-Registry-Auth`, the
+opt-in `X-Registry-Auth` header without a plaintext credential, bounded
+progress, reassignment before submission, HTTP rejection, transport loss after
+submission as unknown, error-record draining to EOF, and daemon-text redaction.
+Removal cases cover exact-ID DELETE with noprune=true, no force/auth
 fields, success, invalid input without a connection, and safe status rejection
 without response-body exposure. History cases cover exact encoded routing,
 allowlisted fields, discarded command/tag/comment data, empty and malformed/API
@@ -590,11 +592,11 @@ push, remove, or modify images. No live image mutation or registry contact is
 claimed.
 
 Image pull, push, tag, and removal use the validated local Docker Unix-socket
-endpoint. Pulls are anonymous by default; fake credential-helper and fake-engine
-tests cover opt-in protocol/header behavior without invoking a real helper or
-registry. No live helper-authenticated pull is claimed. Push remains
-anonymous-only: Ferrum reads no saved registry credentials or helper output,
-and registries requiring authentication reject it.
+endpoint. Pulls and pushes are anonymous by default; fake-helper tests cover the
+helper protocol and fake Unix-engine tests cover the authenticated pull/push
+headers without invoking real helpers or contacting a registry. No live
+helper-authenticated pull or push is claimed. Ferrum does not read saved Docker
+credential entries; Buildx remains credential-free.
 
 Manual release-mode performance samples are opt-in and have no timing
 thresholds. See the [performance and accessibility evidence](../performance.md)

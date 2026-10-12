@@ -8,13 +8,13 @@ use hyperlocal::{UnixConnector, Uri};
 use tokio::time::timeout;
 
 use crate::{
-    EngineClient, EngineError,
+    EngineClient, EngineError, RegistryAuth,
     image_pull::{ImageProgressStream, ImageProgressStreamError},
 };
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Incremental progress for an anonymous push of one existing local image tag.
+/// Incremental progress for one existing local image tag push.
 ///
 /// Data frames are limited to 1 MiB, JSON records to 64 KiB, and progress
 /// status to 256 bytes. Dropping the stream closes Ferrum's response stream,
@@ -66,6 +66,7 @@ pub(crate) async fn open_image_push(
     engine: &EngineClient,
     image_id: &str,
     target: &ImagePushTarget,
+    registry_auth: Option<&RegistryAuth>,
 ) -> Result<ImagePushStream, EngineError> {
     if image_id.is_empty() || image_id.len() > 4096 {
         return Err(EngineError::InvalidImageId);
@@ -96,12 +97,16 @@ pub(crate) async fn open_image_push(
     path.push_str("/push?tag=");
     path.push_str(target.tag());
     let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
-    // Match Moby's anonymous ImagePush client path: no auth header, but
-    // an empty JSON auth object prevents older daemon EOF fallback errors.
-    let request = Request::builder()
+    // Match Moby's empty JSON push body in both modes. Anonymous pushes omit
+    // X-Registry-Auth; authenticated pushes send only the supplied opaque value.
+    let mut request_builder = Request::builder()
         .method(Method::POST)
         .uri(Uri::new(&engine.socket_path, &path))
-        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header(hyper::header::CONTENT_TYPE, "application/json");
+    if let Some(registry_auth) = registry_auth {
+        request_builder = request_builder.header("x-registry-auth", registry_auth.header_value());
+    }
+    let request = request_builder
         .body(Full::new(Bytes::from_static(b"{}")))
         .map_err(|_| EngineError::ImagePushUnavailable { endpoint_label })?;
     let response = timeout(OPEN_TIMEOUT, client.request(request))
@@ -317,7 +322,7 @@ mod tests {
         let target = ImagePushTarget::parse("registry.example/team/app:stable")
             .expect("local repository tag should parse");
         let mut push = engine(socket.clone())
-            .open_image_push("sha256:source-id", &target)
+            .open_image_push("sha256:source-id", &target, None)
             .await
             .expect("selected local tag should open an anonymous push");
         assert_eq!(
@@ -335,6 +340,78 @@ mod tests {
                 current_bytes: None,
                 total_bytes: None,
             })
+        );
+        assert_eq!(push.next_progress().await.unwrap(), None);
+
+        server.await.expect("fake engine server should finish");
+        cleanup(&socket, &directory);
+    }
+    #[tokio::test]
+    async fn sends_explicit_registry_auth_header_for_authenticated_push() {
+        let (socket, directory) = temporary_socket();
+        let listener = UnixListener::bind(&socket).expect("fake engine socket should bind");
+        let auth = crate::RegistryAuth::from_helper_credentials(
+            "ferrum-user".to_owned(),
+            "push-secret-SENTINEL".to_owned(),
+            "registry.example",
+        )
+        .expect("valid helper credentials should produce registry auth");
+        let expected_auth_header = auth.header_value().to_owned();
+        let server = tokio::spawn(async move {
+            let (mut inspect, _) = listener
+                .accept()
+                .await
+                .expect("image preflight request should arrive");
+            let inspect_request = read_request(&mut inspect).await;
+            assert!(
+                !String::from_utf8_lossy(&inspect_request)
+                    .to_ascii_lowercase()
+                    .contains("x-registry-auth:")
+            );
+            write_response(
+                &mut inspect,
+                "200 OK",
+                br#"{"Id":"sha256:source-id","RepoTags":["registry.example/team/app:stable"]}"#,
+            )
+            .await;
+
+            let (mut push, _) = listener
+                .accept()
+                .await
+                .expect("authenticated push request should follow preflight");
+            let request = read_request_with_body(&mut push).await;
+            let request_text = String::from_utf8_lossy(&request);
+            let auth_header = request_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("x-registry-auth")
+                        .then_some(value.trim())
+                })
+                .expect("explicit credentials should add X-Registry-Auth");
+            assert_eq!(auth_header, expected_auth_header);
+            assert!(!request_text.contains("push-secret-SENTINEL"));
+            let body_start = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("push request headers should end")
+                + 4;
+            assert_eq!(&request[body_start..], b"{}");
+            write_chunked(&mut push, b"{\"status\":\"Pushed\"}\n").await;
+        });
+
+        let target = ImagePushTarget::parse("registry.example/team/app:stable")
+            .expect("local repository tag should parse");
+        let mut push = engine(socket.clone())
+            .open_image_push("sha256:source-id", &target, Some(&auth))
+            .await
+            .expect("explicit credentials should open the authenticated push");
+        assert_eq!(
+            push.next_progress()
+                .await
+                .unwrap()
+                .map(|progress| progress.status),
+            Some("Pushed".to_owned())
         );
         assert_eq!(push.next_progress().await.unwrap(), None);
 
@@ -362,7 +439,7 @@ mod tests {
         let target = ImagePushTarget::parse("registry.example/team/app:stable")
             .expect("local repository tag should parse");
         let error = engine(socket.clone())
-            .open_image_push("sha256:source-id", &target)
+            .open_image_push("sha256:source-id", &target, None)
             .await
             .err()
             .expect("a reassigned tag must not be pushed");
@@ -410,7 +487,7 @@ mod tests {
         let target = ImagePushTarget::parse("registry.example/team/app:stable")
             .expect("local repository tag should parse");
         let error = engine(socket.clone())
-            .open_image_push("sha256:source-id", &target)
+            .open_image_push("sha256:source-id", &target, None)
             .await
             .err()
             .expect("HTTP rejection should be safe");
@@ -455,7 +532,7 @@ mod tests {
         let target = ImagePushTarget::parse("registry.example/team/app:stable")
             .expect("local repository tag should parse");
         let mut push = engine(socket.clone())
-            .open_image_push("sha256:source-id", &target)
+            .open_image_push("sha256:source-id", &target, None)
             .await
             .expect("push stream should open before daemon progress error");
         let error = push
@@ -496,7 +573,7 @@ mod tests {
         let target = ImagePushTarget::parse("registry.example/team/app:stable")
             .expect("local repository tag should parse");
         let error = engine(socket.clone())
-            .open_image_push("sha256:source-id", &target)
+            .open_image_push("sha256:source-id", &target, None)
             .await
             .err()
             .expect("lost response should return an error");

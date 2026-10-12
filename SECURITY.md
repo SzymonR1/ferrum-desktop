@@ -31,47 +31,48 @@ Please use the private vulnerability-reporting feature for this repository in Gi
 
 The Linux application provides container inventory, inspection, bounded
 historical/live logs, state-gated lifecycle actions, image listing and
-inspection, anonymous-by-default pulls with opt-in Linux credential-helper
-authentication, local tagging, confirmed removal, and an experimental embedded
-exec terminal over the selected local Docker-compatible Unix socket. Container
-Remove requires confirmation and does not force-remove containers or remove
-volumes. Every image-tag request requires confirmation because Docker Engine
-v1.56 may reassign an existing `repository:tag`; the image data remains.
-Removal confirmation snapshots the selected ID and known tags, warns that
-removing the final reference may delete image data, and explains that the
-non-force request may be rejected for images used by containers or with other
-tags. Removal omits `force` and sets `noprune=true`. Push and Buildx remain
-credential-free. Image pull/tag/removal use only the selected local Linux Docker
-Unix socket; Ferrum does not support remote engine connections or read Docker
-`config.json` credential entries.
+inspection, anonymous-by-default pulls and pushes with opt-in Linux
+credential-helper authentication, local tagging, confirmed removal, and an
+experimental embedded exec terminal over the selected local Docker-compatible
+Unix socket. Container Remove requires confirmation and does not force-remove
+containers or remove volumes. Every image-tag request requires confirmation
+because Docker Engine v1.56 may reassign an existing `repository:tag`; the
+image data remains. Removal confirmation snapshots the selected ID and known
+tags, warns that removing the final reference may delete image data, and
+explains that the non-force request may be rejected for images used by
+containers or with other tags. Removal omits `force` and sets `noprune=true`.
+Image pull/push/tag/removal use only the selected local Linux Docker Unix socket;
+Buildx remains credential-free. Ferrum does not support remote engine
+connections or read Docker `config.json` credential entries.
 
-Pull authentication requires both a configured `SecretService` or `pass` helper
-and an explicit one-operation checkbox; anonymous pulls remain the default.
-Ferrum invokes only the selected `docker-credential-secretservice` or
-`docker-credential-pass` binary with argv `get`, sends the normalized
-registry key on stdin, and uses bounded helper output/time. Helper stderr and
-error text are discarded; malformed results and helper failures stop the pull
-before Engine submission without anonymous fallback. Only the helper enum is
-stored in settings; credential material is not persisted or logged.
+Pull and push authentication require both a configured `SecretService` or
+`pass` helper and a separate explicit one-operation checkbox; anonymous pulls
+and pushes remain the default. Ferrum invokes only the selected
+`docker-credential-secretservice` or `docker-credential-pass` binary with argv
+`get`, sends the normalized registry key on stdin, and uses bounded helper
+output/time. Helper stderr and error text are discarded; malformed results,
+helper failures, and exceeded bounds stop the selected operation before Engine
+submission without anonymous fallback. Only the helper enum is stored in
+settings; credential material is not persisted or logged.
 
 After opt-in, the selected local Engine receives the helper credential over
-its Unix socket for that pull. Treat the selected host helper and Engine as
-trusted. The Engine's registry-mirror configuration may forward credentials
+its Unix socket for that pull or push. Treat the selected host helper and Engine
+as trusted. The Engine's registry-mirror configuration may forward credentials
 according to daemon behavior; Ferrum does not control or validate downstream
 routing. Opt in only when the Engine and its mirror configuration are trusted.
 The Engine AuthConfig and short-lived helper/serialization buffers are
 zeroized where supported; HTTP-stack `HeaderValue` copies cannot be guaranteed
-wiped. The helper-assisted integration has not been validated against a live
-engine or registry; issue #16 remains partial/open.
+wiped. Helper-assisted pull/push integration has not been validated against a
+live engine or registry; issue #16 remains partial/open.
 Image layer history is read-only on the selected Linux local Docker socket and
 bounded to a 16 MiB response and 65,536 rows. Only validated full layer IDs and
 nonnegative creation times/sizes are retained; `CreatedBy` command text, tags,
 comments, and other daemon fields are discarded.
 
-Hiding image-pull progress or invalidating the Images page/context does not abort
-an active pull reader: Ferrum drains the response and keeps the mutation gate
-closed until a terminal event. Closing Ferrum does not guarantee that the
-daemon-side pull stops.
+Hiding image-pull or image-push progress or invalidating the Images
+page/context does not abort an active response reader: Ferrum drains the
+response and keeps the mutation gate closed until a terminal event. Closing
+Ferrum does not guarantee that daemon-side pull or push work stops.
 
 Image pull, push, tag, and removal requests emit local structured process traces
 with only the static action and a `success`, `not_submitted`, or `request_error`

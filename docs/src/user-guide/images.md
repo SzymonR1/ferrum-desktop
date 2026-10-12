@@ -1,6 +1,6 @@
 # Images
 
-**Status:** Linux local Docker Unix-socket image listing/inspection and bounded read-only layer history, anonymous pulls by default with opt-in per-pull Secret Service/pass credential-helper authentication, local tagging/removal, confirmed local Buildx builds, and anonymous push of one existing local tag. An opt-in read-only history smoke passed on Docker Engine 29.9.0/API 1.56; no live pull/auth, tag, removal, build, or push integration was performed or validated. No image mutation is claimed. Native Images-page visual validation remains unverified.
+**Status:** Linux local Docker Unix-socket image listing/inspection and bounded read-only layer history, anonymous-by-default pulls and pushes with explicit per-operation Secret Service/pass helper authentication, local tagging/removal, and confirmed local Buildx builds. An opt-in read-only history smoke passed on Docker Engine 29.9.0/API 1.56. No live helper-authenticated pull/push, registry push, tag, removal, or build integration was performed or validated; no image mutation is claimed. Native Images-page visual validation remains unverified.
 
 Open **Images** in the sidebar to view images returned by the connected local
 Docker engine. Search is case-insensitive across repository tags and image IDs.
@@ -65,8 +65,8 @@ settings, audit records, or logs. Treat both the selected host helper and local
 Engine as trusted: the Engine receives the credential and its registry-mirror
 configuration may forward it according to daemon behavior. Ferrum does not
 control or validate that downstream routing. Use authentication only when you
-trust the Engine and its mirror configuration. Push and Buildx remain
-credential-free and do not use this helper setting.
+trust the Engine and its mirror configuration. Push can use the same configured
+helper only after a separate per-push opt-in; Buildx remains credential-free.
 
 While a pull is active, **Hide progress** suppresses progress updates in the UI
 only: Ferrum continues draining the Engine response and keeps other image
@@ -90,13 +90,22 @@ Before sending a push, Ferrum reinspects the selected image ID and verifies the
 target tag is still reported for that image. This is a point-in-time check, not
 an atomic lock against another Docker client changing tags concurrently.
 Confirmation names the image ID and exact tag and warns that layers and metadata
-are sent to the registry and may contain secrets. **Cancel** sends no push.
+are sent to the registry and may contain secrets. **Cancel** sends no push. If a
+helper is configured, the confirmation also offers an unchecked **Use the
+configured credential helper for this push only** checkbox. The choice is
+consumed for that push and resets on cancellation or the next confirmation.
+Without the checkbox, the push remains anonymous. With it, the configured
+helper credential is sent to the local Docker Engine for registry access; the
+engine's registry mirrors may forward it. Opt in only when you trust both.
 
 Push uses the negotiated Docker Engine API through the selected local Unix
-socket, with an explicit tag so the daemon is not asked to push every tag. It
-uses anonymous registry access only: Ferrum does not read Docker config,
-credential helpers, or saved credentials. Docker registries requiring
-authentication will reject the operation; response bodies are never displayed.
+socket, with an explicit tag so the daemon is not asked to push every tag.
+Anonymous pushes omit `X-Registry-Auth`. After opt-in, Ferrum uses the same
+bounded helper protocol described in [Pulling images](#pulling-images); helper
+failure, malformed output, or exceeded bounds stop before Engine submission
+without falling back anonymously. Ferrum does not read Docker config or saved
+credential entries, and does not persist the helper result. Response bodies
+are never displayed.
 The API stream is bounded to 1 MiB per frame and 64 KiB per progress record;
 displayed status is capped at 256 bytes. Opening the push request uses an
 eight-second bound, and progress waits use a 60-second idle timeout. A timeout
@@ -161,21 +170,20 @@ the UI does not expose daemon response bodies.
 
 ## Scope and limitations
 
-Image listing, inspection, read-only history, pulls, tagging, removal, builds,
-and anonymous push of one existing local tag are limited to the local Docker
-Unix socket on Linux. Pulls are anonymous unless a configured Secret Service or
-`pass` helper is explicitly enabled for a single operation. Push and Buildx stay
-credential-free, and registries requiring authentication reject them. Builds
-require Docker CLI and Buildx; private base-image authentication remains
-unsupported. The helper-assisted pull path and its integration with a live
-engine/registry have not been validated. Podman/rootless behavior and broader
-endpoint or platform compatibility remain unvalidated under open, blocked
-[issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10). Issue
+Image listing, inspection, read-only history, pulls, pushes, tagging, removal,
+and builds are limited to the selected local Docker Unix socket on Linux. Pulls
+and pushes are anonymous unless a configured Secret Service or `pass` helper is
+explicitly enabled for that single operation. Buildx remains credential-free;
+private base-image authentication is unsupported. Helper-assisted pull/push
+authentication has not been validated against a live engine or registry.
+Podman/rootless behavior and broader endpoint or platform compatibility remain
+unvalidated under open, blocked
+[#10](https://github.com/SzymonR1/ferrum-desktop/issues/10). Issue
 [#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) remains partial/open.
-No release or broader support claim is made. No live pull/auth, tag, removal,
-build, or push was performed during validation. Native Images-page visual
-validation remains unverified. Fake-socket and headless tests do not contact a
-real engine or mutate image resources. See the
+No release or broader support claim is made. No live pull, authenticated or
+anonymous push, tag, removal, or build was performed during validation. Native
+Images-page visual validation remains unverified. Fake-socket and headless
+tests do not contact a real engine or mutate image resources. See the
 [platform support matrix](../platform-support.md).
 
 ## Building a local image
