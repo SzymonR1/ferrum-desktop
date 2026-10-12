@@ -37,6 +37,28 @@ which Ferrum sets to the base file's parent. See Docker's [Compose CLI reference
 for ordered merge and path semantics and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
 for validation flags.
 
+On Linux, explicitly selected base and override files have a combined 16 MiB
+byte limit (exactly 16 MiB is accepted); larger selections are rejected before
+any Docker/Compose process is launched. This is a point-in-time check, not an
+atomic security boundary: a same-UID process may change or replace a selected
+file after it is checked. After the Compose version preflight, Compose reopens
+the original selected paths for validation, so the contents read may differ
+from those measured by the check. The check does not include local files read
+through `include` or service `extends.file`.
+Linux Compose subprocesses for version, discovery, and validation receive
+per-process `RLIMIT_AS` of 4 GiB and `RLIMIT_DATA` of 512 MiB, preserving lower
+inherited limits. These limits apply while Compose reads selected and included
+files. They are inherited by child processes and bound each process, not
+aggregate process-tree RSS; they are not a sandbox. The private child
+environment sets `GOMEMLIMIT=402653184` (384 MiB), a Go runtime soft target
+that may be exceeded to avoid excessive GC thrashing. Resource exhaustion may
+produce a generic validation failure.
+
+Compose remains trusted local code, not a sandbox. The point-in-time selected-
+file size check does not eliminate the race with same-UID changes, and neither
+it nor the process limits confine included local-file reads or eliminate the
+need to validate only trusted files.
+
 Validation skips interpolation and service `env_file` resolution, uses no
 engine, and does not mutate project files. Compose can still recursively read
 local `include`/`extends.file` Compose files and included projects' default
@@ -45,7 +67,7 @@ permissions, potentially outside the base directory. Remote Git/OCI loaders
 are disabled. The selected files and private CLI environment do not sandbox
 those reads; validate only trusted files. Profiles, `.env`/service
 `env_file` resolution, import, lifecycle/build/pull/logs, and project mutations
-remain unsupported. Issue #18 remains partial/open; issue #10 remains
+remain unsupported. Issues #18 and #19 remain partial/open; issue #10 remains
 blocked/open. No release or broader support claim is made.
 
 
@@ -85,9 +107,14 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   documents the validation flags.
 
 - Keep validation read-only, engine-independent, and bounded to eight seconds
-  and 1 MiB stdout per command. Success is structural validation only;
-  interpolation and service `env_file` resolution are skipped. Do not mutate,
-  extract, or write project files.
+  and 1 MiB stdout per command. Before launching any Docker/Compose process,
+  reject a combined selected base-and-override file size above 16 MiB; exactly
+  16 MiB is accepted. This is a point-in-time size check, not atomic against
+  same-UID changes; Compose reopens the original paths after preflight. This
+  applies only to explicitly selected files, not local `include`/`extends.file`
+  files. Success is structural validation only; interpolation and service
+  `env_file` resolution are skipped. Do not mutate, extract, or write project
+  files.
 
 - Treat Compose references as untrusted filesystem reads. Compose may
   recursively read local files referenced by `include` or service
