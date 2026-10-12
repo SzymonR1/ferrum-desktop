@@ -47,7 +47,7 @@ struct RegistryServer {
     key: String,
 }
 
-/// Resolves a configured helper only after the per-pull opt-in was consumed.
+/// Resolves a configured helper only after a one-operation opt-in is consumed.
 pub(super) async fn authorization(
     helper: RegistryCredentialHelper,
     reference: &str,
@@ -60,6 +60,19 @@ pub(super) async fn authorization(
         RegistryCredentialHelper::Pass => "docker-credential-pass",
     };
     authorization_with_binary(reference, Path::new(binary).as_os_str()).await
+}
+/// Resolves credentials for a push and maps helper failures to a push-specific,
+/// pre-submission error.
+pub(super) async fn authorization_for_push(
+    helper: RegistryCredentialHelper,
+    reference: &str,
+) -> Result<RegistryAuth, EngineError> {
+    match authorization(helper, reference).await {
+        Err(EngineError::ImagePullCredentialUnavailable) => {
+            Err(EngineError::ImagePushCredentialUnavailable)
+        }
+        result => result,
+    }
 }
 
 async fn authorization_with_binary(
@@ -522,5 +535,16 @@ mod tests {
             &error,
             EngineError::ImagePullCredentialUnavailable
         ));
+    }
+    #[tokio::test]
+    async fn opted_in_push_reports_push_specific_helper_failure() {
+        let error = authorization_for_push(
+            RegistryCredentialHelper::None,
+            "registry.example/team/app:stable",
+        )
+        .await
+        .expect_err("explicit push credentials require a configured helper");
+        assert!(matches!(error, EngineError::ImagePushCredentialUnavailable));
+        assert!(error.to_string().contains("image push"));
     }
 }

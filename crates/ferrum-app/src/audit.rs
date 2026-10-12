@@ -353,6 +353,7 @@ pub(super) fn record_image_mutation_result(
             | EngineError::InvalidImageReference
             | EngineError::InvalidImageTagTarget
             | EngineError::ImagePullCredentialUnavailable
+            | EngineError::ImagePushCredentialUnavailable
             | EngineError::ImagePushSourceUnavailable { .. }
             | EngineError::ImagePushSourceChanged { .. },
         ) => {
@@ -653,6 +654,7 @@ mod tests {
         let unverified_push = Err(EngineError::ImagePushSourceChanged {
             endpoint_label: "local Docker Unix socket",
         });
+        let push_credential_helper_failed = Err(EngineError::ImagePushCredentialUnavailable);
 
         tracing::dispatcher::with_default(&dispatcher, || {
             record_image_mutation_result(ImageMutation::Pull, &succeeded);
@@ -668,6 +670,7 @@ mod tests {
             record_image_mutation_result(ImageMutation::Push, &succeeded);
             record_image_mutation_result(ImageMutation::Push, &rejected_push);
             record_image_mutation_result(ImageMutation::Push, &unverified_push);
+            record_image_mutation_result(ImageMutation::Push, &push_credential_helper_failed);
         });
 
         let captured = match writer.0.lock() {
@@ -689,6 +692,7 @@ mod tests {
             ("remove", "request_error"),
             ("push", "success"),
             ("push", "request_error"),
+            ("push", "not_submitted"),
             ("push", "not_submitted"),
         ];
         assert_eq!(events.len(), expected.len());
@@ -1019,6 +1023,13 @@ mod tests {
             ))
             .await
             .unwrap();
+        store
+            .persist(record_image_mutation_result(
+                ImageMutation::Push,
+                &Err(EngineError::ImagePushCredentialUnavailable),
+            ))
+            .await
+            .unwrap();
 
         let log_path = root.join("audit.jsonl");
         let contents = fs::read_to_string(&log_path).unwrap();
@@ -1030,7 +1041,7 @@ mod tests {
         let file_mode = fs::metadata(&log_path).unwrap().permissions().mode() & 0o777;
         let _ = fs::remove_dir_all(&root);
 
-        assert_eq!(records.len(), 11);
+        assert_eq!(records.len(), 12);
         assert!(contents.ends_with('\n'));
         assert_eq!(directory_mode, 0o700);
         assert_eq!(file_mode, 0o600);
@@ -1094,6 +1105,9 @@ mod tests {
         assert_eq!(records[10]["event"], "image_mutation");
         assert_eq!(records[10]["action"], "pull");
         assert_eq!(records[10]["outcome"], "not_submitted");
+        assert_eq!(records[11]["event"], "image_mutation");
+        assert_eq!(records[11]["action"], "push");
+        assert_eq!(records[11]["outcome"], "not_submitted");
         for (record, outcome) in
             records[7..10]
                 .iter()

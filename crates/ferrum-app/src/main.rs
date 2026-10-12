@@ -2261,15 +2261,28 @@ impl FerrumApp {
         let Some(request) = self.images.begin_push() else {
             return;
         };
+        let credential_helper = self.settings.registry_credential_helper;
         let sender = self.sender.clone();
         let audit_store = self.audit_store.clone();
         let progress_reporting = Arc::new(AtomicBool::new(true));
         self.image_push_progress_reporting = Some(Arc::clone(&progress_reporting));
         self.image_push_task = Some(self.runtime.spawn(async move {
             let result = async {
+                let registry_auth = if request.use_registry_credentials {
+                    Some(
+                        registry_auth::authorization_for_push(
+                            credential_helper,
+                            request.target.as_str(),
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
                 let mut stream = engine
-                    .open_image_push(&request.image_id, &request.target)
+                    .open_image_push(&request.image_id, &request.target, registry_auth.as_ref())
                     .await?;
+                drop(registry_auth);
                 // Stop rendering stale progress, but drain until a terminal response.
                 while let Some(progress) = stream.next_progress().await? {
                     if progress_reporting.load(Ordering::Acquire) {
@@ -4529,11 +4542,11 @@ impl FerrumApp {
                 ui.label("The startup connection preference applies the next time Ferrum starts.");
                 #[cfg(target_os = "linux")]
                 {
-                    ui.label("Registry credential helper (Linux pulls)");
+                    ui.label("Registry credential helper (Linux pulls and pushes)");
                     ui.radio_value(
                         &mut self.settings_draft.registry_credential_helper,
                         settings::RegistryCredentialHelper::None,
-                        "None (anonymous pulls only)",
+                        "None (anonymous pulls and pushes)",
                     );
                     ui.radio_value(
                         &mut self.settings_draft.registry_credential_helper,
@@ -4545,10 +4558,10 @@ impl FerrumApp {
                         settings::RegistryCredentialHelper::Pass,
                         "pass",
                     );
-                    ui.label("Ferrum invokes only the selected Docker credential-helper binary after you opt in for one pull. Install and configure the helper in your Linux user session. Credentials are never stored in Ferrum settings.");
+                    ui.label("Ferrum invokes only the selected Docker credential-helper binary after you opt in for one pull or push. Install and configure the helper in your Linux user session. Credentials are never stored in Ferrum settings.");
                 }
                 #[cfg(not(target_os = "linux"))]
-                ui.label("Registry credential-helper pulls are not available on this platform.");
+                ui.label("Registry credential-helper authentication is not available on this platform.");
                 if let Some(error) = self.settings_error {
                     ui.colored_label(Color32::from_rgb(227, 113, 102), error.message());
                 }

@@ -1816,6 +1816,12 @@ pub enum EngineError {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
     },
+    /// The configured credential helper failed before an image push was submitted.
+    #[cfg(target_os = "linux")]
+    #[error(
+        "Ferrum could not obtain or use credentials from the configured helper for this image push."
+    )]
+    ImagePushCredentialUnavailable,
     /// The image-push request could not reach the local engine.
     #[cfg(target_os = "linux")]
     #[error("Image pushing is unavailable at the {endpoint_label}.")]
@@ -1861,7 +1867,7 @@ pub enum EngineError {
     },
     /// The engine reported that the image push failed.
     #[cfg(target_os = "linux")]
-    #[error("The engine could not complete the anonymous image push.")]
+    #[error("The engine could not complete the image push.")]
     ImagePushFailed,
     /// An image inspection response omitted its required engine identifier.
     #[cfg(target_os = "linux")]
@@ -2106,17 +2112,17 @@ impl EngineClient {
     ) -> Result<ImagePullStream, EngineError> {
         image_pull::open_image_pull(self, reference, registry_auth).await
     }
-    /// Opens an anonymous push for one explicitly tagged local image.
+    /// Opens a push for one explicitly tagged local image.
     ///
     /// The target must be an existing repository:tag reference on the selected
     /// image. Ferrum reinspects the image before pushing and refuses if the tag
     /// no longer belongs to that image. The request includes the explicit tag,
-    /// so it never invokes Docker's all-tags push behavior. No registry
-    /// credential store or helper is read; the anonymous request omits
-    /// X-Registry-Auth and sends only an empty JSON auth fallback body.
+    /// so it never invokes Docker's all-tags push behavior. When `registry_auth`
+    /// is present, its opaque value is sent in `X-Registry-Auth`; otherwise the
+    /// request omits that header. Both paths send an empty JSON auth fallback
+    /// body. This method never reads a credential helper or store.
     /// Progress text is bounded and sanitized. Dropping the stream closes
-    /// Ferrum's response stream but does not guarantee the daemon-side transfer
-    /// stops.
+    /// Ferrum's response stream but does not guarantee daemon-side cancellation.
     ///
     /// # Errors
     ///
@@ -2131,8 +2137,9 @@ impl EngineClient {
         &self,
         image_id: &str,
         target: &ImagePushTarget,
+        registry_auth: Option<&RegistryAuth>,
     ) -> Result<ImagePushStream, EngineError> {
-        image_push::open_image_push(self, image_id, target).await
+        image_push::open_image_push(self, image_id, target, registry_auth).await
     }
 }
 impl EngineClient {
