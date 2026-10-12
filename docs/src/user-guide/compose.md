@@ -1,8 +1,10 @@
 # Compose
 
-The Compose page keeps its read-only project discovery and provides structural
-validation of a local base Compose file with ordered local overrides. Project
-discovery uses Docker's Compose CLI:
+The Compose page provides read-only project discovery, structural validation of
+a local base file with ordered overrides, and read-only status for containers
+already associated with the selected files. It does not import or persist
+projects.
+Project discovery uses Docker's Compose CLI:
 
 - `docker compose version --short`
 - `docker compose ls --all --format json`
@@ -61,8 +63,8 @@ files. A successful result means structural validation only:
 `env_file` resolution. The selected paths are held only for the current
 validation session; Ferrum displays only bounded, escaped basenames and a static
 result, never full paths or raw CLI diagnostics.
-On Linux, each Compose subprocess (version, discovery, and validation) runs
-with a 4 GiB `RLIMIT_AS` address-space ceiling and a 512 MiB `RLIMIT_DATA`
+On Linux, each Compose subprocess (version, discovery, validation, and status)
+runs with a 4 GiB `RLIMIT_AS` address-space ceiling and a 512 MiB `RLIMIT_DATA`
 ceiling, preserving lower inherited limits. These per-process limits apply to
 Compose reading both the selected and included files, and child processes
 inherit them; they bound each process, not aggregate process-tree RSS. The
@@ -102,20 +104,63 @@ are not loaded. Saved Docker `config.json` credentials and proxy settings are
 not read or passed to the CLI. This does not prevent Compose from reading local
 environment files declared by included projects.
 
-Profiles, `.env`/service `env_file` resolution, remote Git/OCI references
-(explicitly disabled and rejected), import, project start/stop/restart,
-build/pull, logs, and project mutations are unsupported. This multi-file
-validation slice does not complete Issue [#18](https://github.com/SzymonR1/ferrum-desktop/issues/18), which remains open; [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) remains blocked. It makes no full-issue, release, or broader platform-support claim.
+## Inspect existing project containers
+
+After the selected base and overrides pass structural validation, click
+**Refresh existing containers** to query the same selected local Docker Unix
+socket. Ferrum invokes Compose with the files in their selected order:
+
+```text
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... ps --all --format json
+```
+
+This is a read-only status snapshot. `--all` includes stopped containers; the
+Compose CLI's default orphan inclusion is preserved. Ferrum displays only
+bounded, escaped container name, service, state, and reported health. It discards
+container IDs, command text, published ports, project labels, exit-code data,
+and other response fields. No output means no existing containers for that
+selection; it does not mean the Compose file declares no services. The page
+does not poll automatically; refresh status when needed.
+Status also clears inherited environment values and disables the selected
+project's default `.env`. Values normally supplied by the shell or that file may
+therefore resolve differently; status can fail or match a different project
+configuration than a normal shell invocation. It is a current read-only
+snapshot, not proof that another environment or context has no containers.
+
+See Docker's [Compose `ps` reference](https://docs.docker.com/reference/cli/docker/compose/ps/)
+for the JSON Lines format and status command options.
+
+Status is implemented only for Linux local Docker Unix sockets. It does not
+import or persist a project, start/stop/restart containers, build/pull images,
+or mutate project or engine resources. The command uses Ferrum's private Docker
+config/HOME and cleared environment; the selected project's default `.env` is
+disabled, and remote Git/OCI loaders are disabled. If Compose cannot resolve
+the selected project under this isolated environment, Ferrum shows a static
+status error rather than raw CLI output. Compose may still read local files
+referenced by `include` or `extends.file` and included-project environment
+sources under the logged-in user's permissions; validate only trusted files.
+The command uses the same subprocess timeout, output cap, and per-process
+resource limits described above.
+
+Profiles, project import/persistence, start/stop/restart, build/pull, logs, and
+project mutations remain unsupported. Structural validation skips environment
+interpolation and service `env_file` resolution; status uses the isolated
+environment above and may differ from a normal shell invocation. Status reports
+only existing containers; it does not enumerate declared services with no
+containers. Issue [#18](https://github.com/SzymonR1/ferrum-desktop/issues/18)
+remains open/partial; [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10)
+remains blocked. This is not a full-issue, release, or broader platform claim.
 
 For environment semantics, see Docker's [Compose environment variables guide](https://docs.docker.com/compose/how-tos/environment-variables/envvars/).
 The direct CLI probe and discovery smoke, single-file and ordered base/override
-temporary-file validation smokes, and loopback remote-loader safety smoke
-passed with Compose v5.6.0. The ordered smoke uses owned temporary files without
-an engine or user project; no project mutation is performed.
-Discovery reads the selected local engine; validation parses local files
-without contacting an engine. The remote safety smoke verifies Git/OCI include
-references do not open a local connection or contact an external host. None of
-the smokes mutates projects. Linux local Docker discovery was validated; the
-native Compose page visual check is unavailable. For security implications of
-remote and local references, see Docker's [Compose trust model](https://docs.docker.com/compose/trust-model).
+temporary-file validation smokes, read-only temporary-project status smoke, and
+loopback remote-loader safety smoke passed with Compose v5.6.0. The status smoke
+used Docker Engine 29.9.0 and created no containers; all temporary project files
+were owned by the test. The validation smokes do not contact an engine and touch
+no user project. Discovery and status query the selected local engine read-only;
+the remote safety smoke verifies Git/OCI includes do not open a local connection
+or contact an external host. None of the smokes mutates projects. Linux local
+Docker discovery was validated; the native Compose page visual check is
+unavailable. For security implications of remote and local references, see
+Docker's [Compose trust model](https://docs.docker.com/compose/trust-model).
 This page does not claim full issue completion or a release.

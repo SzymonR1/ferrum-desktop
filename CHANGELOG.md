@@ -78,14 +78,14 @@ All notable project changes are documented here. The project has not published a
   accepted), using a point-in-time check that is not atomic against same-UID
   changes. After version preflight, Compose reopens the original selected
   paths for validation. Apply per-process 4 GiB `RLIMIT_AS` and 512 MiB
-  `RLIMIT_DATA` ceilings to Compose version, discovery, and validation
+  `RLIMIT_DATA` ceilings to Compose version, discovery, validation, and status
   subprocesses, retaining lower inherited limits. These per-process limits
   apply while reading selected and included files; they bound each process,
   not aggregate process-tree RSS, and are not a sandbox. The child environment
   sets Go's 384 MiB `GOMEMLIMIT`, a soft target that may be exceeded to avoid
   GC thrashing. Included local `include`/`extends.file` reads remain outside
   the selected-file size check and remain under the logged-in user's
-  permissions. Resource exhaustion can produce a generic validation failure.
+  permissions. Resource exhaustion can produce a generic validation or status failure.
   Issues #18 and #19 remain partial/open; no full issue completion, release,
   or broader support claim is made.
 - Clarified the Compose validation trust boundary: included projects may still
@@ -94,6 +94,17 @@ All notable project changes are documented here. The project has not published a
   no-interpolation/no-env-resolution flags. These reads are under the logged-in
   user's permissions, are not path-confined, and require validating only
   trusted Compose files.
+- Added read-only Linux local Docker Compose container status for successfully
+  validated selected base/override files using `docker compose ps --all
+  --format json`, pinned to the selected local Unix socket. The UI displays only
+  bounded escaped container name, service, state, and optional health; IDs,
+  commands, ports, and unknown fields are discarded. Empty results are distinct
+  from query errors, results are manually refreshed, and no project or engine
+  resources are mutated. The private environment disables the selected `.env`;
+  environment-dependent status may differ from a normal shell invocation.
+  Headless/fake-CLI regression coverage and the Compose v5.6.0 temporary-project
+  smoke passed on Docker Engine 29.9.0 without creating containers. Issue #18
+  remains partial/open; lifecycle, import, and log support remain outstanding.
 - Optional ignored validation smokes cover single-file relative paths and an
   ordered temporary base/override pair. The multi-file smoke passed with
   Compose v5.6.0; it contacted no engine, touched no user project, and performed
