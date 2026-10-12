@@ -882,6 +882,7 @@ struct FerrumApp {
     compose_status_task: Option<JoinHandle<()>>,
     compose_logs_task: Option<JoinHandle<()>>,
     compose_lifecycle_task: Option<JoinHandle<()>>,
+    compose_lifecycle_audit_task: Option<JoinHandle<()>>,
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
     // Hold the reader until the terminal response event releases the mutation gate.
@@ -1091,6 +1092,7 @@ impl FerrumApp {
             compose_status_task: None,
             compose_logs_task: None,
             compose_lifecycle_task: None,
+            compose_lifecycle_audit_task: None,
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
@@ -1483,17 +1485,23 @@ impl FerrumApp {
         let sender = self.sender.clone();
         let audit_store = self.audit_store.clone();
         let selection = task.selection.clone();
+        let action = match task.action {
+            compose::ComposeLifecycleAction::Start => audit::ComposeMutationAction::Start,
+            compose::ComposeLifecycleAction::Stop => audit::ComposeMutationAction::Stop,
+        };
+        let started_record =
+            audit::record_compose_mutation_result(action, audit::ComposeMutationOutcome::Started);
+        let started_audit_store = audit_store.clone();
+        let (audit_started_sender, audit_started_receiver) = tokio::sync::oneshot::channel();
+        self.compose_lifecycle_audit_task = Some(self.runtime.spawn(async move {
+            persist_audit_record(&started_audit_store, started_record).await;
+            let _ = audit_started_sender.send(());
+        }));
         context.request_repaint();
         self.compose_lifecycle_task = Some(self.runtime.spawn(async move {
-            let action = match task.action {
-                compose::ComposeLifecycleAction::Start => audit::ComposeMutationAction::Start,
-                compose::ComposeLifecycleAction::Stop => audit::ComposeMutationAction::Stop,
-            };
-            let started_record = audit::record_compose_mutation_result(
-                action,
-                audit::ComposeMutationOutcome::Started,
-            );
-            persist_audit_record(&audit_store, started_record).await;
+            if audit_started_receiver.await.is_err() {
+                return;
+            }
             let result = match (precondition_error, socket_path) {
                 (Some(error), _) => compose::ComposeLifecycleResult {
                     outcome: Err(error),
@@ -2927,10 +2935,12 @@ impl FerrumApp {
                         // Refresh is started after the terminal event is accepted below.
                         if self.compose.finish_lifecycle(generation, result) {
                             self.compose_lifecycle_task = None;
+                            self.compose_lifecycle_audit_task = None;
                             self.start_compose_status_refresh(context.clone());
                         }
                     } else if self.compose.finish_lifecycle(generation, result) {
                         self.compose_lifecycle_task = None;
+                        self.compose_lifecycle_audit_task = None;
                     }
                 }
                 EngineEvent::VolumeInspected {
@@ -4781,6 +4791,16 @@ impl Drop for FerrumApp {
         self.cancel_image_build();
         self.cancel_image_read_tasks();
         self.invalidate_compose();
+        if let Some(audit_task) = self.compose_lifecycle_audit_task.take()
+            && !audit_task.is_finished()
+            && tokio::runtime::Handle::try_current().is_err()
+        {
+            // The lifecycle task waits for this marker before it can start Compose.
+            // Drain the bounded audit stage before aborting it on app shutdown.
+            let _ = self.runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(1), audit_task).await
+            });
+        }
         if let Some(task) = self.compose_lifecycle_task.take() {
             task.abort();
         }
@@ -5447,6 +5467,7 @@ mod event_reconciliation_tests {
             compose_status_task: None,
             compose_logs_task: None,
             compose_lifecycle_task: None,
+            compose_lifecycle_audit_task: None,
             pending_resource_read: None,
             image_list_task: None,
             image_inspection_task: None,
@@ -6820,21 +6841,7 @@ mod event_reconciliation_tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn unavailable_compose_lifecycle_finishes_and_persists_not_submitted_outcome() {
-        let (mut app, _) = app_with_open_inspection();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "ferrum-compose-lifecycle-audit-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&root).unwrap();
-        app.audit_store = audit::AuditStore::new(Arc::new(settings::SettingsStore::at(
-            root.join("settings.toml"),
-        )));
+    fn confirmed_imported_compose_lifecycle(app: &mut FerrumApp) -> compose::ComposeLifecycleTask {
         let generation = app.compose.begin_file_selection();
         assert!(app.compose.finish_file_selection(
             generation,
@@ -6853,10 +6860,28 @@ mod event_reconciliation_tests {
             app.compose
                 .request_lifecycle_confirmation(compose::ComposeLifecycleAction::Start)
         );
-        let lifecycle = app
-            .compose
+        app.compose
             .confirm_lifecycle()
-            .expect("the imported configuration should request a lifecycle action");
+            .expect("the imported configuration should request a lifecycle action")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unavailable_compose_lifecycle_finishes_and_persists_not_submitted_outcome() {
+        let (mut app, _) = app_with_open_inspection();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-compose-lifecycle-audit-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        app.audit_store = audit::AuditStore::new(Arc::new(settings::SettingsStore::at(
+            root.join("settings.toml"),
+        )));
+        let lifecycle = confirmed_imported_compose_lifecycle(&mut app);
         app.page = images::AppPage::Compose;
         app.start_compose_lifecycle(lifecycle, egui::Context::default());
 
@@ -6885,6 +6910,43 @@ mod event_reconciliation_tests {
         assert_eq!(records[0]["action"], "start");
         assert_eq!(records[0]["outcome"], "started");
         assert_eq!(records[1]["outcome"], "not_submitted");
+        assert!(!contents.contains("/private/compose.yaml"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropping_app_before_lifecycle_worker_poll_persists_started_audit_marker() {
+        let (mut app, _) = app_with_open_inspection();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-compose-lifecycle-drop-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        app.audit_store = audit::AuditStore::new(Arc::new(settings::SettingsStore::at(
+            root.join("settings.toml"),
+        )));
+        let lifecycle = confirmed_imported_compose_lifecycle(&mut app);
+        app.page = images::AppPage::Compose;
+        app.start_compose_lifecycle(lifecycle, egui::Context::default());
+
+        drop(app);
+
+        let contents = std::fs::read_to_string(root.join("audit.jsonl")).unwrap();
+        let first_record = serde_json::from_str::<serde_json::Value>(
+            contents
+                .lines()
+                .next()
+                .expect("the attempt marker should be written"),
+        )
+        .unwrap();
+        assert_eq!(first_record["event"], "compose_mutation");
+        assert_eq!(first_record["action"], "start");
+        assert_eq!(first_record["outcome"], "started");
         assert!(!contents.contains("/private/compose.yaml"));
         std::fs::remove_dir_all(&root).unwrap();
     }

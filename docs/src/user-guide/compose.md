@@ -229,10 +229,12 @@ or final audit persistence failed, and the Engine result is unknown. `not_submit
 means preflight/validation or any process-spawn failure before the lifecycle
 process starts; a returned failure or timeout after process start is
 `request_error`. Audit persistence failure does not change the operation result.
-Shutting Ferrum down may terminate its child after submission, leaving Engine
-state uncertain; refresh status after restarting. Raw diagnostics, paths,
-labels, profiles, endpoint values, and service names are not audited or shown as
-command diagnostics. `up`, `down`, restart, create, build, pull, remove,
+During shutdown Ferrum makes a best-effort, up-to-one-second flush of the
+initial audit marker before aborting the lifecycle worker. A submitted child
+may still be terminated, leaving Engine state uncertain; refresh after restart.
+Raw diagnostics, paths, labels, profiles, endpoint values, and service names
+are not audited or shown as command diagnostics. `up`, `down`, restart, create,
+build, pull, remove,
 persistence, and live log follow remain outside this partial Issue #18 slice.
 
 ## One-shot service log snapshot

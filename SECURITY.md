@@ -99,8 +99,10 @@ no later terminal outcome, Ferrum exited or final audit persistence failed; it
 does not prove whether Compose reached or changed the engine, so refresh status.
 `not_submitted` covers local preflight/validation or any process-spawn failure
 before the lifecycle process starts; a returned failure or timeout after start
-is `request_error`. Closing Ferrum may terminate the submitted child, leaving
-Engine state uncertain. A build entry contains only the static
+is `request_error`. During shutdown Ferrum makes a best-effort, up-to-one-second
+flush of the initial marker before aborting the lifecycle worker; a submitted
+child may still be terminated with Engine state uncertain. A build entry
+contains only the static
 `image_mutation` event, `build` action, and outcome. It excludes build output
 and all build-specific metadata, as well as names, image references/tags,
 endpoints, credentials, raw errors, daemon bodies, and terminal/log contents.

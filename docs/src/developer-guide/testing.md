@@ -474,9 +474,10 @@ actions, confirmation gating while the engine is unavailable, clearing
 unsubmitted confirmations on page invalidation, preventing status refresh during
 a running lifecycle command, preserving submitted results across page
 invalidation, and persisted redacted `started`/`not_submitted` audit outcomes
-for an unavailable-engine precondition. No live Compose lifecycle mutation test
-is run. Selecting an import clears stale read-only results; other lifecycle
-operations remain out of scope.
+for an unavailable-engine precondition; drop-before-first-poll shutdown flushes
+the initial marker. No live Compose lifecycle mutation test is run. Selecting an
+import clears stale read-only results; other lifecycle operations remain out of
+scope.
 See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
 and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
 Headless AccessKit/state tests cover ordered base/override selection, removing

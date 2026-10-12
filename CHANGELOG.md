@@ -3,8 +3,9 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
-- Completed the confirmed Compose lifecycle slice for a currently selected,
-  session-imported configuration after successful explicit revalidation. The
+- Implemented (not live-engine validated) a confirmed Compose lifecycle slice
+  for a currently selected, session-imported configuration after successful
+  explicit revalidation. The
   Linux-only `start`/`stop` commands use the selected ordered `--file` and
   `--profile` argv, base project directory, isolated CLI environment, and
   pinned local socket, and revalidate before mutation. The confirmation names

@@ -164,6 +164,7 @@ enum ComposeStatusState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ComposeLifecycleError {
     DockerCliMissing,
+    CommandStartFailed,
     PrivateConfigSetupFailed,
     ValidationFailed,
     EngineUnavailable,
@@ -174,6 +175,7 @@ impl ComposeLifecycleError {
     fn message(&self) -> &'static str {
         match self {
             Self::DockerCliMissing => "Docker Compose CLI is unavailable.",
+            Self::CommandStartFailed => "Docker Compose CLI could not be started.",
             Self::PrivateConfigSetupFailed => {
                 "Could not prepare an isolated Docker CLI environment."
             }
@@ -323,6 +325,7 @@ pub(super) struct ComposeDiscovery {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ComposeError {
     DockerCliMissing,
+    CommandStartFailed,
     ComposePluginUnavailable,
     PrivateConfigSetupFailed,
     ProjectListFailed { version: String },
@@ -334,6 +337,7 @@ impl ComposeError {
             Self::DockerCliMissing => {
                 "Docker CLI is unavailable. Install Docker CLI to discover Compose projects."
             }
+            Self::CommandStartFailed => "Docker Compose CLI could not be started.",
             Self::ComposePluginUnavailable => {
                 "Docker Compose is unavailable. Install the Docker Compose plugin to discover projects."
             }
@@ -350,6 +354,7 @@ impl ComposeError {
         match self {
             Self::ProjectListFailed { version } => Some(version),
             Self::DockerCliMissing
+            | Self::CommandStartFailed
             | Self::ComposePluginUnavailable
             | Self::PrivateConfigSetupFailed => None,
         }
@@ -358,6 +363,7 @@ impl ComposeError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ComposeValidationError {
     DockerCliMissing,
+    CommandStartFailed,
     ComposePluginUnavailable,
     PrivateConfigSetupFailed,
     InvalidSelectedFile,
@@ -372,6 +378,7 @@ impl ComposeValidationError {
             Self::DockerCliMissing => {
                 "Docker CLI is unavailable. Install Docker CLI to validate Compose files."
             }
+            Self::CommandStartFailed => "Docker Compose CLI could not be started.",
             Self::ComposePluginUnavailable => {
                 "Docker Compose is unavailable. Install the Docker Compose plugin to validate Compose files."
             }
@@ -1684,6 +1691,7 @@ async fn discover_with_binary(
         .await
         .map_err(|failure| match failure {
             CommandFailure::Launch => ComposeError::DockerCliMissing,
+            CommandFailure::Spawn => ComposeError::CommandStartFailed,
             CommandFailure::Rejected
             | CommandFailure::TimedOut
             | CommandFailure::OutputLimit
@@ -1710,6 +1718,7 @@ async fn discover_with_binary(
     {
         Ok(output) => output,
         Err(CommandFailure::Launch) => return Err(ComposeError::DockerCliMissing),
+        Err(CommandFailure::Spawn) => return Err(ComposeError::CommandStartFailed),
         Err(_) => {
             return Err(ComposeError::ProjectListFailed { version });
         }
@@ -2070,6 +2079,7 @@ impl<'de> serde::Deserialize<'de> for RawComposeProject {
 #[derive(Debug)]
 enum CommandFailure {
     Launch,
+    Spawn,
     Rejected,
     TimedOut,
     OutputLimit,
@@ -2155,7 +2165,13 @@ async fn run_command_with_timeout(
             Ok(())
         });
     }
-    let mut child = command.spawn().map_err(|_| CommandFailure::Launch)?;
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CommandFailure::Launch
+        } else {
+            CommandFailure::Spawn
+        }
+    })?;
     let mut process_group = child
         .id()
         .and_then(|id| libc::pid_t::try_from(id).ok())
@@ -2491,6 +2507,7 @@ async fn validate_with_profiles_report(
         Err(failure) => {
             let error = match failure {
                 CommandFailure::Launch => ComposeValidationError::DockerCliMissing,
+                CommandFailure::Spawn => ComposeValidationError::CommandStartFailed,
                 CommandFailure::Rejected
                 | CommandFailure::TimedOut
                 | CommandFailure::OutputLimit
@@ -2527,6 +2544,7 @@ async fn validate_with_profiles_report(
             None => (Vec::new(), Err(ComposeValidationError::ValidationFailed)),
         },
         Err(CommandFailure::Launch) => (Vec::new(), Err(ComposeValidationError::DockerCliMissing)),
+        Err(CommandFailure::Spawn) => (Vec::new(), Err(ComposeValidationError::CommandStartFailed)),
         Err(
             CommandFailure::Rejected
             | CommandFailure::TimedOut
@@ -2768,6 +2786,7 @@ async fn lifecycle_with_binary(
             | ComposeValidationError::ComposePluginUnavailable => {
                 ComposeLifecycleError::DockerCliMissing
             }
+            ComposeValidationError::CommandStartFailed => ComposeLifecycleError::CommandStartFailed,
             ComposeValidationError::PrivateConfigSetupFailed => {
                 ComposeLifecycleError::PrivateConfigSetupFailed
             }
@@ -2825,6 +2844,7 @@ async fn run_lifecycle_command_with_timeout(
     let (outcome, submitted) = match run_command_with_timeout(command, deadline).await {
         Ok(_) => (Ok(()), true),
         Err(CommandFailure::Launch) => (Err(ComposeLifecycleError::DockerCliMissing), false),
+        Err(CommandFailure::Spawn) => (Err(ComposeLifecycleError::CommandStartFailed), false),
         Err(_) => (Err(ComposeLifecycleError::OperationFailed), true),
     };
     ComposeLifecycleResult { outcome, submitted }
@@ -4439,15 +4459,38 @@ mod tests {
                     "the lifecycle process started before {mode}"
                 );
             }
+
             let unlaunchable = directory.path().join("docker-lifecycle-unlaunchable");
             fs::create_dir(&unlaunchable).expect("the non-executable test path should exist");
-            let mut command = tokio::process::Command::new(unlaunchable);
+            let mut command = tokio::process::Command::new(&unlaunchable);
+            let result = run_lifecycle_command_with_timeout(&mut command, COMMAND_TIMEOUT).await;
+            assert_eq!(
+                result.outcome,
+                Err(ComposeLifecycleError::CommandStartFailed)
+            );
+            assert!(!result.submitted, "the process could not be started");
+            let project_file = directory.path().join("compose.yaml");
+            fs::write(&project_file, "services: {}\n")
+                .expect("the validation fixture should be written");
+            let validation = validate_with_profiles_report(
+                &unlaunchable,
+                std::slice::from_ref(&project_file),
+                &[],
+                OsStr::new("/usr/bin"),
+                None,
+                COMMAND_TIMEOUT,
+            )
+            .await;
+            assert_eq!(
+                validation.outcome,
+                Err(ComposeValidationError::CommandStartFailed)
+            );
+
+            let missing = directory.path().join("missing-docker-command");
+            let mut command = tokio::process::Command::new(missing);
             let result = run_lifecycle_command_with_timeout(&mut command, COMMAND_TIMEOUT).await;
             assert_eq!(result.outcome, Err(ComposeLifecycleError::DockerCliMissing));
-            assert!(
-                !result.submitted,
-                "a process that did not start was not submitted"
-            );
+            assert!(!result.submitted, "a missing CLI did not submit a process");
         }
         #[tokio::test]
         #[ignore = "requires a local Docker-compatible Unix socket and Compose; queries only a unique owned temporary project and creates no resources"]
