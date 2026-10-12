@@ -1485,9 +1485,11 @@ impl FerrumApp {
         let sender = self.sender.clone();
         let audit_store = self.audit_store.clone();
         let selection = task.selection.clone();
+        let service = task.service.clone();
         let action = match task.action {
             compose::ComposeLifecycleAction::Start => audit::ComposeMutationAction::Start,
             compose::ComposeLifecycleAction::Stop => audit::ComposeMutationAction::Stop,
+            compose::ComposeLifecycleAction::Restart => audit::ComposeMutationAction::Restart,
         };
         let started_record =
             audit::record_compose_mutation_result(action, audit::ComposeMutationOutcome::Started);
@@ -1508,13 +1510,30 @@ impl FerrumApp {
                     submitted: false,
                 },
                 (None, Some(socket_path)) => {
-                    compose::compose_lifecycle(
-                        &socket_path,
-                        &task.selection.files,
-                        &task.selection.profiles,
-                        task.action,
-                    )
-                    .await
+                    if task.action == compose::ComposeLifecycleAction::Restart {
+                        if let Some(service) = service.as_deref() {
+                            compose::compose_service_restart(
+                                &socket_path,
+                                &task.selection.files,
+                                &task.selection.profiles,
+                                service,
+                            )
+                            .await
+                        } else {
+                            compose::ComposeLifecycleResult {
+                                outcome: Err(compose::ComposeLifecycleError::ServiceUnavailable),
+                                submitted: false,
+                            }
+                        }
+                    } else {
+                        compose::compose_lifecycle(
+                            &socket_path,
+                            &task.selection.files,
+                            &task.selection.profiles,
+                            task.action,
+                        )
+                        .await
+                    }
                 }
                 (None, None) => compose::ComposeLifecycleResult {
                     outcome: Err(compose::ComposeLifecycleError::EngineUnavailable),
@@ -4922,6 +4941,9 @@ impl eframe::App for FerrumApp {
         if let Some(service) = compose_actions.logs_service.as_deref() {
             #[cfg(target_os = "linux")]
             self.start_compose_service_logs(service, context.clone());
+        }
+        if let Some(service) = compose_actions.restart_service.as_deref() {
+            self.compose.request_service_restart_confirmation(service);
         }
         if compose_actions.start_imported {
             self.compose

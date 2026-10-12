@@ -455,29 +455,39 @@ and 64-byte/name limits, the allowed name grammar, and standalone `*` wildcard
 enabling all profiles; input is bounded before CLI launch. Fake CLI fixtures
 assert exact argument-array construction and repeated `--profile <name>` pairs
 before `config --services`, `ps`, and `logs`, with no profile environment
-variable. The logs fixture verifies that the status recheck reuses selected
-profiles. Headless state tests cover profile-edit invalidation, invalid-profile
-gating, cancellation/stale results, revalidation, and keeping profile input
-disabled during asynchronous file selection. Preserve private Docker
-config/HOME, cleared environment, disabled selected-project `.env`, and
-disabled remote Git/OCI loaders. Transient imports use synthetic path state and
-headless UI only; they retain no file contents and persist no registry. Tests
-cover validation gating, duplicate/name and 32-entry bounds, ordered path/profile
-restoration, stale-generation rejection, and cancellation requests for in-flight
-validation/status/log tasks. Lifecycle UI requires an imported, currently
-selected and explicitly revalidated configuration. Controlled CLI tests assert
-the pinned socket, ordered file/profile argv, `start`/`stop` command names,
-isolated environment, validation-before-mutation, static error redaction, and
-spawn/failure/timeout outcome classification.
-Headless tests cover imported-selection restoration through the UI, accessible
-actions, confirmation gating while the engine is unavailable, clearing
-unsubmitted confirmations on page invalidation, preventing status refresh during
-a running lifecycle command, preserving submitted results across page
-invalidation, and persisted redacted `started`/`not_submitted` audit outcomes
-for an unavailable-engine precondition; drop-before-first-poll shutdown flushes
-the initial marker. No live Compose lifecycle mutation test is run. Selecting an
-import clears stale read-only results; other lifecycle operations remain out of
-scope.
+variable. The log and service-restart fixtures verify that status rechecks reuse
+selected profiles. Headless state tests cover profile-edit invalidation,
+invalid-profile gating, cancellation/stale results, revalidation, and keeping
+profile input disabled during asynchronous file selection.
+
+Preserve private Docker config/HOME, cleared environment, disabled
+selected-project `.env`, and disabled remote Git/OCI loaders. Transient imports
+use synthetic path state and headless UI only; they retain no file contents and
+persist no registry. Tests cover validation gating, duplicate/name and 32-entry
+bounds, ordered path/profile restoration, stale-generation rejection, and
+cancellation requests for in-flight validation/status/log tasks.
+
+Lifecycle UI requires an imported, currently selected and explicitly
+revalidated configuration. Service restart also requires a service in the
+current successful status snapshot. Controlled fake-CLI regressions cover exact
+ordered base/override, profile, and pinned-socket arguments; explicit
+validation, then fresh read-only `ps --all --format json` membership, then only
+`restart --no-deps SERVICE`; and no restart after failed status or absent
+membership. The restart command test checks each argv item and the validation /
+status / mutation order without invoking a live Docker command. Other lifecycle
+tests retain start/stop argv coverage, isolated environment, validation-before-
+mutation, safe static errors, and spawn/failure/timeout outcome classification.
+Headless tests cover the restart control's visibility/disabled state,
+confirmation naming the service/import label/ordered safe files/profiles/action,
+and cancellation without creating a task. Existing headless tests cover
+confirmation gating while the engine is unavailable, clearing unsubmitted
+confirmations on page invalidation, preventing status refresh during a running
+lifecycle command, preserving submitted results across page invalidation, and
+persisted redacted `started`/`not_submitted` outcomes. Audit regression checks
+static `restart` action/outcome fields without service, project, or path data.
+Drop-before-first-poll shutdown flushes the initial marker. No live Compose
+lifecycle mutation test is run; selecting an import clears stale read-only
+results. Issue #18 remains partial/open.
 See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
 and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
 Headless AccessKit/state tests cover ordered base/override selection, removing
@@ -562,12 +572,13 @@ selected project's default `.env`; `--no-interpolate` and
 loaders are explicitly disabled, so remote include/extends references fail
 without fetching. The CLI/plugin remains unsandboxed; validate only trusted
 files. Bounded profile selection applies to structural validation, read-only
-status, one-shot service logs, and imported-project start/stop; the declared-
-service inventory is not profile-filtered and lists all declarations from
-selected files. Profiles are passed as explicit `--profile` arguments and are
-not inherited from the environment. Transient import is session-only; no
-persistent project registry, build/pull, live log follow, or project-file
-mutation is introduced.
+status, one-shot service logs, imported-project start/stop, and single-service
+restart; the declared-service inventory is not profile-filtered and lists all
+declarations from selected files. Profiles are passed as explicit `--profile`
+arguments and are not inherited from the environment. Transient import is
+session-only; no persistent project registry, build/pull, live log follow, or
+project-file mutation is introduced. Service restart is covered by controlled
+fake-CLI/headless regressions only; no live restart is run.
 The one-shot service logs are covered by fake-CLI and headless tests; no real
 service logs are read by default. A temporary-project profile-validation smoke
 verifies that `config --services` lists all declarations, including one in

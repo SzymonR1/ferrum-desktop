@@ -3,24 +3,25 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
-- Implemented (not live-engine validated) a confirmed Compose lifecycle slice
-  for a currently selected, session-imported configuration after successful
-  explicit revalidation. The
-  Linux-only `start`/`stop` commands use the selected ordered `--file` and
-  `--profile` argv, base project directory, isolated CLI environment, and
-  pinned local socket, and revalidate before mutation. The confirmation names
-  the imported local label, safe ordered file basenames, profiles, and action;
-  cancellation submits nothing. `start` only starts existing containers and
-  `stop` does not remove them. The import label and Engine-reported `Project`
-  field are not passed as project identity or used for scope. Pending work
-  survives page navigation, blocks context switching, and refreshes status on
-  completion only when the same selection/context remains current. Audit stores
-  only static action/outcome values; where the initial write succeeds, a
-  `started` record remains if shutdown interrupts before a terminal result, but
-  does not prove Engine submission or completion. Returned failures/timeouts or
-  application shutdown may leave Engine state uncertain; refresh status. No
-  live lifecycle command or resource mutation was tested. Issue #18 remains
-  partial/open; Issue #10 remains open/blocked.
+- Extended the confirmed imported-configuration Compose lifecycle slice with
+  service-scoped `restart --no-deps SERVICE` on Linux local Docker Unix sockets.
+  Restart is offered only beside a service in the current successful status
+  snapshot, revalidates the selected ordered files/profiles, then performs a
+  fresh read-only `compose ps --all --format json` membership check against the
+  same pinned socket before mutation. Failed status or absent membership submits
+  no restart. Argument arrays preserve file/profile order and base-parent
+  directory; no project label or Engine-reported `Project` metadata authorizes
+  scope. Confirmation names the service, imported label, ordered safe file
+  basenames, profiles, and action; cancellation submits nothing.
+  `--no-deps` keeps the mutation scoped to the selected service; Docker Compose
+  restart does not apply configuration changes. Audit records contain only
+  static action/outcome values, never service/project/path data. Existing
+  single-flight ownership, context gating, stale-result rejection, status
+  refresh, and shutdown's preflight/started-audit-before-command invariant are
+  retained. Controlled fake-CLI/headless regressions were added; no live
+  lifecycle command, user project, service log, or resource mutation was run.
+  Trusted local include/extends reads remain unsandboxed under user
+  permissions. Issue #18 remains partial/open; Issue #10 remains open/blocked.
 - Fixed imported-configuration selection so choosing a session entry restores
   its ordered files/profiles and invalidates stale validation. An unsubmitted
   confirmation is cleared on page invalidation and cannot be confirmed while
