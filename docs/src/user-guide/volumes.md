@@ -60,27 +60,32 @@ remove. The mountpoint remains untrusted text and is never accessed.
 Removal is enabled only when the selected volume is still in the loaded
 inventory, a matching inspection returns the exact name, and usage for that
 exact name reports `RefCount == 0`. Positive or unavailable counts keep the
-control disabled. Confirmation names the volume and warns that the count can
-change before deletion. Ferrum sends the negotiated
-`DELETE /v{api}/volumes/{name}` without a `force` parameter; this deletes the
-volume and its data. Docker may reject removal if a container starts using the
-volume before the request arrives. A timeout or transport error may follow
-deletion. After every result, Ferrum marks inventory stale; it refreshes
-immediately if Volumes remains open, or when the page is opened again. A new
-inspection/usage snapshot is required before retrying. Only one volume mutation
-is active; context switching is blocked while it is pending. Navigating away
-does not abort a submitted request. Pruning, modification, connection,
-disconnection, and filesystem browsing are not offered.
+control disabled. Confirmation names the volume and warns that the `RefCount`
+snapshot is not atomic. Docker volume removal is name-addressed, not bound to
+an immutable ID; a concurrent delete/recreate under the same name cannot be
+detected, so inspection and confirmation are not a stable ownership lock.
+Docker may reject removal if a container starts using the volume before the
+request arrives, but it cannot distinguish a same-name replacement. Ferrum
+sends the negotiated `DELETE /v{api}/volumes/{name}` without a `force`
+parameter; this deletes the volume and its data. A timeout or transport error
+may follow deletion. After every result, Ferrum marks inventory stale; it
+refreshes immediately if Volumes remains open, or when the page is opened
+again. A new inspection/usage snapshot is required before retrying. Only one
+volume mutation is active; context switching is blocked while it is pending.
+Navigating away does not abort a submitted request. Pruning, modification,
+connection, disconnection, and filesystem browsing are not offered.
 
 The implementation scope is Linux with the selected local Docker Unix socket.
 Podman/rootless behavior is unvalidated, remote endpoints are unsupported, and
 Windows/macOS volume support is not implemented. Fake-socket/headless tests
-cover protocol and controls. Optional live read-only tests target a
-caller-selected existing volume; mutating live tests use unique test-owned
-volumes and verify exact identity before cleanup. Broader security work remains
-tracked in #19, while #10 remains open/blocked for endpoint compatibility.
-Native Volumes-page visual validation remains unverified. No release or wider
-support claim is made.
+cover protocol and controls; optional read-only live tests target a
+caller-selected existing volume. The mutating live create/remove test uses a
+generated name, but volume APIs expose no immutable ID and cannot detect a
+concurrent same-name replacement. Run it only on a disposable local Engine; its
+cleanup is best-effort and name-based. Broader security work remains tracked in
+#19, while #10 remains open/blocked for endpoint compatibility. Native Volumes
+visual validation remains unverified; no release or wider support claim is
+made.
 
 The optional ignored live list/inspect/usage test requires `FERRUM_TEST_VOLUME`
 to name an existing volume on the current local Docker context. It is
@@ -90,17 +95,17 @@ read-only and does not clean up resources:
 FERRUM_TEST_VOLUME=my-existing-volume cargo test -p ferrum-engine --test live_engine local_engine_lists_and_inspects_existing_volume_read_only -- --exact --ignored
 ```
 
-The optional ignored live create/remove test is mutating and requires the
-current local Docker context to use a Unix socket. It preflights a generated
-name, creates it with EngineClient, and arms cleanup only after the create
-response and inventory confirm that exact name. Before removal, the test
-requires the exact-name usage snapshot to report `RefCount == 0`; it then
-disarms the guard, calls `EngineClient::remove_volume`, and verifies the name
-is absent. If the test unwinds before the removal request is submitted, the
-Drop fallback uses an argument-array Docker CLI `--host unix://...` request on
-the same pinned socket without force. Once removal is submitted there is no
-retry by name; a failed or uncertain request may leave the volume. If ownership
-cannot be confirmed, no removal or cleanup request is sent:
+The optional ignored live create/remove test is mutating and must run only on
+a disposable local Docker Engine using a Unix socket. It preflights a generated
+name, verifies the create response/inventory name, and requires `RefCount == 0`
+before cleanup. Docker volumes have no immutable ID in this path: a concurrent
+delete/recreate under the same name cannot be distinguished. The generated-name
+checks are best-effort, not a stable ownership proof; cleanup by name may
+target a same-name replacement if another actor races the test. Do not run it
+on an Engine containing valuable user data. If the initial name/response checks
+fail, the test does not issue cleanup and the generated volume may remain.
+Removal is not retried after submission, and the fallback uses the same pinned
+socket without force:
 
 ```sh
 cargo test -p ferrum-engine live_volume_create_tests::local_engine_creates_and_removes_unique_volume -- --exact --ignored

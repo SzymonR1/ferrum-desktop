@@ -133,16 +133,19 @@ matching that ID and name before arming cleanup. If ownership cannot be
 confirmed, it sends no cleanup request and the created network may remain; once
 verified, cleanup uses only that ID in the current local Docker context.
 
-The opt-in ignored volume create/remove live test is mutating and requires the
-current local Docker context to use a Unix socket. EngineClient uses the
-discovered socket path, preflights a generated name, verifies the create
-response and inventory, then requires exact-name usage `RefCount == 0`.
-The guard is disarmed immediately before the test removes the owned volume
-through EngineClient and confirms absence. A Drop fallback invokes Docker CLI
-with an argument-array `--host unix://...` on that pinned socket without force
-only if the test unwinds before submitting removal. There is no name-based
-retry after submission, so a failed removal may leave the volume. If ownership
-cannot be verified, no remove request is sent:
+The optional ignored volume create/remove live test is mutating and must run
+only against a disposable Docker Engine using a local Unix socket. It preflights
+a generated name, verifies the create response/inventory name, and requires
+exact-name usage `RefCount == 0` before cleanup. Docker volumes are
+name-addressed, not identified by an immutable ID; a concurrent delete/recreate
+under the same name cannot be distinguished. These checks are best-effort, not
+a stable ownership proof, and cleanup may target a same-name replacement if
+another actor races the test. Do not run this test against an Engine containing
+valuable user data. If initial name/response checks fail, the test sends no
+cleanup request and the generated volume may remain. A Drop fallback uses
+argument-array Docker CLI `--host unix://...` on the same pinned socket without
+force if the test unwinds before removal submission; there is no retry after
+submission.
 
 ```sh
 cargo test -p ferrum-engine live_volume_create_tests::local_engine_creates_and_removes_unique_volume -- --exact --ignored

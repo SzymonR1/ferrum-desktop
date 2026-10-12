@@ -135,11 +135,14 @@ unknown counts disable it. Confirmation names the volume and warns that the
 snapshot can change before deletion. Ferrum sends the negotiated
 `DELETE /v{api}/volumes/{name}` without `force`, with an eight-second bound.
 Docker may reject removal if the volume becomes in use. A timeout or transport
-error can follow a successful deletion. Ferrum marks inventory stale after every
+error can follow a successful deletion. Volume deletion is name-addressed rather
+than bound to an immutable ID; a concurrent delete/recreate under the same name
+cannot be detected by the preflight/confirmation snapshot. These checks are
+not an atomic ownership guarantee. Ferrum marks inventory stale after every
 result and refreshes immediately if Volumes remains open, or when that page is
 opened again; a fresh inspection/usage snapshot is required before retrying.
-Only one volume mutation may be active and context switching is blocked while it is
-pending. Pruning, modification, connection, disconnection, and filesystem
+Only one volume mutation may be active and context switching is blocked while
+it is pending. Pruning, modification, connection, disconnection, and filesystem
 browsing are not offered. Podman/rootless behavior remains unvalidated; remote
 endpoints remain unsupported.
 

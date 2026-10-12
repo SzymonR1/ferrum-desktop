@@ -359,14 +359,16 @@ open, blocked issue #10. No broader endpoint or platform support is claimed.
 Fake-Unix-socket image protocol tests and headless Images UI tests cover tag/removal and anonymous push request/confirmation behavior without contacting a real engine or registry, and without mutating image resources. Push tests verify exact image/tag preflight, one explicit target tag, the empty anonymous JSON body with no auth header, bounded progress, safe HTTP rejection, and daemon error redaction. No live image push, deletion, or other image mutation test is claimed. Fake-socket image protocol tests, headless Images UI tests, and controlled helper-process Buildx tests do not contact a real engine or mutate images. There is no live pull, tag, removal, image build, or image-mutation test. Separate opt-in ignored lifecycle, logs, and terminal tests mutate engine state using one uniquely named disposable container and only its validated full ID as cleanup authority. Logs and terminal tests require locally installed images and never pull, tag, push, or delete images. See [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
 
 The optional ignored volume create/remove test uses the current local Docker
-context's parsed Unix socket path for EngineClient operations. It preflights a
-generated name, then arms cleanup only after the create response and inventory
-confirm that exact name; the test also requires the exact-name usage snapshot
-to report `RefCount == 0`. It disarms the guard before calling
-`EngineClient::remove_volume` and confirms the name is absent. The Drop fallback
-uses Docker CLI `--host unix://...` on the same pinned socket without force only
-if the test unwinds before the removal request is submitted. There is no
-name-based retry after submission; a failed request may leave the volume. If
-ownership cannot be confirmed, no removal is sent. The separate
-`FERRUM_TEST_VOLUME` live test is read-only. Default fake-socket and headless UI
-tests do not contact a live engine.
+context's parsed Unix socket path for EngineClient operations and must run only
+against a disposable local Docker Engine. It preflights a generated name,
+checks the create response and inventory, and requires an exact-name usage
+snapshot reporting `RefCount == 0`. Docker volume operations are name-addressed
+here and expose no immutable ID; a concurrent delete/recreate under the same
+name cannot be distinguished by those checks. The generated-name verification
+is best-effort, not a stable ownership proof, and cleanup by name may target a
+same-name replacement if another actor races the test. The Drop fallback uses
+the same pinned socket without force only if the test unwinds before removal
+submission. There is no name-based retry after submission, and a failed request
+may leave the volume. If initial preflight/response checks fail, no cleanup is
+sent. The separate `FERRUM_TEST_VOLUME` live test is read-only. Default
+fake-socket and headless UI tests do not contact a live engine.
