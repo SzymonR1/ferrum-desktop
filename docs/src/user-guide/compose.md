@@ -4,10 +4,11 @@ The Compose page provides read-only project discovery, structural validation of
 a local base file with ordered overrides, a list of every service declared in
 the selected files (including profile-gated services regardless of active
 profiles), and read-only status for existing containers. It also supports
-explicit `start` and `stop` only for the selected, imported, and revalidated
-configuration. The declared-service list is local Compose CLI/file-derived and
-does not query an Engine; it is separate from running-container status. Imports
-are session-only labels, never Engine-discovered project identities.
+explicit imported-configuration `start`/`stop` and single-service `restart`
+operations for the current imported, revalidated selection. The declared-
+service list is local Compose CLI/file-derived and does not query an Engine;
+it is separate from running-container status. Imports are session-only labels,
+never Engine-discovered project identities.
 Project discovery uses Docker's Compose CLI:
 
 - `docker compose version --short`
@@ -128,7 +129,8 @@ and sets `COMPOSE_EXPERIMENTAL_GIT_REMOTE=false` and
 by Ferrum itself; included projects may still read their default `.env` and
 explicit `include.env_file` under the logged-in user's permissions. Discovery,
 validation, status, and one-shot log subprocesses have an eight-second deadline
-per command; imported start/stop has a 30-second command bound after validation.
+per command; imported start/stop/restart mutations have a 30-second command
+bound after validation (restart also has a separate eight-second status check).
 Each call has a 1 MiB stdout cap; raw stderr and diagnostics are discarded.
 
 CLI processes use a private isolated Docker config and `HOME` with a cleared
@@ -180,41 +182,52 @@ environment sources under the logged-in user's permissions; validate only
 trusted files. The command uses the same subprocess timeout, output cap, and
 per-process resource limits described above.
 
-## Start and stop an imported configuration
+## Start/stop an imported configuration or restart a service
 
 The Linux local Docker-socket page exposes **Start imported project** and
 **Stop imported project** only when the current selection was imported for this
-session and then explicitly validated successfully. Selecting an import clears
-old validation/status/log data; revalidate before either action. The local
-import label is display-only and is never passed as `--project-name`. The
-untrusted per-container `Project` metadata is also not used to choose or
-authorize the target. Scope is the selected ordered files/profiles and the
-currently selected local socket.
+session and then explicitly validated successfully. **Restart service SERVICE**
+is shown beside each service present in the current successful container-status
+snapshot, and is enabled only for the current imported, explicitly revalidated
+selection. Selecting an import clears old validation/status/log data; revalidate
+before requesting an operation or refresh status before choosing a service to
+restart. The local import label is display-only and is never passed as
+`--project-name`. Untrusted per-container `Project` metadata is not used to
+choose or authorize the target. Scope comes from the selected ordered
+files/profiles, current local socket, and—for restart—the service name in the
+current status snapshot.
 
 Before each action, Ferrum revalidates the current files and profiles with the
-same structural validation command. The confirmation names the imported local
-label, ordered safe file basenames, selected profiles, and requested action;
-cancelling it sends no command. Confirmation is rejected if the imported label,
-ordered files, profiles, or successful validation no longer match its snapshot.
-If validation fails, no lifecycle command is sent. On success, Ferrum invokes
-the installed Docker Compose CLI with argument arrays:
+same structural validation command. Restart then queries a fresh read-only
+`compose ps --all --format json` using that same selection/socket and refuses
+the operation if the service is absent or the query fails. The confirmation
+names the imported local label, ordered safe file basenames, selected profiles,
+action, and (for restart) service; cancelling it sends no command. Confirmation
+is rejected if the imported label, ordered files, profiles, successful
+validation, or restart service's current status membership no longer match its
+snapshot. Validation or status failure submits no mutation. Ferrum invokes the
+installed Docker Compose CLI through argument arrays:
 
 ```text
 docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... start
 docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... stop
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... restart --no-deps <SERVICE>
 ```
 
-Only `start` and `stop` are supported in this slice. Docker Compose `start` starts
-existing containers; it does not create, build, or pull. `stop` stops running
-containers without removing them. The commands preserve the selected file
-ordering, active profile arguments, and base-parent project directory; Ferrum
-does not add an import-label project name. Commands use Ferrum's private Docker
-CLI config/HOME, cleared environment, disabled selected project `.env`,
-disabled remote Git/OCI loaders, an eight-second per-command validation bound,
-and a 30-second lifecycle-command deadline, 1 MiB output cap, and Linux
-process resource limits. As with validation and status, Compose may still read
-trusted local `include`/`extends.file` files and included-project environment
-files under the logged-in user's permissions; this is not a sandbox.
+`start` starts existing containers; it does not create, build, or pull.
+`stop` stops running containers without removing them. Restart targets only the
+selected service; `--no-deps` prevents restarting dependent services. Docker
+Compose restart does **not** apply changes made to the Compose configuration:
+it restarts containers using their existing configuration. These mutations
+are Linux local Docker Unix-socket only and preserve selected file ordering,
+active profile arguments, and the base-parent project directory; Ferrum does
+not add an import-label project name. Commands use Ferrum's private Docker CLI
+config/HOME, cleared environment, disabled selected project `.env`, disabled
+remote Git/OCI loaders, an eight-second per-command validation/status bound,
+and a 30-second lifecycle-command deadline, 1 MiB output cap, and Linux process
+resource limits. As with validation and status, trusted local Compose
+`include`/`extends.file` files and included-project environment files remain
+unsandboxed and may be read under the logged-in user's permissions.
 
 Lifecycle tasks remain owned by the app when navigating away; leaving Compose
 does not cancel a command that may already have been accepted by the Engine.
@@ -222,20 +235,21 @@ Context switching is blocked while a lifecycle command is pending. After
 completion Ferrum refreshes read-only status only if the same imported files,
 profiles, validation, and selected context remain current; otherwise refresh
 manually after returning to that configuration. Ferrum records only static
-`start`/`stop` action and `started`, `success`, `not_submitted`, or
+`start`/`stop`/`restart` action and `started`, `success`, `not_submitted`, or
 `request_error` outcomes in its best-effort local audit history. A `started`
-record is written before preflight; with no later terminal outcome, Ferrum exited
-or final audit persistence failed, and the Engine result is unknown. `not_submitted`
-means preflight/validation or any process-spawn failure before the lifecycle
-process starts; a returned failure or timeout after process start is
-`request_error`. Audit persistence failure does not change the operation result.
-During shutdown Ferrum makes a best-effort, up-to-one-second flush of the
-initial audit marker before aborting the lifecycle worker. A submitted child
-may still be terminated, leaving Engine state uncertain; refresh after restart.
-Raw diagnostics, paths, labels, profiles, endpoint values, and service names
-are not audited or shown as command diagnostics. `up`, `down`, restart, create,
-build, pull, remove,
-persistence, and live log follow remain outside this partial Issue #18 slice.
+record is written before preflight; with no later terminal outcome, Ferrum
+exited or final audit persistence failed, and the Engine result is unknown.
+`not_submitted` means preflight/validation, service-membership query, or
+process-spawn failure before the mutation process starts; a returned failure or
+timeout after process start is `request_error`. Audit persistence failure does
+not change the operation result. During shutdown Ferrum makes a best-effort,
+up-to-one-second flush of the initial audit marker before aborting the lifecycle
+worker. A submitted child may still be terminated, leaving Engine state
+uncertain; refresh after restart. Service names, paths, labels, profiles,
+endpoint values, raw diagnostics, and project metadata are never audited.
+`up`, `down`, create, build, pull, remove, persistence, and live log follow
+remain outside this partial Issue #18 slice.
+
 
 ## One-shot service log snapshot
 
@@ -295,7 +309,7 @@ docker --host unix://<selected-socket> compose --project-directory <base-parent>
 ```
 
 Selected profiles are passed to structural validation, existing-container
-status, one-shot service logs, and imported-configuration start/stop. The
+status, one-shot service logs, and imported-configuration start/stop/restart.
 `config --services` inventory includes every service declared in the selected
 files regardless of the active profile set. The status recheck immediately
 before logs uses the same profiles as the earlier status query. Profile flags
@@ -310,19 +324,22 @@ operations already submitted are not cancelled by selection or navigation.
 See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
 and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
 
-Project persistence, restart/build/pull/up/down/removal, live log follow, and
+Project persistence, build/pull/up/down/removal, live log follow, and
 project-file mutation remain unsupported. Transient import is session-only and
 does not persist files or project state. Structural validation skips
 interpolation and service `env_file` resolution; status uses the isolated
-environment above and may differ from a normal shell invocation. Start/stop
-use only the currently selected imported and revalidated configuration, as
-described above. The declared-service inventory lists all services in the
-selected files, including services whose profiles are not selected. Status
-reports only existing containers; the separately shown declared-service
-inventory comes from local Compose configuration and does not query the Engine.
-Issue [#18](https://github.com/SzymonR1/ferrum-desktop/issues/18)
-remains partial/open; [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10)
-remains open/blocked. This is not a full-issue, release, or broader platform claim.
+environment above and may differ from a normal shell invocation. Start/stop/
+restart use only the currently selected imported and revalidated configuration,
+as described above. Restart requires the service in a successful status
+snapshot and does not apply Compose configuration changes. The declared-service
+inventory lists all services in the selected files, including services whose
+profiles are not selected. Status reports only existing containers; the
+separately shown declared-service inventory comes from local Compose
+configuration and does not query the Engine. Issue
+[#18](https://github.com/SzymonR1/ferrum-desktop/issues/18) remains
+partial/open; [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10)
+remains open/blocked. This is not a full-issue, release, or broader platform
+claim.
 
 The direct CLI probe and discovery smoke, single-file and ordered base/override
 temporary-file validation smokes, and loopback remote-loader safety smoke

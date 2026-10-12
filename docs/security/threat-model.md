@@ -49,13 +49,14 @@ the original selected paths for validation, so the contents read may differ
 from those measured by the check. The check does not include local files read
 through `include` or service `extends.file`.
 Linux Compose subprocesses for version, discovery, validation, status, one-shot
-logs, and start/stop have per-process `RLIMIT_AS` of 4 GiB and `RLIMIT_DATA` of
-512 MiB, preserving lower inherited limits. These limits apply while Compose
-reads selected and included files. They are inherited by child processes and
-bound each process, not aggregate process-tree RSS; they are not a sandbox. The
-private child environment sets `GOMEMLIMIT=402653184` (384 MiB), a Go runtime
-soft target that may be exceeded to avoid excessive GC thrashing. Resource
-exhaustion may produce generic validation, status, log, or lifecycle failures.
+logs, and start/stop/restart have per-process `RLIMIT_AS` of 4 GiB and
+`RLIMIT_DATA` of 512 MiB, preserving lower inherited limits. These limits apply
+while Compose reads selected and included files. They are inherited by child
+processes and bound each process, not aggregate process-tree RSS; they are not a
+sandbox. The private child environment sets `GOMEMLIMIT=402653184` (384 MiB), a
+Go runtime soft target that may be exceeded to avoid excessive GC thrashing.
+Resource exhaustion may produce generic validation, status, log, or lifecycle
+failures.
 
 Compose remains trusted local code, not a sandbox. The point-in-time selected-
 file size check does not eliminate the race with same-UID changes, and neither
@@ -69,20 +70,24 @@ local `include`/`extends.file` Compose files and included projects' default
 permissions, potentially outside the base directory. Remote Git/OCI loaders
 are disabled. The selected files and private CLI environment do not sandbox
 those reads; validate only trusted files. Explicit profiles affect validation,
-read-only status, and one-shot service logs, and are also passed to imported
-configuration start/stop. The declared-service inventory includes every
-declaration regardless of active profiles. Lifecycle is available only for the
-currently selected, session-imported, explicitly revalidated files/profiles and
-the selected local Docker socket. Ferrum reruns structural validation before
-each mutation; failure prevents the lifecycle command. The import label and
-engine-reported `Project` metadata do not establish identity or authorization.
-Compose `start` starts existing containers; `stop` does not remove them. No
-restart, build, pull, `up`, `down`, remove, or persistent project storage is
-added. Navigation does not cancel submitted lifecycle work; its redacted result
-is retained for the session. A static `started` audit entry precedes preflight;
-without a later terminal outcome, the final state is unknown and must be
-reconciled by refreshing the current project status. Issues #18 and #19 remain
-partial/open; issue #10 remains blocked/open.
+read-only status, one-shot service logs, and imported configuration
+start/stop/restart. The declared-service inventory includes every declaration
+regardless of active profiles. Lifecycle is available only for the currently
+selected, session-imported, explicitly revalidated files/profiles and the
+selected local Docker Unix socket. Before service restart Ferrum additionally
+requires the service to appear in the successful current status snapshot,
+revalidates the files/profiles, and makes a fresh read-only `compose ps --all
+--format json` query on the same socket before mutation. Failure or absent
+membership submits no restart. The import label and engine-reported `Project`
+metadata do not establish identity or authorization. Compose `start` starts
+existing containers; `stop` does not remove them. Service restart invokes only
+`restart --no-deps <SERVICE>`; Docker Compose restart does not apply Compose
+configuration changes. No build, pull, `up`, `down`, remove, or persistent
+project storage is added. Navigation does not cancel submitted lifecycle work;
+its redacted result is retained for the session. A static `started` audit entry
+precedes preflight; without a later terminal outcome, the final state is unknown
+and must be reconciled by refreshing the current project status. Issues #18 and
+#19 remain partial/open; issue #10 remains blocked/open.
 
 The service inventory comes from that same validation command, so no additional
 CLI process or Engine request is made. It accepts at most 128 KiB of service
@@ -202,29 +207,34 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   diagnostics private; display only a bounded escaped basename and static result.
 
 - Accept optional comma-separated Compose profiles for validation, read-only
-  status, one-shot service logs, and imported-configuration start/stop. Limit
-  input to 1024 UTF-8 bytes, 16 profiles, and 64 UTF-8 bytes per name. Trim
-  outer whitespace per token; blank means no explicit profiles. Reject empty
-  entries and duplicate names. Accept `[A-Za-z0-9][A-Za-z0-9_.-]+` names and
-  standalone `*`; pass each as its own `--profile <name>` argv before `config`,
-  `ps`, `logs`, `start`, or `stop`, never through an environment variable. Reuse
-  profiles for the status recheck before logs. Invalid or changed selection
-  clears validation/status/log state, cancels read-only tasks, and requires
-  revalidation; already-submitted lifecycle work is not cancelled.
+  status, one-shot service logs, and imported-configuration start/stop/restart.
+  Limit input to 1024 UTF-8 bytes, 16 profiles, and 64 UTF-8 bytes per name.
+  Trim outer whitespace per token; blank means no explicit profiles. Reject
+  empty entries and duplicate names. Accept `[A-Za-z0-9][A-Za-z0-9_.-]+` names
+  and standalone `*`; pass each as its own `--profile <name>` argv before
+  `config`, `ps`, `logs`, `start`, `stop`, or `restart`, never through an
+  environment variable. Reuse profiles for status rechecks before logs and
+  restart. Invalid or changed selection clears validation/status/log state,
+  cancels read-only tasks, and requires revalidation; already-submitted
+  lifecycle work is not cancelled.
 - Keep private Docker config/HOME, cleared allowlisted environment, disabled
   selected-project `.env`, and disabled remote Git/OCI loaders. A transient
   import retains validated ordered file paths, profiles, and a bounded local
   label in memory only; import itself invokes no CLI/Engine operation and
   copies/persists no files. The label is not project identity or authorization.
   Only the currently selected session import after successful explicit
-  revalidation can start/stop. Revalidate before each operation; failure must
-  prevent the lifecycle command. The current local socket, ordered files,
-  profiles, and base-parent directory scope the operation, not the label or
+  revalidation can start/stop/restart. Revalidate before each operation; failure
+  must prevent lifecycle mutation. Restart additionally requires current
+  successful status membership and a fresh status query with the same selected
+  local Docker Unix socket before mutation. The current socket, ordered files,
+  profiles, and base-parent directory scope operations, not the local label or
   engine-reported `Project` metadata. Docker `start` starts existing containers;
-  `stop` does not remove them. No persistent storage, restart/build/pull/up/down,
-  remove, live log follow, or project-file mutation is added. Controlled
-  fake-CLI/headless tests cover argv and states; no live lifecycle mutation was
-  performed. See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
+  `stop` does not remove them. Restart uses only
+  `restart --no-deps <SERVICE>`; Compose restart does not apply configuration
+  changes. No persistent storage, build/pull/up/down, remove, live log follow,
+  or project-file mutation is added. Controlled fake-CLI/headless tests cover
+  argv and states; no live lifecycle mutation was performed. See Docker's
+  [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
   and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
   Remote references remain disabled and are not fetched. Linux local
   discovery, single-file validation, ordered temporary base/override, and
@@ -464,11 +474,12 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
 - Compose `.env`/service `env_file` resolution and remote OCI/Git inputs (remote
   loaders are disabled during validation) remain trust risks. The transient
   configuration import stores only session-local path/profile metadata and a
-  local label; file-content import, persistent project registration, restart,
-  build/pull/up/down/removal, live log follow, and project-file mutations remain
-  deferred. Scoped start/stop is available only for a selected imported and
-  revalidated configuration. The bounded one-shot service log snapshot is
-  implemented as described above.
+  local label; file-content import, persistent project registration, build/
+  pull/up/down/removal, live log follow, and project-file mutations remain
+  deferred. Scoped start/stop and a confirmed service-scoped restart are
+  available only for a selected imported and revalidated configuration; restart
+  also requires current and freshly rechecked status membership. The bounded
+  one-shot service log snapshot is implemented as described above.
 - The explicit local Docker CLI Buildx invocation is an added external build process. Other external process integrations, archive extraction, and file-path surfaces remain deferred.
 - Credential stores, registry authentication, managed engines, and update delivery.
 

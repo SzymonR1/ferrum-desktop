@@ -168,6 +168,8 @@ pub(super) enum ComposeLifecycleError {
     PrivateConfigSetupFailed,
     ValidationFailed,
     EngineUnavailable,
+    ServiceUnavailable,
+    StatusUnavailable,
     OperationFailed,
 }
 
@@ -184,6 +186,12 @@ impl ComposeLifecycleError {
             }
             Self::EngineUnavailable => {
                 "The engine or Compose configuration is not ready; no lifecycle command was run."
+            }
+            Self::ServiceUnavailable => {
+                "The selected service is no longer present in the current Compose status; refresh and retry."
+            }
+            Self::StatusUnavailable => {
+                "Could not verify current Compose status; no restart command was run. Refresh and retry."
             }
             Self::OperationFailed => "Compose lifecycle operation failed.",
         }
@@ -208,6 +216,7 @@ struct ComposeLifecycleConfirmation {
     action: ComposeLifecycleAction,
     selection: ComposeLifecycleSelection,
     ordered_files: Vec<String>,
+    service: Option<String>,
 }
 
 #[derive(Default)]
@@ -218,14 +227,17 @@ enum ComposeLifecycleState {
     Running {
         action: ComposeLifecycleAction,
         file_name: String,
+        service: Option<String>,
     },
     Succeeded {
         action: ComposeLifecycleAction,
         file_name: String,
+        service: Option<String>,
     },
     Failed {
         action: ComposeLifecycleAction,
         file_name: String,
+        service: Option<String>,
         error: ComposeLifecycleError,
     },
 }
@@ -234,6 +246,7 @@ enum ComposeLifecycleState {
 pub(super) enum ComposeLifecycleAction {
     Start,
     Stop,
+    Restart,
 }
 
 impl ComposeLifecycleAction {
@@ -241,6 +254,7 @@ impl ComposeLifecycleAction {
         match self {
             Self::Start => "start",
             Self::Stop => "stop",
+            Self::Restart => "restart",
         }
     }
 }
@@ -249,6 +263,7 @@ pub(super) struct ComposeLifecycleTask {
     pub(super) generation: u64,
     pub(super) action: ComposeLifecycleAction,
     pub(super) selection: ComposeLifecycleSelection,
+    pub(super) service: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -445,6 +460,7 @@ pub(super) struct ComposeActions {
     pub(super) cancel_validation: bool,
     pub(super) cancel_logs: bool,
     pub(super) logs_service: Option<String>,
+    pub(super) restart_service: Option<String>,
     pub(super) cancel_status: bool,
     pub(super) start_imported: bool,
     pub(super) stop_imported: bool,
@@ -569,7 +585,34 @@ impl ComposeView {
         &mut self,
         action: ComposeLifecycleAction,
     ) -> bool {
+        self.set_lifecycle_confirmation(action, None)
+    }
+
+    pub(super) fn request_service_restart_confirmation(&mut self, service: &str) -> bool {
+        let Some(service) = validate_service_selector(service) else {
+            return false;
+        };
+        if !matches!(&self.status, ComposeStatusState::Succeeded { .. })
+            || !matches!(&self.validation, ComposeValidationState::Succeeded { .. })
+            || !self
+                .containers
+                .iter()
+                .any(|container| container.service == service)
+        {
+            return false;
+        }
+        self.set_lifecycle_confirmation(ComposeLifecycleAction::Restart, Some(service.to_owned()))
+    }
+
+    fn set_lifecycle_confirmation(
+        &mut self,
+        action: ComposeLifecycleAction,
+        service: Option<String>,
+    ) -> bool {
         if !self.can_start_lifecycle() {
+            return false;
+        }
+        if service.is_some() && !matches!(&self.status, ComposeStatusState::Succeeded { .. }) {
             return false;
         }
         let (Some(imported_label), Ok(profiles)) =
@@ -591,6 +634,7 @@ impl ComposeView {
             action,
             selection,
             ordered_files,
+            service,
         });
         true
     }
@@ -600,12 +644,20 @@ impl ComposeView {
             return None;
         };
         let action = confirmation.action;
+        let service = confirmation.service.clone();
         if !self.current_imported_selection_validated()
             || self.selected_import_label.as_deref()
                 != Some(confirmation.selection.imported_label.as_str())
             || self.selected_files != confirmation.selection.files
             || self.selected_profiles().ok().as_deref()
                 != Some(confirmation.selection.profiles.as_slice())
+            || service.as_ref().is_some_and(|service| {
+                !matches!(&self.status, ComposeStatusState::Succeeded { .. })
+                    || !self
+                        .containers
+                        .iter()
+                        .any(|container| &container.service == service)
+            })
         {
             self.lifecycle = ComposeLifecycleState::Idle;
             return None;
@@ -616,11 +668,16 @@ impl ComposeView {
         self.lifecycle_generation = self.lifecycle_generation.wrapping_add(1);
         let generation = self.lifecycle_generation;
         let file_name = display_compose_file_list(&selection.files);
-        self.lifecycle = ComposeLifecycleState::Running { action, file_name };
+        self.lifecycle = ComposeLifecycleState::Running {
+            action,
+            file_name,
+            service: service.clone(),
+        };
         Some(ComposeLifecycleTask {
             generation,
             action,
             selection,
+            service,
         })
     }
 
@@ -668,16 +725,24 @@ impl ComposeView {
         {
             return false;
         }
-        let ComposeLifecycleState::Running { action, file_name } =
-            std::mem::take(&mut self.lifecycle)
+        let ComposeLifecycleState::Running {
+            action,
+            file_name,
+            service,
+        } = std::mem::take(&mut self.lifecycle)
         else {
             return false;
         };
         self.lifecycle = match result.outcome {
-            Ok(()) => ComposeLifecycleState::Succeeded { action, file_name },
+            Ok(()) => ComposeLifecycleState::Succeeded {
+                action,
+                file_name,
+                service,
+            },
             Err(error) => ComposeLifecycleState::Failed {
                 action,
                 file_name,
+                service,
                 error,
             },
         };
@@ -697,6 +762,21 @@ impl ComposeView {
                 ComposeLifecycleState::Confirming(_) | ComposeLifecycleState::Running { .. }
             )
     }
+    fn can_request_service_restart(&self, service: &str) -> bool {
+        validate_service_selector(service).is_some()
+            && self.current_imported_selection_validated()
+            && matches!(&self.status, ComposeStatusState::Succeeded { .. })
+            && self.selected_profiles().is_ok()
+            && matches!(&self.validation, ComposeValidationState::Succeeded { .. })
+            && self
+                .containers
+                .iter()
+                .any(|container| container.service == service)
+            && !matches!(
+                &self.lifecycle,
+                ComposeLifecycleState::Confirming(_) | ComposeLifecycleState::Running { .. }
+            )
+    }
 
     pub(super) fn begin_status_refresh(
         &mut self,
@@ -704,7 +784,10 @@ impl ComposeView {
         let profiles = self.selected_profiles().ok()?;
         if !self.can_refresh_containers()
             || matches!(&self.status, ComposeStatusState::Loading { .. })
-            || matches!(&self.lifecycle, ComposeLifecycleState::Running { .. })
+            || matches!(
+                &self.lifecycle,
+                ComposeLifecycleState::Confirming(_) | ComposeLifecycleState::Running { .. }
+            )
         {
             return None;
         }
@@ -1179,7 +1262,7 @@ impl ComposeView {
                 self.validated_generation = None;
             }
         });
-        ui.label("Profiles apply to validation, status, one-shot logs, and imported-project start/stop; * enables all profiles.");
+        ui.label("Profiles apply to validation, status, one-shot logs, and imported-project start/stop/restart; * enables all profiles.");
         let profiles_valid = self.selected_profiles().is_ok();
         if !profiles_valid {
             ui.colored_label(
@@ -1416,7 +1499,11 @@ impl ComposeView {
                     && !self.loading
                     && self.can_refresh_containers()
                     && !matches!(&self.status, ComposeStatusState::Loading { .. })
-                    && !matches!(&self.lifecycle, ComposeLifecycleState::Running { .. }),
+                    && !matches!(
+                        &self.lifecycle,
+                        ComposeLifecycleState::Confirming(_)
+                            | ComposeLifecycleState::Running { .. }
+                    ),
                 egui::Button::new("Refresh existing containers"),
             )
             .clicked();
@@ -1431,13 +1518,14 @@ impl ComposeView {
                 ui.label("No existing containers for the selected Compose files.");
             }
             ComposeStatusState::Succeeded { .. } => {
-                ui.columns(6, |columns| {
+                ui.columns(7, |columns| {
                     columns[0].strong("Container");
                     columns[1].strong("Service");
                     columns[2].strong("Project");
                     columns[3].strong("State");
                     columns[4].strong("Health");
                     columns[5].strong("Recent logs");
+                    columns[6].strong("Restart");
                 });
                 ui.separator();
                 egui::ScrollArea::vertical()
@@ -1450,7 +1538,7 @@ impl ComposeView {
                         |ui, rows| {
                             for row in rows {
                                 let container = &self.containers[row];
-                                ui.columns(6, |columns| {
+                                ui.columns(7, |columns| {
                                     columns[0]
                                         .add(egui::Label::new(container.name.as_str()).truncate());
                                     columns[1].add(
@@ -1481,6 +1569,21 @@ impl ComposeView {
                                         .clicked()
                                     {
                                         actions.logs_service = Some(container.service.clone());
+                                    }
+                                    if columns[6]
+                                        .add_enabled(
+                                            status_enabled
+                                                && self.can_request_service_restart(
+                                                    &container.service,
+                                                ),
+                                            egui::Button::new(format!(
+                                                "Restart service {}",
+                                                container.service
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        actions.restart_service = Some(container.service.clone());
                                     }
                                 });
                             }
@@ -1527,7 +1630,7 @@ impl ComposeView {
             }
         }
         ui.heading("Imported configuration lifecycle");
-        ui.label("Start or stop affects only the currently selected, imported, and explicitly revalidated local files. Start requires existing containers; it does not create, build, or pull. Stop does not remove containers.");
+        ui.label("Start or stop affects only the currently selected, imported, and explicitly revalidated local files. Start requires existing containers; it does not create, build, or pull. Stop does not remove containers. Restart is offered only for a service in the current successful status snapshot.");
         let lifecycle_enabled = status_enabled && self.can_start_lifecycle();
         ui.horizontal(|ui| {
             actions.start_imported = ui
@@ -1552,6 +1655,9 @@ impl ComposeView {
                         "Imported local label: {}",
                         confirmation.selection.imported_label
                     ));
+                    if let Some(service) = &confirmation.service {
+                        ui.label(format!("Service: {service}"));
+                    }
                     ui.label(format!("Ordered files: {}", confirmation.ordered_files.join(" + ")));
                     ui.label(format!(
                         "Profiles: {}",
@@ -1578,27 +1684,48 @@ impl ComposeView {
                     actions.cancel_lifecycle = ui.button("Cancel lifecycle action").clicked();
                 });
             }
-            ComposeLifecycleState::Running { action, file_name } => {
+            ComposeLifecycleState::Running {
+                action,
+                file_name,
+                service,
+            } => {
                 ui.spinner();
                 ui.label(format!(
-                    "Compose {} running for {file_name}…",
-                    action.label()
+                    "Compose {}{} running for {file_name}…",
+                    action.label(),
+                    service
+                        .as_deref()
+                        .map(|service| format!(" service {service}"))
+                        .unwrap_or_default()
                 ));
             }
-            ComposeLifecycleState::Succeeded { action, file_name } => {
+            ComposeLifecycleState::Succeeded {
+                action,
+                file_name,
+                service,
+            } => {
                 ui.label(format!(
-                    "Compose {} succeeded for {file_name}.",
-                    action.label()
+                    "Compose {}{} succeeded for {file_name}.",
+                    action.label(),
+                    service
+                        .as_deref()
+                        .map(|service| format!(" service {service}"))
+                        .unwrap_or_default()
                 ));
             }
             ComposeLifecycleState::Failed {
                 action,
                 file_name,
+                service,
                 error,
             } => {
                 ui.label(format!(
-                    "Compose {} failed for {file_name}.",
-                    action.label()
+                    "Compose {}{} failed for {file_name}.",
+                    action.label(),
+                    service
+                        .as_deref()
+                        .map(|service| format!(" service {service}"))
+                        .unwrap_or_default()
                 ));
                 ui.colored_label(egui::Color32::from_rgb(224, 174, 109), error.message());
             }
@@ -2770,6 +2897,12 @@ async fn lifecycle_with_binary(
     search_path: &std::ffi::OsStr,
     user_compose_plugin: Option<&std::path::Path>,
 ) -> ComposeLifecycleResult {
+    if action == ComposeLifecycleAction::Restart {
+        return ComposeLifecycleResult {
+            outcome: Err(ComposeLifecycleError::ServiceUnavailable),
+            submitted: false,
+        };
+    }
     use tokio::process::Command;
     let validation = validate_with_profiles_report(
         binary,
@@ -2835,6 +2968,106 @@ async fn lifecycle_with_binary(
     command.arg(action.label());
     run_lifecycle_command_with_timeout(&mut command, LIFECYCLE_COMMAND_TIMEOUT).await
 }
+#[cfg(target_os = "linux")]
+async fn service_restart_with_binary(
+    binary: &std::path::Path,
+    socket_path: &std::path::Path,
+    files: &[std::path::PathBuf],
+    profiles: &[String],
+    service: &str,
+    search_path: &std::ffi::OsStr,
+    user_compose_plugin: Option<&std::path::Path>,
+) -> ComposeLifecycleResult {
+    use tokio::process::Command;
+    let failure = |error| ComposeLifecycleResult {
+        outcome: Err(error),
+        submitted: false,
+    };
+    let Some(service) = validate_service_selector(service) else {
+        return failure(ComposeLifecycleError::ServiceUnavailable);
+    };
+    let validation = validate_with_profiles_report(
+        binary,
+        files,
+        profiles,
+        search_path,
+        user_compose_plugin,
+        COMMAND_TIMEOUT,
+    )
+    .await;
+    if let Err(error) = validation.outcome {
+        return failure(match error {
+            ComposeValidationError::DockerCliMissing
+            | ComposeValidationError::ComposePluginUnavailable => {
+                ComposeLifecycleError::DockerCliMissing
+            }
+            ComposeValidationError::CommandStartFailed => ComposeLifecycleError::CommandStartFailed,
+            ComposeValidationError::PrivateConfigSetupFailed => {
+                ComposeLifecycleError::PrivateConfigSetupFailed
+            }
+            _ => ComposeLifecycleError::ValidationFailed,
+        });
+    }
+    let containers = match containers_with_binary(
+        binary,
+        socket_path,
+        files,
+        profiles,
+        search_path,
+        user_compose_plugin,
+    )
+    .await
+    {
+        Ok(containers) => containers,
+        Err(ComposeStatusError::DockerCliMissing) => {
+            return failure(ComposeLifecycleError::DockerCliMissing);
+        }
+        Err(ComposeStatusError::PrivateConfigSetupFailed) => {
+            return failure(ComposeLifecycleError::PrivateConfigSetupFailed);
+        }
+        Err(ComposeStatusError::QueryFailed | ComposeStatusError::InvalidOutput) => {
+            return failure(ComposeLifecycleError::StatusUnavailable);
+        }
+    };
+    if !containers
+        .iter()
+        .any(|container| container.service == service)
+    {
+        return failure(ComposeLifecycleError::ServiceUnavailable);
+    }
+    if !valid_profile_list(profiles)
+        || !selected_compose_files_are_valid(files)
+        || selected_compose_files_size_exceeds_limit(files)
+    {
+        return failure(ComposeLifecycleError::ValidationFailed);
+    }
+    let isolated = match PrivateDockerConfig::new(user_compose_plugin) {
+        Ok(isolated) => isolated,
+        Err(_) => return failure(ComposeLifecycleError::PrivateConfigSetupFailed),
+    };
+    let Some(socket_path) = socket_path.to_str() else {
+        return failure(ComposeLifecycleError::OperationFailed);
+    };
+    let Some(parent) = files.first().and_then(|file| file.parent()) else {
+        return failure(ComposeLifecycleError::ValidationFailed);
+    };
+    let mut command = Command::new(binary);
+    isolated.configure(&mut command, search_path);
+    command
+        .env("COMPOSE_DISABLE_ENV_FILE", "1")
+        .arg("--host")
+        .arg(format!("unix://{socket_path}"))
+        .args(["compose", "--project-directory"])
+        .arg(parent);
+    for file in files {
+        command.arg("--file").arg(file);
+    }
+    for profile in profiles {
+        command.arg("--profile").arg(profile);
+    }
+    command.args(["restart", "--no-deps"]).arg(service);
+    run_lifecycle_command_with_timeout(&mut command, LIFECYCLE_COMMAND_TIMEOUT).await
+}
 
 #[cfg(target_os = "linux")]
 async fn run_lifecycle_command_with_timeout(
@@ -2857,6 +3090,12 @@ pub(super) async fn compose_lifecycle(
     profiles: &[String],
     action: ComposeLifecycleAction,
 ) -> ComposeLifecycleResult {
+    if action == ComposeLifecycleAction::Restart {
+        return ComposeLifecycleResult {
+            outcome: Err(ComposeLifecycleError::ServiceUnavailable),
+            submitted: false,
+        };
+    }
     let Some(search_path) = std::env::var_os("PATH") else {
         return ComposeLifecycleResult {
             outcome: Err(ComposeLifecycleError::DockerCliMissing),
@@ -2876,6 +3115,38 @@ pub(super) async fn compose_lifecycle(
         files,
         profiles,
         action,
+        &search_path,
+        plugin.as_deref(),
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+pub(super) async fn compose_service_restart(
+    socket_path: &std::path::Path,
+    files: &[std::path::PathBuf],
+    profiles: &[String],
+    service: &str,
+) -> ComposeLifecycleResult {
+    let Some(search_path) = std::env::var_os("PATH") else {
+        return ComposeLifecycleResult {
+            outcome: Err(ComposeLifecycleError::DockerCliMissing),
+            submitted: false,
+        };
+    };
+    let Some(binary) = docker_binary(&search_path) else {
+        return ComposeLifecycleResult {
+            outcome: Err(ComposeLifecycleError::DockerCliMissing),
+            submitted: false,
+        };
+    };
+    let plugin = user_compose_plugin();
+    service_restart_with_binary(
+        &binary,
+        socket_path,
+        files,
+        profiles,
+        service,
         &search_path,
         plugin.as_deref(),
     )
@@ -4396,6 +4667,182 @@ mod tests {
             }
         }
         #[tokio::test]
+        async fn service_restart_revalidates_checks_fresh_membership_and_scopes_restart() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("project with spaces");
+            fs::create_dir(&project).unwrap();
+            let base = project.join("base compose.yaml");
+            let overlay = project.join("override compose.yaml");
+            fs::write(&base, "services:\n  web:\n    image: busybox\n").unwrap();
+            fs::write(&overlay, "services:\n  worker:\n    image: busybox\n").unwrap();
+            let socket = directory.path().join("selected socket.sock");
+            let validation_trace = directory.path().join("validation-argv");
+            let status_trace = directory.path().join("status-argv");
+            let restart_trace = directory.path().join("restart-argv");
+            let binary = directory.path().join("docker-restart-fixture");
+            let status = "{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"running\"}\n";
+            let sequence = directory.path().join("sequence");
+            let script = format!(
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                   *' version --short'* ) printf 'version\\n' >> {}; printf 'v5.6.0\\n'; exit 0 ;;\n\
+                   *' config '* ) printf 'validation\\n' >> {}; printf '%s\\n' \"$@\" > {}; printf 'web\\nworker\\n'; exit 0 ;;\n\
+                   *' ps '* ) printf 'status\\n' >> {}; printf '%s\\n' \"$@\" > {}; printf '%s' {}; exit 0 ;;\n\
+                   *' restart '* ) printf 'restart\\n' >> {}; printf '%s\\n' \"$@\" > {}; exit 0 ;;\n\
+                 esac\n\
+                 exit 94\n",
+                shell_quote(sequence.to_str().unwrap()),
+                shell_quote(sequence.to_str().unwrap()),
+                shell_quote(validation_trace.to_str().unwrap()),
+                shell_quote(sequence.to_str().unwrap()),
+                shell_quote(status_trace.to_str().unwrap()),
+                shell_quote(status),
+                shell_quote(sequence.to_str().unwrap()),
+                shell_quote(restart_trace.to_str().unwrap()),
+            );
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+            let files = [base.clone(), overlay.clone()];
+            let profiles = ["frontend".to_owned(), "qa".to_owned()];
+            let result = service_restart_with_binary(
+                &binary,
+                &socket,
+                &files,
+                &profiles,
+                "web",
+                OsStr::new("/usr/bin"),
+                None,
+            )
+            .await;
+
+            assert_eq!(result.outcome, Ok(()));
+            assert!(result.submitted);
+            let expected_validation = [
+                "compose".to_owned(),
+                "--project-directory".to_owned(),
+                project.display().to_string(),
+                "--file".to_owned(),
+                base.display().to_string(),
+                "--file".to_owned(),
+                overlay.display().to_string(),
+                "--profile".to_owned(),
+                "frontend".to_owned(),
+                "--profile".to_owned(),
+                "qa".to_owned(),
+                "config".to_owned(),
+                "--no-interpolate".to_owned(),
+                "--no-env-resolution".to_owned(),
+                "--services".to_owned(),
+            ]
+            .join("\n")
+                + "\n";
+            assert_eq!(
+                fs::read_to_string(validation_trace).unwrap(),
+                expected_validation
+            );
+            let expected_status = [
+                "--host".to_owned(),
+                format!("unix://{}", socket.display()),
+                "compose".to_owned(),
+                "--project-directory".to_owned(),
+                project.display().to_string(),
+                "--file".to_owned(),
+                base.display().to_string(),
+                "--file".to_owned(),
+                overlay.display().to_string(),
+                "--profile".to_owned(),
+                "frontend".to_owned(),
+                "--profile".to_owned(),
+                "qa".to_owned(),
+                "ps".to_owned(),
+                "--all".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ]
+            .join("\n")
+                + "\n";
+            assert_eq!(fs::read_to_string(status_trace).unwrap(), expected_status);
+            let expected_restart = [
+                "--host".to_owned(),
+                format!("unix://{}", socket.display()),
+                "compose".to_owned(),
+                "--project-directory".to_owned(),
+                project.display().to_string(),
+                "--file".to_owned(),
+                base.display().to_string(),
+                "--file".to_owned(),
+                overlay.display().to_string(),
+                "--profile".to_owned(),
+                "frontend".to_owned(),
+                "--profile".to_owned(),
+                "qa".to_owned(),
+                "restart".to_owned(),
+                "--no-deps".to_owned(),
+                "web".to_owned(),
+            ]
+            .join("\n")
+                + "\n";
+            assert_eq!(fs::read_to_string(restart_trace).unwrap(), expected_restart);
+            assert_eq!(
+                fs::read_to_string(sequence).unwrap(),
+                "version\nvalidation\nstatus\nrestart\n"
+            );
+        }
+
+        #[tokio::test]
+        async fn service_restart_rejects_failed_invalid_or_absent_fresh_status() {
+            for (status_response, expected_error) in [
+                ("", ComposeLifecycleError::StatusUnavailable),
+                ("not-json", ComposeLifecycleError::StatusUnavailable),
+                (
+                    "{\"Name\":\"worker-1\",\"Service\":\"worker\",\"State\":\"running\"}\n",
+                    ComposeLifecycleError::ServiceUnavailable,
+                ),
+            ] {
+                let directory = FixtureDirectory::new();
+                let project = directory.path().join("project");
+                fs::create_dir(&project).unwrap();
+                let file = project.join("compose.yaml");
+                fs::write(&file, "services:\n  web:\n    image: busybox\n").unwrap();
+                let marker = directory.path().join("restart-invoked");
+                let binary = directory.path().join("docker-restart-guard");
+                let script = format!(
+                    "#!/bin/sh\n\
+                     case \"$*\" in\n\
+                       *' version --short'* ) printf 'v5.6.0\\n'; exit 0 ;;\n\
+                       *' config '* ) printf 'web\\n'; exit 0 ;;\n\
+                       *' ps '* ) printf '%s' {}; exit {} ;;\n\
+                       *' restart '* ) : > {}; exit 0 ;;\n\
+                     esac\n\
+                     exit 94\n",
+                    shell_quote(status_response),
+                    if status_response.is_empty() { 7 } else { 0 },
+                    shell_quote(marker.to_str().unwrap()),
+                );
+                fs::write(&binary, script).unwrap();
+                fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+                let result = service_restart_with_binary(
+                    &binary,
+                    &directory.path().join("socket.sock"),
+                    &[file],
+                    &[],
+                    "web",
+                    OsStr::new("/usr/bin"),
+                    None,
+                )
+                .await;
+
+                assert_eq!(result.outcome, Err(expected_error));
+                assert!(!result.submitted);
+                assert!(
+                    !marker.exists(),
+                    "no restart command may follow failed/absent status"
+                );
+            }
+        }
+        #[tokio::test]
         async fn invalid_configuration_prevents_lifecycle_command_and_hides_diagnostics() {
             let directory = FixtureDirectory::new();
             let project_directory = directory.path().join("trusted fixture");
@@ -5811,6 +6258,125 @@ mod tests {
 
             let _start = harness.get_by_role_and_label(Role::Button, "Start imported project");
             let _stop = harness.get_by_role_and_label(Role::Button, "Stop imported project");
+        }
+        #[test]
+        fn service_restart_confirmation_rejects_absent_status_service_or_changed_selection() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("Local label"));
+            assert!(
+                !view.request_service_restart_confirmation("web"),
+                "a missing successful status snapshot must not authorize restart"
+            );
+            let (generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                generation,
+                ComposeStatusResult {
+                    containers: vec![ComposeContainer {
+                        name: "worker-1".to_owned(),
+                        service: "worker".to_owned(),
+                        project: None,
+                        state: "exited".to_owned(),
+                        health: None,
+                    }],
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(
+                !view.request_service_restart_confirmation("web"),
+                "only a service in the successful current snapshot may be selected"
+            );
+            assert!(view.request_service_restart_confirmation("worker"));
+            view.profile_input = "qa".to_owned();
+            assert!(view.confirm_lifecycle().is_none());
+        }
+
+        #[test]
+        fn service_restart_control_is_visible_but_disabled_without_imported_revalidated_scope() {
+            let mut view = validated_compose_view();
+            let (generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                generation,
+                ComposeStatusResult {
+                    containers: vec![ComposeContainer {
+                        name: "web-1".to_owned(),
+                        service: "web".to_owned(),
+                        project: Some("untrusted-engine-project".to_owned()),
+                        state: "running".to_owned(),
+                        health: None,
+                    }],
+                    outcome: Ok(()),
+                },
+            ));
+            let mut harness = harness_for(view);
+            harness.run();
+            assert!(
+                harness
+                    .get_by_role_and_label(Role::Button, "Restart service web")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+        }
+
+        #[test]
+        fn service_restart_confirmation_names_scope_and_cancel_submits_no_task() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("Local label"));
+            let (generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                generation,
+                ComposeStatusResult {
+                    containers: vec![ComposeContainer {
+                        name: "web-1".to_owned(),
+                        service: "web".to_owned(),
+                        project: Some("not-an-authorization-input".to_owned()),
+                        state: "running".to_owned(),
+                        health: None,
+                    }],
+                    outcome: Ok(()),
+                },
+            ));
+            let mut harness = harness_for(view);
+            harness.run();
+            assert!(
+                !harness
+                    .get_by_role_and_label(Role::Button, "Restart service web")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            harness
+                .get_by_role_and_label(Role::Button, "Restart service web")
+                .click_accesskit();
+            harness.step();
+            assert_eq!(
+                harness.state().actions.restart_service.as_deref(),
+                Some("web")
+            );
+            assert!(
+                harness
+                    .state_mut()
+                    .view
+                    .request_service_restart_confirmation("web")
+            );
+            harness.step();
+            let _service = harness.get_by_role_and_label(Role::Label, "Service: web");
+            let _label =
+                harness.get_by_role_and_label(Role::Label, "Imported local label: Local label");
+            let _files = harness.get_by_role_and_label(Role::Label, "Ordered files: compose.yaml");
+            let _profiles = harness.get_by_role_and_label(Role::Label, "Profiles: default");
+            let _confirm = harness.get_by_role_and_label(Role::Button, "Confirm restart");
+            harness
+                .get_by_role_and_label(Role::Button, "Cancel lifecycle action")
+                .click_accesskit();
+            harness.step();
+            assert!(harness.state().actions.cancel_lifecycle);
+            assert!(
+                harness
+                    .state_mut()
+                    .view
+                    .cancel_lifecycle_confirmation()
+                    .is_some()
+            );
+            assert!(harness.state_mut().view.confirm_lifecycle().is_none());
         }
         #[test]
         fn lifecycle_confirmation_is_accessible_and_cancel_does_not_create_a_task() {

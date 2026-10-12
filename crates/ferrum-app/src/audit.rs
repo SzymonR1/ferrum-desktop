@@ -207,6 +207,7 @@ pub(super) fn record_container_action_result(
 pub(super) enum ComposeMutationAction {
     Start,
     Stop,
+    Restart,
 }
 
 #[cfg(target_os = "linux")]
@@ -215,6 +216,7 @@ impl ComposeMutationAction {
         match self {
             Self::Start => "start",
             Self::Stop => "stop",
+            Self::Restart => "restart",
         }
     }
 }
@@ -722,6 +724,18 @@ mod tests {
                 "success",
             ),
             (
+                ComposeMutationAction::Restart,
+                ComposeMutationOutcome::Started,
+                "restart",
+                "started",
+            ),
+            (
+                ComposeMutationAction::Restart,
+                ComposeMutationOutcome::Success,
+                "restart",
+                "success",
+            ),
+            (
                 ComposeMutationAction::Stop,
                 ComposeMutationOutcome::NotSubmitted,
                 "stop",
@@ -749,6 +763,7 @@ mod tests {
             assert!(!record.contains("network_id"));
             assert!(!record.contains("project"));
             assert!(!record.contains("path"));
+            assert!(!record.contains("service"));
             assert!(!record.contains("diagnostic"));
         }
         let captured = match writer.0.lock() {
