@@ -7,9 +7,9 @@ Preferences include `auto_connect_on_startup` (default `true`) and
 `none`). The helper setting stores only the selected enum, never credentials.
 When disabled, startup remains disconnected with an explanation, and the user
 can still connect manually with **Retry connection**; auto-connect takes effect
-at the next startup. A configured registry helper is used only after opting in
-for one pull on the Images page. Changes are written only after explicitly
-selecting **Save**; **Cancel** discards edits.
+at the next startup. A configured registry helper is used only after a separate
+explicit opt-in for each pull or push on the Images page. Changes are written
+only after explicitly selecting **Save**; **Cancel** discards edits.
 
 Missing files use defaults. Versionless legacy settings are migrated in memory
 while preserving recognized values. Invalid, oversized, or future-version files
@@ -81,5 +81,5 @@ fails before any settings write.
 
 Ferrum does not persist credential material, secrets, endpoints, or remote
 contexts. The registry helper preference is only the `none`,
-`secret_service`, or `pass` enum; authentication remains per-pull opt-in and
-pull-only.
+`secret_service`, or `pass` enum. Pulls and pushes remain anonymous by
+default; each Linux local-Docker operation requires its own explicit opt-in.

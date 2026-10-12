@@ -286,7 +286,9 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   `PATH`, `HOME`, optional `PASSWORD_STORE_DIR`, and the minimum session,
   keyring, and GPG variables needed by the selected helper. Discard stderr and
   output, parsed secret strings, serialized AuthConfig, and encoded auth
-  buffers. Do not read Docker `config.json` or credentials. Helper failure,
+  buffers. Ferrum does not directly read Docker `config.json` or its saved
+  credential entries. On opt-in, Ferrum transiently consumes the selected
+  helper's credential response. Helper failure,
   malformed protocol, invalid registry authority, timeout, or excess output
   returns a static safe error before Engine submission; never fall back
   anonymously after explicit helper use fails.
@@ -481,9 +483,13 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   also requires current and freshly rechecked status membership. The bounded
   one-shot service log snapshot is implemented as described above.
 - The explicit local Docker CLI Buildx invocation is an added external build process. Other external process integrations, archive extraction, and file-path surfaces remain deferred.
-- Credential stores, registry authentication, managed engines, and update delivery.
+- Ferrum-managed credential persistence and helper integrations beyond the
+  Linux Secret Service/`pass` choices; authenticated Podman/remote-engine
+  operations; managed engines; and update delivery remain deferred. Linux
+  local-Docker pulls and pushes have separate per-operation opt-ins through
+  those helpers; live helper/registry authentication is not validated.
 
-These surfaces must receive explicit design and tests before their implementation. Engine access should be treated as privileged throughout; API version negotiation is not a security boundary. UI state gating and confirmation reduce accidental destructive operations but cannot constrain a compromised or malicious engine endpoint.
+These remaining surfaces require explicit design and tests before implementation or broader support claims. Engine access should be treated as privileged throughout; API version negotiation is not a security boundary. UI state gating and confirmation reduce accidental destructive operations but cannot constrain a compromised or malicious engine endpoint.
 
 ## Validation plan
 
