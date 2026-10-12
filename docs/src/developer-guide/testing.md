@@ -285,6 +285,19 @@ paths, invalid IDs before connection, a minimal `Container` body with no
 endpoint configuration or `Force`, no removal force/prune parameters, and safe
 typed rejection errors without daemon-body or resource-ID exposure.
 
+The local container-event subscription contract tests use fake Unix sockets and
+verify both the container-only filter and a `since` timestamp captured within
+two seconds of the current local Unix time. This prevents retained
+pre-subscription events from being replayed as live changes; the application
+continues to load an inventory snapshot after subscription and reconnect. The
+event API cutoff is second-resolution, so a same-second overlap is possible;
+the inventory snapshot covers that boundary. These tests do not contact a live
+engine or mutate containers. Run them with:
+
+```sh
+cargo test -p ferrum-engine container_change_stream_tests
+```
+
 Headless Networks UI/state tests cover removal only after a fresh matching
 inspection reports `Some(0)`, disable positive/unreported counts and predefined
 networks, and require an explicit confirmation/cancel. Attachment controls
