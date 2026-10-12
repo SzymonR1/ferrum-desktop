@@ -623,18 +623,20 @@ impl ComposeView {
     fn selected_profiles(&self) -> Result<Vec<String>, ()> {
         parse_compose_profiles(&self.profile_input)
     }
-    pub(super) fn can_import_current_project(&self) -> bool {
+    fn is_current_selection_validated(&self) -> bool {
         !self.selected_files.is_empty()
             && !self.is_file_selection_running()
             && !self.is_validation_running()
             && self.validated_generation == Some(self.validation_generation)
             && matches!(&self.validation, ComposeValidationState::Succeeded { .. })
-            && self.selected_profiles().is_ok()
+    }
+    pub(super) fn can_import_current_project(&self, profiles_valid: bool) -> bool {
+        self.is_current_selection_validated() && profiles_valid
     }
 
     fn import_current_project(&mut self, name: &str) -> bool {
         let name = name.trim();
-        if !self.can_import_current_project()
+        if !self.is_current_selection_validated()
             || name.is_empty()
             || name.len() > MAX_IMPORTED_COMPOSE_NAME_BYTES
             || self.imported_projects.len() >= MAX_IMPORTED_COMPOSE_PROJECTS
@@ -659,7 +661,11 @@ impl ComposeView {
     }
 
     fn select_imported_project(&mut self, index: usize) -> bool {
-        let Some(project) = self.imported_projects.get(index).cloned() else {
+        let Some((files, profile_input)) = self
+            .imported_projects
+            .get(index)
+            .map(|project| (project.files.clone(), project.profiles.join(",")))
+        else {
             return false;
         };
         self.validation_generation = self.validation_generation.wrapping_add(1);
@@ -667,8 +673,8 @@ impl ComposeView {
         self.invalidate_status();
         self.validated_services.clear();
         self.validation = ComposeValidationState::Idle;
-        self.selected_files = project.files;
-        self.profile_input = project.profiles.join(",");
+        self.selected_files = files;
+        self.profile_input = profile_input;
         self.import_feedback = None;
         true
     }
@@ -979,7 +985,7 @@ impl ComposeView {
             }
             if ui
                 .add_enabled(
-                    self.can_import_current_project()
+                    self.can_import_current_project(profiles_valid)
                         && !import_limit_reached
                         && !actions.select_base_file
                         && !actions.add_override_file
@@ -4915,7 +4921,7 @@ mod tests {
             let mut view = ComposeView::default();
             let generation = view.begin_file_selection();
             assert!(view.finish_file_selection(generation, Some(file)));
-            assert!(!view.can_import_current_project());
+            assert!(!view.is_current_selection_validated());
             assert!(view.finish_validation(
                 generation,
                 validation_result(Err(ComposeValidationError::ValidationFailed)),
@@ -4924,13 +4930,13 @@ mod tests {
             let mut changed_profiles = validated_compose_view();
             changed_profiles.profile_input = "different".to_owned();
             changed_profiles.profiles_changed();
-            assert!(!changed_profiles.can_import_current_project());
+            assert!(!changed_profiles.is_current_selection_validated());
             assert!(!changed_profiles.import_current_project("stale-profile"));
 
             let generation = view.begin_file_selection();
             assert!(view.finish_file_selection(generation, Some(file)));
             assert!(view.finish_validation(generation, validation_result(Ok(()))));
-            assert!(view.can_import_current_project());
+            assert!(view.is_current_selection_validated());
             let mut eligible_harness = harness_for(view);
             eligible_harness.run();
             assert!(
