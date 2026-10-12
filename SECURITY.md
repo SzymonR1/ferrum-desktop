@@ -170,6 +170,11 @@ options, peers, services, raw status, and raw response bodies are not retained
 or displayed. These point-in-time values describe IP allocation, not network
 traffic; per-container/interface counters are not aggregated.
 
+Network inspection retains at most 16,384 `Containers` map entries,
+independently of the 4 MiB response-body bound. A larger map makes the entire
+inspection unavailable; Ferrum does not expose partial membership IDs or a
+partial attached-container count.
+
 Removal is offered only for selected custom networks, never Docker's predefined
 `bridge`, `host`, or `none` networks. A fresh inspection of the selected exact
 ID must report `attached_container_count == Some(0)`, and the user must confirm

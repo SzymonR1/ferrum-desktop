@@ -17,6 +17,9 @@ full 64-character hexadecimal ID. Endpoint values are discarded. A missing
 map means the count is not reported; an empty map means zero. Ferrum never
 retains or displays endpoint names, endpoint IDs/configuration, addresses,
 labels, options, raw status, subnet/CIDR keys, endpoint data, peers, or services.
+Ferrum accepts at most 16,384 `Containers` entries per inspection, independently
+of the 4 MiB response-body limit. A larger map makes the entire inspection
+unavailable; the UI does not show a partial membership set or count.
 The validated membership set is used only to compare exact container IDs against
 the current container inventory and to show network-attachment controls.
 

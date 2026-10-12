@@ -81,6 +81,9 @@ const LIFECYCLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
 const MAX_INSPECT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(target_os = "linux")]
+// Bound retained membership IDs independently of the inspect response byte cap.
+const MAX_NETWORK_MEMBERSHIP_ENTRIES: usize = 16_384;
+#[cfg(target_os = "linux")]
 const MAX_LIST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_IMAGE_HISTORY_ROWS: usize = 65_536;
@@ -1274,8 +1277,13 @@ impl<'de> Deserialize<'de> for NetworkContainerMembership {
                 let mut ids = Vec::new();
                 let mut valid = true;
                 while let Some(id) = map.next_key::<String>()? {
+                    if count >= MAX_NETWORK_MEMBERSHIP_ENTRIES {
+                        return Err(<A::Error as serde::de::Error>::custom(
+                            "too many network membership entries",
+                        ));
+                    }
                     map.next_value::<IgnoredAny>()?;
-                    count = count.saturating_add(1);
+                    count += 1;
                     if is_full_container_id(&id) {
                         ids.push(id);
                     } else {
@@ -2433,6 +2441,9 @@ impl EngineClient {
     /// Full 64-character hexadecimal container IDs are retained only when
     /// every `Containers` map key is valid; the point-in-time attached-
     /// container count remains separate from aggregate IP allocation counts.
+    /// At most 16,384 `Containers` map entries are accepted; larger maps make
+    /// the whole inspection unavailable rather than returning partial IDs.
+    /// This count bound is independent of the 4 MiB response-body limit.
     /// IPAM usage is unavailable when reported values cannot be safely
     /// aggregated.
     ///
@@ -6449,6 +6460,7 @@ mod context_selection_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod network_api_tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -6545,6 +6557,19 @@ mod network_api_tests {
         .into_bytes();
         result.extend_from_slice(body);
         result
+    }
+    fn network_inspection_body(container_count: usize) -> Vec<u8> {
+        let mut body = String::with_capacity(container_count.saturating_mul(71).saturating_add(64));
+        body.push_str(r#"{"Id":"network","Name":"custom","Containers":{"#);
+        for index in 0..container_count {
+            if index > 0 {
+                body.push(',');
+            }
+            write!(&mut body, "\"{index:064x}\":{{}}")
+                .expect("writing a network membership test body should succeed");
+        }
+        body.push_str("}}");
+        body.into_bytes()
     }
 
     fn cleanup(socket: &std::path::Path, directory: &std::path::Path) {
@@ -6972,6 +6997,44 @@ mod network_api_tests {
         assert!(!debug.contains("192.0.2.0/24"));
         assert!(!debug.contains("2001:db8::/64"));
         cleanup(&socket, &directory);
+    }
+    #[tokio::test]
+    async fn rejects_network_inspection_over_membership_limit() {
+        let body = network_inspection_body(MAX_NETWORK_MEMBERSHIP_ENTRIES + 1);
+        assert!(body.len() < MAX_INSPECT_RESPONSE_BYTES);
+        let (socket, directory, server) = fixture(response("200 OK", &body)).await;
+        let result = client(socket.clone()).inspect_network("network").await;
+        let _request = server.await.expect("server");
+        cleanup(&socket, &directory);
+
+        assert!(
+            matches!(
+                result,
+                Err(EngineError::NetworkInspectionUnavailable { .. })
+            ),
+            "over-limit network membership should fail closed"
+        );
+    }
+    #[tokio::test]
+    async fn accepts_network_inspection_at_membership_limit() {
+        let body = network_inspection_body(MAX_NETWORK_MEMBERSHIP_ENTRIES);
+        assert!(body.len() < MAX_INSPECT_RESPONSE_BYTES);
+        let (socket, directory, server) = fixture(response("200 OK", &body)).await;
+        let details = client(socket.clone())
+            .inspect_network("network")
+            .await
+            .expect("network membership at the limit is accepted");
+        let _request = server.await.expect("server");
+        cleanup(&socket, &directory);
+
+        assert_eq!(
+            details.attached_container_count,
+            Some(MAX_NETWORK_MEMBERSHIP_ENTRIES)
+        );
+        assert_eq!(
+            details.attached_container_ids.as_ref().map(Vec::len),
+            Some(MAX_NETWORK_MEMBERSHIP_ENTRIES)
+        );
     }
 
     #[test]
