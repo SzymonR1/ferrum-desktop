@@ -24,6 +24,11 @@ earlier state, while the event stream carries only subsequent changes. The same
 cutoff is applied on reconnect; no event history is required to reconstruct
 current inventory.
 
+The Engine cursor uses whole Unix seconds, so events from earlier within that
+same second may still be emitted. The immediate inventory snapshot and normal
+event refresh path reconcile this small overlap; the cutoff prevents replay of
+the older retained backlog without suppressing events after subscription.
+
 This decision applies only to the existing Linux local Unix-socket engine path. Remote transports, Podman/rootless behavior, Windows, and macOS are not enabled or validated by lifecycle support.
 
 ## Alternatives considered

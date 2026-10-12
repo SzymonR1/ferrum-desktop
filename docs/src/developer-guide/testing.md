@@ -287,8 +287,10 @@ The local container-event subscription contract tests use fake Unix sockets and
 verify both the container-only filter and a `since` timestamp captured within
 two seconds of the current local Unix time. This prevents retained
 pre-subscription events from being replayed as live changes; the application
-continues to load an inventory snapshot after subscription and reconnect. These
-tests do not contact a live engine or mutate containers. Run them with:
+continues to load an inventory snapshot after subscription and reconnect. The
+event API cutoff is second-resolution, so a same-second overlap is possible;
+the inventory snapshot covers that boundary. These tests do not contact a live
+engine or mutate containers. Run them with:
 
 ```sh
 cargo test -p ferrum-engine container_change_stream_tests
