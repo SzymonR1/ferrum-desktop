@@ -20,6 +20,7 @@ pub(super) enum ImageBuildError {
     InvalidTarget,
     InvalidContext,
     DockerUnavailable,
+    SpawnFailed,
     Failed,
     Cancelled,
 }
@@ -32,6 +33,7 @@ impl fmt::Display for ImageBuildError {
                 "Choose a directory containing a regular root-level Dockerfile."
             }
             Self::DockerUnavailable => "Docker CLI with the Buildx plugin is unavailable.",
+            Self::SpawnFailed => "Docker Buildx could not be started; the build was not submitted.",
             Self::Failed => "Docker build failed; image state may have changed.",
             Self::Cancelled => "Docker build cancelled; image state may have changed.",
         })
@@ -317,7 +319,7 @@ pub(super) async fn run_command(
         if error.kind() == std::io::ErrorKind::NotFound {
             ImageBuildError::DockerUnavailable
         } else {
-            ImageBuildError::Failed
+            ImageBuildError::SpawnFailed
         }
     })?;
     let pid = child.id().ok_or(ImageBuildError::Failed)? as i32;

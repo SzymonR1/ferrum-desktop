@@ -104,13 +104,13 @@ The 2026-10-11 read-only history smoke passed against Docker Engine 29.9.0/API
 1.56 using the preinstalled `ghcr.io/catthehacker/ubuntu:rust-latest` image
 and current local Unix context; it read history without mutating the image.
 
-Image-build regressions exercise only temporary files and a controlled helper
-process. They do not invoke Docker or Buildx against an engine, build an image,
+Image-build regressions exercise only temporary files and controlled helper
+processes. They do not invoke Docker or Buildx against an engine, build an image,
 or mutate image resources. Tests cover local-context and target validation,
 private config permissions and cleanup, socket-pinned command construction,
-credential isolation, bounded and escaped output, process failure/cancellation,
-explicit confirmation, context-switch gating, and static non-persistent build
-outcome tracing.
+credential isolation, bounded and escaped output, process spawn failure versus
+post-start failure/cancellation, explicit confirmation, context-switch gating,
+and static durable build-outcome classification.
 
 The named tests are:
 
@@ -128,6 +128,7 @@ The named tests are:
 - `build_start_progress_success_error_and_cancel_have_terminal_transitions`
 - `build_output_is_bounded_and_escaped`
 - `records_static_image_build_outcomes`
+- `event_reconciliation_tests::build_runner_spawn_failure_is_persisted_as_not_submitted`
 - `event_reconciliation_tests::pending_image_build_confirmation_disables_context_switching`
 - `event_reconciliation_tests::pending_image_build_disables_context_selector_accessibly`
 - `event_reconciliation_tests::active_image_build_disables_context_switching`
@@ -205,17 +206,19 @@ the current local Docker CLI context to use a Unix socket:
 cargo test -p ferrum-engine live_volume_create_tests::local_engine_creates_and_removes_unique_volume -- --exact --ignored
 ```
 
-EngineClient uses the socket path stored in the discovered current context. The
-test preflights its generated name, verifies the create response and inventory,
-and requires the exact-name usage snapshot to report `RefCount == 0`. It
-disarms the cleanup guard immediately before calling
-`EngineClient::remove_volume`, then confirms inventory absence. The Drop
-fallback uses argument-array Docker CLI `--host unix://...` pinned to the same
-socket without force, only if the test unwinds before the removal request is
-submitted. There is no name-based retry after submission; a failed or uncertain
-removal may leave the volume. If ownership cannot be confirmed, no removal
-request is sent. The read-only `FERRUM_TEST_VOLUME` test is separate.
-Fake-socket and headless UI tests do not contact a live engine.
+This test is mutating and must run only against a disposable local Docker Engine
+using a Unix socket. EngineClient uses the socket path stored in the discovered
+current context. The test preflights a generated name, verifies the create
+response and inventory names, and requires the exact-name usage snapshot to
+report `RefCount == 0`. Docker volumes have no immutable ID in this path; a
+concurrent delete/recreate under the same name cannot be distinguished. The
+generated-name checks are best-effort, not a stable ownership proof, and
+cleanup by name may target a same-name replacement if another actor races the
+test. If initial name/response checks fail, no cleanup is issued and the
+generated volume may remain. The Drop fallback uses the same pinned socket
+without force only if the test unwinds before removal submission. There is no
+name-based retry after submission. The read-only `FERRUM_TEST_VOLUME` test is
+separate. Fake-socket and headless UI tests do not contact a live engine.
 
 The optional ignored network list/inspect test is read-only and requires
 `FERRUM_TEST_NETWORK` to name an existing network on the selected local Docker
@@ -282,6 +285,19 @@ Fake-socket network API tests cover versioned exact-ID delete/connect/disconnect
 paths, invalid IDs before connection, a minimal `Container` body with no
 endpoint configuration or `Force`, no removal force/prune parameters, and safe
 typed rejection errors without daemon-body or resource-ID exposure.
+
+The local container-event subscription contract tests use fake Unix sockets and
+verify both the container-only filter and a `since` timestamp captured within
+two seconds of the current local Unix time. This prevents retained
+pre-subscription events from being replayed as live changes; the application
+continues to load an inventory snapshot after subscription and reconnect. The
+event API cutoff is second-resolution, so a same-second overlap is possible;
+the inventory snapshot covers that boundary. These tests do not contact a live
+engine or mutate containers. Run them with:
+
+```sh
+cargo test -p ferrum-engine container_change_stream_tests
+```
 
 Headless Networks UI/state tests cover removal only after a fresh matching
 inspection reports `Some(0)`, disable positive/unreported counts and predefined

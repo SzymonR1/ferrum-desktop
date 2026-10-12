@@ -3252,7 +3252,7 @@ impl EngineClient {
         }
     }
 
-    /// Opens the engine's incremental container event stream.
+    /// Opens an incremental container event stream starting at the current local time.
     ///
     /// # Errors
     ///
@@ -3260,8 +3260,13 @@ impl EngineClient {
     #[cfg(target_os = "linux")]
     pub async fn subscribe_container_changes(&self) -> Result<ContainerChangeStream, EngineError> {
         let endpoint_label = self.info.endpoint_label;
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| EngineError::ContainerEventsUnavailable { endpoint_label })?
+            .as_secs();
+        // Historical events are covered by the caller's inventory snapshot.
         let path = format!(
-            "/v{}/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D",
+            "/v{}/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D&since={since}",
             self.api_version
         );
         let result = timeout(REQUEST_TIMEOUT, async {
@@ -6320,11 +6325,39 @@ mod container_change_stream_tests {
             assert_ne!(count, 0, "client should send HTTP headers");
             request.extend_from_slice(&buffer[..count]);
         }
-        assert!(
-            request.starts_with(
-                b"GET /v1.45/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D HTTP/1.1\r\n"
-            ),
+        let request_line = String::from_utf8_lossy(
+            request
+                .split(|byte| *byte == b'\n')
+                .next()
+                .expect("HTTP request line should exist"),
+        );
+        let request_target = request_line
+            .split_whitespace()
+            .nth(1)
+            .expect("event request target should exist");
+        let (path, query) = request_target
+            .split_once('?')
+            .expect("event subscription query should exist");
+        assert_eq!(path, "/v1.45/events");
+        let mut parameters = query.split('&');
+        assert_eq!(
+            parameters.next(),
+            Some("filters=%7B%22type%22%3A%5B%22container%22%5D%7D"),
             "event subscription must filter to container events"
+        );
+        let since = parameters
+            .find_map(|parameter| parameter.strip_prefix("since="))
+            .expect("event subscription must exclude retained pre-connection events");
+        let since = since
+            .parse::<u64>()
+            .expect("event start time should be Unix seconds");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_secs();
+        assert!(
+            since.abs_diff(now) <= 2,
+            "event start time should be captured when subscribing"
         );
     }
 

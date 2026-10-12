@@ -21,9 +21,11 @@ or build is active. Stream only sanitized bounded plain text in memory; do not
 persist output. Best-effort cancellation terminates the CLI process group;
 refresh inventory after every terminal/cancel result because state may be
 uncertain. Build traces contain only static action and outcome, excluding
-context path, tag, and output. Their redacted outcome is also written to the
-existing best-effort durable JSONL audit; only static event/action/outcome are
-persisted for builds. Build output remains bounded transient UI data and is
+context path, tag, and output. A Buildx spawn failure is `not_submitted`;
+an unsuccessful outcome after a child starts is `request_error` because
+builder-side state may be uncertain. The redacted outcome is also written to
+the existing best-effort durable JSONL audit; only static event/action/outcome
+are persisted for builds. Build output remains bounded transient UI data and is
 never persisted.
 
 Compose support includes read-only Docker CLI version/project discovery and
@@ -35,6 +37,28 @@ which Ferrum sets to the base file's parent. See Docker's [Compose CLI reference
 for ordered merge and path semantics and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
 for validation flags.
 
+On Linux, explicitly selected base and override files have a combined 16 MiB
+byte limit (exactly 16 MiB is accepted); larger selections are rejected before
+any Docker/Compose process is launched. This is a point-in-time check, not an
+atomic security boundary: a same-UID process may change or replace a selected
+file after it is checked. After the Compose version preflight, Compose reopens
+the original selected paths for validation, so the contents read may differ
+from those measured by the check. The check does not include local files read
+through `include` or service `extends.file`.
+Linux Compose subprocesses for version, discovery, and validation receive
+per-process `RLIMIT_AS` of 4 GiB and `RLIMIT_DATA` of 512 MiB, preserving lower
+inherited limits. These limits apply while Compose reads selected and included
+files. They are inherited by child processes and bound each process, not
+aggregate process-tree RSS; they are not a sandbox. The private child
+environment sets `GOMEMLIMIT=402653184` (384 MiB), a Go runtime soft target
+that may be exceeded to avoid excessive GC thrashing. Resource exhaustion may
+produce a generic validation failure.
+
+Compose remains trusted local code, not a sandbox. The point-in-time selected-
+file size check does not eliminate the race with same-UID changes, and neither
+it nor the process limits confine included local-file reads or eliminate the
+need to validate only trusted files.
+
 Validation skips interpolation and service `env_file` resolution, uses no
 engine, and does not mutate project files. Compose can still recursively read
 local `include`/`extends.file` Compose files and included projects' default
@@ -43,7 +67,7 @@ permissions, potentially outside the base directory. Remote Git/OCI loaders
 are disabled. The selected files and private CLI environment do not sandbox
 those reads; validate only trusted files. Profiles, `.env`/service
 `env_file` resolution, import, lifecycle/build/pull/logs, and project mutations
-remain unsupported. Issue #18 remains partial/open; issue #10 remains
+remain unsupported. Issues #18 and #19 remain partial/open; issue #10 remains
 blocked/open. No release or broader support claim is made.
 
 
@@ -83,9 +107,14 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   documents the validation flags.
 
 - Keep validation read-only, engine-independent, and bounded to eight seconds
-  and 1 MiB stdout per command. Success is structural validation only;
-  interpolation and service `env_file` resolution are skipped. Do not mutate,
-  extract, or write project files.
+  and 1 MiB stdout per command. Before launching any Docker/Compose process,
+  reject a combined selected base-and-override file size above 16 MiB; exactly
+  16 MiB is accepted. This is a point-in-time size check, not atomic against
+  same-UID changes; Compose reopens the original paths after preflight. This
+  applies only to explicitly selected files, not local `include`/`extends.file`
+  files. Success is structural validation only; interpolation and service
+  `env_file` resolution are skipped. Do not mutate, extract, or write project
+  files.
 
 - Treat Compose references as untrusted filesystem reads. Compose may
   recursively read local files referenced by `include` or service
@@ -125,7 +154,7 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   raw-or-escaped limit before retaining it, so the page shows those fields as
   unavailable. The UI applies the display cap again before rendering.
   Create only by sending `Name` to the negotiated `POST /v{api}/volumes/create` endpoint. Validate nonblank names of at most 4096 UTF-8 bytes, reject control or selected invisible formatting characters and `.`/`..`, and send no driver, labels, or options. Bound the request body to 16 KiB, response to 64 KiB, and total request to eight seconds. Require the response name to match the submitted name exactly; escape selected control, bidi, and invisible formatting characters in optional display fields as visible `\u{...}` text.
-  Remove only a selected listed volume whose matching inspection reports the exact name and whose exact-name usage snapshot reports `Some(0)` references. Require explicit confirmation naming the volume; positive or unavailable counts cannot be submitted. Send only the negotiated `DELETE /v{api}/volumes/{name}` without `force`, bound it to eight seconds, and do not consume or expose daemon response bodies. The usage count is not atomic with deletion; Docker may reject the request if dependencies change. Timeouts or transport errors may follow a successful removal. Permit one volume mutation at a time, block context switching while pending, and refresh inventory after every result. Do not offer pruning, modification, connection, disconnection, or filesystem browsing. Podman/rootless remains unvalidated and remote endpoints remain unsupported; issues #17 and #10 stay open.
+  Remove only a selected listed volume whose matching inspection reports the exact name and whose exact-name usage snapshot reports `Some(0)` references. Require explicit confirmation naming the volume; positive or unavailable counts cannot be submitted. Send only the negotiated `DELETE /v{api}/volumes/{name}` without `force`, bound it to eight seconds, and do not consume or expose daemon response bodies. The usage count is not atomic with deletion; Docker may reject the request if dependencies change. Timeouts or transport errors may follow a successful removal. Permit one volume mutation at a time, block context switching while pending, and refresh inventory after every result. Do not offer pruning, modification, connection, disconnection, or filesystem browsing. Podman/rootless remains unvalidated and remote endpoints remain unsupported; issue #10 remains open and blocked for the broader endpoint matrix.
 - Treat duplicate/conflicting volume-usage `VolumeUsage`, `Items`, `Name`, or
   `UsageData` keys and repeated exact-name items as ambiguous; their usage is
   unavailable and cannot satisfy the `RefCount == 0` removal gate.
@@ -378,19 +407,21 @@ connect/disconnect confirmation and cancel, stale selections/results, and
 single-flight/context-switch gates. They do not contact a live engine; native
 UI click/visual validation remains unverified. IPAM allocation counts are
 implemented as described above; per-network traffic totals are not implemented.
-Issues #17 and #10 remain open; Podman/rootless and remote behavior are not
-claimed.
+Podman/rootless and remote behavior remain unsupported or unvalidated under
+open, blocked issue #10. No broader endpoint or platform support is claimed.
 Fake-Unix-socket image protocol tests and headless Images UI tests cover tag/removal and anonymous push request/confirmation behavior without contacting a real engine or registry, and without mutating image resources. Push tests verify exact image/tag preflight, one explicit target tag, the empty anonymous JSON body with no auth header, bounded progress, safe HTTP rejection, and daemon error redaction. No live image push, deletion, or other image mutation test is claimed. Fake-socket image protocol tests, headless Images UI tests, and controlled helper-process Buildx tests do not contact a real engine or mutate images. There is no live pull, tag, removal, image build, or image-mutation test. Separate opt-in ignored lifecycle, logs, and terminal tests mutate engine state using one uniquely named disposable container and only its validated full ID as cleanup authority. Logs and terminal tests require locally installed images and never pull, tag, push, or delete images. See [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
 
 The optional ignored volume create/remove test uses the current local Docker
-context's parsed Unix socket path for EngineClient operations. It preflights a
-generated name, then arms cleanup only after the create response and inventory
-confirm that exact name; the test also requires the exact-name usage snapshot
-to report `RefCount == 0`. It disarms the guard before calling
-`EngineClient::remove_volume` and confirms the name is absent. The Drop fallback
-uses Docker CLI `--host unix://...` on the same pinned socket without force only
-if the test unwinds before the removal request is submitted. There is no
-name-based retry after submission; a failed request may leave the volume. If
-ownership cannot be confirmed, no removal is sent. The separate
-`FERRUM_TEST_VOLUME` live test is read-only. Default fake-socket and headless UI
-tests do not contact a live engine.
+context's parsed Unix socket path for EngineClient operations and must run only
+against a disposable local Docker Engine. It preflights a generated name,
+checks the create response and inventory, and requires an exact-name usage
+snapshot reporting `RefCount == 0`. Docker volume operations are name-addressed
+here and expose no immutable ID; a concurrent delete/recreate under the same
+name cannot be distinguished by those checks. The generated-name verification
+is best-effort, not a stable ownership proof, and cleanup by name may target a
+same-name replacement if another actor races the test. The Drop fallback uses
+the same pinned socket without force only if the test unwinds before removal
+submission. There is no name-based retry after submission, and a failed request
+may leave the volume. If initial preflight/response checks fail, no cleanup is
+sent. The separate `FERRUM_TEST_VOLUME` live test is read-only. Default
+fake-socket and headless UI tests do not contact a live engine.
