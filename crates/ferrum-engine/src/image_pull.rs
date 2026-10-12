@@ -504,8 +504,10 @@ mod tests {
         cleanup(&socket, &directory);
     }
 
-    #[tokio::test]
-    async fn posts_exact_registry_auth_config_when_supplied() {
+    async fn authenticated_pull_with_fake_engine(
+        reference: &str,
+        auth: &RegistryAuth,
+    ) -> (serde_json::Value, String) {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 
         let (socket, directory) = temporary_socket();
@@ -519,25 +521,29 @@ mod tests {
                 .find_map(|line| {
                     line.to_ascii_lowercase()
                         .starts_with("x-registry-auth:")
-                        .then(|| line.split_once(':').unwrap().1.trim())
+                        .then(|| line.split_once(':').unwrap().1.trim().to_owned())
                 })
                 .unwrap();
-            let decoded = URL_SAFE.decode(encoded).unwrap();
+            let decoded = URL_SAFE.decode(encoded.as_bytes()).unwrap();
             let auth: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-            assert_eq!(
-                auth,
-                serde_json::json!({
-                    "username": "alice",
-                    "password": "not-a-real-secret",
-                    "serveraddress": "registry.example",
-                })
-            );
-            assert!(encoded.ends_with('='));
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .await
                 .unwrap();
+            (auth, encoded)
         });
+        let mut pull = engine(socket.clone())
+            .open_image_pull(reference, Some(auth))
+            .await
+            .unwrap();
+        assert_eq!(pull.next_progress().await.unwrap(), None);
+        let result = server.await.unwrap();
+        cleanup(&socket, &directory);
+        result
+    }
+
+    #[tokio::test]
+    async fn posts_exact_registry_auth_config_when_supplied() {
         let auth = RegistryAuth::from_helper_credentials(
             "alice".to_owned(),
             "not-a-real-secret".to_owned(),
@@ -545,13 +551,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(format!("{auth:?}"), "RegistryAuth([REDACTED])");
-        let mut pull = engine(socket.clone())
-            .open_image_pull("registry.example/team/app:latest", Some(&auth))
-            .await
-            .unwrap();
-        assert_eq!(pull.next_progress().await.unwrap(), None);
-        server.await.unwrap();
-        cleanup(&socket, &directory);
+        let (observed, encoded) =
+            authenticated_pull_with_fake_engine("registry.example/team/app:latest", &auth).await;
+        assert_eq!(
+            observed,
+            serde_json::json!({
+                "username": "alice",
+                "password": "not-a-real-secret",
+                "serveraddress": "registry.example",
+            })
+        );
+        assert!(encoded.ends_with('='));
     }
 
     #[test]
@@ -576,49 +586,20 @@ mod tests {
     }
     #[tokio::test]
     async fn posts_identity_token_config_to_fake_engine() {
-        use base64::{Engine as _, engine::general_purpose::URL_SAFE};
-
-        let (socket, directory) = temporary_socket();
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let request = read_request(&mut stream).await;
-            let headers = String::from_utf8_lossy(&request);
-            let encoded = headers
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .starts_with("x-registry-auth:")
-                        .then(|| line.split_once(':').unwrap().1.trim())
-                })
-                .unwrap();
-            let decoded = URL_SAFE.decode(encoded).unwrap();
-            let auth: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-            assert_eq!(
-                auth,
-                serde_json::json!({
-                    "identitytoken": "synthetic-token",
-                    "serveraddress": "https://index.docker.io/v1/",
-                })
-            );
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await
-                .unwrap();
-        });
         let auth = RegistryAuth::from_helper_credentials(
             "<token>".to_owned(),
             "synthetic-token".to_owned(),
             "https://index.docker.io/v1/",
         )
         .unwrap();
-        let mut pull = engine(socket.clone())
-            .open_image_pull("alpine:latest", Some(&auth))
-            .await
-            .unwrap();
-        assert_eq!(pull.next_progress().await.unwrap(), None);
-        server.await.unwrap();
-        cleanup(&socket, &directory);
+        let (observed, _) = authenticated_pull_with_fake_engine("alpine:latest", &auth).await;
+        assert_eq!(
+            observed,
+            serde_json::json!({
+                "identitytoken": "synthetic-token",
+                "serveraddress": "https://index.docker.io/v1/",
+            })
+        );
     }
 
     #[test]
