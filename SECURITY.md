@@ -299,9 +299,13 @@ are skipped. Ferrum displays bounded escaped basenames, static outcomes, and
 the bounded escaped declared-service rows returned on successful validation;
 Explicit profile selection affects structural validation, read-only status, and
 one-shot service logs only. The declared-service inventory includes every
-declaration in the selected files regardless of active profiles. It does not
-add project import/persistence or lifecycle operations (start/stop/restart/
-build/pull), live log follow, or project mutation.
+declaration in the selected files regardless of active profiles. Transient
+imports retain only validated ordered paths, profiles, and a bounded local
+label in memory for this session. They copy/persist no files, invoke no
+CLI/Engine operation, and do not establish project identity or authorization.
+Persistent project storage and lifecycle operations
+(start/stop/restart/build/pull), live log follow, and project mutation remain
+unavailable.
 
 On successful validation the same bounded CLI invocation returns every
 declared service name via `config --services`, including services gated by

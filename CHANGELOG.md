@@ -3,6 +3,20 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Added transient in-memory Compose configuration imports for a currently
+  validated ordered file/profile selection. Unique local display labels (up to
+  256 UTF-8 bytes) and absolute file/profile selections are retained for this
+  session only, with a 32-entry cap; duplicate/empty/oversized names are
+  rejected. Imported configurations appear separately from Engine-discovered
+  projects, and their labels or per-container `Project` metadata are not
+  treated as canonical identity, file ownership, or authorization. Selecting
+  an import cancels in-flight validation/status/log tasks, restores exact file
+  order and profiles, and invalidates old results; explicit revalidation is
+  required before status/log queries. Import starts no CLI/Engine operation;
+  selection starts no new command or Engine request. Neither action mutates,
+  copies, or persists files or manages project lifecycle. Documentation preserves
+  the warning that Compose `include` and `extends.file` can read trusted local
+  files outside the explicit selection.
 - Added bounded, escaped optional per-container `Project` metadata to the
   read-only Compose status parser and virtualized container rows. Missing values
   render as `Not reported`; rows remain independent, and the label is untrusted
@@ -21,7 +35,7 @@ All notable project changes are documented here. The project has not published a
   `logs`, never via an environment variable, and reuses the selection for the
   status recheck before logs. Invalid or changed selection clears results,
   cancels in-flight work, and requires revalidation. Private Docker config/HOME
-  and the cleared environment remain in effect. No project import/persistence,
+  and the cleared environment remain in effect. No persistent project import,
   start/stop/restart, build/pull, live log follow, or project mutation is added.
   See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
   and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).

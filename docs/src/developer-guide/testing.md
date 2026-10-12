@@ -451,8 +451,13 @@ profiles. Headless state tests cover profile-edit invalidation, invalid-profile
 gating, cancellation/stale results, revalidation, and keeping profile input
 disabled during asynchronous file selection. Preserve private Docker
 config/HOME, cleared environment, disabled selected-project `.env`, and
-disabled remote Git/OCI loaders. Do not add project import or lifecycle/
-mutation operations. See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
+disabled remote Git/OCI loaders. Transient imports use synthetic path state and
+headless UI only; they retain no file contents, persist no registry, and start
+no CLI/Engine operation. Tests cover validation gating, duplicate/name and
+32-entry bounds, ordered path/profile restoration, stale-generation rejection,
+and cancellation requests for in-flight validation/status/log tasks. Selecting
+clears stale results; persistent project registration and lifecycle/mutation
+operations remain out of scope. See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
 and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
 
 Headless AccessKit/state tests cover ordered base/override selection, removing
@@ -540,8 +545,8 @@ files. Bounded profile selection applies to structural validation, read-only
 status, and one-shot service logs; the declared-service inventory is not
 profile-filtered and lists all declarations from selected files. Profiles are
 passed as explicit `--profile` arguments and are not inherited from the
-environment. Project import/persistence, lifecycle, build/pull, live log
-follow, and project mutations remain unsupported.
+environment. Transient import is session-only; no persistent project registry,
+lifecycle, build/pull, live log follow, or project mutation is introduced.
 The one-shot service logs are covered by fake-CLI and headless tests; no real
 service logs are read by default. A temporary-project profile-validation smoke
 verifies that `config --services` lists all declarations, including one in
