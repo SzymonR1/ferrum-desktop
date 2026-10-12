@@ -6,7 +6,9 @@ Ferrum keeps native presentation, engine-independent domain values, and Docker-c
 flowchart LR
     UI[eframe native UI] --> APP[Application state]
     APP --> CORE[Engine-independent domain]
-    APP --> CLIENT[EngineClient]
+    APP -->|anonymous by default; optional RegistryAuth on pull only| CLIENT[EngineClient]
+    APP -->|explicit one-pull opt-in| HELPER[Allowlisted Secret Service/pass helper]
+    HELPER -->|bounded credential response, transient in app| APP
     CLIENT -->|bounded version, inventory, inspect, lifecycle requests| SOCKET[Selected local Linux Unix socket]
     SOCKET --> ENGINE[Docker-compatible engine]
     ENGINE -->|container events| SOCKET
