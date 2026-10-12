@@ -16,6 +16,14 @@ const MAX_VERSION_BYTES: usize = 64;
 const MAX_COMPOSE_FILENAME_DISPLAY_BYTES: usize = 128;
 #[cfg(target_os = "linux")]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(target_os = "linux")]
+const MAX_COMPOSE_INPUT_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const CHILD_ADDRESS_SPACE_LIMIT: libc::rlim_t = 4 * 1024 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const CHILD_DATA_LIMIT: libc::rlim_t = 512 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const CHILD_GO_MEMORY_LIMIT: &str = "402653184";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ComposeProject {
@@ -70,6 +78,7 @@ pub(super) enum ComposeValidationError {
     ComposePluginUnavailable,
     PrivateConfigSetupFailed,
     InvalidSelectedFile,
+    InputTooLarge,
     ValidationFailed,
 }
 
@@ -86,6 +95,9 @@ impl ComposeValidationError {
                 "Compose validation could not start safely. Try again later."
             }
             Self::InvalidSelectedFile => "The selected Compose file could not be validated.",
+            Self::InputTooLarge => {
+                "Selected Compose files exceed the 16 MiB validation input limit."
+            }
             Self::ValidationFailed => "Compose file validation failed.",
         }
     }
@@ -757,11 +769,12 @@ async fn run_command_with_timeout(
     command: &mut tokio::process::Command,
     deadline: Duration,
 ) -> Result<Vec<u8>, CommandFailure> {
-    #[cfg(test)]
-    let _test_subprocess_guard = crate::TEST_SUBPROCESS_LOCK.lock().await;
-
+    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
+
+    #[cfg(test)]
+    let _test_subprocess_guard = crate::TEST_SUBPROCESS_LOCK.lock().await;
 
     command
         .stdin(Stdio::null())
@@ -769,7 +782,45 @@ async fn run_command_with_timeout(
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .process_group(0);
-    let mut child = command.spawn().map_err(|_| CommandFailure::Launch)?;
+    // SAFETY: The pre-exec closure uses only stack locals and AS-Safe
+    // getrlimit/setrlimit calls. It performs no allocation, locking, logging,
+    // or environment access after fork.
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_AS, &mut limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limit.rlim_cur = limit.rlim_cur.min(CHILD_ADDRESS_SPACE_LIMIT);
+            limit.rlim_max = limit.rlim_max.min(CHILD_ADDRESS_SPACE_LIMIT);
+            limit.rlim_cur = limit.rlim_cur.min(limit.rlim_max);
+            // SAFETY: setrlimit is AS-Safe and `limit` is a stack-local copy
+            // of RLIMIT_AS with non-increasing soft and hard bounds.
+            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            if libc::getrlimit(libc::RLIMIT_DATA, &mut limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limit.rlim_cur = limit.rlim_cur.min(CHILD_DATA_LIMIT);
+            limit.rlim_max = limit.rlim_max.min(CHILD_DATA_LIMIT);
+            limit.rlim_cur = limit.rlim_cur.min(limit.rlim_max);
+            // SAFETY: setrlimit is AS-Safe and `limit` is a stack-local copy
+            // of RLIMIT_DATA with non-increasing soft and hard bounds.
+            if libc::setrlimit(libc::RLIMIT_DATA, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CommandFailure::Launch
+        } else {
+            CommandFailure::Io
+        }
+    })?;
     let mut process_group = child
         .id()
         .and_then(|id| libc::pid_t::try_from(id).ok())
@@ -896,6 +947,7 @@ impl PrivateDockerConfig {
             .env("DOCKER_CONFIG", &self.docker_config)
             .env("LANG", "C")
             .env("LC_ALL", "C")
+            .env("GOMEMLIMIT", CHILD_GO_MEMORY_LIMIT)
             // Remote Compose sources can make Git/registry requests during
             // config parsing; disable both loaders for every CLI invocation.
             .env("COMPOSE_EXPERIMENTAL_GIT_REMOTE", "false")
@@ -966,6 +1018,16 @@ fn selected_compose_files_are_valid(files: &[std::path::PathBuf]) -> bool {
                 && !files[..index].iter().any(|selected| selected == file)
         })
 }
+#[cfg(target_os = "linux")]
+fn selected_compose_files_size_exceeds_limit(files: &[std::path::PathBuf]) -> bool {
+    files.iter().fold(0_u64, |total, file| {
+        let size = file
+            .symlink_metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(MAX_COMPOSE_INPUT_BYTES.saturating_add(1));
+        total.saturating_add(size)
+    }) > MAX_COMPOSE_INPUT_BYTES
+}
 
 #[cfg(target_os = "linux")]
 pub(super) async fn validate_compose_files(
@@ -974,6 +1036,11 @@ pub(super) async fn validate_compose_files(
     use std::env;
     if !selected_compose_files_are_valid(files) {
         return ComposeValidationResult::failed(ComposeValidationError::InvalidSelectedFile);
+    }
+    // Keep input-limit errors deterministic even when Docker is unavailable;
+    // the report path rechecks after CLI discovery before starting a subprocess.
+    if selected_compose_files_size_exceeds_limit(files) {
+        return ComposeValidationResult::failed(ComposeValidationError::InputTooLarge);
     }
 
     let Some(search_path) = env::var_os("PATH") else {
@@ -1042,6 +1109,9 @@ async fn validate_with_files_report(
 
     if !selected_compose_files_are_valid(files) {
         return ComposeValidationResult::failed(ComposeValidationError::InvalidSelectedFile);
+    }
+    if selected_compose_files_size_exceeds_limit(files) {
+        return ComposeValidationResult::failed(ComposeValidationError::InputTooLarge);
     }
     let parent = files[0].parent().expect("absolute file has a parent");
     let isolated = match PrivateDockerConfig::new(user_compose_plugin) {
@@ -1241,8 +1311,9 @@ mod tests {
                    [ -z \"${{COMPOSE_DISABLE_ENV_FILE+x}}\" ] || exit 90\n\
                    [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = \"false\" ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = \"false\" ] || exit 91\n\
                    env | while IFS='=' read -r name value; do\n\
-                     case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|PWD|SHLVL|_) : ;; *) exit 89 ;; esac\n\
+                     case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|GOMEMLIMIT|PWD|SHLVL|_) : ;; *) exit 89 ;; esac\n\
                    done || exit 89\n\
+                   [ \"$GOMEMLIMIT\" = 402653184 ] || exit 89\n\
                    printf '%s\\n%s' \"$DOCKER_CONFIG\" \"$HOME\" > {}\n\
                    printf '%s' {}\n\
                    exit {}\n\
@@ -1259,8 +1330,9 @@ mod tests {
                  [ \"$(cat {})\" = \"$(printf '%s\\n%s' \"$DOCKER_CONFIG\" \"$HOME\")\" ] || exit 90\n\
                  if [ -n \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{DOCKER_API_VERSION+x}}${{DOCKER_CERT_PATH+x}}${{DOCKER_TLS+x}}${{DOCKER_TLS_VERIFY+x}}${{DOCKER_CUSTOM_HEADERS+x}}${{DOCKER_DEFAULT_PLATFORM+x}}${{HTTP_PROXY+x}}${{HTTPS_PROXY+x}}${{NO_PROXY+x}}${{ALL_PROXY+x}}${{FTP_PROXY+x}}${{http_proxy+x}}${{https_proxy+x}}${{no_proxy+x}}${{all_proxy+x}}${{ftp_proxy+x}}${{COMPOSE_FILE+x}}${{COMPOSE_ENV_FILES+x}}${{COMPOSE_PROFILES+x}}${{COMPOSE_PROJECT_NAME+x}}${{COMPOSE_PATH_SEPARATOR+x}}\" ]; then exit 88; fi\n\
                  env | while IFS='=' read -r name value; do\n\
-                   case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_DISABLE_ENV_FILE|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|PWD|SHLVL|_) : ;; *) exit 89 ;; esac\n\
+                   case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_DISABLE_ENV_FILE|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|GOMEMLIMIT|PWD|SHLVL|_) : ;; *) exit 89 ;; esac\n\
                  done || exit 89\n\
+                 [ \"$GOMEMLIMIT\" = 402653184 ] || exit 89\n\
                  : > {}\n\
                  {}\n\
                  {}\n\
@@ -1293,7 +1365,7 @@ mod tests {
         ) -> PathBuf {
             let script = format!(
                 "#!/bin/sh\n\
-                 if [ \"$#\" -eq 3 ]; then [ \"$1\" = compose ] && [ \"$2\" = version ] && [ \"$3\" = --short ] || exit 70; printf 'v5.6.0\\n'; exit 0; fi\n\
+                 if [ \"$#\" -eq 3 ]; then [ \"$1\" = compose ] && [ \"$2\" = version ] && [ \"$3\" = --short ] || exit 70; printf '%s' started > {}; printf 'v5.6.0\\n'; exit 0; fi\n\
                  [ \"$#\" -eq 13 ] || exit 71\n\
                  [ \"$1\" = compose ] && [ \"$2\" = --project-directory ] && [ \"$3\" = {} ] || exit 72\n\
                  [ \"$4\" = --file ] && [ \"$5\" = {} ] && [ \"$6\" = --file ] && [ \"$7\" = {} ] && [ \"$8\" = --file ] && [ \"$9\" = {} ] || exit 73\n\
@@ -1302,8 +1374,15 @@ mod tests {
                  [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = false ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = false ] || exit 76\n\
                  [ -n \"$PATH\" ] && [ -d \"$HOME\" ] && [ -d \"$DOCKER_CONFIG\" ] && [ \"$HOME\" != \"$DOCKER_CONFIG\" ] || exit 77\n\
                  if [ -n \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{DOCKER_API_VERSION+x}}${{DOCKER_CERT_PATH+x}}${{DOCKER_TLS+x}}${{DOCKER_TLS_VERIFY+x}}${{HTTP_PROXY+x}}${{HTTPS_PROXY+x}}${{NO_PROXY+x}}${{COMPOSE_FILE+x}}${{COMPOSE_ENV_FILES+x}}\" ]; then exit 78; fi\n\
-                 env | while IFS='=' read -r name value; do case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_DISABLE_ENV_FILE|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|PWD|SHLVL|_) : ;; *) exit 79 ;; esac; done || exit 79\n\
+                 env | while IFS='=' read -r name value; do case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_DISABLE_ENV_FILE|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|GOMEMLIMIT|PWD|SHLVL|_) : ;; *) exit 79 ;; esac; done || exit 79\n\
+                 [ \"$GOMEMLIMIT\" = 402653184 ] || exit 79\n\
                  exit 0\n",
+                shell_quote(
+                    &directory
+                        .path()
+                        .join("ordered-validation-version-marker")
+                        .to_string_lossy()
+                ),
                 shell_quote(&project_directory.to_string_lossy()),
                 shell_quote(&base_file.to_string_lossy()),
                 shell_quote(&first_override.to_string_lossy()),
@@ -1319,6 +1398,114 @@ mod tests {
         fn search_path() -> std::ffi::OsString {
             std::env::var_os("PATH").unwrap_or_else(|| OsStr::new("/usr/bin:/bin").to_owned())
         }
+        #[tokio::test]
+        async fn subprocess_limits_bound_go_memory_and_shell_resource_limits() {
+            let isolated = PrivateDockerConfig::new(None)
+                .expect("a private fixture directory should be created");
+            let mut command = tokio::process::Command::new("/bin/sh");
+            isolated.configure(&mut command, &search_path());
+            command.args(["-c", "printf '%s\\n' \"$GOMEMLIMIT\"; ulimit -v; ulimit -d"]);
+
+            let output = run_command_with_timeout(&mut command, COMMAND_TIMEOUT)
+                .await
+                .expect("the shell should report its configured process limits");
+            let output = String::from_utf8(output).expect("shell output should be UTF-8");
+            let mut values = output.lines();
+            assert_eq!(values.next(), Some("402653184"));
+            let address_space_kib = values
+                .next()
+                .expect("the address-space limit should be reported")
+                .parse::<u64>()
+                .expect("the address-space limit should be numeric");
+            let data_kib = values
+                .next()
+                .expect("the data limit should be reported")
+                .parse::<u64>()
+                .expect("the data limit should be numeric");
+            assert!(address_space_kib <= 4 * 1024 * 1024);
+            assert!(data_kib <= 512 * 1024);
+        }
+
+        fn create_sparse_file(path: &std::path::Path, length: u64) {
+            fs::File::create(path)
+                .expect("sparse Compose fixture should be created")
+                .set_len(length)
+                .expect("sparse Compose fixture should have the requested length");
+        }
+
+        #[tokio::test]
+        async fn validation_accepts_selected_base_and_overrides_at_16_mib_aggregate_limit() {
+            let directory = FixtureDirectory::new();
+            let project_directory = directory.path().join("sparse project");
+            fs::create_dir(&project_directory).expect("the project directory should exist");
+            let base = project_directory.join("base.yaml");
+            let override_one = directory.path().join("override-one.yaml");
+            let override_two = directory.path().join("override-two.yaml");
+            create_sparse_file(&base, 8 * 1024 * 1024);
+            create_sparse_file(&override_one, 8 * 1024 * 1024);
+            create_sparse_file(&override_two, 0);
+            let marker = directory.path().join("ordered-validation-version-marker");
+            let binary = ordered_validation_fixture_cli(
+                &directory,
+                &project_directory,
+                &base,
+                &override_one,
+                &override_two,
+            );
+
+            let result = validate_with_files(
+                &binary,
+                &[base, override_one, override_two],
+                &search_path(),
+                None,
+                COMMAND_TIMEOUT,
+            )
+            .await;
+
+            assert!(result.is_ok());
+            assert!(marker.exists(), "the CLI preflight should have run");
+        }
+
+        #[tokio::test]
+        async fn validation_rejects_selected_base_and_overrides_over_16_mib_before_cli() {
+            let directory = FixtureDirectory::new();
+            let project_directory = directory.path().join("sparse project");
+            fs::create_dir(&project_directory).expect("the project directory should exist");
+            let base = project_directory.join("base.yaml");
+            let override_one = directory.path().join("override-one.yaml");
+            let override_two = directory.path().join("override-two.yaml");
+            create_sparse_file(&base, 8 * 1024 * 1024);
+            create_sparse_file(&override_one, 8 * 1024 * 1024);
+            create_sparse_file(&override_two, 1);
+            let marker = directory.path().join("ordered-validation-version-marker");
+            let binary = ordered_validation_fixture_cli(
+                &directory,
+                &project_directory,
+                &base,
+                &override_one,
+                &override_two,
+            );
+
+            let result = validate_with_files_report(
+                &binary,
+                &[base, override_one, override_two],
+                &search_path(),
+                None,
+                COMMAND_TIMEOUT,
+            )
+            .await;
+
+            assert!(
+                !marker.exists(),
+                "oversized input must fail before CLI preflight"
+            );
+            assert!(result.version.is_none());
+            assert_eq!(
+                result.outcome.unwrap_err().message(),
+                "Selected Compose files exceed the 16 MiB validation input limit."
+            );
+        }
+
         #[tokio::test]
         async fn validation_uses_the_selected_local_file_parent_and_isolated_environment() {
             let directory = FixtureDirectory::new();

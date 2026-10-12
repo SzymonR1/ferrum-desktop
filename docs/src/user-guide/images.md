@@ -1,6 +1,6 @@
 # Images
 
-**Status:** Linux local Docker Unix-socket image listing/inspection and bounded read-only layer history, anonymous public pulls, local tagging/removal, confirmed local Buildx builds, and anonymous push of one existing local tag. An opt-in read-only history smoke passed on Docker Engine 29.9.0/API 1.56; no live pull, tag, removal, build, or push was performed during validation, and no image mutation is claimed. Native Images-page visual validation remains unverified.
+**Status:** Linux local Docker Unix-socket image listing/inspection and bounded read-only layer history, anonymous pulls by default with opt-in per-pull Secret Service/pass credential-helper authentication, local tagging/removal, confirmed local Buildx builds, and anonymous push of one existing local tag. An opt-in read-only history smoke passed on Docker Engine 29.9.0/API 1.56; no live pull/auth, tag, removal, build, or push integration was performed or validated. No image mutation is claimed. Native Images-page visual validation remains unverified.
 
 Open **Images** in the sidebar to view images returned by the connected local
 Docker engine. Search is case-insensitive across repository tags and image IDs.
@@ -31,15 +31,48 @@ connection, and engine-error states are shown in the page. Search filters the
 most recently loaded inventory; use **Refresh** to request a new image list.
 History results are discarded if the selected image or current inventory changes.
 
-## Pulling public images
+## Pulling images
 
-The pull form accepts an anonymous public image reference only. Ferrum does not
-read credentials or send registry authentication. While a pull is active,
-**Hide progress** suppresses progress updates in the UI only: Ferrum continues
-draining the Engine response and keeps other image mutations disabled until the
-terminal response. Leaving Images or changing context hides stale pull results
-without aborting the reader; closing Ferrum does not guarantee the daemon-side
-transfer stops.
+Pulls are anonymous by default. To use credentials for one pull, first choose
+**Secret Service** or **pass** in Settings, install/configure that Docker
+credential helper for your Linux user session, then enable **Use the configured
+credential helper for this pull only** before selecting **Pull image**. The
+choice is consumed and reset when that pull begins; changing the reference or
+configured helper also clears it. With no selected helper or no per-pull opt-in,
+the request omits `X-Registry-Auth` and remains anonymous.
+
+Ferrum's helper choice is global; it does not inspect Docker's `credsStore` or
+`credHelpers` mappings. To populate a helper store, configure Docker CLI to use
+the same supported helper and sign in with `docker login`; see Docker's
+[credential store and helper guide](https://docs.docker.com/reference/cli/docker/login/#credential-stores).
+If registries use different helper types, change Ferrum's setting before
+opting in to a pull. Docker `auths` entries, including base64-encoded
+credentials, are not read.
+
+After opt-in, Ferrum invokes only the selected `docker-credential-secretservice`
+or `docker-credential-pass` binary with argv `get`. It sends the normalized
+registry key on stdin: Docker Hub references use
+`https://index.docker.io/v1/`; other registries use the hostname (and optional
+port) without a scheme. Ferrum does not read Docker `config.json` or other
+credential entries. Helper execution has a 30-second deadline and 64 KiB
+stdout bound. Stderr and helper error text are discarded. A failed helper,
+malformed response, or exceeded bound fails the pull without falling back to
+anonymous access.
+
+Ferrum sends the helper result to the currently selected local Docker Engine
+over its Unix socket using `X-Registry-Auth`. Ferrum does not persist secrets in
+settings, audit records, or logs. Treat both the selected host helper and local
+Engine as trusted: the Engine receives the credential and its registry-mirror
+configuration may forward it according to daemon behavior. Ferrum does not
+control or validate that downstream routing. Use authentication only when you
+trust the Engine and its mirror configuration. Push and Buildx remain
+credential-free and do not use this helper setting.
+
+While a pull is active, **Hide progress** suppresses progress updates in the UI
+only: Ferrum continues draining the Engine response and keeps other image
+mutations disabled until the terminal response. Leaving Images or changing
+context hides stale pull results without aborting the reader; closing Ferrum
+does not guarantee the daemon-side transfer stops.
 
 ## Pushing an existing local tag
 
@@ -128,7 +161,21 @@ the UI does not expose daemon response bodies.
 
 ## Scope and limitations
 
-Image listing, inspection, read-only history, anonymous pulls, tagging, removal, builds, and anonymous push of one existing local tag are limited to the local Docker Unix socket on Linux. Push requires explicit confirmation naming the selected image ID and target and warns that layers/metadata may disclose secrets; it sends no credentials and registries requiring authentication reject it. Builds require Docker CLI and the Buildx plugin in `PATH`; private-registry authentication beyond anonymous pulls is not offered. Podman/rootless behavior and broader endpoint or platform compatibility remain unvalidated under open, blocked [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10). Issues [#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) and [#19](https://github.com/SzymonR1/ferrum-desktop/issues/19) remain open/partial. No release or broader support claim is made. No live pull, tag, removal, build, or push was performed during validation. Native Images-page visual validation remains unverified. Fake-socket and headless tests do not contact a real engine or mutate image resources. See the
+Image listing, inspection, read-only history, pulls, tagging, removal, builds,
+and anonymous push of one existing local tag are limited to the local Docker
+Unix socket on Linux. Pulls are anonymous unless a configured Secret Service or
+`pass` helper is explicitly enabled for a single operation. Push and Buildx stay
+credential-free, and registries requiring authentication reject them. Builds
+require Docker CLI and Buildx; private base-image authentication remains
+unsupported. The helper-assisted pull path and its integration with a live
+engine/registry have not been validated. Podman/rootless behavior and broader
+endpoint or platform compatibility remain unvalidated under open, blocked
+[issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10). Issue
+[#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) remains partial/open.
+No release or broader support claim is made. No live pull/auth, tag, removal,
+build, or push was performed during validation. Native Images-page visual
+validation remains unverified. Fake-socket and headless tests do not contact a
+real engine or mutate image resources. See the
 [platform support matrix](../platform-support.md).
 
 ## Building a local image
@@ -156,9 +203,11 @@ settings, build arguments, secrets, or SSH access.
 Output is streamed as sanitized plain text with bounded in-memory retention and
 is not persisted to logs or audit traces. Build outcome tracing records only a
 static action and result; when persistence succeeds, the redacted outcome is
-also included in the local durable audit. Build output remains transient,
-bounded, and is never persisted. Cancellation is best effort: Ferrum terminates
-the Docker CLI process group, but cannot guarantee builder work stopped or
-determine whether the image/tag changed. Inventory refreshes after every
-terminal result, including cancellation, because the outcome may be uncertain.
+also included in the local durable audit. If Docker cannot start the Buildx
+process, Ferrum reports that the build was not submitted. A failed or cancelled
+build after process start is treated as potentially state-changing. Build
+output remains transient, bounded, and is never persisted. Cancellation is best
+effort: Ferrum terminates the Docker CLI process group, but cannot guarantee
+builder work stopped or determine whether the image/tag changed. Inventory
+refreshes after every terminal result, including cancellation.
 

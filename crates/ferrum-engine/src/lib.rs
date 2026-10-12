@@ -46,6 +46,8 @@ use contexts::{
 };
 
 #[cfg(target_os = "linux")]
+use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+#[cfg(target_os = "linux")]
 use ferrum_core::ImagePushTarget;
 use ferrum_core::{
     ContainerAction, ContainerChange, ContainerDetails, ContainerMount, ContainerState,
@@ -60,6 +62,94 @@ use serde::{
     de::{DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 use thiserror::Error;
+#[cfg(target_os = "linux")]
+use zeroize::Zeroizing;
+
+#[cfg(target_os = "linux")]
+const MAX_REGISTRY_AUTH_USERNAME_BYTES: usize = 4 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_REGISTRY_AUTH_SECRET_BYTES: usize = 32 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_REGISTRY_AUTH_SERVER_ADDRESS_BYTES: usize = 512;
+
+/// Opaque pull-only registry authorization value. Its contents are never
+/// included in `Debug` output.
+#[cfg(target_os = "linux")]
+pub struct RegistryAuth {
+    encoded: Zeroizing<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for RegistryAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RegistryAuth([REDACTED])")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RegistryAuth {
+    /// Builds a Docker Engine AuthConfig from credential-helper `Username`,
+    /// `Secret`, and the canonical registry server key. Docker Hub's canonical
+    /// key includes its `https://index.docker.io/v1/` URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImagePullCredentialUnavailable` when a field is empty,
+    /// oversized, or contains an invalid server-address character.
+    pub fn from_helper_credentials(
+        username: String,
+        secret: String,
+        server_address: &str,
+    ) -> Result<Self, EngineError> {
+        #[derive(Serialize)]
+        struct UserPassword<'a> {
+            username: &'a str,
+            password: &'a str,
+            serveraddress: &'a str,
+        }
+        #[derive(Serialize)]
+        struct IdentityToken<'a> {
+            #[serde(rename = "identitytoken")]
+            identity_token: &'a str,
+            serveraddress: &'a str,
+        }
+        let username = Zeroizing::new(username);
+        let secret = Zeroizing::new(secret);
+        if username.is_empty()
+            || secret.is_empty()
+            || username.len() > MAX_REGISTRY_AUTH_USERNAME_BYTES
+            || secret.len() > MAX_REGISTRY_AUTH_SECRET_BYTES
+            || server_address.is_empty()
+            || server_address.len() > MAX_REGISTRY_AUTH_SERVER_ADDRESS_BYTES
+            || !server_address.is_ascii()
+            || server_address
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        {
+            return Err(EngineError::ImagePullCredentialUnavailable);
+        }
+        let json = if username.as_str() == "<token>" {
+            serde_json::to_vec(&IdentityToken {
+                identity_token: secret.as_str(),
+                serveraddress: server_address,
+            })
+        } else {
+            serde_json::to_vec(&UserPassword {
+                username: username.as_str(),
+                password: secret.as_str(),
+                serveraddress: server_address,
+            })
+        }
+        .map_err(|_| EngineError::ImagePullCredentialUnavailable)?;
+        let json = Zeroizing::new(json);
+        let encoded = Zeroizing::new(URL_SAFE.encode(json.as_slice()));
+        Ok(Self { encoded })
+    }
+
+    fn header_value(&self) -> &str {
+        self.encoded.as_str()
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1671,6 +1761,13 @@ pub enum EngineError {
         /// HTTP response status.
         status: u16,
     },
+    /// Credential helper use failed before an image pull request was submitted.
+    #[cfg(target_os = "linux")]
+    #[error(
+        "Ferrum could not obtain or use credentials from the configured helper. Check the helper, or disable authentication for an anonymous pull."
+    )]
+    ImagePullCredentialUnavailable,
+
     /// The engine could not open the image pull progress stream.
     #[cfg(target_os = "linux")]
     #[error("Image pull progress is unavailable at the {endpoint_label}.")]
@@ -1988,22 +2085,26 @@ impl EngineClient {
             })
         }
     }
-    /// Opens an anonymous Docker image pull and streams bounded progress.
+    /// Opens a Docker image pull and streams bounded progress.
     ///
-    /// The reference must be nonempty, at most 512 bytes, and contain no ASCII
-    /// whitespace or control characters. Registry credentials are never read
-    /// or sent. Dropping the returned stream cancels Ferrum's HTTP response
-    /// stream, but does not guarantee that the daemon-side pull stops. Progress
-    /// reads use a 60-second idle timeout.
+    /// `registry_auth`, when supplied, is an opaque `RegistryAuth` containing
+    /// the Moby-compatible padded base64url `X-Registry-Auth` JSON value.
+    /// `None` preserves the anonymous request. Dropping the stream closes
+    /// Ferrum's response stream but does not guarantee daemon-side cancellation.
+    /// Progress reads use a 60-second idle timeout.
     ///
     /// # Errors
     ///
     /// Returns `InvalidImageReference` for an invalid reference,
-    /// `ImagePullRejected` when the engine rejects the request, or a safe
-    /// availability/timeout error when the stream cannot be opened.
+    /// `ImagePullRejected` when the selected engine rejects the request, or a
+    /// safe availability/timeout error when the stream cannot be opened.
     #[cfg(target_os = "linux")]
-    pub async fn open_image_pull(&self, reference: &str) -> Result<ImagePullStream, EngineError> {
-        image_pull::open_image_pull(self, reference).await
+    pub async fn open_image_pull(
+        &self,
+        reference: &str,
+        registry_auth: Option<&RegistryAuth>,
+    ) -> Result<ImagePullStream, EngineError> {
+        image_pull::open_image_pull(self, reference, registry_auth).await
     }
     /// Opens an anonymous push for one explicitly tagged local image.
     ///
@@ -3154,7 +3255,7 @@ impl EngineClient {
         }
     }
 
-    /// Opens the engine's incremental container event stream.
+    /// Opens an incremental container event stream starting at the current local time.
     ///
     /// # Errors
     ///
@@ -3162,8 +3263,13 @@ impl EngineClient {
     #[cfg(target_os = "linux")]
     pub async fn subscribe_container_changes(&self) -> Result<ContainerChangeStream, EngineError> {
         let endpoint_label = self.info.endpoint_label;
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| EngineError::ContainerEventsUnavailable { endpoint_label })?
+            .as_secs();
+        // Historical events are covered by the caller's inventory snapshot.
         let path = format!(
-            "/v{}/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D",
+            "/v{}/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D&since={since}",
             self.api_version
         );
         let result = timeout(REQUEST_TIMEOUT, async {
@@ -6233,11 +6339,39 @@ mod container_change_stream_tests {
             assert_ne!(count, 0, "client should send HTTP headers");
             request.extend_from_slice(&buffer[..count]);
         }
-        assert!(
-            request.starts_with(
-                b"GET /v1.45/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D HTTP/1.1\r\n"
-            ),
+        let request_line = String::from_utf8_lossy(
+            request
+                .split(|byte| *byte == b'\n')
+                .next()
+                .expect("HTTP request line should exist"),
+        );
+        let request_target = request_line
+            .split_whitespace()
+            .nth(1)
+            .expect("event request target should exist");
+        let (path, query) = request_target
+            .split_once('?')
+            .expect("event subscription query should exist");
+        assert_eq!(path, "/v1.45/events");
+        let mut parameters = query.split('&');
+        assert_eq!(
+            parameters.next(),
+            Some("filters=%7B%22type%22%3A%5B%22container%22%5D%7D"),
             "event subscription must filter to container events"
+        );
+        let since = parameters
+            .find_map(|parameter| parameter.strip_prefix("since="))
+            .expect("event subscription must exclude retained pre-connection events");
+        let since = since
+            .parse::<u64>()
+            .expect("event start time should be Unix seconds");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_secs();
+        assert!(
+            since.abs_diff(now) <= 2,
+            "event start time should be captured when subscribing"
         );
     }
 
