@@ -413,6 +413,22 @@ engine or credential/proxy settings, and no user config copied into the child
 config. Failure diagnostics and selected paths are not exposed; output and
 subprocess deadlines are bounded.
 
+Compose profile coverage uses controlled CLI fixtures and headless state checks;
+it does not contact a live engine or user project. Unit tests cover blank input
+as no explicit profiles, whitespace trimming, the 1024-byte input, 16-profile,
+and 64-byte/name limits, the allowed name grammar, and standalone `*` wildcard
+enabling all profiles; input is bounded before CLI launch. Fake CLI fixtures
+assert exact argument-array construction and repeated `--profile <name>` pairs
+before `config`, `ps`, and `logs`, with no profile environment variable. The
+logs fixture verifies that the status recheck reuses the selected profiles.
+Headless state tests cover profile-edit invalidation, invalid-profile gating,
+cancellation/stale results, revalidation, and keeping profile input disabled
+while asynchronous file selection is active. Preserve private Docker
+config/HOME, cleared environment, disabled selected-project `.env`, and disabled
+remote Git/OCI loaders. Do not add project
+import or lifecycle/mutation operations. See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
+and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
+
 Headless AccessKit/state tests cover ordered base/override selection, removing
 overrides and explicitly revalidating the remaining set, replacing the base
 (which clears overrides), the 16-file limit, escaped basename display,
@@ -494,9 +510,13 @@ selected project's default `.env`; `--no-interpolate` and
 `--no-env-resolution` do not confine included-project reads. Remote Git and OCI
 loaders are explicitly disabled, so remote include/extends references fail
 without fetching. The CLI/plugin remains unsandboxed; validate only trusted
-files. Profiles, import, lifecycle/build/pull, live log follow, and project
-mutations remain unsupported. The one-shot service log snapshot is covered by
-fake-CLI and headless tests; no real project logs are read by default.
+files. Bounded profile selection applies only to structural validation,
+read-only status, and one-shot service logs; profiles are passed as explicit
+`--profile` arguments and are not inherited from the environment. Project
+import/persistence, lifecycle, build/pull, live log follow, and project
+mutations remain unsupported. The one-shot logs are covered by fake-CLI and
+headless tests; no real project logs are read by default. Profile validation
+smoke uses only a temporary project and no Engine.
 
 Only Linux local Docker discovery was validated; validation uses no engine.
 The native Compose page visual check is unavailable, and Podman/rootless and

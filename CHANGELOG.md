@@ -3,6 +3,21 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Added explicit Compose profile selection for structural validation,
+  read-only status, and one-shot service-log snapshots. Input is
+  comma-separated, trims outer whitespace per token, and blank means no
+  explicit profiles. The input is limited to 1024 UTF-8 bytes, 16 profiles,
+  and 64 bytes per name; empty entries and duplicates are rejected. Names
+  follow `[A-Za-z0-9][A-Za-z0-9_.-]+`; standalone `*` enables all profiles. Ferrum
+  passes repeated `--profile <name>` argv pairs before `config`, `ps`, or
+  `logs`, never via an environment variable, and reuses the selection for the
+  status recheck before logs. Invalid or changed selection clears results,
+  cancels in-flight work, and requires revalidation. Private Docker config/HOME
+  and the cleared environment remain in effect. No project import/persistence,
+  start/stop/restart, build/pull, live log follow, or project mutation is added.
+  See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
+  and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
+  Issue #18 remains partial/open.
 - Added a read-only one-shot Compose service-log snapshot for a listed service. Ferrum rechecks service membership with a fresh status query before logs; Compose `--tail 200` applies per container, while Ferrum keeps the first 200 combined lines/256 KiB without a global chronological merge. Escaped output is transient, cancellation/stale-state safe, and not persisted or audited. Live follow and project lifecycle operations remain unsupported; Issue #18 stays open/partial.
 
 - Added confirmed Linux local Docker Buildx builds pinned to the selected Unix socket with an empty private CLI config. Confirmations name the selected context or a safe endpoint-source label and lock context switching until completion; no socket path is shown. Client validation rejects uppercase repository characters while Docker CLI validates complete repository grammar. Docker CLI handles `.dockerignore`; credentials, proxy settings, build args/secrets/SSH, push, and remote contexts are excluded, so private bases may fail. Build output is sanitized, bounded, transient, and never persisted; static build outcome metadata is included in the local durable redacted audit when persistence succeeds. Best-effort cancellation refreshes inventory. Issues #16/#19 remain open/ready, #10 open/blocked; no release or broader support claim.

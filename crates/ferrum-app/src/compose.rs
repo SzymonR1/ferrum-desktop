@@ -25,6 +25,72 @@ const CHILD_DATA_LIMIT: libc::rlim_t = 512 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const CHILD_GO_MEMORY_LIMIT: &str = "402653184";
 
+const MAX_COMPOSE_PROFILES: usize = 16;
+const MAX_COMPOSE_PROFILE_NAME_BYTES: usize = 64;
+const MAX_COMPOSE_PROFILE_INPUT_BYTES: usize = 1024;
+
+fn parse_compose_profiles(input: &str) -> Result<Vec<String>, ()> {
+    if input.len() > MAX_COMPOSE_PROFILE_INPUT_BYTES {
+        return Err(());
+    }
+    if input.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut profiles = Vec::new();
+    for token in input.split(',') {
+        let name = token.trim();
+        if name.is_empty()
+            || name.len() > MAX_COMPOSE_PROFILE_NAME_BYTES
+            || (name != "*"
+                && (name.len() < 2
+                    || !name.as_bytes().iter().enumerate().all(|(index, byte)| {
+                        if index == 0 {
+                            byte.is_ascii_alphanumeric()
+                        } else {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+                        }
+                    })))
+        {
+            return Err(());
+        }
+        if name == "*" && (!profiles.is_empty() || input.split(',').count() != 1) {
+            return Err(());
+        }
+        if profiles.iter().any(|profile| profile == name) {
+            return Err(());
+        }
+        profiles.push(name.to_owned());
+        if profiles.len() > MAX_COMPOSE_PROFILES {
+            return Err(());
+        }
+    }
+    Ok(profiles)
+}
+fn valid_profile_list(profiles: &[String]) -> bool {
+    if profiles.len() > MAX_COMPOSE_PROFILES {
+        return false;
+    }
+    let input_bytes = profiles
+        .iter()
+        .fold(0_usize, |total, profile| {
+            total.saturating_add(profile.len())
+        })
+        .saturating_add(profiles.len().saturating_sub(1));
+    input_bytes <= MAX_COMPOSE_PROFILE_INPUT_BYTES
+        && profiles.iter().enumerate().all(|(index, name)| {
+            name.len() <= MAX_COMPOSE_PROFILE_NAME_BYTES
+                && (name == "*" && profiles.len() == 1
+                    || (name.len() >= 2
+                        && name.as_bytes().iter().enumerate().all(|(i, byte)| {
+                            if i == 0 {
+                                byte.is_ascii_alphanumeric()
+                            } else {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+                            }
+                        })
+                        && !profiles[..index].iter().any(|previous| previous == name)))
+        })
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ComposeContainer {
     pub(super) name: String,
@@ -197,6 +263,7 @@ pub(super) enum ComposeValidationError {
     PrivateConfigSetupFailed,
     InvalidSelectedFile,
     InputTooLarge,
+    InvalidProfiles,
     ValidationFailed,
 }
 
@@ -216,6 +283,7 @@ impl ComposeValidationError {
             Self::InputTooLarge => {
                 "Selected Compose files exceed the 16 MiB validation input limit."
             }
+            Self::InvalidProfiles => "The selected Compose profile input is invalid.",
             Self::ValidationFailed => "Compose file validation failed.",
         }
     }
@@ -270,6 +338,7 @@ pub(super) struct ComposeActions {
     pub(super) cancel_status: bool,
     pub(super) logs_service: Option<String>,
     pub(super) cancel_logs: bool,
+    pub(super) profiles_changed: bool,
 }
 const MAX_COMPOSE_FILES: usize = 16;
 
@@ -305,6 +374,7 @@ pub(super) struct ComposeView {
     validation_generation: u64,
     validation: ComposeValidationState,
     selected_files: Vec<std::path::PathBuf>,
+    profile_input: String,
     status_generation: u64,
     status: ComposeStatusState,
     containers: Vec<ComposeContainer>,
@@ -360,7 +430,10 @@ impl ComposeView {
         matches!(&self.validation, ComposeValidationState::Succeeded { .. })
     }
 
-    pub(super) fn begin_status_refresh(&mut self) -> Option<(u64, Vec<std::path::PathBuf>)> {
+    pub(super) fn begin_status_refresh(
+        &mut self,
+    ) -> Option<(u64, Vec<std::path::PathBuf>, Vec<String>)> {
+        let profiles = self.selected_profiles().ok()?;
         if !self.can_refresh_containers()
             || matches!(&self.status, ComposeStatusState::Loading { .. })
         {
@@ -371,7 +444,11 @@ impl ComposeView {
         self.containers.clear();
         let file_name = display_compose_file_list(&self.selected_files);
         self.status = ComposeStatusState::Loading { file_name };
-        Some((self.status_generation, self.selected_files.clone()))
+        Some((
+            self.status_generation,
+            self.selected_files.clone(),
+            profiles,
+        ))
     }
 
     pub(super) fn finish_status_refresh(
@@ -418,6 +495,7 @@ impl ComposeView {
     fn can_request_service_logs(&self, service: &str) -> bool {
         validate_service_selector(service).is_some()
             && matches!(&self.status, ComposeStatusState::Succeeded { .. })
+            && self.selected_profiles().is_ok()
             && matches!(&self.validation, ComposeValidationState::Succeeded { .. })
             && self
                 .containers
@@ -428,7 +506,8 @@ impl ComposeView {
     pub(super) fn begin_service_logs(
         &mut self,
         service: &str,
-    ) -> Option<(u64, Vec<std::path::PathBuf>, String)> {
+    ) -> Option<(u64, Vec<std::path::PathBuf>, Vec<String>, String)> {
+        let profiles = self.selected_profiles().ok()?;
         let service = validate_service_selector(service)?;
         if !matches!(&self.status, ComposeStatusState::Succeeded { .. })
             || !matches!(&self.validation, ComposeValidationState::Succeeded { .. })
@@ -448,6 +527,7 @@ impl ComposeView {
         Some((
             self.logs_generation,
             self.selected_files.clone(),
+            profiles,
             service.to_owned(),
         ))
     }
@@ -508,6 +588,32 @@ impl ComposeView {
         &self.selected_files
     }
 
+    fn selected_profiles(&self) -> Result<Vec<String>, ()> {
+        parse_compose_profiles(&self.profile_input)
+    }
+
+    pub(super) fn profiles_for_automatic_validation(&mut self) -> Option<Vec<String>> {
+        match self.selected_profiles() {
+            Ok(profiles) => Some(profiles),
+            Err(()) => {
+                let file_name = match &self.validation {
+                    ComposeValidationState::Validating { file_name } => file_name.clone(),
+                    _ => return None,
+                };
+                self.validation = ComposeValidationState::Failed {
+                    file_name,
+                    error: ComposeValidationError::InvalidProfiles,
+                };
+                None
+            }
+        }
+    }
+
+    pub(super) fn profiles_changed(&mut self) {
+        self.validation_generation = self.validation_generation.wrapping_add(1);
+        self.invalidate_status();
+        self.validation = ComposeValidationState::Idle;
+    }
     pub(super) fn finish_validation(
         &mut self,
         generation: u64,
@@ -595,18 +701,30 @@ impl ComposeView {
             self.validation = ComposeValidationState::Idle;
         }
     }
-    pub(super) fn begin_validation(&mut self) -> Option<(u64, Vec<std::path::PathBuf>)> {
+    pub(super) fn begin_validation(
+        &mut self,
+    ) -> Option<(u64, Vec<std::path::PathBuf>, Vec<String>)> {
         if self.selected_files.is_empty()
             || self.is_file_selection_running()
             || self.is_validation_running()
         {
             return None;
         }
+        let profiles = match self.selected_profiles() {
+            Ok(profiles) => profiles,
+            Err(()) => {
+                self.validation = ComposeValidationState::Failed {
+                    file_name: display_compose_file_list(&self.selected_files),
+                    error: ComposeValidationError::InvalidProfiles,
+                };
+                return None;
+            }
+        };
         self.invalidate_status();
         let generation = self.validation_generation;
         let file_name = display_compose_file_list(&self.selected_files);
         self.validation = ComposeValidationState::Validating { file_name };
-        Some((generation, self.selected_files.clone()))
+        Some((generation, self.selected_files.clone(), profiles))
     }
 
     pub(super) fn cancel_validation(&mut self) {
@@ -654,9 +772,31 @@ impl ComposeView {
                 ),
             );
         });
+        ui.horizontal(|ui| {
+            let label = ui.label("Profiles:");
+            let response = ui
+                .add_enabled(
+                    !self.is_file_selection_running(),
+                    egui::TextEdit::singleline(&mut self.profile_input)
+                        .char_limit(MAX_COMPOSE_PROFILE_INPUT_BYTES)
+                        .hint_text("comma-separated; * = all, blank = default")
+                        .desired_width(260.0),
+                )
+                .labelled_by(label.id);
+            actions.profiles_changed = response.changed();
+        });
+        ui.label("Profiles apply to read-only validation, status, and one-shot logs; * enables all profiles. No project lifecycle operations are available.");
+        let profiles_valid = self.selected_profiles().is_ok();
+        if !profiles_valid {
+            ui.colored_label(
+                egui::Color32::from_rgb(224, 174, 109),
+                "Invalid profiles. Use up to 16 unique names (64 bytes each), or * alone to enable all profiles; input is limited to 1024 bytes.",
+            );
+        }
         let selection_enabled = validation_enabled
             && !self.is_file_selection_running()
             && !self.is_validation_running();
+        let validation_action_enabled = selection_enabled && profiles_valid;
         ui.horizontal(|ui| {
             actions.refresh = ui
                 .add_enabled(
@@ -685,7 +825,7 @@ impl ComposeView {
             if !self.selected_files.is_empty() {
                 actions.validate_files = ui
                     .add_enabled(
-                        selection_enabled,
+                        validation_action_enabled,
                         egui::Button::new("Validate selected files"),
                     )
                     .clicked();
@@ -761,6 +901,7 @@ impl ComposeView {
         actions.refresh_containers = ui
             .add_enabled(
                 status_enabled
+                    && profiles_valid
                     && !self.loading
                     && self.can_refresh_containers()
                     && !matches!(&self.status, ComposeStatusState::Loading { .. }),
@@ -1590,8 +1731,12 @@ fn selected_compose_files_size_exceeds_limit(files: &[std::path::PathBuf]) -> bo
 #[cfg(target_os = "linux")]
 pub(super) async fn validate_compose_files(
     files: &[std::path::PathBuf],
+    profiles: &[String],
 ) -> ComposeValidationResult {
     use std::env;
+    if !valid_profile_list(profiles) {
+        return ComposeValidationResult::failed(ComposeValidationError::InvalidProfiles);
+    }
     if !selected_compose_files_are_valid(files) {
         return ComposeValidationResult::failed(ComposeValidationError::InvalidSelectedFile);
     }
@@ -1608,9 +1753,10 @@ pub(super) async fn validate_compose_files(
         return ComposeValidationResult::failed(ComposeValidationError::DockerCliMissing);
     };
     let user_compose_plugin = user_compose_plugin();
-    validate_with_files_report(
+    validate_with_profiles_report(
         &binary,
         files,
+        profiles,
         &search_path,
         user_compose_plugin.as_deref(),
         COMMAND_TIMEOUT,
@@ -1655,7 +1801,7 @@ async fn validate_with_binary_report(
     validate_with_files_report(binary, &files, search_path, user_compose_plugin, deadline).await
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 async fn validate_with_files_report(
     binary: &std::path::Path,
     files: &[std::path::PathBuf],
@@ -1663,8 +1809,31 @@ async fn validate_with_files_report(
     user_compose_plugin: Option<&std::path::Path>,
     deadline: Duration,
 ) -> ComposeValidationResult {
+    validate_with_profiles_report(
+        binary,
+        files,
+        &[],
+        search_path,
+        user_compose_plugin,
+        deadline,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn validate_with_profiles_report(
+    binary: &std::path::Path,
+    files: &[std::path::PathBuf],
+    profiles: &[String],
+    search_path: &std::ffi::OsStr,
+    user_compose_plugin: Option<&std::path::Path>,
+    deadline: Duration,
+) -> ComposeValidationResult {
     use tokio::process::Command;
 
+    if !valid_profile_list(profiles) {
+        return ComposeValidationResult::failed(ComposeValidationError::InvalidProfiles);
+    }
     if !selected_compose_files_are_valid(files) {
         return ComposeValidationResult::failed(ComposeValidationError::InvalidSelectedFile);
     }
@@ -1706,6 +1875,9 @@ async fn validate_with_files_report(
         .arg(parent);
     for file in files {
         command.arg("--file").arg(file);
+    }
+    for profile in profiles {
+        command.arg("--profile").arg(profile);
     }
     command.args([
         "config",
@@ -1751,11 +1923,14 @@ async fn containers_with_binary(
     binary: &std::path::Path,
     socket_path: &std::path::Path,
     files: &[std::path::PathBuf],
+    profiles: &[String],
     search_path: &std::ffi::OsStr,
     user_compose_plugin: Option<&std::path::Path>,
 ) -> Result<Vec<ComposeContainer>, ComposeStatusError> {
     use tokio::process::Command;
-    if !selected_compose_files_are_valid(files) || selected_compose_files_size_exceeds_limit(files)
+    if !valid_profile_list(profiles)
+        || !selected_compose_files_are_valid(files)
+        || selected_compose_files_size_exceeds_limit(files)
     {
         return Err(ComposeStatusError::QueryFailed);
     }
@@ -1775,6 +1950,9 @@ async fn containers_with_binary(
         .arg(files[0].parent().ok_or(ComposeStatusError::QueryFailed)?);
     for file in files {
         command.arg("--file").arg(file);
+    }
+    for profile in profiles {
+        command.arg("--profile").arg(profile);
     }
     command.args(["ps", "--all", "--format", "json"]);
     let output = run_command_with_timeout(&mut command, COMMAND_TIMEOUT)
@@ -1821,24 +1999,32 @@ async fn service_logs_with_binary(
     binary: &std::path::Path,
     socket_path: &std::path::Path,
     files: &[std::path::PathBuf],
+    profiles: &[String],
     service: &str,
     search_path: &std::ffi::OsStr,
     user_compose_plugin: Option<&std::path::Path>,
 ) -> Result<String, ComposeLogsError> {
     use tokio::process::Command;
+    if !valid_profile_list(profiles) {
+        return Err(ComposeLogsError::QueryFailed);
+    }
     let service = validate_service_selector(service).ok_or(ComposeLogsError::QueryFailed)?;
-    let current_containers =
-        containers_with_binary(binary, socket_path, files, search_path, user_compose_plugin)
-            .await
-            .map_err(|error| match error {
-                ComposeStatusError::DockerCliMissing => ComposeLogsError::DockerCliMissing,
-                ComposeStatusError::PrivateConfigSetupFailed => {
-                    ComposeLogsError::PrivateConfigSetupFailed
-                }
-                ComposeStatusError::QueryFailed | ComposeStatusError::InvalidOutput => {
-                    ComposeLogsError::QueryFailed
-                }
-            })?;
+    let current_containers = containers_with_binary(
+        binary,
+        socket_path,
+        files,
+        profiles,
+        search_path,
+        user_compose_plugin,
+    )
+    .await
+    .map_err(|error| match error {
+        ComposeStatusError::DockerCliMissing => ComposeLogsError::DockerCliMissing,
+        ComposeStatusError::PrivateConfigSetupFailed => ComposeLogsError::PrivateConfigSetupFailed,
+        ComposeStatusError::QueryFailed | ComposeStatusError::InvalidOutput => {
+            ComposeLogsError::QueryFailed
+        }
+    })?;
     if !current_containers
         .iter()
         .any(|container| container.service == service)
@@ -1865,6 +2051,9 @@ async fn service_logs_with_binary(
     for file in files {
         command.arg("--file").arg(file);
     }
+    for profile in profiles {
+        command.arg("--profile").arg(profile);
+    }
     command
         .args(["logs", "--tail", "200", "--no-color"])
         .arg(service);
@@ -1881,6 +2070,7 @@ async fn service_logs_with_binary(
 pub(super) async fn compose_service_logs(
     socket_path: &std::path::Path,
     files: &[std::path::PathBuf],
+    profiles: &[String],
     service: &str,
 ) -> ComposeLogsResult {
     let result = async {
@@ -1892,6 +2082,7 @@ pub(super) async fn compose_service_logs(
             &binary,
             socket_path,
             files,
+            profiles,
             service,
             &search_path,
             plugin.as_deref(),
@@ -1911,12 +2102,16 @@ pub(super) async fn compose_service_logs(
     }
 }
 
-#[cfg(target_os = "linux")]
 pub(super) async fn existing_compose_containers(
     socket_path: &std::path::Path,
     files: &[std::path::PathBuf],
+    profiles: &[String],
 ) -> ComposeStatusResult {
-    if validate_compose_files(files).await.outcome.is_err() {
+    if validate_compose_files(files, profiles)
+        .await
+        .outcome
+        .is_err()
+    {
         return ComposeStatusResult {
             containers: Vec::new(),
             outcome: Err(ComposeStatusError::QueryFailed),
@@ -1926,7 +2121,15 @@ pub(super) async fn existing_compose_containers(
         let search_path = std::env::var_os("PATH").ok_or(ComposeStatusError::DockerCliMissing)?;
         let binary = docker_binary(&search_path).ok_or(ComposeStatusError::DockerCliMissing)?;
         let plugin = user_compose_plugin();
-        containers_with_binary(&binary, socket_path, files, &search_path, plugin.as_deref()).await
+        containers_with_binary(
+            &binary,
+            socket_path,
+            files,
+            profiles,
+            &search_path,
+            plugin.as_deref(),
+        )
+        .await
     }
     .await;
     match result {
@@ -1944,7 +2147,76 @@ pub(super) async fn existing_compose_containers(
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compose_profiles_parse_limits_duplicates_names_and_wildcard() {
+        assert_eq!(parse_compose_profiles(""), Ok(Vec::new()));
+        assert_eq!(
+            parse_compose_profiles(" web, api-v2 "),
+            Ok(vec!["web".to_owned(), "api-v2".to_owned()])
+        );
+        assert_eq!(parse_compose_profiles("*"), Ok(vec!["*".to_owned()]));
+        assert!(parse_compose_profiles("web,,api").is_err());
+        assert!(parse_compose_profiles("web, web").is_err());
+        assert!(parse_compose_profiles("a").is_err());
+        assert!(parse_compose_profiles("-web").is_err());
+        assert!(parse_compose_profiles("web!,api").is_err());
+        assert!(parse_compose_profiles("*,web").is_err());
+        assert!(parse_compose_profiles("web,*").is_err());
+        assert!(parse_compose_profiles(&"a".repeat(MAX_COMPOSE_PROFILE_NAME_BYTES + 1)).is_err());
+        assert!(
+            parse_compose_profiles(
+                &(0..=MAX_COMPOSE_PROFILES)
+                    .map(|index| format!("p{index}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+            .is_err()
+        );
+        assert!(parse_compose_profiles(&"x".repeat(MAX_COMPOSE_PROFILE_INPUT_BYTES + 1)).is_err());
+        assert_eq!(
+            parse_compose_profiles(&format!(
+                "p{},",
+                "x".repeat(MAX_COMPOSE_PROFILE_NAME_BYTES - 1)
+            )),
+            Err(())
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compose_profile_limits_accept_exact_name_and_count_bounds() {
+        assert_eq!(
+            parse_compose_profiles(&format!(
+                "a{}",
+                "x".repeat(MAX_COMPOSE_PROFILE_NAME_BYTES - 1)
+            ))
+            .unwrap()
+            .len(),
+            1
+        );
+        let maximum_count = (0..MAX_COMPOSE_PROFILES)
+            .map(|index| format!("p{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            parse_compose_profiles(&maximum_count).unwrap().len(),
+            MAX_COMPOSE_PROFILES
+        );
+        let mut maximum_input = vec![format!("a{}", "x".repeat(48))];
+        maximum_input.extend((1..MAX_COMPOSE_PROFILES).map(|index| {
+            let prefix = format!("p{index}");
+            format!(
+                "{prefix}{}",
+                "x".repeat(MAX_COMPOSE_PROFILE_NAME_BYTES - prefix.len())
+            )
+        }));
+        let maximum_input = maximum_input.join(",");
+        assert_eq!(maximum_input.len(), MAX_COMPOSE_PROFILE_INPUT_BYTES);
+        assert_eq!(
+            parse_compose_profiles(&maximum_input).unwrap().len(),
+            MAX_COMPOSE_PROFILES
+        );
+    }
     #[cfg(target_os = "linux")]
     mod subprocess {
         use super::*;
@@ -2118,14 +2390,15 @@ mod tests {
             let script = format!(
                 "#!/bin/sh\n\
                  if [ \"$#\" -eq 3 ]; then [ \"$1\" = compose ] && [ \"$2\" = version ] && [ \"$3\" = --short ] || exit 70; printf '%s' started > {}; printf 'v5.6.0\\n'; exit 0; fi\n\
-                 [ \"$#\" -eq 13 ] || exit 71\n\
+                 [ \"$#\" -eq 17 ] || exit 71\n\
                  [ \"$1\" = compose ] && [ \"$2\" = --project-directory ] && [ \"$3\" = {} ] || exit 72\n\
                  [ \"$4\" = --file ] && [ \"$5\" = {} ] && [ \"$6\" = --file ] && [ \"$7\" = {} ] && [ \"$8\" = --file ] && [ \"$9\" = {} ] || exit 73\n\
-                 [ \"${{10}}\" = config ] && [ \"${{11}}\" = --quiet ] && [ \"${{12}}\" = --no-interpolate ] && [ \"${{13}}\" = --no-env-resolution ] || exit 74\n\
+                 [ \"${{10}}\" = --profile ] && [ \"${{11}}\" = frontend ] && [ \"${{12}}\" = --profile ] && [ \"${{13}}\" = qa ] || exit 74\n\
+                 [ \"${{14}}\" = config ] && [ \"${{15}}\" = --quiet ] && [ \"${{16}}\" = --no-interpolate ] && [ \"${{17}}\" = --no-env-resolution ] || exit 75\n\
                  [ \"$COMPOSE_DISABLE_ENV_FILE\" = 1 ] || exit 75\n\
                  [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = false ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = false ] || exit 76\n\
                  [ -n \"$PATH\" ] && [ -d \"$HOME\" ] && [ -d \"$DOCKER_CONFIG\" ] && [ \"$HOME\" != \"$DOCKER_CONFIG\" ] || exit 77\n\
-                 if [ -n \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{DOCKER_API_VERSION+x}}${{DOCKER_CERT_PATH+x}}${{DOCKER_TLS+x}}${{DOCKER_TLS_VERIFY+x}}${{HTTP_PROXY+x}}${{HTTPS_PROXY+x}}${{NO_PROXY+x}}${{COMPOSE_FILE+x}}${{COMPOSE_ENV_FILES+x}}\" ]; then exit 78; fi\n\
+                 if [ -n \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{DOCKER_API_VERSION+x}}${{DOCKER_CERT_PATH+x}}${{DOCKER_TLS+x}}${{DOCKER_TLS_VERIFY+x}}${{HTTP_PROXY+x}}${{HTTPS_PROXY+x}}${{NO_PROXY+x}}${{COMPOSE_FILE+x}}${{COMPOSE_ENV_FILES+x}}${{COMPOSE_PROFILES+x}}\" ]; then exit 78; fi\n\
                  env | while IFS='=' read -r name value; do case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_DISABLE_ENV_FILE|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|GOMEMLIMIT|PWD|SHLVL|_) : ;; *) exit 79 ;; esac; done || exit 79\n\
                  [ \"$GOMEMLIMIT\" = 402653184 ] || exit 79\n\
                  exit 0\n",
@@ -2205,14 +2478,18 @@ mod tests {
                 &override_two,
             );
 
-            let result = validate_with_files(
+            let files = [base, override_one, override_two];
+            let profiles = ["frontend".to_owned(), "qa".to_owned()];
+            let result = validate_with_profiles_report(
                 &binary,
-                &[base, override_one, override_two],
+                &files,
+                &profiles,
                 &search_path(),
                 None,
                 COMMAND_TIMEOUT,
             )
-            .await;
+            .await
+            .outcome;
 
             assert!(result.is_ok());
             assert!(marker.exists(), "the CLI preflight should have run");
@@ -2299,9 +2576,40 @@ mod tests {
             );
 
             let files = [base, override_one, override_two];
-            let result =
-                validate_with_files(&binary, &files, &search_path(), None, COMMAND_TIMEOUT).await;
-            assert!(result.is_ok());
+            let profiles = ["frontend".to_owned(), "qa".to_owned()];
+            let result = validate_with_profiles_report(
+                &binary,
+                &files,
+                &profiles,
+                &search_path(),
+                None,
+                COMMAND_TIMEOUT,
+            )
+            .await;
+            assert!(result.outcome.is_ok());
+        }
+
+        #[tokio::test]
+        async fn invalid_profile_list_is_rejected_before_cli_launch() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("project");
+            fs::create_dir(&project).expect("the project directory should exist");
+            let file = project.join("compose.yaml");
+            fs::write(&file, "services: {}\n").expect("the Compose file should exist");
+            let binary = directory.path().join("does-not-exist");
+            let profiles = ["--help".to_owned()];
+
+            let result = validate_with_profiles_report(
+                &binary,
+                &[file],
+                &profiles,
+                &search_path(),
+                None,
+                COMMAND_TIMEOUT,
+            )
+            .await;
+
+            assert_eq!(result.outcome, Err(ComposeValidationError::InvalidProfiles));
         }
 
         #[tokio::test]
@@ -2493,7 +2801,7 @@ mod tests {
             let override_file = project_directory.join("compose.override.yaml");
             fs::write(
                 &base,
-                "services:\n  app:\n    image: busybox:latest\n    volumes:\n      - ./data:/data\n",
+                "services:\n  app:\n    image: busybox:latest\n    profiles: [smoke]\n    volumes:\n      - ./data:/data\n",
             )
             .expect("the controlled base Compose file should be written");
             fs::write(
@@ -2503,7 +2811,8 @@ mod tests {
             .expect("the controlled override Compose file should be written");
 
             let files = [base, override_file];
-            validate_compose_files(&files)
+            let profiles = ["smoke".to_owned()];
+            validate_compose_files(&files, &profiles)
                 .await
                 .outcome
                 .expect("the local Compose CLI should validate the temporary project without contacting an engine");
@@ -2881,10 +3190,17 @@ mod tests {
             fs::write(&binary, script).unwrap();
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
             let files = [base.clone(), override_file.clone()];
-            let rows =
-                containers_with_binary(&binary, &socket, &files, OsStr::new("/usr/bin"), None)
-                    .await
-                    .expect("fake CLI status output should parse");
+            let profiles = ["frontend".to_owned(), "qa".to_owned()];
+            let rows = containers_with_binary(
+                &binary,
+                &socket,
+                &files,
+                &profiles,
+                OsStr::new("/usr/bin"),
+                None,
+            )
+            .await
+            .expect("fake CLI status output should parse");
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].state, "exited");
             assert!(!format!("{rows:?}").contains("discard"));
@@ -2900,6 +3216,10 @@ mod tests {
                 base.display().to_string(),
                 "--file".to_owned(),
                 override_file.display().to_string(),
+                "--profile".to_owned(),
+                "frontend".to_owned(),
+                "--profile".to_owned(),
+                "qa".to_owned(),
                 "ps".to_owned(),
                 "--all".to_owned(),
                 "--format".to_owned(),
@@ -2933,6 +3253,7 @@ mod tests {
                 &binary,
                 &directory.path().join("socket.sock"),
                 &[file],
+                &[],
                 "web",
                 OsStr::new("/usr/bin"),
                 None,
@@ -2955,29 +3276,33 @@ mod tests {
             fs::write(&base, "services: {}\n").unwrap();
             fs::write(&overlay, "services: {}\n").unwrap();
             let socket = directory.path().join("selected socket.sock");
-            let trace = directory.path().join("argv");
+            let trace_status = directory.path().join("status-argv");
+            let trace_logs = directory.path().join("logs-argv");
             let binary = directory.path().join("docker-logs");
             let status_output = "{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"running\"}\n";
             let script = format!(
                 "#!/bin/sh\n\
                  [ -n \"$PATH\" ] && [ -n \"$HOME\" ] && [ -n \"$DOCKER_CONFIG\" ] || exit 91\n\
                  [ \"$COMPOSE_DISABLE_ENV_FILE\" = 1 ] && [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = false ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = false ] || exit 92\n\
-                 [ -z \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{HTTP_PROXY+x}}${{COMPOSE_FILE+x}}\" ] || exit 93\n\
+                 [ -z \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{HTTP_PROXY+x}}${{COMPOSE_FILE+x}}${{COMPOSE_PROFILES+x}}\" ] || exit 93\n\
                  for argument do\n\
-                   if [ \"$argument\" = ps ]; then printf '%s' {}; exit 0; fi\n\
+                   if [ \"$argument\" = ps ]; then printf '%s\\n' \"$@\" > {}; printf '%s' {}; exit 0; fi\n\
                    if [ \"$argument\" = logs ]; then printf '%s\\n' \"$@\" > {}; printf 'first\\033[2J\\nsecond\\n'; exit 0; fi\n\
                  done\n\
                  exit 94\n",
+                shell_quote(trace_status.to_str().unwrap()),
                 shell_quote(status_output),
-                shell_quote(trace.to_str().unwrap()),
+                shell_quote(trace_logs.to_str().unwrap()),
             );
             fs::write(&binary, script).unwrap();
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
             let files = [base.clone(), overlay.clone()];
+            let profiles = ["frontend".to_owned(), "qa".to_owned()];
             let output = service_logs_with_binary(
                 &binary,
                 &socket,
                 &files,
+                &profiles,
                 "web",
                 OsStr::new("/usr/bin"),
                 None,
@@ -2986,8 +3311,9 @@ mod tests {
             .expect("fake Compose logs should succeed");
             assert!(output.contains(r"first\x1b[2J"));
             assert!(output.contains("second"));
-            let args = fs::read_to_string(trace).unwrap();
-            let expected = [
+            let status_args = fs::read_to_string(trace_status).unwrap();
+            let logs_args = fs::read_to_string(trace_logs).unwrap();
+            let common = [
                 "--host".to_owned(),
                 format!("unix://{}", socket.display()),
                 "compose".to_owned(),
@@ -2997,15 +3323,38 @@ mod tests {
                 base.display().to_string(),
                 "--file".to_owned(),
                 overlay.display().to_string(),
-                "logs".to_owned(),
-                "--tail".to_owned(),
-                "200".to_owned(),
-                "--no-color".to_owned(),
-                "web".to_owned(),
+                "--profile".to_owned(),
+                "frontend".to_owned(),
+                "--profile".to_owned(),
+                "qa".to_owned(),
+            ];
+            let expected_status = [
+                common.clone().to_vec(),
+                vec![
+                    "ps".to_owned(),
+                    "--all".to_owned(),
+                    "--format".to_owned(),
+                    "json".to_owned(),
+                ],
             ]
+            .concat()
             .join("\n")
                 + "\n";
-            assert_eq!(args, expected);
+            let expected_logs = [
+                common.to_vec(),
+                vec![
+                    "logs".to_owned(),
+                    "--tail".to_owned(),
+                    "200".to_owned(),
+                    "--no-color".to_owned(),
+                    "web".to_owned(),
+                ],
+            ]
+            .concat()
+            .join("\n")
+                + "\n";
+            assert_eq!(status_args, expected_status);
+            assert_eq!(logs_args, expected_logs);
         }
 
         #[tokio::test]
@@ -3013,6 +3362,7 @@ mod tests {
             let error = service_logs_with_binary(
                 std::path::Path::new("/definitely/not/a/docker-cli"),
                 std::path::Path::new("/tmp/socket"),
+                &[],
                 &[],
                 "--help",
                 OsStr::new("/usr/bin"),
@@ -3044,6 +3394,7 @@ mod tests {
                 &binary,
                 &directory.path().join("socket.sock"),
                 &[project],
+                &[],
                 "web",
                 OsStr::new("/usr/bin"),
                 None,
@@ -3076,7 +3427,8 @@ mod tests {
             )
             .expect("the temporary Compose file should be written");
 
-            let status = existing_compose_containers(engine.local_socket_path(), &[file]).await;
+            let status =
+                existing_compose_containers(engine.local_socket_path(), &[file], &[]).await;
             status
                 .outcome
                 .expect("read-only status for the temporary project should succeed");
@@ -3188,10 +3540,11 @@ mod tests {
                 view.selected_files(),
                 &[base.to_path_buf(), second.to_path_buf()]
             );
-            let (generation, files) = view
+            let (generation, files, profiles) = view
                 .begin_validation()
                 .expect("the remaining ordered file set should be revalidatable");
             assert_eq!(files, [base.to_path_buf(), second.to_path_buf()]);
+            assert!(profiles.is_empty());
             assert!(view.is_validation_running());
             assert!(view.finish_validation(generation, validation_result(Ok(()))));
 
@@ -3373,6 +3726,12 @@ mod tests {
             assert!(
                 harness
                     .get_by_role_and_label(Role::Button, "Choose base file")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            assert!(
+                harness
+                    .get_by_role_and_label(Role::TextInput, "Profiles:")
                     .accesskit_node()
                     .is_disabled()
             );
@@ -3623,6 +3982,112 @@ mod tests {
             view
         }
         #[test]
+        fn profile_changes_invalidate_status_and_logs_and_reject_stale_results() {
+            let mut view = validated_compose_view();
+            let (status_generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: vec![ComposeContainer {
+                        name: "api-1".to_owned(),
+                        service: "api".to_owned(),
+                        state: "running".to_owned(),
+                        health: None,
+                    }],
+                    outcome: Ok(()),
+                },
+            ));
+            let (logs_generation, _, _, _) = view.begin_service_logs("api").unwrap();
+            view.profiles_changed();
+
+            assert!(matches!(&view.validation, ComposeValidationState::Idle));
+            assert!(matches!(&view.status, ComposeStatusState::Idle));
+            assert!(matches!(&view.logs, ComposeLogsState::Idle));
+            assert!(view.containers.is_empty());
+            assert!(view.logs_output.is_empty());
+            assert!(!view.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: Vec::new(),
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(!view.finish_service_logs(
+                logs_generation,
+                ComposeLogsResult {
+                    output: "stale".to_owned(),
+                    outcome: Ok(()),
+                },
+            ));
+        }
+
+        #[test]
+        fn profile_text_input_emits_change_action() {
+            let mut harness = harness_for(ComposeView::default());
+            harness.run();
+            harness
+                .get_by_role_and_label(Role::TextInput, "Profiles:")
+                .focus();
+            harness.step();
+            assert!(
+                harness
+                    .get_by_role_and_label(Role::TextInput, "Profiles:")
+                    .is_focused()
+            );
+            harness
+                .get_by_role_and_label(Role::TextInput, "Profiles:")
+                .type_text("api");
+            harness.step();
+
+            assert_eq!(harness.state().view.profile_input, "api");
+            assert!(harness.state().actions.profiles_changed);
+        }
+
+        #[test]
+        fn invalid_profiles_are_visible_and_gate_validation() {
+            let mut view = validated_compose_view();
+            view.profile_input = "api,,worker".to_owned();
+            let mut harness = harness_for(view);
+            harness.run();
+            let _invalid = harness.get_by_role_and_label(
+                Role::Label,
+                "Invalid profiles. Use up to 16 unique names (64 bytes each), or * alone to enable all profiles; input is limited to 1024 bytes.",
+            );
+            assert!(
+                harness
+                    .get_by_role_and_label(Role::Button, "Validate selected files")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            assert!(harness.state_mut().view.begin_validation().is_none());
+            assert!(matches!(
+                &harness.state().view.validation,
+                ComposeValidationState::Failed {
+                    error: ComposeValidationError::InvalidProfiles,
+                    ..
+                }
+            ));
+        }
+        #[test]
+        fn file_selection_with_invalid_profiles_skips_automatic_validation() {
+            let mut view = ComposeView::default();
+            view.profile_input = "api,,worker".to_owned();
+            let generation = view.begin_file_selection();
+            assert!(view.finish_file_selection(
+                generation,
+                Some(std::path::Path::new("/private/compose.yaml")),
+            ));
+            assert!(view.is_validation_running());
+            assert!(view.profiles_for_automatic_validation().is_none());
+            assert!(matches!(
+                &view.validation,
+                ComposeValidationState::Failed {
+                    error: ComposeValidationError::InvalidProfiles,
+                    ..
+                }
+            ));
+        }
+        #[test]
         fn container_status_refresh_waits_for_project_inventory() {
             let mut view = validated_compose_view();
             view.begin_load();
@@ -3638,7 +4103,7 @@ mod tests {
         #[test]
         fn container_status_cancellation_and_selection_reject_stale_results() {
             let mut stale = validated_compose_view();
-            let (stale_generation, _) = stale
+            let (stale_generation, _, _) = stale
                 .begin_status_refresh()
                 .expect("validated selected files should allow a status refresh");
             stale.begin_file_selection();
@@ -3658,7 +4123,7 @@ mod tests {
             assert!(stale.containers.is_empty());
 
             let mut cancelled = validated_compose_view();
-            let (generation, _) = cancelled
+            let (generation, _, _) = cancelled
                 .begin_status_refresh()
                 .expect("validated selected files should allow a status refresh");
             cancelled.cancel_status_refresh();
@@ -3696,7 +4161,7 @@ mod tests {
         #[test]
         fn successful_container_status_renders_existing_service_fields() {
             let mut view = validated_compose_view();
-            let (generation, _) = view
+            let (generation, _, _) = view
                 .begin_status_refresh()
                 .expect("validated selected files should allow a status refresh");
             assert!(view.finish_status_refresh(
@@ -3733,7 +4198,7 @@ mod tests {
         #[test]
         fn empty_container_status_is_distinct_from_a_query_error() {
             let mut empty = validated_compose_view();
-            let (generation, _) = empty
+            let (generation, _, _) = empty
                 .begin_status_refresh()
                 .expect("validated selected files should allow a status refresh");
             assert!(empty.finish_status_refresh(
@@ -3751,7 +4216,7 @@ mod tests {
             );
 
             let mut failed = validated_compose_view();
-            let (generation, _) = failed
+            let (generation, _, _) = failed
                 .begin_status_refresh()
                 .expect("validated selected files should allow a status refresh");
             assert!(failed.finish_status_refresh(
@@ -3825,7 +4290,7 @@ mod tests {
         fn service_log_action_requires_current_status_and_cancel_rejects_stale_output() {
             let mut view = validated_compose_view();
             assert!(view.begin_service_logs("api").is_none());
-            let (status_generation, _) = view.begin_status_refresh().unwrap();
+            let (status_generation, _, _) = view.begin_status_refresh().unwrap();
             assert!(view.finish_status_refresh(
                 status_generation,
                 ComposeStatusResult {
@@ -3857,7 +4322,7 @@ mod tests {
                 .click_accesskit();
             harness.step();
             assert_eq!(harness.state().actions.logs_service.as_deref(), Some("api"));
-            let (generation, _, service) =
+            let (generation, _, _, service) =
                 harness.state_mut().view.begin_service_logs("api").unwrap();
             assert_eq!(service, "api");
             harness.step();
@@ -3882,7 +4347,7 @@ mod tests {
         fn service_log_results_render_content_empty_and_static_error_states() {
             fn view_with_service_status() -> ComposeView {
                 let mut view = validated_compose_view();
-                let (generation, _) = view.begin_status_refresh().unwrap();
+                let (generation, _, _) = view.begin_status_refresh().unwrap();
                 assert!(view.finish_status_refresh(
                     generation,
                     ComposeStatusResult {
@@ -3899,7 +4364,7 @@ mod tests {
             }
 
             let mut success = view_with_service_status();
-            let (generation, _, _) = success.begin_service_logs("api").unwrap();
+            let (generation, _, _, _) = success.begin_service_logs("api").unwrap();
             assert!(success.finish_service_logs(
                 generation,
                 ComposeLogsResult {
@@ -3913,7 +4378,7 @@ mod tests {
             drop(success_harness);
 
             let mut empty = view_with_service_status();
-            let (generation, _, _) = empty.begin_service_logs("api").unwrap();
+            let (generation, _, _, _) = empty.begin_service_logs("api").unwrap();
             assert!(empty.finish_service_logs(
                 generation,
                 ComposeLogsResult {
@@ -3927,7 +4392,7 @@ mod tests {
             drop(empty_harness);
 
             let mut failed = view_with_service_status();
-            let (generation, _, _) = failed.begin_service_logs("api").unwrap();
+            let (generation, _, _, _) = failed.begin_service_logs("api").unwrap();
             assert!(failed.finish_service_logs(
                 generation,
                 ComposeLogsResult {

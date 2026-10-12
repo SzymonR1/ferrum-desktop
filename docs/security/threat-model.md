@@ -64,10 +64,11 @@ local `include`/`extends.file` Compose files and included projects' default
 `.env` and explicit `include.env_file` paths under the logged-in user's
 permissions, potentially outside the base directory. Remote Git/OCI loaders
 are disabled. The selected files and private CLI environment do not sandbox
-those reads; validate only trusted files. Profiles, `.env`/service
-`env_file` resolution, import, lifecycle/build/pull, live log follow, and
-project mutations remain unsupported. One-shot service logs are described
-below. Issues #18 and #19 remain partial/open; issue #10 remains blocked/open.
+those reads; validate only trusted files. Explicit profiles apply only to
+structural validation, read-only status, and one-shot service logs. `.env` /
+service `env_file` resolution, import, lifecycle/build/pull, live log follow,
+and project mutations remain unsupported. Issues #18 and #19 remain
+partial/open; issue #10 remains blocked/open.
 No release or broader support claim is made.
 
 Status is available only after selected files pass structural validation and a
@@ -163,10 +164,24 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   not a sandbox; validate only trusted files. Keep selected paths and raw
   diagnostics private; display only a bounded escaped basename and static result.
 
-- Keep profiles, `.env`/service `env_file` resolution, file import, project
-  start/stop/restart, build/pull, live log follow, and project mutations
-  unsupported. One-shot read-only service logs are implemented as described
-  above. Remote references remain disabled and are not fetched. Linux local
+- Accept optional comma-separated Compose profiles only for structural
+  validation, read-only status, and one-shot service logs. Limit the input to
+  1024 UTF-8 bytes, 16 profiles, and 64 UTF-8 bytes per name. Trim outer
+  whitespace per token; blank means no explicit profiles. Reject empty entries
+  and duplicate names. Accept names matching
+  `[A-Za-z0-9][A-Za-z0-9_.-]+`, plus standalone `*` to enable every profile
+  for these read-only queries. Pass each selected name as a separate
+  `--profile <name>` argument before `config`, `ps`, or `logs`; never pass
+  profiles through an environment variable. Reuse the same selection for the
+  status recheck immediately before logs. Invalid or changed selection clears
+  validation/status/log state, cancels in-flight Compose work, and requires
+  revalidation. Keep private Docker config/HOME,
+  the cleared allowlisted environment, selected-project `.env` disabled, and
+  remote Git/OCI loaders disabled. This adds no project import/persistence,
+  start/stop/restart, build/pull, live log follow, or project mutation. See
+  Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
+  and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
+  Remote references remain disabled and are not fetched. Linux local
   discovery, single-file validation, ordered temporary base/override, and
   remote-loader safety smokes passed with Compose v5.6.0; they do not validate
   arbitrary projects or lifecycle behavior. The native page visual check is
@@ -369,10 +384,10 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
 
 - Remote TCP/HTTP/TLS/SSH transport trust, credentials, and identity validation.
 - Podman API compatibility and rootless endpoint discovery; issue #10 remains open for these and the broader engine matrix.
-- Compose profiles, `.env`/service `env_file` resolution, remote OCI/Git inputs
-  (remote loaders are disabled during validation), file import, project
-  lifecycle actions, build/pull, live log follow, and project mutations. The
-  bounded one-shot service log snapshot is implemented as described above.
+- Compose `.env`/service `env_file` resolution, remote OCI/Git inputs (remote
+  loaders are disabled during validation), file import, project lifecycle,
+  build/pull, live log follow, and project mutations. The bounded one-shot
+  service log snapshot is implemented as described above.
 - The explicit local Docker CLI Buildx invocation is an added external build process. Other external process integrations, archive extraction, and file-path surfaces remain deferred.
 - Credential stores, registry authentication, managed engines, and update delivery.
 

@@ -256,10 +256,30 @@ Validation is read-only, does not contact or require an engine socket, and
 Ferrum does not write, modify, delete, or extract project files. Success means
 structural validation only: interpolation and service `env_file` resolution
 are skipped. Only bounded escaped basenames and a static result are displayed;
-paths are session-only and raw diagnostics are discarded. Profiles,
-`.env`/service `env_file` resolution, remote Git/OCI references, file import,
-project lifecycle, build/pull, live log follow, and project mutations remain
-unsupported. One-shot service logs are described below.
+paths are session-only and raw diagnostics are discarded. Explicit profile
+selection is available for structural validation, read-only status, and
+one-shot service logs only; it does not add project import/persistence or
+lifecycle operations (start/stop/restart/build/pull), live log follow, or
+project mutation.
+
+The profile input is comma-separated, capped at 1024 UTF-8 bytes overall, 16
+profiles, and 64 UTF-8 bytes per name. Ferrum trims outer whitespace per token;
+blank input means no explicit profiles. Empty entries and duplicate names are
+rejected. Names must match `[A-Za-z0-9][A-Za-z0-9_.-]+`; standalone `*`
+enables every profile and is accepted only by itself. It does not start
+services; status still lists existing containers and each log query targets
+one selected service.
+Ferrum passes each profile through an individual
+`--profile <name>` argv pair before the Compose subcommand, never through an
+environment variable. The same profiles are used for the immediate status
+recheck before a one-shot log query. Invalid or changed selection clears prior
+validation/status/log state, cancels in-flight Compose work, and requires
+revalidation. Private Docker config/HOME and the cleared environment remain in
+effect, including disabling the selected project's default `.env` and remote
+Git/OCI loaders.
+
+See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
+and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
 
 Read-only container status is available for selected files after structural
 validation. It pins `docker compose ps --all --format json` to the selected
