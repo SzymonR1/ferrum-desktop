@@ -72,16 +72,15 @@ is active; context switching is blocked while it is pending. Navigating away
 does not abort a submitted request. Pruning, modification, connection,
 disconnection, and filesystem browsing are not offered.
 
-Only Linux with the selected local Docker Unix socket is covered. Podman and
-rootless behavior are unvalidated, remote endpoints are unsupported, and
-Windows and macOS volume support is not implemented. Headless UI and fake-socket
-tests cover the interface and protocol. This is a partial display-hardening
-slice; issues [#17](https://github.com/SzymonR1/ferrum-desktop/issues/17) and
-[#19](https://github.com/SzymonR1/ferrum-desktop/issues/19) remain open/ready,
-while [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) remains
-open/blocked for Podman/rootless behavior and broader endpoint validation. No
-endpoint/platform support or release is claimed; native Volumes visual
-validation remains unverified.
+The implementation scope is Linux with the selected local Docker Unix socket.
+Podman/rootless behavior is unvalidated, remote endpoints are unsupported, and
+Windows/macOS volume support is not implemented. Fake-socket/headless tests
+cover protocol and controls. Optional live read-only tests target a
+caller-selected existing volume; mutating live tests use unique test-owned
+volumes and verify exact identity before cleanup. Broader security work remains
+tracked in #19, while #10 remains open/blocked for endpoint compatibility.
+Native Volumes-page visual validation remains unverified. No release or wider
+support claim is made.
 
 The optional ignored live list/inspect/usage test requires `FERRUM_TEST_VOLUME`
 to name an existing volume on the current local Docker context. It is

@@ -67,11 +67,8 @@ send only the validated `Container` ID, no endpoint configuration or force
 flag, use an eight-second deadline, and are not retried.
 The Networks page refresh reads both inventories; container events and failed
 inventory reads keep attachment controls disabled until fresh state is available.
-Inspect retains attached IDs only when every `Containers` key is a full 64-character hexadecimal ID; endpoint values are discarded. Network usage statistics and credential access are not provided.
-Podman/rootless and remote endpoints remain unsupported or unvalidated. Issues
-[#17](https://github.com/SzymonR1/ferrum-desktop/issues/17) and
-[#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) remain open; this
-slice is not a release. Native UI click/visual validation remains unverified.
+Inspect retains attached IDs only when every `Containers` key is a full 64-character hexadecimal ID; endpoint values are discarded. Aggregate IP allocation counts are shown when available; they are point-in-time values, not per-network traffic totals. Credential access is not provided.
+Podman/rootless and remote endpoints remain unsupported or unvalidated under [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10); this is not a release. Native UI click/visual validation remains unverified.
 See the [Networks guide](docs/src/user-guide/networks.md).
 
 

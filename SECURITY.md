@@ -61,7 +61,7 @@ persistence fails, Ferrum emits a static process warning and does not claim the
 event was persisted; the engine request outcome is unchanged. This is local
 Ferrum-request history only, mutable by the same-UID user, not tamper-proof, and
 does not prove final engine state or record external engine actions.
-Issues #16, #17, and #19 remain open/ready; issue #10 remains open/blocked for
+Issues #16 and #19 remain open/ready; issue #10 remains open/blocked for
 Podman/rootless and broader endpoint validation. No release or platform/endpoint
 support is claimed.
 
@@ -200,7 +200,7 @@ not persistent or tamper-proof; a separate durable redacted copy is described
 above. Only one network mutation may be active, and context switching is blocked
 until it returns. IPAM parsing and metric availability are as described above;
 credential access is not provided. Podman/rootless and remote endpoints remain
-unsupported or unvalidated. Issues #17, #19, and #10 remain open; no release is
+unsupported or unvalidated. Issue #10 remains open/blocked; no release is
 claimed.
 
 The Compose page keeps read-only project discovery for the selected Linux local

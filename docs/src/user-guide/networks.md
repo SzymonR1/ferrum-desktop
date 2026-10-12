@@ -85,14 +85,13 @@ the network list is marked stale and must be reloaded before another action.
 Only one network mutation may be active, and context switching is blocked
 until its result arrives.
 
-Per-network traffic totals and credential access are not provided. This
-implementation is scoped to the selected local Docker Unix socket on Linux;
-this scope statement is not a platform or engine support claim.
-Podman/rootless behavior remains unvalidated, remote endpoints are unsupported,
-and Windows named pipes and macOS are outside the current engine scope. Issues
-[#17](https://github.com/SzymonR1/ferrum-desktop/issues/17) and
-[#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) remain open; this
-is not completion of either issue or a release.
+Per-network traffic totals and credential access are not provided; available
+IPAM values are point-in-time allocation counts, not traffic. Network operations
+are scoped to the selected local Docker Unix socket on Linux. Podman/rootless
+behavior remains unvalidated, remote endpoints are unsupported, and Windows
+named pipes and macOS are outside the current engine scope; see [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10)
+for the remaining endpoint matrix. No general platform/engine or release claim
+is made.
 
 Native Networks-page click/visual validation remains unverified because the
 available desktop provider cannot enumerate Ferrum or capture its native
