@@ -4370,7 +4370,7 @@ mod container_inventory_api_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        net::{UnixListener, UnixStream},
+        net::UnixListener,
     };
 
     static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
