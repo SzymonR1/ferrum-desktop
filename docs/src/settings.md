@@ -2,7 +2,14 @@
 
 Ferrum stores application preferences on Linux at `$XDG_CONFIG_HOME/ferrum/settings.toml` when `XDG_CONFIG_HOME` is an absolute path. Otherwise, it uses `$HOME/.config/ferrum/settings.toml`. If neither location can be determined, Ferrum remains usable with defaults and reports that settings cannot be saved.
 
-The only preference is `auto_connect_on_startup`, which defaults to `true`. When disabled, startup remains disconnected with an explanation, and the user can still connect manually with **Retry connection**. The setting takes effect at the next startup. Changes are written only after explicitly selecting **Save**; **Cancel** discards edits.
+Preferences include `auto_connect_on_startup` (default `true`) and
+`registry_credential_helper` (`none`, `secret_service`, or `pass`; default
+`none`). The helper setting stores only the selected enum, never credentials.
+When disabled, startup remains disconnected with an explanation, and the user
+can still connect manually with **Retry connection**; auto-connect takes effect
+at the next startup. A configured registry helper is used only after opting in
+for one pull on the Images page. Changes are written only after explicitly
+selecting **Save**; **Cancel** discards edits.
 
 Missing files use defaults. Versionless legacy settings are migrated in memory
 while preserving recognized values. Invalid, oversized, or future-version files
@@ -72,6 +79,7 @@ settings; an owner or a process with `CAP_FOWNER` can normalize it. If umask
 removes owner-read permission required for the `O_RDONLY` open, opening likewise
 fails before any settings write.
 
-Ferrum does not persist credentials, secrets, endpoints, or remote contexts.
-Credentials and remote connection contexts are not supported by this Linux-only
-settings slice.
+Ferrum does not persist credential material, secrets, endpoints, or remote
+contexts. The registry helper preference is only the `none`,
+`secret_service`, or `pass` enum; authentication remains per-pull opt-in and
+pull-only.

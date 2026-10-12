@@ -144,8 +144,14 @@ and any open inspection.
 The current implementation is Linux-only. Local Unix-socket Docker CLI contexts
 can be selected for the current session. Listing and switching contexts requires
 the Docker CLI; direct local `DOCKER_HOST` and automatic socket discovery do
-not. Direct remote `DOCKER_HOST` values and remote TCP/HTTP/HTTPS/SSH contexts
-return typed unsupported errors without local fallback. Podman/rootless behavior
-is not validated, and Windows/macOS remain deferred to issue
-[#21](https://github.com/SzymonR1/ferrum-desktop/issues/21) / M8. See the
+not. With no explicit endpoint/context, discovery checks
+`$XDG_RUNTIME_DIR/docker.sock`, `$XDG_RUNTIME_DIR/podman/podman.sock`, then
+`/var/run/docker.sock`.
+The Podman entry is only a user-socket discovery candidate; Podman runtime/API
+compatibility is not validated. If the user has enabled Podman's systemd socket
+activation, connecting may activate its API service; Ferrum does not invoke or
+enable systemd units. Direct remote
+`DOCKER_HOST` values and remote TCP/HTTP/HTTPS/SSH contexts return typed
+unsupported errors without local fallback. Windows/macOS remain deferred to
+issue [#21](https://github.com/SzymonR1/ferrum-desktop/issues/21) / M8. See the
 [platform support matrix](../platform-support.md) for current evidence.
