@@ -196,9 +196,12 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   validation/status/log state, cancels in-flight Compose work, and requires
   revalidation. Keep private Docker config/HOME,
   the cleared allowlisted environment, selected-project `.env` disabled, and
-  remote Git/OCI loaders disabled. This adds no project import/persistence,
-  start/stop/restart, build/pull, live log follow, or project mutation. See
-  Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
+  remote Git/OCI loaders disabled. Transient import retains only validated
+  ordered file paths, profile names, and a bounded local label in memory for
+  this session; it invokes no CLI/Engine operation and copies or persists no
+  files. It is not a project identity or authorization mechanism. Persistent
+  project storage, start/stop/restart, build/pull, live log follow, and project
+  mutations remain unavailable. See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
   and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
   Remote references remain disabled and are not fetched. Linux local
   discovery, single-file validation, ordered temporary base/override, and
@@ -403,10 +406,12 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
 
 - Remote TCP/HTTP/TLS/SSH transport trust, credentials, and identity validation.
 - Podman API compatibility and rootless endpoint discovery; issue #10 remains open for these and the broader engine matrix.
-- Compose `.env`/service `env_file` resolution, remote OCI/Git inputs (remote
-  loaders are disabled during validation), file import, project lifecycle,
-  build/pull, live log follow, and project mutations. The bounded one-shot
-  service log snapshot is implemented as described above.
+- Compose `.env`/service `env_file` resolution and remote OCI/Git inputs (remote
+  loaders are disabled during validation) remain trust risks. The transient
+  configuration import stores only session-local path/profile metadata and a
+  local label; file-content import, persistent project registration, project
+  lifecycle, build/pull, live log follow, and project mutations remain deferred.
+  The bounded one-shot service log snapshot is implemented as described above.
 - The explicit local Docker CLI Buildx invocation is an added external build process. Other external process integrations, archive extraction, and file-path surfaces remain deferred.
 - Credential stores, registry authentication, managed engines, and update delivery.
 

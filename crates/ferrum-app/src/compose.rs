@@ -367,7 +367,6 @@ fn display_imported_project_name(name: &str) -> String {
         .unwrap_or_else(|| "[name omitted]".to_owned())
 }
 
-
 fn display_compose_basename(path: &std::path::Path) -> String {
     let Some(file_name) = path.file_name() else {
         return "[name omitted]".to_owned();
@@ -639,7 +638,10 @@ impl ComposeView {
             || name.is_empty()
             || name.len() > MAX_IMPORTED_COMPOSE_NAME_BYTES
             || self.imported_projects.len() >= MAX_IMPORTED_COMPOSE_PROJECTS
-            || self.imported_projects.iter().any(|project| project.name == name)
+            || self
+                .imported_projects
+                .iter()
+                .any(|project| project.name == name)
         {
             return false;
         }
@@ -670,7 +672,6 @@ impl ComposeView {
         self.import_feedback = None;
         true
     }
-
 
     pub(super) fn profiles_for_automatic_validation(&mut self) -> Option<Vec<String>> {
         match self.selected_profiles() {
@@ -960,20 +961,31 @@ impl ComposeView {
         ui.label("The local label is only for this session; it is not a Compose project identity.");
         ui.horizontal(|ui| {
             let label = ui.label("Import name:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.import_name_input)
-                    .char_limit(MAX_IMPORTED_COMPOSE_NAME_BYTES)
-                    .hint_text("local display label")
-                    .desired_width(220.0)
-                    .labelled_by(label.id),
-            );
+            let input = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.import_name_input)
+                        .char_limit(MAX_IMPORTED_COMPOSE_NAME_BYTES)
+                        .hint_text("local display label")
+                        .desired_width(220.0),
+                )
+                .labelled_by(label.id);
+            if input.changed() {
+                self.import_feedback = None;
+            }
+            let import_limit_reached =
+                self.imported_projects.len() >= MAX_IMPORTED_COMPOSE_PROJECTS;
+            if import_limit_reached {
+                ui.label("This session has reached the 32-import limit.");
+            }
             if ui
                 .add_enabled(
                     self.can_import_current_project()
+                        && !import_limit_reached
                         && !actions.select_base_file
                         && !actions.add_override_file
                         && !actions.validate_files
                         && actions.remove_override.is_none(),
+                    egui::Button::new("Import validated selection"),
                 )
                 .clicked()
             {
@@ -4930,14 +4942,13 @@ mod tests {
             assert!(view.finish_validation(generation, validation_result(Ok(()))));
             view.begin_override_selection();
             let mut pending_harness = harness_for(view);
-            pending_harness.run();
+            pending_harness.step();
             assert!(
                 pending_harness
                     .get_by_role_and_label(Role::Button, "Import validated selection")
                     .accesskit_node()
                     .is_disabled()
             );
-
         }
 
         #[test]
@@ -4952,27 +4963,38 @@ mod tests {
             }
             assert_eq!(view.imported_projects.len(), MAX_IMPORTED_COMPOSE_PROJECTS);
             assert!(!view.import_current_project("overflow"));
+            let mut harness = harness_for(view);
+            harness.run();
+            assert!(
+                harness
+                    .get_by_role_and_label(Role::Button, "Import validated selection")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            let _limit_message = harness.get_by_role_and_label(
+                Role::Label,
+                "This session has reached the 32-import limit.",
+            );
         }
 
         #[test]
         fn selecting_import_restores_ordered_files_and_profiles_and_clears_old_results() {
             let base = std::path::PathBuf::from("/private/base/compose.yaml");
             let override_file = std::path::PathBuf::from("/private/overrides/dev.yaml");
-            let mut source = ComposeView::default();
-            source.profile_input = "dev".to_owned();
-            let generation = source.begin_file_selection();
-            assert!(source.finish_file_selection(generation, Some(&base)));
-            assert!(source.finish_validation(generation, validation_result(Ok(()))));
-            let generation = source.begin_override_selection();
-            assert!(source.finish_file_selection(generation, Some(&override_file)));
-            assert!(source.finish_validation(generation, validation_result(Ok(()))));
-            source.profile_input = "dev,qa".to_owned();
-            source.profiles_changed();
-            let (generation, _, _) = source.begin_validation().unwrap();
-            assert!(source.finish_validation(generation, validation_result(Ok(()))));
-            assert!(source.import_current_project("Imported"));
+            let mut view = ComposeView::default();
+            view.profile_input = "dev".to_owned();
+            let generation = view.begin_file_selection();
+            assert!(view.finish_file_selection(generation, Some(&base)));
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
+            let generation = view.begin_override_selection();
+            assert!(view.finish_file_selection(generation, Some(&override_file)));
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
+            view.profile_input = "dev,qa".to_owned();
+            view.profiles_changed();
+            let (generation, _, _) = view.begin_validation().unwrap();
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
+            assert!(view.import_current_project("Imported"));
 
-            let mut view = validated_compose_view();
             let (status_generation, _, _) = view.begin_status_refresh().unwrap();
             assert!(view.finish_status_refresh(
                 status_generation,
@@ -4992,12 +5014,12 @@ mod tests {
             let stale_file = std::path::Path::new("/private/stale/override.yaml");
             let validation_generation = view.validation_generation;
             assert!(view.select_imported_project(0));
-            assert!(!view.finish_file_selection(
-                picker_generation,
-                Some(stale_file),
-            ));
-            assert_eq!(view.selected_files, [base, override_file]);
-            assert_eq!(view.imported_projects[0].files, [base.clone(), override_file.clone()]);
+            assert!(!view.finish_file_selection(picker_generation, Some(stale_file)));
+            assert_eq!(view.selected_files, [base.clone(), override_file.clone()]);
+            assert_eq!(
+                view.imported_projects[0].files,
+                [base.clone(), override_file.clone()]
+            );
             assert_eq!(
                 view.imported_projects[0].profiles,
                 vec!["dev".to_owned(), "qa".to_owned()],
@@ -5007,10 +5029,7 @@ mod tests {
             assert!(view.containers.is_empty());
             assert!(view.logs_output.is_empty());
             assert!(!view.can_request_service_logs("api"));
-            assert!(!view.finish_validation(
-                validation_generation,
-                validation_result(Ok(())),
-            ));
+            assert!(!view.finish_validation(validation_generation, validation_result(Ok(())),));
             assert!(!view.finish_status_refresh(
                 status_generation,
                 ComposeStatusResult {
@@ -5039,7 +5058,8 @@ mod tests {
             view.loaded = true;
             let mut harness = harness_for(view);
             harness.run();
-            let _import_heading = harness.get_by_role_and_label(Role::Label, "Imported local projects (this session only)");
+            let _import_heading = harness
+                .get_by_role_and_label(Role::Label, "Imported local projects (this session only)");
             let _local_name = harness.get_by_role_and_label(Role::Label, "Local label");
             let _discovery_name = harness.get_by_role_and_label(Role::Label, "engine-project");
         }
