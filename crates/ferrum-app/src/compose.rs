@@ -84,6 +84,65 @@ enum ComposeStatusState {
         file_name: String,
     },
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ComposeLogsError {
+    DockerCliMissing,
+    PrivateConfigSetupFailed,
+    QueryFailed,
+    ServiceUnavailable,
+    InvalidOutput,
+}
+
+impl ComposeLogsError {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::DockerCliMissing => "Docker CLI is unavailable.",
+            Self::PrivateConfigSetupFailed => {
+                "Could not prepare an isolated Docker CLI environment."
+            }
+            Self::ServiceUnavailable => {
+                "The service is no longer present in the current Compose status. Refresh and retry."
+            }
+            Self::QueryFailed => "Could not read the selected Compose service logs.",
+            Self::InvalidOutput => "Compose returned invalid or excessive log data.",
+        }
+    }
+}
+
+pub(super) struct ComposeLogsResult {
+    output: String,
+    outcome: Result<(), ComposeLogsError>,
+}
+
+impl std::fmt::Debug for ComposeLogsResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ComposeLogsResult")
+            .field("output_bytes", &self.output.len())
+            .field("outcome", &self.outcome)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum ComposeLogsState {
+    #[default]
+    Idle,
+    Loading {
+        service: String,
+    },
+    Succeeded {
+        service: String,
+    },
+    Failed {
+        service: String,
+        error: ComposeLogsError,
+    },
+    Cancelled {
+        service: String,
+    },
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ComposeProject {
     name: String,
@@ -199,7 +258,7 @@ enum ComposeValidationState {
     SelectionCancelled,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct ComposeActions {
     pub(super) refresh: bool,
     pub(super) refresh_containers: bool,
@@ -209,6 +268,8 @@ pub(super) struct ComposeActions {
     pub(super) validate_files: bool,
     pub(super) cancel_validation: bool,
     pub(super) cancel_status: bool,
+    pub(super) logs_service: Option<String>,
+    pub(super) cancel_logs: bool,
 }
 const MAX_COMPOSE_FILES: usize = 16;
 
@@ -247,6 +308,9 @@ pub(super) struct ComposeView {
     status_generation: u64,
     status: ComposeStatusState,
     containers: Vec<ComposeContainer>,
+    logs_generation: u64,
+    logs: ComposeLogsState,
+    logs_output: String,
 }
 
 impl ComposeView {
@@ -303,6 +367,7 @@ impl ComposeView {
             return None;
         }
         self.status_generation = self.status_generation.wrapping_add(1);
+        self.invalidate_logs();
         self.containers.clear();
         let file_name = display_compose_file_list(&self.selected_files);
         self.status = ComposeStatusState::Loading { file_name };
@@ -348,6 +413,80 @@ impl ComposeView {
         self.status_generation = self.status_generation.wrapping_add(1);
         self.status = ComposeStatusState::Idle;
         self.containers.clear();
+        self.invalidate_logs();
+    }
+    fn can_request_service_logs(&self, service: &str) -> bool {
+        validate_service_selector(service).is_some()
+            && matches!(&self.status, ComposeStatusState::Succeeded { .. })
+            && matches!(&self.validation, ComposeValidationState::Succeeded { .. })
+            && self
+                .containers
+                .iter()
+                .any(|container| container.service == service)
+            && !matches!(&self.logs, ComposeLogsState::Loading { .. })
+    }
+    pub(super) fn begin_service_logs(
+        &mut self,
+        service: &str,
+    ) -> Option<(u64, Vec<std::path::PathBuf>, String)> {
+        let service = validate_service_selector(service)?;
+        if !matches!(&self.status, ComposeStatusState::Succeeded { .. })
+            || !matches!(&self.validation, ComposeValidationState::Succeeded { .. })
+            || !self
+                .containers
+                .iter()
+                .any(|container| container.service == service)
+            || matches!(&self.logs, ComposeLogsState::Loading { .. })
+        {
+            return None;
+        }
+        self.logs_generation = self.logs_generation.wrapping_add(1);
+        self.logs_output.clear();
+        self.logs = ComposeLogsState::Loading {
+            service: service.to_owned(),
+        };
+        Some((
+            self.logs_generation,
+            self.selected_files.clone(),
+            service.to_owned(),
+        ))
+    }
+
+    pub(super) fn finish_service_logs(
+        &mut self,
+        generation: u64,
+        result: ComposeLogsResult,
+    ) -> bool {
+        if generation != self.logs_generation
+            || !matches!(&self.logs, ComposeLogsState::Loading { .. })
+        {
+            return false;
+        }
+        let ComposeLogsState::Loading { service } = std::mem::take(&mut self.logs) else {
+            return false;
+        };
+        match result.outcome {
+            Ok(()) => {
+                self.logs_output = result.output;
+                self.logs = ComposeLogsState::Succeeded { service };
+            }
+            Err(error) => self.logs = ComposeLogsState::Failed { service, error },
+        }
+        true
+    }
+
+    pub(super) fn cancel_service_logs(&mut self) {
+        if let ComposeLogsState::Loading { service } = std::mem::take(&mut self.logs) {
+            self.logs_generation = self.logs_generation.wrapping_add(1);
+            self.logs_output.clear();
+            self.logs = ComposeLogsState::Cancelled { service };
+        }
+    }
+
+    fn invalidate_logs(&mut self) {
+        self.logs_generation = self.logs_generation.wrapping_add(1);
+        self.logs_output.clear();
+        self.logs = ComposeLogsState::Idle;
     }
 
     pub(super) fn begin_file_selection(&mut self) -> u64 {
@@ -639,11 +778,12 @@ impl ComposeView {
                 ui.label("No existing containers for the selected Compose files.");
             }
             ComposeStatusState::Succeeded { .. } => {
-                ui.columns(4, |columns| {
+                ui.columns(5, |columns| {
                     columns[0].strong("Container");
                     columns[1].strong("Service");
                     columns[2].strong("State");
                     columns[3].strong("Health");
+                    columns[4].strong("Recent logs");
                 });
                 ui.separator();
                 egui::ScrollArea::vertical()
@@ -656,7 +796,7 @@ impl ComposeView {
                         |ui, rows| {
                             for row in rows {
                                 let container = &self.containers[row];
-                                ui.columns(4, |columns| {
+                                ui.columns(5, |columns| {
                                     columns[0]
                                         .add(egui::Label::new(container.name.as_str()).truncate());
                                     columns[1].add(
@@ -670,6 +810,18 @@ impl ComposeView {
                                         )
                                         .truncate(),
                                     );
+                                    if columns[4]
+                                        .add_enabled(
+                                            self.can_request_service_logs(&container.service),
+                                            egui::Button::new(format!(
+                                                "Snapshot logs for {}",
+                                                container.service
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        actions.logs_service = Some(container.service.clone());
+                                    }
                                 });
                             }
                         },
@@ -680,6 +832,38 @@ impl ComposeView {
             }
             ComposeStatusState::Cancelled { .. } => {
                 ui.label("Container refresh cancelled.");
+            }
+        }
+        match &self.logs {
+            ComposeLogsState::Idle => {}
+            ComposeLogsState::Loading { service } => {
+                ui.spinner();
+                ui.label(format!(
+                    "Checking current status and reading recent logs for {service}…"
+                ));
+                actions.cancel_logs = ui.button("Cancel log snapshot").clicked();
+            }
+            ComposeLogsState::Succeeded { service } => {
+                ui.heading(format!("Recent logs: {service}"));
+                ui.label(concat!(
+                    "Compose tails up to 200 lines per container. Ferrum shows at most ",
+                    "200 combined lines/256 KiB; replicated output may be truncated."
+                ));
+                if self.logs_output.is_empty() {
+                    ui.label("No log output.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(&self.logs_output).monospace());
+                        });
+                }
+            }
+            ComposeLogsState::Failed { error, .. } => {
+                ui.colored_label(egui::Color32::from_rgb(224, 174, 109), error.message());
+            }
+            ComposeLogsState::Cancelled { .. } => {
+                ui.label("Log snapshot cancelled.");
             }
         }
 
@@ -810,7 +994,19 @@ async fn discover_with_binary(
     Ok(ComposeDiscovery { version, projects })
 }
 
-#[cfg(target_os = "linux")]
+fn validate_service_selector(service: &str) -> Option<&str> {
+    if service.is_empty() || service.len() > 128 {
+        return None;
+    }
+    let mut bytes = service.bytes();
+    let first = bytes.next()?;
+    if !first.is_ascii_alphanumeric()
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(service)
+}
 fn parse_containers(output: &[u8]) -> Option<Vec<ComposeContainer>> {
     use std::collections::HashSet;
     let output = output.trim_ascii();
@@ -1588,6 +1784,131 @@ async fn containers_with_binary(
             _ => ComposeStatusError::QueryFailed,
         })?;
     parse_containers(&output).ok_or(ComposeStatusError::InvalidOutput)
+}
+
+#[cfg(target_os = "linux")]
+const MAX_COMPOSE_LOG_LINE_BYTES: usize = 4096;
+
+#[cfg(target_os = "linux")]
+const MAX_COMPOSE_LOG_DISPLAY_BYTES: usize = 256 * 1024;
+#[cfg(target_os = "linux")]
+fn sanitize_compose_logs(output: &[u8]) -> Option<String> {
+    if output.len() > MAX_COMMAND_OUTPUT_BYTES {
+        return None;
+    }
+    let mut sanitized = String::with_capacity(output.len().min(MAX_COMPOSE_LOG_DISPLAY_BYTES));
+    for (index, line) in String::from_utf8_lossy(output)
+        .lines()
+        .take(200)
+        .enumerate()
+    {
+        let escaped =
+            escape_untrusted_display_text_with_limit(line.to_owned(), MAX_COMPOSE_LOG_LINE_BYTES)?;
+        let separator_bytes = usize::from(index > 0);
+        if sanitized.len() + separator_bytes + escaped.len() > MAX_COMPOSE_LOG_DISPLAY_BYTES {
+            break;
+        }
+        if index > 0 {
+            sanitized.push('\n');
+        }
+        sanitized.push_str(&escaped);
+    }
+    Some(sanitized)
+}
+
+#[cfg(target_os = "linux")]
+async fn service_logs_with_binary(
+    binary: &std::path::Path,
+    socket_path: &std::path::Path,
+    files: &[std::path::PathBuf],
+    service: &str,
+    search_path: &std::ffi::OsStr,
+    user_compose_plugin: Option<&std::path::Path>,
+) -> Result<String, ComposeLogsError> {
+    use tokio::process::Command;
+    let service = validate_service_selector(service).ok_or(ComposeLogsError::QueryFailed)?;
+    let current_containers =
+        containers_with_binary(binary, socket_path, files, search_path, user_compose_plugin)
+            .await
+            .map_err(|error| match error {
+                ComposeStatusError::DockerCliMissing => ComposeLogsError::DockerCliMissing,
+                ComposeStatusError::PrivateConfigSetupFailed => {
+                    ComposeLogsError::PrivateConfigSetupFailed
+                }
+                ComposeStatusError::QueryFailed | ComposeStatusError::InvalidOutput => {
+                    ComposeLogsError::QueryFailed
+                }
+            })?;
+    if !current_containers
+        .iter()
+        .any(|container| container.service == service)
+    {
+        return Err(ComposeLogsError::ServiceUnavailable);
+    }
+    if !selected_compose_files_are_valid(files) || selected_compose_files_size_exceeds_limit(files)
+    {
+        return Err(ComposeLogsError::QueryFailed);
+    }
+    let isolated = PrivateDockerConfig::new(user_compose_plugin)
+        .map_err(|_| ComposeLogsError::PrivateConfigSetupFailed)?;
+    let socket_path = socket_path.to_str().ok_or(ComposeLogsError::QueryFailed)?;
+    let host = format!("unix://{socket_path}");
+    let parent = files[0].parent().ok_or(ComposeLogsError::QueryFailed)?;
+    let mut command = Command::new(binary);
+    isolated.configure(&mut command, search_path);
+    command
+        .env("COMPOSE_DISABLE_ENV_FILE", "1")
+        .arg("--host")
+        .arg(host)
+        .args(["compose", "--project-directory"])
+        .arg(parent);
+    for file in files {
+        command.arg("--file").arg(file);
+    }
+    command
+        .args(["logs", "--tail", "200", "--no-color"])
+        .arg(service);
+    let output = run_command_with_timeout(&mut command, COMMAND_TIMEOUT)
+        .await
+        .map_err(|failure| match failure {
+            CommandFailure::Launch => ComposeLogsError::DockerCliMissing,
+            _ => ComposeLogsError::QueryFailed,
+        })?;
+    sanitize_compose_logs(&output).ok_or(ComposeLogsError::InvalidOutput)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) async fn compose_service_logs(
+    socket_path: &std::path::Path,
+    files: &[std::path::PathBuf],
+    service: &str,
+) -> ComposeLogsResult {
+    let result = async {
+        validate_service_selector(service).ok_or(ComposeLogsError::QueryFailed)?;
+        let search_path = std::env::var_os("PATH").ok_or(ComposeLogsError::DockerCliMissing)?;
+        let binary = docker_binary(&search_path).ok_or(ComposeLogsError::DockerCliMissing)?;
+        let plugin = user_compose_plugin();
+        service_logs_with_binary(
+            &binary,
+            socket_path,
+            files,
+            service,
+            &search_path,
+            plugin.as_deref(),
+        )
+        .await
+    }
+    .await;
+    match result {
+        Ok(output) => ComposeLogsResult {
+            output,
+            outcome: Ok(()),
+        },
+        Err(error) => ComposeLogsResult {
+            output: String::new(),
+            outcome: Err(error),
+        },
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2589,6 +2910,149 @@ mod tests {
             assert_eq!(args, expected);
         }
         #[tokio::test]
+        async fn logs_are_not_requested_when_service_is_absent_from_fresh_status() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("temporary project");
+            fs::create_dir(&project).unwrap();
+            let file = project.join("compose.yaml");
+            fs::write(&file, "services: {}\n").unwrap();
+            let marker = directory.path().join("logs-invoked");
+            let binary = directory.path().join("docker-fixture");
+            let script = format!(
+                "#!/bin/sh\n\
+                 for argument do\n\
+                   if [ \"$argument\" = logs ]; then : > {}; printf 'unexpected-log-output\\n'; exit 0; fi\n\
+                 done\n\
+                 exit 0\n",
+                shell_quote(marker.to_str().unwrap()),
+            );
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+            let result = service_logs_with_binary(
+                &binary,
+                &directory.path().join("socket.sock"),
+                &[file],
+                "web",
+                OsStr::new("/usr/bin"),
+                None,
+            )
+            .await;
+
+            assert_eq!(result, Err(ComposeLogsError::ServiceUnavailable));
+            assert!(
+                !marker.exists(),
+                "the logs command must not run if fresh status lacks the service"
+            );
+        }
+        #[tokio::test]
+        async fn service_logs_use_exact_safe_arguments_private_environment_and_sanitized_output() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("project with spaces");
+            fs::create_dir(&project).unwrap();
+            let base = project.join("compose.yaml");
+            let overlay = project.join("override.yaml");
+            fs::write(&base, "services: {}\n").unwrap();
+            fs::write(&overlay, "services: {}\n").unwrap();
+            let socket = directory.path().join("selected socket.sock");
+            let trace = directory.path().join("argv");
+            let binary = directory.path().join("docker-logs");
+            let status_output = "{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"running\"}\n";
+            let script = format!(
+                "#!/bin/sh\n\
+                 [ -n \"$PATH\" ] && [ -n \"$HOME\" ] && [ -n \"$DOCKER_CONFIG\" ] || exit 91\n\
+                 [ \"$COMPOSE_DISABLE_ENV_FILE\" = 1 ] && [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = false ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = false ] || exit 92\n\
+                 [ -z \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{HTTP_PROXY+x}}${{COMPOSE_FILE+x}}\" ] || exit 93\n\
+                 for argument do\n\
+                   if [ \"$argument\" = ps ]; then printf '%s' {}; exit 0; fi\n\
+                   if [ \"$argument\" = logs ]; then printf '%s\\n' \"$@\" > {}; printf 'first\\033[2J\\nsecond\\n'; exit 0; fi\n\
+                 done\n\
+                 exit 94\n",
+                shell_quote(status_output),
+                shell_quote(trace.to_str().unwrap()),
+            );
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let files = [base.clone(), overlay.clone()];
+            let output = service_logs_with_binary(
+                &binary,
+                &socket,
+                &files,
+                "web",
+                OsStr::new("/usr/bin"),
+                None,
+            )
+            .await
+            .expect("fake Compose logs should succeed");
+            assert!(output.contains(r"first\x1b[2J"));
+            assert!(output.contains("second"));
+            let args = fs::read_to_string(trace).unwrap();
+            let expected = [
+                "--host".to_owned(),
+                format!("unix://{}", socket.display()),
+                "compose".to_owned(),
+                "--project-directory".to_owned(),
+                project.display().to_string(),
+                "--file".to_owned(),
+                base.display().to_string(),
+                "--file".to_owned(),
+                overlay.display().to_string(),
+                "logs".to_owned(),
+                "--tail".to_owned(),
+                "200".to_owned(),
+                "--no-color".to_owned(),
+                "web".to_owned(),
+            ]
+            .join("\n")
+                + "\n";
+            assert_eq!(args, expected);
+        }
+
+        #[tokio::test]
+        async fn unsafe_service_is_rejected_before_launch() {
+            let error = service_logs_with_binary(
+                std::path::Path::new("/definitely/not/a/docker-cli"),
+                std::path::Path::new("/tmp/socket"),
+                &[],
+                "--help",
+                OsStr::new("/usr/bin"),
+                None,
+            )
+            .await
+            .expect_err("unsafe service must be rejected before CLI launch");
+            assert_eq!(error, ComposeLogsError::QueryFailed);
+        }
+        #[tokio::test]
+        async fn service_logs_report_cli_failure_without_exposing_diagnostics() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("compose.yaml");
+            fs::write(&project, "services: {}\n").unwrap();
+            let binary = directory.path().join("docker-failure");
+            let status_output = "{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"running\"}\n";
+            let script = format!(
+                "#!/bin/sh\n\
+                 for argument do\n\
+                   if [ \"$argument\" = ps ]; then printf '%s' {}; exit 0; fi\n\
+                   if [ \"$argument\" = logs ]; then echo secret-diagnostic >&2; exit 7; fi\n\
+                 done\n\
+                 exit 94\n",
+                shell_quote(status_output),
+            );
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let result = service_logs_with_binary(
+                &binary,
+                &directory.path().join("socket.sock"),
+                &[project],
+                "web",
+                OsStr::new("/usr/bin"),
+                None,
+            )
+            .await;
+            assert_eq!(result, Err(ComposeLogsError::QueryFailed));
+            assert!(!format!("{result:?}").contains("secret-diagnostic"));
+        }
+        #[tokio::test]
         #[ignore = "requires a local Docker-compatible Unix socket and Compose; ps reads only an owned temporary project"]
         async fn local_compose_status_reads_temporary_project_without_mutation() {
             use std::time::{SystemTime, UNIX_EPOCH};
@@ -3357,6 +3821,127 @@ mod tests {
                 "Compose projects could not be read from the selected local Docker Engine.",
             );
         }
+        #[test]
+        fn service_log_action_requires_current_status_and_cancel_rejects_stale_output() {
+            let mut view = validated_compose_view();
+            assert!(view.begin_service_logs("api").is_none());
+            let (status_generation, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: vec![
+                        ComposeContainer {
+                            name: "api-1".to_owned(),
+                            service: "api".to_owned(),
+                            state: "running".to_owned(),
+                            health: None,
+                        },
+                        ComposeContainer {
+                            name: "worker-1".to_owned(),
+                            service: "worker".to_owned(),
+                            state: "running".to_owned(),
+                            health: None,
+                        },
+                    ],
+                    outcome: Ok(()),
+                }
+            ));
+            assert!(view.begin_service_logs("--help").is_none());
+            let mut harness = harness_for(view);
+            harness.run();
+            let _api_logs = harness.get_by_role_and_label(Role::Button, "Snapshot logs for api");
+            let _worker_logs =
+                harness.get_by_role_and_label(Role::Button, "Snapshot logs for worker");
+            harness
+                .get_by_role_and_label(Role::Button, "Snapshot logs for api")
+                .click_accesskit();
+            harness.step();
+            assert_eq!(harness.state().actions.logs_service.as_deref(), Some("api"));
+            let (generation, _, service) =
+                harness.state_mut().view.begin_service_logs("api").unwrap();
+            assert_eq!(service, "api");
+            harness.step();
+            harness
+                .get_by_role_and_label(Role::Button, "Cancel log snapshot")
+                .click_accesskit();
+            harness.step();
+            assert!(harness.state().actions.cancel_logs);
+            harness.state_mut().view.cancel_service_logs();
+            assert!(!harness.state_mut().view.finish_service_logs(
+                generation,
+                ComposeLogsResult {
+                    output: "stale".to_owned(),
+                    outcome: Ok(()),
+                }
+            ));
+            assert!(harness.state().view.logs_output.is_empty());
+            harness.run();
+            let _cancelled = harness.get_by_role_and_label(Role::Label, "Log snapshot cancelled.");
+        }
+        #[test]
+        fn service_log_results_render_content_empty_and_static_error_states() {
+            fn view_with_service_status() -> ComposeView {
+                let mut view = validated_compose_view();
+                let (generation, _) = view.begin_status_refresh().unwrap();
+                assert!(view.finish_status_refresh(
+                    generation,
+                    ComposeStatusResult {
+                        containers: vec![ComposeContainer {
+                            name: "api-1".to_owned(),
+                            service: "api".to_owned(),
+                            state: "running".to_owned(),
+                            health: None,
+                        }],
+                        outcome: Ok(()),
+                    },
+                ));
+                view
+            }
+
+            let mut success = view_with_service_status();
+            let (generation, _, _) = success.begin_service_logs("api").unwrap();
+            assert!(success.finish_service_logs(
+                generation,
+                ComposeLogsResult {
+                    output: "safe log line".to_owned(),
+                    outcome: Ok(()),
+                },
+            ));
+            let mut success_harness = harness_for(success);
+            success_harness.run();
+            let _output = success_harness.get_by_role_and_label(Role::Label, "safe log line");
+            drop(success_harness);
+
+            let mut empty = view_with_service_status();
+            let (generation, _, _) = empty.begin_service_logs("api").unwrap();
+            assert!(empty.finish_service_logs(
+                generation,
+                ComposeLogsResult {
+                    output: String::new(),
+                    outcome: Ok(()),
+                },
+            ));
+            let mut empty_harness = harness_for(empty);
+            empty_harness.run();
+            let _empty = empty_harness.get_by_role_and_label(Role::Label, "No log output.");
+            drop(empty_harness);
+
+            let mut failed = view_with_service_status();
+            let (generation, _, _) = failed.begin_service_logs("api").unwrap();
+            assert!(failed.finish_service_logs(
+                generation,
+                ComposeLogsResult {
+                    output: String::new(),
+                    outcome: Err(ComposeLogsError::QueryFailed),
+                },
+            ));
+            let mut failed_harness = harness_for(failed);
+            failed_harness.run();
+            let _error = failed_harness.get_by_role_and_label(
+                Role::Label,
+                "Could not read the selected Compose service logs.",
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -3397,5 +3982,49 @@ mod tests {
                 "displayed project text must be escaped"
             );
         }
+    }
+    #[test]
+    fn compose_logs_result_debug_redacts_log_content() {
+        let result = ComposeLogsResult {
+            output: "compose-log-SECRET-SENTINEL".to_owned(),
+            outcome: Ok(()),
+        };
+        let debug = format!("{result:?}");
+
+        assert!(!debug.contains("compose-log-SECRET-SENTINEL"));
+        assert!(debug.contains("output_bytes"));
+    }
+
+    #[test]
+    fn service_selector_accepts_safe_compose_names_and_rejects_option_injection() {
+        assert_eq!(validate_service_selector("api"), Some("api"));
+        assert_eq!(
+            validate_service_selector("api.v2_worker-1"),
+            Some("api.v2_worker-1")
+        );
+        assert_eq!(validate_service_selector("--help"), None);
+        assert_eq!(validate_service_selector("-dash"), None);
+        assert_eq!(validate_service_selector("bad/name"), None);
+        assert_eq!(validate_service_selector(&"a".repeat(129)), None);
+        assert_eq!(validate_service_selector(""), None);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compose_log_sanitization_bounds_lines_and_rendered_bytes() {
+        let output = (0..201)
+            .map(|line| format!("line-{line}\n"))
+            .collect::<String>();
+        let sanitized = sanitize_compose_logs(output.as_bytes()).unwrap();
+        assert_eq!(sanitized.lines().count(), 200);
+        assert_eq!(
+            sanitize_compose_logs("x".repeat(MAX_COMPOSE_LOG_LINE_BYTES + 1).as_bytes()),
+            None,
+        );
+        let controls = "\u{0001}".repeat(1000);
+        let large = std::iter::repeat_n(controls, 200)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sanitized = sanitize_compose_logs(large.as_bytes()).unwrap();
+        assert!(sanitized.len() <= MAX_COMPOSE_LOG_DISPLAY_BYTES);
     }
 }

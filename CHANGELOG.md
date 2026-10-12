@@ -3,6 +3,7 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Added a read-only one-shot Compose service-log snapshot for a listed service. Ferrum rechecks service membership with a fresh status query before logs; Compose `--tail 200` applies per container, while Ferrum keeps the first 200 combined lines/256 KiB without a global chronological merge. Escaped output is transient, cancellation/stale-state safe, and not persisted or audited. Live follow and project lifecycle operations remain unsupported; Issue #18 stays open/partial.
 
 - Added automatic Linux discovery of the documented rootless Podman user
   socket at `$XDG_RUNTIME_DIR/podman/podman.sock`, after the XDG Docker socket
