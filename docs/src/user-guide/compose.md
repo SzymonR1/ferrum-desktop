@@ -180,10 +180,46 @@ files.
 See Docker's [Compose `logs` reference](https://docs.docker.com/reference/cli/docker/compose/logs/)
 for CLI options and per-container tail semantics.
 
-Profiles, project import/persistence, start/stop/restart, build/pull, live log
-follow, and project mutations remain unsupported. Structural validation skips
+## Select Compose profiles
+
+Enter a comma-separated list of Compose profile names. Ferrum trims outer
+whitespace from each token; blank input means no explicit profiles. The input
+is limited to 1024 UTF-8 bytes, at most 16 profiles, and 64 UTF-8 bytes per
+name. Empty entries (including leading, trailing, or repeated commas) and
+duplicate names are rejected. A name must match
+`[A-Za-z0-9][A-Za-z0-9_.-]+`. The special value `*` is accepted only by itself
+and enables every profile in the Compose model. It does not start services:
+status still lists existing containers, and each log snapshot still targets one
+selected service. Ferrum passes each selected profile as its own `--profile <name>`
+argument before the Compose subcommand:
+
+```text
+docker compose --profile <name> --file <base-file> ... config --quiet --no-interpolate --no-env-resolution
+docker --host unix://<selected-socket> compose --profile <name> --file <base-file> ... ps --all --format json
+docker --host unix://<selected-socket> compose --profile <name> --file <base-file> ... logs --tail 200 --no-color <service>
+```
+
+The same selection is used for structural validation, read-only status, and
+one-shot service logs. The status recheck immediately before logs uses the same
+profiles as the earlier status query. Profiles are separate argument-array
+entries, never an environment variable. CLI invocations retain Ferrum's
+private Docker config/HOME and cleared allowlisted environment, including
+disabling the selected project's default `.env` and remote Git/OCI loaders.
+Invalid profile input, or changing the selection, clears current
+validation/status/log state and cancels active Compose work; validate again
+before refreshing status or requesting logs. Profile selection does not import
+or persist projects and does not start, stop, restart, build, pull, or otherwise
+manage project lifecycle.
+
+See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
+and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
+
+Project import/persistence, start/stop/restart, build/pull, live log follow,
+and project mutations remain unsupported. Structural validation skips
 interpolation and service `env_file` resolution; status uses the isolated
-environment above and may differ from a normal shell invocation.
+environment above and may differ from a normal shell invocation. Profile
+selection applies only to structural validation, status, and one-shot service
+logs.
 Status reports only existing containers; it does not enumerate declared
 services with no containers. Issue [#18](https://github.com/SzymonR1/ferrum-desktop/issues/18)
 remains open/partial; [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10)

@@ -1342,6 +1342,7 @@ impl FerrumApp {
     fn start_compose_validation(
         &mut self,
         files: Vec<std::path::PathBuf>,
+        profiles: Vec<String>,
         generation: u64,
         context: egui::Context,
     ) {
@@ -1357,7 +1358,7 @@ impl FerrumApp {
             task.abort();
         }
         self.compose_validation_task = Some(self.runtime.spawn(async move {
-            let result = compose::validate_compose_files(&files).await;
+            let result = compose::validate_compose_files(&files, &profiles).await;
             if sender
                 .send(EngineEvent::ComposeValidationFinished { generation, result })
                 .await
@@ -1380,7 +1381,7 @@ impl FerrumApp {
         else {
             return;
         };
-        let Some((generation, files)) = self.compose.begin_status_refresh() else {
+        let Some((generation, files, profiles)) = self.compose.begin_status_refresh() else {
             return;
         };
         if let Some(task) = self.compose_status_task.take() {
@@ -1392,7 +1393,8 @@ impl FerrumApp {
         context.request_repaint();
         let sender = self.sender.clone();
         self.compose_status_task = Some(self.runtime.spawn(async move {
-            let result = compose::existing_compose_containers(&socket_path, &files).await;
+            let result =
+                compose::existing_compose_containers(&socket_path, &files, &profiles).await;
             if sender
                 .send(EngineEvent::ComposeStatusFinished { generation, result })
                 .await
@@ -1422,7 +1424,8 @@ impl FerrumApp {
         else {
             return;
         };
-        let Some((generation, files, service)) = self.compose.begin_service_logs(service) else {
+        let Some((generation, files, profiles, service)) = self.compose.begin_service_logs(service)
+        else {
             return;
         };
         if let Some(task) = self.compose_logs_task.take() {
@@ -1431,7 +1434,8 @@ impl FerrumApp {
         let sender = self.sender.clone();
         context.request_repaint();
         self.compose_logs_task = Some(self.runtime.spawn(async move {
-            let result = compose::compose_service_logs(&socket_path, &files, &service).await;
+            let result =
+                compose::compose_service_logs(&socket_path, &files, &profiles, &service).await;
             if sender
                 .send(EngineEvent::ComposeLogsFinished { generation, result })
                 .await
@@ -2802,9 +2806,12 @@ impl FerrumApp {
                         .finish_file_selection(generation, file.as_deref())
                     {
                         self.compose_validation_task = None;
-                        if self.compose.is_validation_running() {
+                        if self.compose.is_validation_running()
+                            && let Some(profiles) = self.compose.profiles_for_automatic_validation()
+                        {
                             self.start_compose_validation(
                                 self.compose.selected_files().to_vec(),
+                                profiles,
                                 generation,
                                 context.clone(),
                             );
@@ -4744,6 +4751,19 @@ impl eframe::App for FerrumApp {
                 images::AppPage::Networks => network_action = self.draw_networks(ui),
                 images::AppPage::Compose => compose_actions = self.draw_compose(ui),
             });
+        if compose_actions.profiles_changed {
+            if let Some(task) = self.compose_validation_task.take() {
+                task.abort();
+            }
+            if let Some(task) = self.compose_status_task.take() {
+                task.abort();
+            }
+            if let Some(task) = self.compose_logs_task.take() {
+                task.abort();
+            }
+            self.compose.profiles_changed();
+            context.request_repaint();
+        }
         if compose_actions.cancel_validation {
             self.cancel_compose_validation(context.clone());
         }
@@ -4767,9 +4787,9 @@ impl eframe::App for FerrumApp {
         } else if compose_actions.add_override_file {
             self.select_compose_file(true, context.clone());
         } else if compose_actions.validate_files
-            && let Some((generation, files)) = self.compose.begin_validation()
+            && let Some((generation, files, profiles)) = self.compose.begin_validation()
         {
-            self.start_compose_validation(files, generation, context.clone());
+            self.start_compose_validation(files, profiles, generation, context.clone());
         }
         if compose_actions.refresh_containers {
             #[cfg(target_os = "linux")]
