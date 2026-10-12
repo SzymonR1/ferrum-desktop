@@ -99,7 +99,7 @@ not claim the event was persisted; the engine request outcome is unchanged.
 This is local Ferrum-request history only, mutable by the same-UID user, not
 tamper-proof, and does not prove final engine state or record external engine
 actions.
-Issues #16, #17, and #19 remain open/ready; issue #10 remains open/blocked for
+Issues #16, #18, and #19 remain open/ready; issue #10 remains open/blocked for
 Podman/rootless and broader endpoint validation. No release or platform/endpoint
 support is claimed.
 
@@ -129,9 +129,11 @@ continue and image/tag state may be uncertain. Ferrum refreshes image inventory
 after every terminal result.
 Build traces contain only static `image_mutation` / `build` action and
 `success`, `not_submitted`, or `request_error` outcome; context path, tag, and
-output are excluded. These static outcomes are included in the existing
-best-effort durable redacted JSONL audit; build output remains transient and
-unpersisted.
+output are excluded. Failure to spawn Buildx is recorded as `not_submitted`;
+unsuccessful completion after the process starts is `request_error` because
+image/tag state may be uncertain. These static outcomes are included in the
+existing best-effort durable redacted JSONL audit; build output remains
+transient and unpersisted.
 
 Issues #16 and #19 remain open and ready. This partial slice is not a release
 or a support claim beyond local Linux Docker.
@@ -174,11 +176,14 @@ unknown counts disable it. Confirmation names the volume and warns that the
 snapshot can change before deletion. Ferrum sends the negotiated
 `DELETE /v{api}/volumes/{name}` without `force`, with an eight-second bound.
 Docker may reject removal if the volume becomes in use. A timeout or transport
-error can follow a successful deletion. Ferrum marks inventory stale after every
+error can follow a successful deletion. Volume deletion is name-addressed rather
+than bound to an immutable ID; a concurrent delete/recreate under the same name
+cannot be detected by the preflight/confirmation snapshot. These checks are
+not an atomic ownership guarantee. Ferrum marks inventory stale after every
 result and refreshes immediately if Volumes remains open, or when that page is
 opened again; a fresh inspection/usage snapshot is required before retrying.
-Only one volume mutation may be active and context switching is blocked while it is
-pending. Pruning, modification, connection, disconnection, and filesystem
+Only one volume mutation may be active and context switching is blocked while
+it is pending. Pruning, modification, connection, disconnection, and filesystem
 browsing are not offered. Podman/rootless behavior remains unvalidated; remote
 endpoints remain unsupported.
 
@@ -239,7 +244,7 @@ not persistent or tamper-proof; a separate durable redacted copy is described
 above. Only one network mutation may be active, and context switching is blocked
 until it returns. IPAM parsing and metric availability are as described above;
 credential access is not provided. Podman/rootless and remote endpoints remain
-unsupported or unvalidated. Issues #17, #19, and #10 remain open; no release is
+unsupported or unvalidated. Issue #10 remains open/blocked; no release is
 claimed.
 
 The Compose page keeps read-only project discovery for the selected Linux local
@@ -266,6 +271,27 @@ the project directory to the base file's parent. See Docker's [Compose CLI refer
 for ordered merging and path resolution and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
 for the command flags.
 
+Before launching any Docker/Compose process, Ferrum rejects an aggregate
+selected base-and-override file size greater than 16 MiB; exactly 16 MiB is
+accepted. This is a point-in-time check, not atomic against same-UID changes:
+a same-UID process may change or replace a selected file after the check.
+After the Compose version preflight, Compose reopens the original selected
+paths for validation, so the contents read may differ from those measured.
+The size check covers only explicitly selected files. Local
+`include`/`extends.file` files may remain outside it and are read by the same
+limited CLI process under the logged-in user's permissions.
+
+On Linux, each Compose subprocess for version, discovery, validation, and status
+has `RLIMIT_AS` capped at 4 GiB and `RLIMIT_DATA` capped at 512 MiB, preserving
+lower inherited limits. The per-process limits apply while Compose reads
+selected and included files; child processes inherit them, so they bound each
+process, not aggregate process-tree RSS. The private child environment
+sets `GOMEMLIMIT=402653184` (384 MiB) for Go runtimes. This is a soft runtime
+target, not a hard cap: Go may exceed it to avoid excessive GC thrashing.
+Resource exhaustion can produce generic validation or status failures. These
+limits and the point-in-time selected-file check do not make the trusted CLI a
+sandbox or confine local included-file reads.
+
 Validation is read-only, does not contact or require an engine socket, and
 Ferrum does not write, modify, delete, or extract project files. Success means
 structural validation only: interpolation and service `env_file` resolution
@@ -273,6 +299,23 @@ are skipped. Only bounded escaped basenames and a static result are displayed;
 paths are session-only and raw diagnostics are discarded. Profiles,
 `.env`/service `env_file` resolution, remote Git/OCI references, file import,
 lifecycle actions, build/pull/logs, and project mutations are unsupported.
+
+Read-only container status is available for selected files after structural
+validation. It pins `docker compose ps --all --format json` to the selected
+local Unix socket and does not create, start, stop, remove, or otherwise mutate
+containers or project files. `--all` includes stopped containers; the CLI's
+default orphan inclusion is preserved. Ferrum retains only bounded escaped
+container `Name`, `Service`, `State`, and optional `Health`; IDs, command text,
+published ports, project labels, exit codes, and other response fields are
+discarded. Empty output means no existing containers matched this isolated
+project selection, not that no services are declared. Status is a manually
+refreshed point-in-time snapshot.
+
+Status uses the private cleared environment described below and disables the
+selected project's default `.env`; environment-dependent projects may fail or
+resolve differently than when Compose runs in the user's shell. Compose may
+still read local includes and included-project environment sources under the
+logged-in user's permissions. Validate only trusted files.
 
 Compose can recursively read local files referenced by `include` or service
 `extends.file`, plus each included project's default `.env` and explicit
@@ -288,17 +331,20 @@ include/env reads described above. Private Docker config/HOME and environment
 isolation are not a sandbox, and the CLI/plugin is trusted local code. Validate
 only trusted Compose files.
 
-CLI processes use a private isolated Docker config/HOME and a cleared
+CLI processes use a private isolated Docker config and `HOME` with a cleared
 allowlisted environment. If Compose is installed in the standard per-user CLI
 plugin directory, only the `docker-compose` executable is linked into the
 private config; custom `cliPluginsExtraDirs` from saved config are not loaded.
 Saved `config.json` credentials and proxy settings are not read or passed.
-Each command has an eight-second deadline and a 1 MiB stdout cap.
+Each command has an eight-second deadline and a 1 MiB stdout cap. Process
+resource exhaustion may cause a generic validation or status failure.
 
-Linux local Compose discovery and single-file validation, loopback-loader, and
-ordered multi-file temporary-file smokes passed with Compose v5.6.0. The
-multi-file smoke used an owned base/override pair without an engine or user
-project access. The native page visual check remains unavailable.
-Issue #18 remains partial/open; issue #10 remains blocked/open. No full issue
-completion, release, or broader support claim is made.
+Linux local Compose discovery and single-file validation, loopback-loader,
+ordered multi-file temporary-file, and read-only temporary-project status
+smokes passed with Compose v5.6.0. Status used Docker Engine 29.9.0 and created
+no containers; validation smokes used only owned temporary files without an
+engine or user-project access. The native page visual check remains unavailable.
+Issue #18 remains partial/open; issue #19 remains partial/open; issue #10
+remains blocked/open. No full issue completion, release, or broader support
+claim is made.
 

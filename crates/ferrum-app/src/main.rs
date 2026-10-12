@@ -189,6 +189,10 @@ enum EngineEvent {
         generation: u64,
         result: compose::ComposeValidationResult,
     },
+    ComposeStatusFinished {
+        generation: u64,
+        result: compose::ComposeStatusResult,
+    },
     NetworkCreated {
         generation: u64,
         name: String,
@@ -866,6 +870,7 @@ struct FerrumApp {
     pending_resource_read: Option<PendingResourceRead>,
     compose_task: Option<JoinHandle<()>>,
     compose_validation_task: Option<JoinHandle<()>>,
+    compose_status_task: Option<JoinHandle<()>>,
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
     // Hold the reader until the terminal response event releases the mutation gate.
@@ -1072,6 +1077,7 @@ impl FerrumApp {
             pending_resource_read: None,
             compose_task: None,
             compose_validation_task: None,
+            compose_status_task: None,
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
@@ -1268,6 +1274,9 @@ impl FerrumApp {
         if let Some(task) = self.compose_validation_task.take() {
             task.abort();
         }
+        if let Some(task) = self.compose_status_task.take() {
+            task.abort();
+        }
         self.compose.invalidate();
     }
 
@@ -1286,6 +1295,9 @@ impl FerrumApp {
                 return;
             }
             if let Some(task) = self.compose_validation_task.take() {
+                task.abort();
+            }
+            if let Some(task) = self.compose_status_task.take() {
                 task.abort();
             }
             let generation = if override_file {
@@ -1326,6 +1338,9 @@ impl FerrumApp {
             task.abort();
         }
         let sender = self.sender.clone();
+        if let Some(task) = self.compose_status_task.take() {
+            task.abort();
+        }
         self.compose_validation_task = Some(self.runtime.spawn(async move {
             let result = compose::validate_compose_files(&files).await;
             if sender
@@ -1336,6 +1351,46 @@ impl FerrumApp {
                 context.request_repaint();
             }
         }));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_compose_status_refresh(&mut self, context: egui::Context) {
+        if !matches!(&self.connection, ConnectionState::Connected) || self.compose.is_loading() {
+            return;
+        }
+        let Some(socket_path) = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.local_socket_path().to_path_buf())
+        else {
+            return;
+        };
+        let Some((generation, files)) = self.compose.begin_status_refresh() else {
+            return;
+        };
+        if let Some(task) = self.compose_status_task.take() {
+            task.abort();
+        }
+        context.request_repaint();
+        let sender = self.sender.clone();
+        self.compose_status_task = Some(self.runtime.spawn(async move {
+            let result = compose::existing_compose_containers(&socket_path, &files).await;
+            if sender
+                .send(EngineEvent::ComposeStatusFinished { generation, result })
+                .await
+                .is_ok()
+            {
+                context.request_repaint();
+            }
+        }));
+    }
+
+    fn cancel_compose_status_refresh(&mut self, context: egui::Context) {
+        if let Some(task) = self.compose_status_task.take() {
+            task.abort();
+        }
+        self.compose.cancel_status_refresh();
+        context.request_repaint();
     }
 
     fn load_compose(&mut self, context: egui::Context) {
@@ -1910,6 +1965,25 @@ impl FerrumApp {
     ) {
         persist_audit_record(audit_store, audit::record_image_build_result(outcome)).await;
     }
+    #[cfg(target_os = "linux")]
+    fn image_build_audit_outcome(
+        result: &Result<(), image_build::ImageBuildError>,
+        cancelled_before_submit: bool,
+    ) -> audit::ImageBuildOutcome {
+        if cancelled_before_submit {
+            return audit::ImageBuildOutcome::NotSubmitted;
+        }
+        match result {
+            Ok(()) => audit::ImageBuildOutcome::Success,
+            Err(
+                image_build::ImageBuildError::DockerUnavailable
+                | image_build::ImageBuildError::InvalidContext
+                | image_build::ImageBuildError::InvalidTarget
+                | image_build::ImageBuildError::SpawnFailed,
+            ) => audit::ImageBuildOutcome::NotSubmitted,
+            Err(_) => audit::ImageBuildOutcome::RequestError,
+        }
+    }
 
     #[cfg(target_os = "linux")]
     fn image_build_busy(&self) -> bool {
@@ -2084,19 +2158,7 @@ impl FerrumApp {
                 drop(output_sender);
                 Err(image_build::ImageBuildError::DockerUnavailable)
             };
-            let outcome = if cancelled_before_submit {
-                audit::ImageBuildOutcome::NotSubmitted
-            } else {
-                match result {
-                    Ok(()) => audit::ImageBuildOutcome::Success,
-                    Err(
-                        image_build::ImageBuildError::DockerUnavailable
-                        | image_build::ImageBuildError::InvalidContext
-                        | image_build::ImageBuildError::InvalidTarget,
-                    ) => audit::ImageBuildOutcome::NotSubmitted,
-                    Err(_) => audit::ImageBuildOutcome::RequestError,
-                }
-            };
+            let outcome = Self::image_build_audit_outcome(&result, cancelled_before_submit);
             Self::persist_image_build_outcome(&audit_store, outcome).await;
             if sender
                 .send(EngineEvent::ImageBuildFinished { generation, result })
@@ -2695,6 +2757,11 @@ impl FerrumApp {
                 EngineEvent::ComposeValidationFinished { generation, result } => {
                     if self.compose.finish_validation(generation, result) {
                         self.compose_validation_task = None;
+                    }
+                }
+                EngineEvent::ComposeStatusFinished { generation, result } => {
+                    if self.compose.finish_status_refresh(generation, result) {
+                        self.compose_status_task = None;
                     }
                 }
                 EngineEvent::VolumeInspected {
@@ -3530,6 +3597,7 @@ impl FerrumApp {
                 "Compose projects will load when the engine context change finishes.",
                 false,
                 cfg!(target_os = "linux"),
+                false,
             );
         }
         let engine_selected = self.engine.is_some();
@@ -3562,6 +3630,7 @@ impl FerrumApp {
             message,
             cfg!(target_os = "linux") && !self.loading,
             cfg!(target_os = "linux"),
+            available && connected && !self.loading && !self.compose.is_loading(),
         )
     }
     fn draw_images(&mut self, ui: &mut egui::Ui) -> Option<images::ImageInspectionRequest> {
@@ -4616,8 +4685,14 @@ impl eframe::App for FerrumApp {
         if compose_actions.cancel_validation {
             self.cancel_compose_validation(context.clone());
         }
+        if compose_actions.cancel_status {
+            self.cancel_compose_status_refresh(context.clone());
+        }
         if let Some(index) = compose_actions.remove_override {
             self.compose.remove_override(index);
+            if let Some(task) = self.compose_status_task.take() {
+                task.abort();
+            }
         }
         if compose_actions.select_base_file {
             self.select_compose_file(false, context.clone());
@@ -4627,6 +4702,10 @@ impl eframe::App for FerrumApp {
             && let Some((generation, files)) = self.compose.begin_validation()
         {
             self.start_compose_validation(files, generation, context.clone());
+        }
+        if compose_actions.refresh_containers {
+            #[cfg(target_os = "linux")]
+            self.start_compose_status_refresh(context.clone());
         }
         if compose_actions.refresh {
             self.refresh(context.clone());
@@ -5153,6 +5232,7 @@ mod event_reconciliation_tests {
             resource_read_task: None,
             compose_task: None,
             compose_validation_task: None,
+            compose_status_task: None,
             pending_resource_read: None,
             image_list_task: None,
             image_inspection_task: None,
@@ -6523,6 +6603,67 @@ mod event_reconciliation_tests {
             .collect()
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_runner_spawn_failure_is_persisted_as_not_submitted() {
+        let (mut app, _) = app_with_open_inspection();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ferrum-build-spawn-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root).expect("create test-owned audit directory");
+        let unlaunchable = root.join("buildx-directory");
+        std::fs::create_dir(&unlaunchable).expect("create non-executable test path");
+        app.audit_store = audit::AuditStore::new(Arc::new(settings::SettingsStore::at(
+            root.join("settings.toml"),
+        )));
+
+        let (_cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+        let (output_sender, _output_receiver) = mpsc::channel(1);
+        let result = app.runtime.block_on(image_build::run_command(
+            tokio::process::Command::new(&unlaunchable),
+            cancel_receiver,
+            output_sender,
+        ));
+        assert!(result.is_err(), "a directory cannot be started as Buildx");
+        assert!(
+            matches!(result, Err(image_build::ImageBuildError::SpawnFailed)),
+            "the runner must distinguish a spawn failure from a started build"
+        );
+        let outcome = FerrumApp::image_build_audit_outcome(&result, false);
+        app.runtime.block_on(FerrumApp::persist_image_build_outcome(
+            &app.audit_store,
+            outcome,
+        ));
+
+        let contents = std::fs::read_to_string(root.join("audit.jsonl"))
+            .expect("the audit outcome should be persisted");
+        let record = serde_json::from_str::<serde_json::Value>(&contents).unwrap();
+        assert_eq!(
+            record["outcome"], "not_submitted",
+            "a failed Buildx process spawn cannot submit a build request"
+        );
+        let (_cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+        let (output_sender, _output_receiver) = mpsc::channel(1);
+        let mut started_command = tokio::process::Command::new("/bin/sh");
+        started_command.arg("-c").arg("exit 7");
+        let started_result = app.runtime.block_on(image_build::run_command(
+            started_command,
+            cancel_receiver,
+            output_sender,
+        ));
+        assert!(matches!(
+            started_result,
+            Err(image_build::ImageBuildError::Failed)
+        ));
+        assert!(matches!(
+            FerrumApp::image_build_audit_outcome(&started_result, false),
+            audit::ImageBuildOutcome::RequestError
+        ));
+        std::fs::remove_dir_all(root).expect("remove the test-owned audit directory");
     }
 
     #[cfg(target_os = "linux")]

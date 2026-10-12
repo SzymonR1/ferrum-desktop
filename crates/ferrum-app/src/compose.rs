@@ -16,7 +16,74 @@ const MAX_VERSION_BYTES: usize = 64;
 const MAX_COMPOSE_FILENAME_DISPLAY_BYTES: usize = 128;
 #[cfg(target_os = "linux")]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(target_os = "linux")]
+const MAX_COMPOSE_INPUT_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const CHILD_ADDRESS_SPACE_LIMIT: libc::rlim_t = 4 * 1024 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const CHILD_DATA_LIMIT: libc::rlim_t = 512 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const CHILD_GO_MEMORY_LIMIT: &str = "402653184";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ComposeContainer {
+    pub(super) name: String,
+    pub(super) service: String,
+    pub(super) state: String,
+    pub(super) health: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+const MAX_COMPOSE_CONTAINERS: usize = 4096;
+#[cfg(target_os = "linux")]
+const MAX_CONTAINER_FIELD_BYTES: usize = 256;
+const COMPOSE_CONTAINER_ROW_HEIGHT: f32 = 28.0;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ComposeStatusError {
+    DockerCliMissing,
+    PrivateConfigSetupFailed,
+    QueryFailed,
+    InvalidOutput,
+}
+
+impl ComposeStatusError {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::DockerCliMissing => "Docker CLI is unavailable.",
+            Self::PrivateConfigSetupFailed => {
+                "Could not prepare an isolated Docker CLI environment."
+            }
+            Self::QueryFailed => "Could not read existing Compose containers.",
+            Self::InvalidOutput => "Compose returned invalid or excessive container status data.",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ComposeStatusResult {
+    pub(super) containers: Vec<ComposeContainer>,
+    pub(super) outcome: Result<(), ComposeStatusError>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum ComposeStatusState {
+    #[default]
+    Idle,
+    Loading {
+        file_name: String,
+    },
+    Succeeded {
+        file_name: String,
+    },
+    Failed {
+        file_name: String,
+        error: ComposeStatusError,
+    },
+    Cancelled {
+        file_name: String,
+    },
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ComposeProject {
     name: String,
@@ -70,6 +137,7 @@ pub(super) enum ComposeValidationError {
     ComposePluginUnavailable,
     PrivateConfigSetupFailed,
     InvalidSelectedFile,
+    InputTooLarge,
     ValidationFailed,
 }
 
@@ -86,6 +154,9 @@ impl ComposeValidationError {
                 "Compose validation could not start safely. Try again later."
             }
             Self::InvalidSelectedFile => "The selected Compose file could not be validated.",
+            Self::InputTooLarge => {
+                "Selected Compose files exceed the 16 MiB validation input limit."
+            }
             Self::ValidationFailed => "Compose file validation failed.",
         }
     }
@@ -131,13 +202,14 @@ enum ComposeValidationState {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ComposeActions {
     pub(super) refresh: bool,
+    pub(super) refresh_containers: bool,
     pub(super) select_base_file: bool,
     pub(super) add_override_file: bool,
     pub(super) remove_override: Option<usize>,
     pub(super) validate_files: bool,
     pub(super) cancel_validation: bool,
+    pub(super) cancel_status: bool,
 }
-
 const MAX_COMPOSE_FILES: usize = 16;
 
 fn display_compose_basename(path: &std::path::Path) -> String {
@@ -172,6 +244,9 @@ pub(super) struct ComposeView {
     validation_generation: u64,
     validation: ComposeValidationState,
     selected_files: Vec<std::path::PathBuf>,
+    status_generation: u64,
+    status: ComposeStatusState,
+    containers: Vec<ComposeContainer>,
 }
 
 impl ComposeView {
@@ -217,6 +292,63 @@ impl ComposeView {
         }
         true
     }
+    pub(super) fn can_refresh_containers(&self) -> bool {
+        matches!(&self.validation, ComposeValidationState::Succeeded { .. })
+    }
+
+    pub(super) fn begin_status_refresh(&mut self) -> Option<(u64, Vec<std::path::PathBuf>)> {
+        if !self.can_refresh_containers()
+            || matches!(&self.status, ComposeStatusState::Loading { .. })
+        {
+            return None;
+        }
+        self.status_generation = self.status_generation.wrapping_add(1);
+        self.containers.clear();
+        let file_name = display_compose_file_list(&self.selected_files);
+        self.status = ComposeStatusState::Loading { file_name };
+        Some((self.status_generation, self.selected_files.clone()))
+    }
+
+    pub(super) fn finish_status_refresh(
+        &mut self,
+        generation: u64,
+        result: ComposeStatusResult,
+    ) -> bool {
+        if generation != self.status_generation
+            || !matches!(&self.status, ComposeStatusState::Loading { .. })
+            || !self.can_refresh_containers()
+        {
+            return false;
+        }
+        let ComposeStatusState::Loading { file_name } = std::mem::take(&mut self.status) else {
+            return false;
+        };
+        match result.outcome {
+            Ok(()) => {
+                self.containers = result.containers;
+                self.status = ComposeStatusState::Succeeded { file_name };
+            }
+            Err(error) => {
+                self.containers.clear();
+                self.status = ComposeStatusState::Failed { file_name, error };
+            }
+        }
+        true
+    }
+
+    pub(super) fn cancel_status_refresh(&mut self) {
+        if let ComposeStatusState::Loading { file_name } = std::mem::take(&mut self.status) {
+            self.status_generation = self.status_generation.wrapping_add(1);
+            self.containers.clear();
+            self.status = ComposeStatusState::Cancelled { file_name };
+        }
+    }
+
+    fn invalidate_status(&mut self) {
+        self.status_generation = self.status_generation.wrapping_add(1);
+        self.status = ComposeStatusState::Idle;
+        self.containers.clear();
+    }
 
     pub(super) fn begin_file_selection(&mut self) -> u64 {
         self.begin_selection(false)
@@ -228,6 +360,7 @@ impl ComposeView {
 
     fn begin_selection(&mut self, override_file: bool) -> u64 {
         self.validation_generation = self.validation_generation.wrapping_add(1);
+        self.invalidate_status();
         self.validation = ComposeValidationState::SelectingFile { override_file };
         self.validation_generation
     }
@@ -317,8 +450,9 @@ impl ComposeView {
 
     pub(super) fn remove_override(&mut self, index: usize) {
         if index > 0 && index < self.selected_files.len() {
-            self.selected_files.remove(index);
+            self.invalidate_status();
             self.validation_generation = self.validation_generation.wrapping_add(1);
+            self.selected_files.remove(index);
             self.validation = ComposeValidationState::Idle;
         }
     }
@@ -329,7 +463,7 @@ impl ComposeView {
         {
             return None;
         }
-        self.validation_generation = self.validation_generation.wrapping_add(1);
+        self.invalidate_status();
         let generation = self.validation_generation;
         let file_name = display_compose_file_list(&self.selected_files);
         self.validation = ComposeValidationState::Validating { file_name };
@@ -352,7 +486,7 @@ impl ComposeView {
         self.version = None;
         self.projects.clear();
         self.error = None;
-        self.validation_generation = self.validation_generation.wrapping_add(1);
+        self.invalidate_status();
         self.validation = ComposeValidationState::Idle;
         self.selected_files.clear();
     }
@@ -364,6 +498,7 @@ impl ComposeView {
         unavailable_message: &str,
         refresh_enabled: bool,
         validation_enabled: bool,
+        status_enabled: bool,
     ) -> ComposeActions {
         let mut actions = ComposeActions::default();
         ui.group(|ui| {
@@ -475,6 +610,76 @@ impl ComposeView {
             }
             ComposeValidationState::SelectionCancelled => {
                 ui.label("File selection cancelled.");
+            }
+        }
+        ui.separator();
+        ui.heading("Existing containers (read-only)");
+        ui.label(concat!(
+            "Status uses Ferrum's isolated CLI environment and skips the selected ",
+            "project's default .env; environment-dependent project matching may ",
+            "differ from a normal shell."
+        ));
+        actions.refresh_containers = ui
+            .add_enabled(
+                status_enabled
+                    && !self.loading
+                    && self.can_refresh_containers()
+                    && !matches!(&self.status, ComposeStatusState::Loading { .. }),
+                egui::Button::new("Refresh existing containers"),
+            )
+            .clicked();
+        match &self.status {
+            ComposeStatusState::Idle => {}
+            ComposeStatusState::Loading { .. } => {
+                ui.spinner();
+                ui.label("Refreshing existing Compose containers…");
+                actions.cancel_status = ui.button("Cancel container refresh").clicked();
+            }
+            ComposeStatusState::Succeeded { .. } if self.containers.is_empty() => {
+                ui.label("No existing containers for the selected Compose files.");
+            }
+            ComposeStatusState::Succeeded { .. } => {
+                ui.columns(4, |columns| {
+                    columns[0].strong("Container");
+                    columns[1].strong("Service");
+                    columns[2].strong("State");
+                    columns[3].strong("Health");
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("compose-container-status")
+                    .max_height(280.0)
+                    .show_rows(
+                        ui,
+                        COMPOSE_CONTAINER_ROW_HEIGHT,
+                        self.containers.len(),
+                        |ui, rows| {
+                            for row in rows {
+                                let container = &self.containers[row];
+                                ui.columns(4, |columns| {
+                                    columns[0]
+                                        .add(egui::Label::new(container.name.as_str()).truncate());
+                                    columns[1].add(
+                                        egui::Label::new(container.service.as_str()).truncate(),
+                                    );
+                                    columns[2]
+                                        .add(egui::Label::new(container.state.as_str()).truncate());
+                                    columns[3].add(
+                                        egui::Label::new(
+                                            container.health.as_deref().unwrap_or("—"),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+                            }
+                        },
+                    );
+            }
+            ComposeStatusState::Failed { error, .. } => {
+                ui.colored_label(egui::Color32::from_rgb(224, 174, 109), error.message());
+            }
+            ComposeStatusState::Cancelled { .. } => {
+                ui.label("Container refresh cancelled.");
             }
         }
 
@@ -606,6 +811,175 @@ async fn discover_with_binary(
 }
 
 #[cfg(target_os = "linux")]
+fn parse_containers(output: &[u8]) -> Option<Vec<ComposeContainer>> {
+    use std::collections::HashSet;
+    let output = output.trim_ascii();
+    if output.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut rows = Vec::new();
+    let mut identities = HashSet::new();
+    let mut display_names = HashSet::new();
+    for line in output.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() || rows.len() >= MAX_COMPOSE_CONTAINERS {
+            return None;
+        }
+        let row = serde_json::from_slice::<RawComposeContainer>(line).ok()?;
+        if row.name.is_empty()
+            || row.service.is_empty()
+            || row.state.is_empty()
+            || row.name.len() > MAX_CONTAINER_FIELD_BYTES
+            || row.service.len() > MAX_CONTAINER_FIELD_BYTES
+            || row.state.len() > MAX_CONTAINER_FIELD_BYTES
+            || row
+                .health
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_CONTAINER_FIELD_BYTES)
+            || !identities.insert(row.name.clone())
+        {
+            return None;
+        }
+        let name = escape_untrusted_display_text_with_limit(row.name, MAX_CONTAINER_FIELD_BYTES)?;
+        if !display_names.insert(name.clone()) {
+            return None;
+        }
+        let service =
+            escape_untrusted_display_text_with_limit(row.service, MAX_CONTAINER_FIELD_BYTES)?;
+        let state = escape_untrusted_display_text_with_limit(row.state, MAX_CONTAINER_FIELD_BYTES)?;
+        let health = match row.health.filter(|health| !health.is_empty()) {
+            Some(health) => Some(escape_untrusted_display_text_with_limit(
+                health,
+                MAX_CONTAINER_FIELD_BYTES,
+            )?),
+            None => None,
+        };
+        rows.push(ComposeContainer {
+            name,
+            service,
+            state,
+            health,
+        });
+    }
+    Some(rows)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct RawComposeContainer {
+    name: String,
+    service: String,
+    state: String,
+    health: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl<'de> serde::Deserialize<'de> for RawComposeContainer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, IgnoredAny, MapAccess, Visitor};
+        use std::fmt;
+        struct ContainerVisitor;
+        impl<'de> Visitor<'de> for ContainerVisitor {
+            type Value = RawComposeContainer;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a Docker Compose container status object")
+            }
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut name = None;
+                let mut service = None;
+                let mut state = None;
+                let mut health = None;
+                let mut seen_health = false;
+                let mut seen_exit_code = false;
+                let mut seen_command = false;
+                let mut seen_id = false;
+                let mut seen_publishers = false;
+                let mut seen_project = false;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "Name" => {
+                            if name.is_some() {
+                                return Err(de::Error::duplicate_field("Name"));
+                            }
+                            name = Some(map.next_value::<String>()?);
+                        }
+                        "Service" => {
+                            if service.is_some() {
+                                return Err(de::Error::duplicate_field("Service"));
+                            }
+                            service = Some(map.next_value::<String>()?);
+                        }
+                        "State" => {
+                            if state.is_some() {
+                                return Err(de::Error::duplicate_field("State"));
+                            }
+                            state = Some(map.next_value::<String>()?);
+                        }
+                        "Health" => {
+                            if seen_health {
+                                return Err(de::Error::duplicate_field("Health"));
+                            }
+                            seen_health = true;
+                            health = map.next_value::<Option<String>>()?;
+                        }
+                        "ExitCode" => {
+                            if seen_exit_code {
+                                return Err(de::Error::duplicate_field("ExitCode"));
+                            }
+                            seen_exit_code = true;
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                        "Command" => {
+                            if seen_command {
+                                return Err(de::Error::duplicate_field("Command"));
+                            }
+                            seen_command = true;
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                        "ID" => {
+                            if seen_id {
+                                return Err(de::Error::duplicate_field("ID"));
+                            }
+                            seen_id = true;
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                        "Publishers" => {
+                            if seen_publishers {
+                                return Err(de::Error::duplicate_field("Publishers"));
+                            }
+                            seen_publishers = true;
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                        "Project" => {
+                            if seen_project {
+                                return Err(de::Error::duplicate_field("Project"));
+                            }
+                            seen_project = true;
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(RawComposeContainer {
+                    name: name.ok_or_else(|| de::Error::missing_field("Name"))?,
+                    service: service.ok_or_else(|| de::Error::missing_field("Service"))?,
+                    state: state.ok_or_else(|| de::Error::missing_field("State"))?,
+                    health,
+                })
+            }
+        }
+        deserializer.deserialize_map(ContainerVisitor)
+    }
+}
+
 fn parse_version(output: &[u8]) -> Option<&str> {
     if output.len() > MAX_VERSION_BYTES + 1 {
         return None;
@@ -757,11 +1131,12 @@ async fn run_command_with_timeout(
     command: &mut tokio::process::Command,
     deadline: Duration,
 ) -> Result<Vec<u8>, CommandFailure> {
-    #[cfg(test)]
-    let _test_subprocess_guard = crate::TEST_SUBPROCESS_LOCK.lock().await;
-
+    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
+
+    #[cfg(test)]
+    let _test_subprocess_guard = crate::TEST_SUBPROCESS_LOCK.lock().await;
 
     command
         .stdin(Stdio::null())
@@ -769,7 +1144,45 @@ async fn run_command_with_timeout(
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .process_group(0);
-    let mut child = command.spawn().map_err(|_| CommandFailure::Launch)?;
+    // SAFETY: The pre-exec closure uses only stack locals and AS-Safe
+    // getrlimit/setrlimit calls. It performs no allocation, locking, logging,
+    // or environment access after fork.
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_AS, &mut limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limit.rlim_cur = limit.rlim_cur.min(CHILD_ADDRESS_SPACE_LIMIT);
+            limit.rlim_max = limit.rlim_max.min(CHILD_ADDRESS_SPACE_LIMIT);
+            limit.rlim_cur = limit.rlim_cur.min(limit.rlim_max);
+            // SAFETY: setrlimit is AS-Safe and `limit` is a stack-local copy
+            // of RLIMIT_AS with non-increasing soft and hard bounds.
+            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            if libc::getrlimit(libc::RLIMIT_DATA, &mut limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limit.rlim_cur = limit.rlim_cur.min(CHILD_DATA_LIMIT);
+            limit.rlim_max = limit.rlim_max.min(CHILD_DATA_LIMIT);
+            limit.rlim_cur = limit.rlim_cur.min(limit.rlim_max);
+            // SAFETY: setrlimit is AS-Safe and `limit` is a stack-local copy
+            // of RLIMIT_DATA with non-increasing soft and hard bounds.
+            if libc::setrlimit(libc::RLIMIT_DATA, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CommandFailure::Launch
+        } else {
+            CommandFailure::Io
+        }
+    })?;
     let mut process_group = child
         .id()
         .and_then(|id| libc::pid_t::try_from(id).ok())
@@ -896,6 +1309,7 @@ impl PrivateDockerConfig {
             .env("DOCKER_CONFIG", &self.docker_config)
             .env("LANG", "C")
             .env("LC_ALL", "C")
+            .env("GOMEMLIMIT", CHILD_GO_MEMORY_LIMIT)
             // Remote Compose sources can make Git/registry requests during
             // config parsing; disable both loaders for every CLI invocation.
             .env("COMPOSE_EXPERIMENTAL_GIT_REMOTE", "false")
@@ -966,6 +1380,16 @@ fn selected_compose_files_are_valid(files: &[std::path::PathBuf]) -> bool {
                 && !files[..index].iter().any(|selected| selected == file)
         })
 }
+#[cfg(target_os = "linux")]
+fn selected_compose_files_size_exceeds_limit(files: &[std::path::PathBuf]) -> bool {
+    files.iter().fold(0_u64, |total, file| {
+        let size = file
+            .symlink_metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(MAX_COMPOSE_INPUT_BYTES.saturating_add(1));
+        total.saturating_add(size)
+    }) > MAX_COMPOSE_INPUT_BYTES
+}
 
 #[cfg(target_os = "linux")]
 pub(super) async fn validate_compose_files(
@@ -974,6 +1398,11 @@ pub(super) async fn validate_compose_files(
     use std::env;
     if !selected_compose_files_are_valid(files) {
         return ComposeValidationResult::failed(ComposeValidationError::InvalidSelectedFile);
+    }
+    // Keep input-limit errors deterministic even when Docker is unavailable;
+    // the report path rechecks after CLI discovery before starting a subprocess.
+    if selected_compose_files_size_exceeds_limit(files) {
+        return ComposeValidationResult::failed(ComposeValidationError::InputTooLarge);
     }
 
     let Some(search_path) = env::var_os("PATH") else {
@@ -1042,6 +1471,9 @@ async fn validate_with_files_report(
 
     if !selected_compose_files_are_valid(files) {
         return ComposeValidationResult::failed(ComposeValidationError::InvalidSelectedFile);
+    }
+    if selected_compose_files_size_exceeds_limit(files) {
+        return ComposeValidationResult::failed(ComposeValidationError::InputTooLarge);
     }
     let parent = files[0].parent().expect("absolute file has a parent");
     let isolated = match PrivateDockerConfig::new(user_compose_plugin) {
@@ -1117,6 +1549,75 @@ pub(super) async fn discover_projects(
         user_compose_plugin.as_deref(),
     )
     .await
+}
+#[cfg(target_os = "linux")]
+async fn containers_with_binary(
+    binary: &std::path::Path,
+    socket_path: &std::path::Path,
+    files: &[std::path::PathBuf],
+    search_path: &std::ffi::OsStr,
+    user_compose_plugin: Option<&std::path::Path>,
+) -> Result<Vec<ComposeContainer>, ComposeStatusError> {
+    use tokio::process::Command;
+    if !selected_compose_files_are_valid(files) || selected_compose_files_size_exceeds_limit(files)
+    {
+        return Err(ComposeStatusError::QueryFailed);
+    }
+    let isolated = PrivateDockerConfig::new(user_compose_plugin)
+        .map_err(|_| ComposeStatusError::PrivateConfigSetupFailed)?;
+    let socket_path = socket_path
+        .to_str()
+        .ok_or(ComposeStatusError::QueryFailed)?;
+    let host = format!("unix://{socket_path}");
+    let mut command = Command::new(binary);
+    isolated.configure(&mut command, search_path);
+    command
+        .env("COMPOSE_DISABLE_ENV_FILE", "1")
+        .arg("--host")
+        .arg(host)
+        .args(["compose", "--project-directory"])
+        .arg(files[0].parent().ok_or(ComposeStatusError::QueryFailed)?);
+    for file in files {
+        command.arg("--file").arg(file);
+    }
+    command.args(["ps", "--all", "--format", "json"]);
+    let output = run_command_with_timeout(&mut command, COMMAND_TIMEOUT)
+        .await
+        .map_err(|failure| match failure {
+            CommandFailure::Launch => ComposeStatusError::DockerCliMissing,
+            _ => ComposeStatusError::QueryFailed,
+        })?;
+    parse_containers(&output).ok_or(ComposeStatusError::InvalidOutput)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) async fn existing_compose_containers(
+    socket_path: &std::path::Path,
+    files: &[std::path::PathBuf],
+) -> ComposeStatusResult {
+    if validate_compose_files(files).await.outcome.is_err() {
+        return ComposeStatusResult {
+            containers: Vec::new(),
+            outcome: Err(ComposeStatusError::QueryFailed),
+        };
+    }
+    let result = async {
+        let search_path = std::env::var_os("PATH").ok_or(ComposeStatusError::DockerCliMissing)?;
+        let binary = docker_binary(&search_path).ok_or(ComposeStatusError::DockerCliMissing)?;
+        let plugin = user_compose_plugin();
+        containers_with_binary(&binary, socket_path, files, &search_path, plugin.as_deref()).await
+    }
+    .await;
+    match result {
+        Ok(containers) => ComposeStatusResult {
+            containers,
+            outcome: Ok(()),
+        },
+        Err(error) => ComposeStatusResult {
+            containers: Vec::new(),
+            outcome: Err(error),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1241,8 +1742,9 @@ mod tests {
                    [ -z \"${{COMPOSE_DISABLE_ENV_FILE+x}}\" ] || exit 90\n\
                    [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = \"false\" ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = \"false\" ] || exit 91\n\
                    env | while IFS='=' read -r name value; do\n\
-                     case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|PWD|SHLVL|_) : ;; *) exit 89 ;; esac\n\
+                     case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|GOMEMLIMIT|PWD|SHLVL|_) : ;; *) exit 89 ;; esac\n\
                    done || exit 89\n\
+                   [ \"$GOMEMLIMIT\" = 402653184 ] || exit 89\n\
                    printf '%s\\n%s' \"$DOCKER_CONFIG\" \"$HOME\" > {}\n\
                    printf '%s' {}\n\
                    exit {}\n\
@@ -1259,8 +1761,9 @@ mod tests {
                  [ \"$(cat {})\" = \"$(printf '%s\\n%s' \"$DOCKER_CONFIG\" \"$HOME\")\" ] || exit 90\n\
                  if [ -n \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{DOCKER_API_VERSION+x}}${{DOCKER_CERT_PATH+x}}${{DOCKER_TLS+x}}${{DOCKER_TLS_VERIFY+x}}${{DOCKER_CUSTOM_HEADERS+x}}${{DOCKER_DEFAULT_PLATFORM+x}}${{HTTP_PROXY+x}}${{HTTPS_PROXY+x}}${{NO_PROXY+x}}${{ALL_PROXY+x}}${{FTP_PROXY+x}}${{http_proxy+x}}${{https_proxy+x}}${{no_proxy+x}}${{all_proxy+x}}${{ftp_proxy+x}}${{COMPOSE_FILE+x}}${{COMPOSE_ENV_FILES+x}}${{COMPOSE_PROFILES+x}}${{COMPOSE_PROJECT_NAME+x}}${{COMPOSE_PATH_SEPARATOR+x}}\" ]; then exit 88; fi\n\
                  env | while IFS='=' read -r name value; do\n\
-                   case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_DISABLE_ENV_FILE|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|PWD|SHLVL|_) : ;; *) exit 89 ;; esac\n\
+                   case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_DISABLE_ENV_FILE|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|GOMEMLIMIT|PWD|SHLVL|_) : ;; *) exit 89 ;; esac\n\
                  done || exit 89\n\
+                 [ \"$GOMEMLIMIT\" = 402653184 ] || exit 89\n\
                  : > {}\n\
                  {}\n\
                  {}\n\
@@ -1293,7 +1796,7 @@ mod tests {
         ) -> PathBuf {
             let script = format!(
                 "#!/bin/sh\n\
-                 if [ \"$#\" -eq 3 ]; then [ \"$1\" = compose ] && [ \"$2\" = version ] && [ \"$3\" = --short ] || exit 70; printf 'v5.6.0\\n'; exit 0; fi\n\
+                 if [ \"$#\" -eq 3 ]; then [ \"$1\" = compose ] && [ \"$2\" = version ] && [ \"$3\" = --short ] || exit 70; printf '%s' started > {}; printf 'v5.6.0\\n'; exit 0; fi\n\
                  [ \"$#\" -eq 13 ] || exit 71\n\
                  [ \"$1\" = compose ] && [ \"$2\" = --project-directory ] && [ \"$3\" = {} ] || exit 72\n\
                  [ \"$4\" = --file ] && [ \"$5\" = {} ] && [ \"$6\" = --file ] && [ \"$7\" = {} ] && [ \"$8\" = --file ] && [ \"$9\" = {} ] || exit 73\n\
@@ -1302,8 +1805,15 @@ mod tests {
                  [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = false ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = false ] || exit 76\n\
                  [ -n \"$PATH\" ] && [ -d \"$HOME\" ] && [ -d \"$DOCKER_CONFIG\" ] && [ \"$HOME\" != \"$DOCKER_CONFIG\" ] || exit 77\n\
                  if [ -n \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{DOCKER_API_VERSION+x}}${{DOCKER_CERT_PATH+x}}${{DOCKER_TLS+x}}${{DOCKER_TLS_VERIFY+x}}${{HTTP_PROXY+x}}${{HTTPS_PROXY+x}}${{NO_PROXY+x}}${{COMPOSE_FILE+x}}${{COMPOSE_ENV_FILES+x}}\" ]; then exit 78; fi\n\
-                 env | while IFS='=' read -r name value; do case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_DISABLE_ENV_FILE|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|PWD|SHLVL|_) : ;; *) exit 79 ;; esac; done || exit 79\n\
+                 env | while IFS='=' read -r name value; do case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|COMPOSE_DISABLE_ENV_FILE|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|GOMEMLIMIT|PWD|SHLVL|_) : ;; *) exit 79 ;; esac; done || exit 79\n\
+                 [ \"$GOMEMLIMIT\" = 402653184 ] || exit 79\n\
                  exit 0\n",
+                shell_quote(
+                    &directory
+                        .path()
+                        .join("ordered-validation-version-marker")
+                        .to_string_lossy()
+                ),
                 shell_quote(&project_directory.to_string_lossy()),
                 shell_quote(&base_file.to_string_lossy()),
                 shell_quote(&first_override.to_string_lossy()),
@@ -1319,6 +1829,114 @@ mod tests {
         fn search_path() -> std::ffi::OsString {
             std::env::var_os("PATH").unwrap_or_else(|| OsStr::new("/usr/bin:/bin").to_owned())
         }
+        #[tokio::test]
+        async fn subprocess_limits_bound_go_memory_and_shell_resource_limits() {
+            let isolated = PrivateDockerConfig::new(None)
+                .expect("a private fixture directory should be created");
+            let mut command = tokio::process::Command::new("/bin/sh");
+            isolated.configure(&mut command, &search_path());
+            command.args(["-c", "printf '%s\\n' \"$GOMEMLIMIT\"; ulimit -v; ulimit -d"]);
+
+            let output = run_command_with_timeout(&mut command, COMMAND_TIMEOUT)
+                .await
+                .expect("the shell should report its configured process limits");
+            let output = String::from_utf8(output).expect("shell output should be UTF-8");
+            let mut values = output.lines();
+            assert_eq!(values.next(), Some("402653184"));
+            let address_space_kib = values
+                .next()
+                .expect("the address-space limit should be reported")
+                .parse::<u64>()
+                .expect("the address-space limit should be numeric");
+            let data_kib = values
+                .next()
+                .expect("the data limit should be reported")
+                .parse::<u64>()
+                .expect("the data limit should be numeric");
+            assert!(address_space_kib <= 4 * 1024 * 1024);
+            assert!(data_kib <= 512 * 1024);
+        }
+
+        fn create_sparse_file(path: &std::path::Path, length: u64) {
+            fs::File::create(path)
+                .expect("sparse Compose fixture should be created")
+                .set_len(length)
+                .expect("sparse Compose fixture should have the requested length");
+        }
+
+        #[tokio::test]
+        async fn validation_accepts_selected_base_and_overrides_at_16_mib_aggregate_limit() {
+            let directory = FixtureDirectory::new();
+            let project_directory = directory.path().join("sparse project");
+            fs::create_dir(&project_directory).expect("the project directory should exist");
+            let base = project_directory.join("base.yaml");
+            let override_one = directory.path().join("override-one.yaml");
+            let override_two = directory.path().join("override-two.yaml");
+            create_sparse_file(&base, 8 * 1024 * 1024);
+            create_sparse_file(&override_one, 8 * 1024 * 1024);
+            create_sparse_file(&override_two, 0);
+            let marker = directory.path().join("ordered-validation-version-marker");
+            let binary = ordered_validation_fixture_cli(
+                &directory,
+                &project_directory,
+                &base,
+                &override_one,
+                &override_two,
+            );
+
+            let result = validate_with_files(
+                &binary,
+                &[base, override_one, override_two],
+                &search_path(),
+                None,
+                COMMAND_TIMEOUT,
+            )
+            .await;
+
+            assert!(result.is_ok());
+            assert!(marker.exists(), "the CLI preflight should have run");
+        }
+
+        #[tokio::test]
+        async fn validation_rejects_selected_base_and_overrides_over_16_mib_before_cli() {
+            let directory = FixtureDirectory::new();
+            let project_directory = directory.path().join("sparse project");
+            fs::create_dir(&project_directory).expect("the project directory should exist");
+            let base = project_directory.join("base.yaml");
+            let override_one = directory.path().join("override-one.yaml");
+            let override_two = directory.path().join("override-two.yaml");
+            create_sparse_file(&base, 8 * 1024 * 1024);
+            create_sparse_file(&override_one, 8 * 1024 * 1024);
+            create_sparse_file(&override_two, 1);
+            let marker = directory.path().join("ordered-validation-version-marker");
+            let binary = ordered_validation_fixture_cli(
+                &directory,
+                &project_directory,
+                &base,
+                &override_one,
+                &override_two,
+            );
+
+            let result = validate_with_files_report(
+                &binary,
+                &[base, override_one, override_two],
+                &search_path(),
+                None,
+                COMMAND_TIMEOUT,
+            )
+            .await;
+
+            assert!(
+                !marker.exists(),
+                "oversized input must fail before CLI preflight"
+            );
+            assert!(result.version.is_none());
+            assert_eq!(
+                result.outcome.unwrap_err().message(),
+                "Selected Compose files exceed the 16 MiB validation input limit."
+            );
+        }
+
         #[tokio::test]
         async fn validation_uses_the_selected_local_file_parent_and_isolated_environment() {
             let directory = FixtureDirectory::new();
@@ -1841,6 +2459,168 @@ mod tests {
             )
             .is_none());
         }
+        #[test]
+        fn compose_container_json_lines_allowlist_and_limits() {
+            let valid = br#"{"Name":"api-1","Service":"api","State":"running","Health":"healthy","ExitCode":0,"Command":"secret","ID":"sensitive","Publishers":[{"PublishedPort":1234}],"Project":"private"}"#;
+            let rows = parse_containers(valid).expect("a valid Compose JSON line should parse");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].name, "api-1");
+            assert_eq!(rows[0].service, "api");
+            assert_eq!(rows[0].state, "running");
+            assert_eq!(rows[0].health.as_deref(), Some("healthy"));
+            assert!(!format!("{rows:?}").contains("secret"));
+            let no_health_reported = parse_containers(
+                br#"{"Name":"api-1","Service":"api","State":"running","Health":""}"#,
+            )
+            .expect("empty health is a valid unreported value");
+            assert_eq!(no_health_reported[0].health, None);
+            assert!(!format!("{rows:?}").contains("sensitive"));
+            assert!(parse_containers(b"").unwrap().is_empty());
+            assert!(parse_containers(b"\n").unwrap().is_empty());
+            assert_eq!(
+                parse_containers(b"{\"Name\":\"api\",\"Service\":\"api\",\"State\":\"running\"}\n")
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(parse_containers(br#"{"Name":"api","Service":"api","State":"running","Health":"bad","Health":"good"}"#).is_none());
+            assert!(parse_containers(br#"{"Name":"api","Service":"api","State":"running","Command":"x","Command":"y"}"#).is_none());
+            assert!(parse_containers(br#"{"Name":"api","State":"running"}"#).is_none());
+            assert!(
+                parse_containers(
+                    format!(
+                        r#"{{"Name":"{}","Service":"api","State":"running"}}"#,
+                        "n".repeat(MAX_CONTAINER_FIELD_BYTES + 1)
+                    )
+                    .as_bytes()
+                )
+                .is_none()
+            );
+            let escaped =
+                parse_containers(br#"{"Name":"api\u202e","Service":"api","State":"running"}"#)
+                    .expect("display controls should be escaped");
+            assert!(escaped[0].name.contains(r"\u{202e}"));
+        }
+        #[test]
+        fn compose_container_status_rejects_duplicate_rows_and_excessive_counts() {
+            assert!(
+                parse_containers(
+                    b"{\"Name\":\"api-1\",\"Service\":\"api\",\"State\":\"running\"}\n\
+                      {\"Name\":\"api-1\",\"Service\":\"api\",\"State\":\"exited\"}"
+                )
+                .is_none(),
+                "duplicate container identity must not create ambiguous rows"
+            );
+
+            let rows = |count: usize| {
+                (0..count)
+                    .map(|index| {
+                        format!(
+                            r#"{{"Name":"container-{index}","Service":"api","State":"running"}}"#
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let at_limit = rows(MAX_COMPOSE_CONTAINERS);
+            assert_eq!(
+                parse_containers(at_limit.as_bytes())
+                    .expect("the exact row limit should be accepted")
+                    .len(),
+                MAX_COMPOSE_CONTAINERS
+            );
+            let over_limit = rows(MAX_COMPOSE_CONTAINERS + 1);
+            assert!(
+                parse_containers(over_limit.as_bytes()).is_none(),
+                "one row over the limit must be rejected"
+            );
+        }
+        #[tokio::test]
+        async fn container_status_uses_pinned_socket_ordered_files_and_private_environment() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("project with spaces");
+            fs::create_dir(&project).unwrap();
+            let base = project.join("base compose.yaml");
+            let override_file = project.join("override compose.yaml");
+            fs::write(&base, "services: {}\n").unwrap();
+            fs::write(&override_file, "services: {}\n").unwrap();
+            let socket = directory.path().join("selected socket.sock");
+            let trace = directory.path().join("argv");
+            let binary = directory.path().join("docker");
+            let output = "{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"exited\",\"Health\":null,\"Command\":\"discard\",\"ID\":\"discard\"}\n";
+            let script = format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n\
+                 if [ -n \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{DOCKER_API_VERSION+x}}${{DOCKER_CERT_PATH+x}}${{DOCKER_TLS+x}}${{DOCKER_TLS_VERIFY+x}}${{DOCKER_CUSTOM_HEADERS+x}}${{DOCKER_DEFAULT_PLATFORM+x}}${{HTTP_PROXY+x}}${{HTTPS_PROXY+x}}${{NO_PROXY+x}}${{ALL_PROXY+x}}${{FTP_PROXY+x}}${{COMPOSE_FILE+x}}${{COMPOSE_ENV_FILES+x}}${{COMPOSE_PROFILES+x}}\" ]; then exit 91; fi\n\
+                 env | while IFS='=' read -r name value; do case \"$name\" in PATH|HOME|DOCKER_CONFIG|LANG|LC_ALL|GOMEMLIMIT|COMPOSE_DISABLE_ENV_FILE|COMPOSE_EXPERIMENTAL_GIT_REMOTE|COMPOSE_EXPERIMENTAL_OCI_REMOTE|PWD|SHLVL|_) : ;; *) exit 92 ;; esac; done || exit 92\n\
+                 [ \"$GOMEMLIMIT\" = 402653184 ] && [ \"$COMPOSE_DISABLE_ENV_FILE\" = 1 ] || exit 93\n\
+                 printf '%s' {}\n",
+                shell_quote(trace.to_str().unwrap()),
+                shell_quote(output),
+            );
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let files = [base.clone(), override_file.clone()];
+            let rows =
+                containers_with_binary(&binary, &socket, &files, OsStr::new("/usr/bin"), None)
+                    .await
+                    .expect("fake CLI status output should parse");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].state, "exited");
+            assert!(!format!("{rows:?}").contains("discard"));
+            let args = fs::read_to_string(trace).unwrap();
+            let host = format!("unix://{}", socket.display());
+            let expected = [
+                "--host".to_owned(),
+                host,
+                "compose".to_owned(),
+                "--project-directory".to_owned(),
+                project.display().to_string(),
+                "--file".to_owned(),
+                base.display().to_string(),
+                "--file".to_owned(),
+                override_file.display().to_string(),
+                "ps".to_owned(),
+                "--all".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ]
+            .join("\n")
+                + "\n";
+            assert_eq!(args, expected);
+        }
+        #[tokio::test]
+        #[ignore = "requires a local Docker-compatible Unix socket and Compose; ps reads only an owned temporary project"]
+        async fn local_compose_status_reads_temporary_project_without_mutation() {
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            let engine = ferrum_engine::EngineClient::connect_default()
+                .await
+                .expect("the selected local engine should be accessible");
+            let directory = FixtureDirectory::new();
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("the system clock should be after the Unix epoch")
+                .as_nanos();
+            let project_name = format!("ferrum-status-{}-{suffix}", std::process::id());
+            let project = directory.path().join(&project_name);
+            fs::create_dir(&project)
+                .expect("the owned Compose project directory should be created");
+            let file = project.join("compose.yaml");
+            fs::write(
+                &file,
+                format!("name: {project_name}\nservices:\n  status-probe:\n    image: scratch\n"),
+            )
+            .expect("the temporary Compose file should be written");
+
+            let status = existing_compose_containers(engine.local_socket_path(), &[file]).await;
+            status
+                .outcome
+                .expect("read-only status for the temporary project should succeed");
+            assert!(
+                status.containers.is_empty(),
+                "the status query must not create Compose containers"
+            );
+        }
     }
     #[cfg(test)]
     mod page {
@@ -1857,6 +2637,7 @@ mod tests {
             message: &'static str,
             refresh_enabled: bool,
             validation_enabled: bool,
+            status_enabled: bool,
             actions: ComposeActions,
         }
 
@@ -1876,6 +2657,7 @@ mod tests {
                         state.message,
                         state.refresh_enabled,
                         state.validation_enabled,
+                        state.status_enabled,
                     );
                 },
                 ComposeUi {
@@ -1888,6 +2670,7 @@ mod tests {
                     },
                     refresh_enabled: true,
                     validation_enabled: true,
+                    status_enabled: available,
                     actions: ComposeActions::default(),
                 },
             )
@@ -2097,6 +2880,22 @@ mod tests {
                 .click_accesskit();
             harness.step();
             assert!(harness.state().actions.select_base_file);
+        }
+
+        #[test]
+        fn superseded_file_selection_results_are_rejected() {
+            let mut view = ComposeView::default();
+            let stale_generation = view.begin_file_selection();
+            let current_generation = view.begin_file_selection();
+            let stale_file = std::path::Path::new("/private/stale/compose.yaml");
+            let current_file = std::path::Path::new("/private/current/compose.yaml");
+
+            assert!(
+                !view.finish_file_selection(stale_generation, Some(stale_file)),
+                "an older chooser result must not replace a newer selection"
+            );
+            assert!(view.finish_file_selection(current_generation, Some(current_file)));
+            assert_eq!(view.selected_files(), &[current_file.to_path_buf()]);
         }
 
         #[test]
@@ -2324,6 +3123,184 @@ mod tests {
                     status: "running(1)".to_owned(),
                 }]
             );
+        }
+
+        #[test]
+        fn validated_compose_files_enable_container_status_refresh() {
+            let mut view = ComposeView::default();
+            let generation = view.begin_file_selection();
+            assert!(view.finish_file_selection(
+                generation,
+                Some(std::path::Path::new("/private/compose.yaml")),
+            ));
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
+
+            let mut harness = harness_for(view);
+            harness.run();
+            assert!(
+                !harness
+                    .get_by_role_and_label(Role::Button, "Refresh existing containers")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            let _environment_note = harness.get_by_role_and_label(
+                Role::Label,
+                "Status uses Ferrum's isolated CLI environment and skips the selected project's default .env; environment-dependent project matching may differ from a normal shell.",
+            );
+        }
+        fn validated_compose_view() -> ComposeView {
+            let mut view = ComposeView::default();
+            let generation = view.begin_file_selection();
+            assert!(view.finish_file_selection(
+                generation,
+                Some(std::path::Path::new("/private/compose.yaml")),
+            ));
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
+            view
+        }
+        #[test]
+        fn container_status_refresh_waits_for_project_inventory() {
+            let mut view = validated_compose_view();
+            view.begin_load();
+            let mut harness = harness_for(view);
+            harness.step();
+            assert!(
+                harness
+                    .get_by_role_and_label(Role::Button, "Refresh existing containers")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+        }
+        #[test]
+        fn container_status_cancellation_and_selection_reject_stale_results() {
+            let mut stale = validated_compose_view();
+            let (stale_generation, _) = stale
+                .begin_status_refresh()
+                .expect("validated selected files should allow a status refresh");
+            stale.begin_file_selection();
+            assert!(!stale.finish_status_refresh(
+                stale_generation,
+                ComposeStatusResult {
+                    containers: vec![ComposeContainer {
+                        name: "stale-1".to_owned(),
+                        service: "stale".to_owned(),
+                        state: "running".to_owned(),
+                        health: None,
+                    }],
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(stale.is_file_selection_running());
+            assert!(stale.containers.is_empty());
+
+            let mut cancelled = validated_compose_view();
+            let (generation, _) = cancelled
+                .begin_status_refresh()
+                .expect("validated selected files should allow a status refresh");
+            cancelled.cancel_status_refresh();
+            assert!(!cancelled.finish_status_refresh(
+                generation,
+                ComposeStatusResult {
+                    containers: Vec::new(),
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(matches!(
+                &cancelled.status,
+                ComposeStatusState::Cancelled { .. }
+            ));
+            let mut harness = harness_for(cancelled);
+            harness.run();
+            let _cancelled =
+                harness.get_by_role_and_label(Role::Label, "Container refresh cancelled.");
+        }
+
+        #[test]
+        fn pending_container_status_exposes_cancel_action() {
+            let mut view = validated_compose_view();
+            view.begin_status_refresh()
+                .expect("validated selected files should allow a status refresh");
+            let mut harness = harness_for(view);
+            harness.step();
+            harness
+                .get_by_role_and_label(Role::Button, "Cancel container refresh")
+                .click_accesskit();
+            harness.step();
+            assert!(harness.state().actions.cancel_status);
+        }
+
+        #[test]
+        fn successful_container_status_renders_existing_service_fields() {
+            let mut view = validated_compose_view();
+            let (generation, _) = view
+                .begin_status_refresh()
+                .expect("validated selected files should allow a status refresh");
+            assert!(view.finish_status_refresh(
+                generation,
+                ComposeStatusResult {
+                    containers: vec![
+                        ComposeContainer {
+                            name: "project-web-1".to_owned(),
+                            service: "web".to_owned(),
+                            state: "running".to_owned(),
+                            health: Some("healthy".to_owned()),
+                        },
+                        ComposeContainer {
+                            name: "project-worker-1".to_owned(),
+                            service: "worker".to_owned(),
+                            state: "exited".to_owned(),
+                            health: None,
+                        },
+                    ],
+                    outcome: Ok(()),
+                },
+            ));
+
+            let mut harness = harness_for(view);
+            harness.run();
+            let _container = harness.get_by_role_and_label(Role::Label, "project-web-1");
+            let _service = harness.get_by_role_and_label(Role::Label, "web");
+            let _state = harness.get_by_role_and_label(Role::Label, "running");
+            let _stopped_state = harness.get_by_role_and_label(Role::Label, "exited");
+            let _health = harness.get_by_role_and_label(Role::Label, "healthy");
+            let _unreported_health = harness.get_by_role_and_label(Role::Label, "—");
+        }
+
+        #[test]
+        fn empty_container_status_is_distinct_from_a_query_error() {
+            let mut empty = validated_compose_view();
+            let (generation, _) = empty
+                .begin_status_refresh()
+                .expect("validated selected files should allow a status refresh");
+            assert!(empty.finish_status_refresh(
+                generation,
+                ComposeStatusResult {
+                    containers: Vec::new(),
+                    outcome: Ok(()),
+                },
+            ));
+            let mut empty_harness = harness_for(empty);
+            empty_harness.run();
+            let _empty = empty_harness.get_by_role_and_label(
+                Role::Label,
+                "No existing containers for the selected Compose files.",
+            );
+
+            let mut failed = validated_compose_view();
+            let (generation, _) = failed
+                .begin_status_refresh()
+                .expect("validated selected files should allow a status refresh");
+            assert!(failed.finish_status_refresh(
+                generation,
+                ComposeStatusResult {
+                    containers: Vec::new(),
+                    outcome: Err(ComposeStatusError::QueryFailed),
+                },
+            ));
+            let mut failed_harness = harness_for(failed);
+            failed_harness.run();
+            let _error = failed_harness
+                .get_by_role_and_label(Role::Label, "Could not read existing Compose containers.");
         }
 
         #[test]

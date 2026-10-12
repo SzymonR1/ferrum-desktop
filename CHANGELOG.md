@@ -4,8 +4,16 @@ All notable project changes are documented here. The project has not published a
 
 ## Unreleased
 
+- Added automatic Linux discovery of the documented rootless Podman user
+  socket at `$XDG_RUNTIME_DIR/podman/podman.sock`, after the XDG Docker socket
+  and before the system Docker socket. This is socket-path discovery only;
+  Podman/runtime compatibility remains unvalidated. Connecting may activate a
+  service through the user's existing systemd socket unit; Ferrum does not
+  enable or invoke units. Issues #10/#11 remain open.
+
 - Added confirmed Linux local Docker Buildx builds pinned to the selected Unix socket with an empty private CLI config. Confirmations name the selected context or a safe endpoint-source label and lock context switching until completion; no socket path is shown. Client validation rejects uppercase repository characters while Docker CLI validates complete repository grammar. Docker CLI handles `.dockerignore`; credentials, proxy settings, build args/secrets/SSH, push, and remote contexts are excluded, so private bases may fail. Build output is sanitized, bounded, transient, and never persisted; static build outcome metadata is included in the local durable redacted audit when persistence succeeds. Best-effort cancellation refreshes inventory. Issues #16/#19 remain open/ready, #10 open/blocked; no release or broader support claim.
 - Buildx confirmation no longer blocks its own start; other image mutations still gate start. Pre-submission rejected or failed starts record only static `not_submitted` outcomes in the existing best-effort audit.
+- Buildx process-spawn failures are now audited as `not_submitted`; failures after a child starts remain `request_error`.
 
 - Added a native Rust workspace with an eframe desktop entry point.
 - Added an asynchronous Linux local Docker-compatible inventory and typed inspection path using negotiated API requests.
@@ -65,12 +73,38 @@ All notable project changes are documented here. The project has not published a
   `config --quiet --no-interpolate --no-env-resolution`, engine-independent
   The new multi-file CLI smoke uses a controlled temporary base/override pair;
   it passed with Compose v5.6.0 without an engine or user project mutation.
+- Bounded Linux Compose resource use: reject selected base-and-override files
+  above 16 MiB in aggregate before launching Docker/Compose (exactly 16 MiB is
+  accepted), using a point-in-time check that is not atomic against same-UID
+  changes. After version preflight, Compose reopens the original selected
+  paths for validation. Apply per-process 4 GiB `RLIMIT_AS` and 512 MiB
+  `RLIMIT_DATA` ceilings to Compose version, discovery, validation, and status
+  subprocesses, retaining lower inherited limits. These per-process limits
+  apply while reading selected and included files; they bound each process,
+  not aggregate process-tree RSS, and are not a sandbox. The child environment
+  sets Go's 384 MiB `GOMEMLIMIT`, a soft target that may be exceeded to avoid
+  GC thrashing. Included local `include`/`extends.file` reads remain outside
+  the selected-file size check and remain under the logged-in user's
+  permissions. Resource exhaustion can produce a generic validation or status failure.
+  Issues #18 and #19 remain partial/open; no full issue completion, release,
+  or broader support claim is made.
 - Clarified the Compose validation trust boundary: included projects may still
   read their default `.env` and explicit `include.env_file` paths outside the
   base directory despite `COMPOSE_DISABLE_ENV_FILE=1` and the
   no-interpolation/no-env-resolution flags. These reads are under the logged-in
   user's permissions, are not path-confined, and require validating only
   trusted Compose files.
+- Added read-only Linux local Docker Compose container status for successfully
+  validated selected base/override files using `docker compose ps --all
+  --format json`, pinned to the selected local Unix socket. The UI displays only
+  bounded escaped container name, service, state, and optional health; IDs,
+  commands, ports, and unknown fields are discarded. Empty results are distinct
+  from query errors, results are manually refreshed, and no project or engine
+  resources are mutated. The private environment disables the selected `.env`;
+  environment-dependent status may differ from a normal shell invocation.
+  Headless/fake-CLI regression coverage and the Compose v5.6.0 temporary-project
+  smoke passed on Docker Engine 29.9.0 without creating containers. Issue #18
+  remains partial/open; lifecycle, import, and log support remain outstanding.
 - Optional ignored validation smokes cover single-file relative paths and an
   ordered temporary base/override pair. The multi-file smoke passed with
   Compose v5.6.0; it contacted no engine, touched no user project, and performed
@@ -81,6 +115,7 @@ All notable project changes are documented here. The project has not published a
 - Added read-only Linux local Docker Compose discovery: `docker compose version --short` reports the CLI version, and `docker compose ls --all --format json` lists projects with the listing pinned to the selected local Docker Unix socket. Compose lifecycle and import operations remain unsupported; issue #18 remains partial/open and issue #10 remains blocked/open.
 - Added read-only verbose network IPAM usage on the Linux local Docker Unix socket, displaying aggregate point-in-time used/reserved IPs and dynamically available IPs when reported. Subnet keys must parse as IPv4/IPv6 CIDRs and are normalized before duplicate detection; invalid CIDRs or duplicate normalized subnet keys make both aggregate metrics unavailable. Missing, malformed, negative, or overflowing count values and checked-sum overflow make only the affected metric unavailable; the other metric may remain available. Subnet/CIDR and endpoint details are not retained. These are allocation counts, not per-network traffic totals; per-container/interface counters are not aggregated. Podman/rootless and remote compatibility remain unvalidated; issues #17 and #10 remain open.
 - Added read-only Linux local Docker Unix-socket image layer history through the negotiated `GET /v{api}/images/{id}/history`, keyed to the exact selected image ID in current inventory. The eight-second request, 16 MiB response body, and 65,536-row limits keep processing bounded; a sequence visitor filters rows during deserialization and rejects excess rows rather than materializing all response rows. Only validated full SHA-256 layer IDs, nonnegative creation timestamps, and nonnegative sizes are retained; `CreatedBy` command text, tags, comments, and other daemon fields are discarded. Added deterministic fake-socket and headless UI coverage for request routing, safe response filtering, loading/empty/error states, stale results, and row-limit boundaries. The opt-in ignored live read-only history smoke passed on 2026-10-11 against Docker Engine 29.9.0/API 1.56 using a preinstalled image; no image mutation or release is claimed. Issue #16 remains open; issue #10 remains open/blocked.
-- Added a bounded Linux-local JSONL copy of redacted Ferrum mutation outcomes, with private permissions, per-record sync, a 16 MiB hard cap, and nonblocking interprocess-lock acquisition bounded to 250 ms. Persistent-audit failures or lock contention do not alter engine outcomes. This local history is not tamper-proof and does not complete Issue #19. The durable redacted audit includes image push and Buildx build outcomes after integration; build output remains transient, bounded, and never persisted. It excludes image IDs, references/tags, endpoints, raw errors, daemon bodies, and build output. Issues #16, #17, and #19 remain open/partial; issue #10 remains open/blocked for Podman/rootless and broader endpoint validation. No release or platform/endpoint support is claimed.
+- Added a bounded Linux-local JSONL copy of redacted Ferrum mutation outcomes, with private permissions, per-record sync, a 16 MiB hard cap, and nonblocking interprocess-lock acquisition bounded to 250 ms. Persistent-audit failures or lock contention do not alter engine outcomes. This local history is not tamper-proof and does not complete Issue #19. The durable redacted audit includes image push and Buildx build outcomes after integration; build output remains transient, bounded, and never persisted. It excludes image IDs, references/tags, endpoints, raw errors, daemon bodies, and build output. Issues #16, #18, and #19 remain open/partial; issue #10 remains open/blocked for Podman/rootless and broader endpoint validation. No release or platform/endpoint support is claimed.
 - Network connect/disconnect audit outcomes are retained even when invalid IDs are omitted; audit handling does not change action outcomes. Issue #19 remains open/partial.
 - Added anonymous-by-default Linux local Docker image-push authentication as a separate per-push opt-in in the existing confirmation. Ferrum uses the selected `SecretService`/`pass` helper only after explicit selection, sends `X-Registry-Auth` only for that request, and fails before Engine submission without anonymous fallback. The helper enum is the only persisted setting; credentials are not read from Docker config or persisted by Ferrum. The Engine receives the credential and configured mirrors may forward it. Anonymous pushes remain unchanged and Buildx remains credential-free. New fake Unix-engine, headless UI, and redacted-audit tests verify the push request and one-operation choice; existing fake-helper tests cover bounded helper protocol handling. No live helper, registry, push, or image mutation was performed. Issue #16 remains partial/open.
+- Bounded local Docker container-event subscriptions to the current Unix timestamp so retained pre-subscription history no longer causes a startup refresh storm. The existing initial/reconnect snapshots cover prior state; the second-resolution cutoff may include earlier events from that same second. Fake Unix-stream coverage checks the time boundary, and an end-to-end fake-engine smoke reduced a 256-event backlog from 40 inventory requests in eight seconds to two expected startup/snapshot requests. No user resources were changed; Issue #20 remains open/blocked for native accessibility and remaining performance acceptance.
