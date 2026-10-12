@@ -54,9 +54,9 @@ socket was available on the validation host; see issues
 [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) and
 [#11](https://github.com/SzymonR1/ferrum-desktop/issues/11).
 
-This clarifies the earlier timing statement in Consequences: discovery is
-implemented, but the no-support-before-contract-testing requirement remains
-unchanged.
+This supersedes only the timing clause in the Consequences bullet above:
+discovery is implemented, but the no-support-before-contract-testing
+requirement remains unchanged.
 
 The official [Podman system-service documentation](https://docs.podman.io/en/latest/markdown/podman-system-service.1.html)
 documents the rootless endpoint under `XDG_RUNTIME_DIR`.
