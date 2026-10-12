@@ -61,7 +61,7 @@ persistence fails, Ferrum emits a static process warning and does not claim the
 event was persisted; the engine request outcome is unchanged. This is local
 Ferrum-request history only, mutable by the same-UID user, not tamper-proof, and
 does not prove final engine state or record external engine actions.
-Issues #16, #17, and #19 remain open/ready; issue #10 remains open/blocked for
+Issues #16 and #19 remain open/ready; issue #10 remains open/blocked for
 Podman/rootless and broader endpoint validation. No release or platform/endpoint
 support is claimed.
 
@@ -135,11 +135,14 @@ unknown counts disable it. Confirmation names the volume and warns that the
 snapshot can change before deletion. Ferrum sends the negotiated
 `DELETE /v{api}/volumes/{name}` without `force`, with an eight-second bound.
 Docker may reject removal if the volume becomes in use. A timeout or transport
-error can follow a successful deletion. Ferrum marks inventory stale after every
+error can follow a successful deletion. Volume deletion is name-addressed rather
+than bound to an immutable ID; a concurrent delete/recreate under the same name
+cannot be detected by the preflight/confirmation snapshot. These checks are
+not an atomic ownership guarantee. Ferrum marks inventory stale after every
 result and refreshes immediately if Volumes remains open, or when that page is
 opened again; a fresh inspection/usage snapshot is required before retrying.
-Only one volume mutation may be active and context switching is blocked while it is
-pending. Pruning, modification, connection, disconnection, and filesystem
+Only one volume mutation may be active and context switching is blocked while
+it is pending. Pruning, modification, connection, disconnection, and filesystem
 browsing are not offered. Podman/rootless behavior remains unvalidated; remote
 endpoints remain unsupported.
 
@@ -200,7 +203,7 @@ not persistent or tamper-proof; a separate durable redacted copy is described
 above. Only one network mutation may be active, and context switching is blocked
 until it returns. IPAM parsing and metric availability are as described above;
 credential access is not provided. Podman/rootless and remote endpoints remain
-unsupported or unvalidated. Issues #17, #19, and #10 remain open; no release is
+unsupported or unvalidated. Issue #10 remains open/blocked; no release is
 claimed.
 
 The Compose page keeps read-only project discovery for the selected Linux local
