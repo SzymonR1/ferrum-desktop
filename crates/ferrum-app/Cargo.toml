@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+zeroize.workspace = true
 vt100 = "0.16.2"
 
 [dev-dependencies]

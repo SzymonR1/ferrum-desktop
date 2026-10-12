@@ -10,11 +10,14 @@ exercised.
 | Linux X11 through XWayland | Smoke-tested | On 2026-10-08, the X11 backend opened a Ferrum window. A window-only capture displayed the real Docker Engine version/API and 15 live container rows (names, images, states, and statuses), matching `docker ps -aq` (15). A second capture showed the disconnected state with a safe socket diagnostic. This is XWayland, not a separate pure X11 session. |
 | Linux Docker CLI contexts with local Unix sockets | Implemented; deterministic coverage added and live coverage is opt-in | Context enumeration/switching requires the Docker CLI. Without it, direct `DOCKER_HOST` and automatic local socket discovery remain available. Only local Unix-socket endpoints are selectable; the ignored live test reads version and inventory without modifying resources. |
 | Linux local Docker inventory decoding limits | Implemented; fake-Unix boundary/fan-out tests and read-only inventory smokes | Typed arrays cap at 65,536 items; all response arrays share a 262,144-item aggregate budget. The 16 MiB body cap and eight-second timeout remain. Over-limit responses fail as a whole; no partial inventories, endpoint expansion, or platform support claim. |
-| Linux local Docker Unix-socket image listing, inspection, read-only history, anonymous public pull/push, tagging, removal, and local Buildx builds | Scoped engine API/UI and local Buildx flows; fake-socket/headless tests; opt-in read-only history smoke passed 2026-10-11 on Docker Engine 29.9.0/API 1.56; no live image mutation, registry contact for push, or live build; native Images-page visuals unverified | History is read-only and uses the selected local Docker Unix socket and exact current inventory image ID; only validated full SHA-256 layer IDs, nonnegative creation times, and nonnegative sizes are retained; CreatedBy, tags, comments, and other daemon fields are discarded. It is bounded to eight seconds, 16 MiB, and 65,536 rows. Push accepts one explicit tag already reported for the selected image, reinspects its ID before submission, and requires confirmation warning that layers/metadata may disclose secrets. It sends an empty JSON body without stored credentials or X-Registry-Auth; registries requiring authentication reject the request. Push coverage uses fake sockets and headless UI only and neither mutates images nor contacts a registry. Buildx coverage uses controlled helpers, not a live build; the CLI flow is pinned to the selected local socket with a private config and bounded transient output. No live image mutation/build is claimed. Podman/rootless and remote support remain unavailable or unvalidated; issues #16 and #19 remain partial/open and #10 remains blocked/open. |
+| Linux local Docker Unix-socket image listing, inspection, read-only history, anonymous-by-default pulls and pushes with per-operation Secret Service/pass helper auth, tagging, removal, and local Buildx builds | Scoped engine API/UI and local Buildx flows; fake-helper, fake-socket, and headless tests; opt-in read-only history smoke passed 2026-10-11 on Docker Engine 29.9.0/API 1.56; no live helper-auth pull/push, registry push, image mutation, or live build; native Images-page visuals unverified | Pull/push helper use is explicit per operation and only reads the selected Docker credential helper; helper output is sent to the selected local Engine and never persisted by Ferrum. Engine mirrors may forward credentials; helper/Engine auth and mirror routing have not been live-validated. Push accepts one explicitly tagged, preflight-verified image; anonymous requests omit X-Registry-Auth. History is read-only and bounded to eight seconds, 16 MiB, and 65,536 rows. Buildx tests use controlled helpers, not a live build; builds are pinned to the selected local socket with private config and bounded transient output. No live image mutation/build is claimed. Podman/rootless and remote support remain unavailable or unvalidated; issues #16 and #19 remain partial/open and #10 remains blocked/open. |
 
-| Linux local Docker Unix-socket volume list/inspect/usage/name-only creation and guarded removal | Scoped API/UI slice; fake-socket and headless tests, opt-in owned-volume live test; native page not visually validated | List/inspect retains allowlisted metadata; usage reports `Size` and point-in-time `RefCount` only for exact inventory matches (`-1`, negative, or missing values are unavailable), with a 30-second/16 MiB usage bound. List, inspect, create, and removal use eight-second request bounds. Creation sends only `Name` and uses Docker's default local driver. Removal requires exact listed/inspected identity, `RefCount == 0`, and explicit confirmation; DELETE omits `force`, and a changing dependency may make Docker reject it. Optional driver/scope/time/mountpoint fields escape selected unsafe text; mountpoints are never accessed. Context switching is blocked and inventory refreshes after every mutation result. No pruning, modification, connection, disconnection, or filesystem browsing is offered. Podman/rootless is unvalidated; remote, Windows, and macOS support is not implemented. Issues #17 and #10 remain open. |
-| Linux local Docker Unix-socket network list/inspect/create/remove/connect/disconnect | Scoped Linux API/UI slice; fake-socket/headless coverage; opt-in live attachment smoke passed 2026-10-10 on Docker Engine 29.9.0/API 1.56; native page not visually validated | Creation sends only `Name`; removal requires a fresh zero-reference inspection and exact-ID confirmation without force/prune. Attachment controls require complete validated membership IDs and an exact current-inventory container ID in `Running` state, plus confirmation. Requests send only `Container`, omit endpoint configuration/Force, use an eight-second deadline, and are not retried. Verbose inspection adds aggregate IP allocation counts; details and unavailable-value semantics are below. The live smoke uses preinstalled `FERRUM_TEST_IMAGE`, `--pull never`, and exact-ID cleanup without force/prune. No usage, Podman/rootless, or remote support is claimed. |
-| Linux local Docker Compose discovery and ordered multi-file structural validation | Read-only CLI/UI; discovery and single-file, loopback-loader, and ordered temporary base/override smokes passed with Compose v5.6.0; the ordered smoke used no engine; native page visual check unavailable | Uses one base file plus up to 15 local overrides in explicit order (max 16), separate `--file` arguments, and `--project-directory` pinned to the base parent. Validation uses a private CLI config/HOME, cleared environment, and no engine or project mutation. It is structural only. Local includes/extends/environment sources can read files outside the base under user permissions; remote Git/OCI is disabled and rejected; validate only trusted files. Profiles/import/lifecycle/logs remain unsupported. #18 partial/open; #10 blocked/open. |
+| Linux local Docker Unix-socket volume list/inspect/usage/name-only creation and guarded removal | Scoped API/UI slice; fake-socket and headless tests; opt-in disposable-engine volume create/remove smoke with generated-name checks (name-based cleanup is not an immutable ownership token); native page not visually validated | List/inspect retains allowlisted metadata; usage reports `Size` and point-in-time `RefCount` only for exact inventory matches (`-1`, negative, or missing values are unavailable), with a 30-second/16 MiB usage bound. List, inspect, create, and removal use eight-second request bounds. Creation sends only `Name` and uses Docker's default local driver. Removal requires exact listed/inspected identity, `RefCount == 0`, and explicit confirmation; DELETE omits `force`, and a changing dependency may make Docker reject it. Optional driver/scope/time/mountpoint fields escape selected unsafe text; mountpoints are never accessed. Context switching is blocked and inventory refreshes after every mutation result. No pruning, modification, connection, disconnection, or filesystem browsing is offered. Podman/rootless is unvalidated; remote, Windows, and macOS support is not implemented; see #10 for the open endpoint compatibility blocker. |
+| Linux local Docker Unix-socket network list/inspect/create/remove/connect/disconnect | Scoped Linux API/UI slice; fake-socket/headless coverage; opt-in live attachment smoke passed 2026-10-10 on Docker Engine 29.9.0/API 1.56; native page not visually validated | Creation sends only `Name`; removal requires a fresh zero-reference inspection and exact-ID confirmation without force/prune. Attachment controls require complete validated membership IDs and an exact current-inventory container ID in `Running` state, plus confirmation. Requests send only `Container`, omit endpoint configuration/Force, use an eight-second deadline, and are not retried. Verbose inspection adds aggregate IP allocation counts; details and unavailable-value semantics are below. The live smoke uses preinstalled `FERRUM_TEST_IMAGE`, `--pull never`, and exact-ID cleanup without force/prune. Per-network traffic totals are not available; reported IPAM counts are point-in-time allocation counts. Podman/rootless is unvalidated; remote, Windows, and macOS support is not implemented; see #10 for the open endpoint compatibility blocker. |
+| Linux local Docker Compose discovery, ordered validation, profiles, and declared-service inventory | Read-only CLI/UI with fake-CLI/headless tests; ordered base/override validation and temporary-project status smokes passed with Compose v5.6.0; profile validation and all-declaration service-list smokes passed on temporary files without Engine access; native page visual check unavailable | Structural validation uses one base plus up to 15 ordered overrides (max 16), separate `--file` arguments, and `--project-directory` pinned to the base parent. The same bounded validation subprocess returns `config --services` names (maximum 128 KiB, 1024 rows, 128 bytes/name), escaped and displayed as declarations, not running status; Compose v5.6.0 returns every declared service, including inactive-profile services, regardless of selected profiles. Profile input is at most 1024 UTF-8 bytes, 16 names, and 64 bytes/name; blank means no explicit profiles, names use `[A-Za-z0-9][A-Za-z0-9_.-]+`, and standalone `*` selects all. Repeated `--profile` argv entries apply to validation/status/logs; no `COMPOSE_PROFILES` environment variable is used. Profile changes invalidate prior work and require revalidation. Structural validation is local-file-only and does not contact an Engine. Local includes/extends may read outside the base under user permissions; remote Git/OCI is disabled; validate only trusted files. Persistent project registry, lifecycle, build/pull, live follow, and project mutations remain unsupported; session-only imports are documented below. #18 partial/open and #10 blocked/open. |
+| Linux local Docker Compose container status | Read-only CLI/UI slice; fake-CLI/headless tests; read-only temporary-project status smoke passed 2026-10-12 with Compose v5.6.0 and Docker Engine 29.9.0; native page visual check unavailable | After successful validation, status uses the currently selected profile set, pins `compose ps --all --format json` to the selected local Unix socket, and retains only bounded escaped container name/service/state/health. It mutates no resources. The isolated CLI environment omits the selected project's `.env`; environment-dependent status may differ from a normal shell. Include/extends reads remain under user permissions; validate only trusted files. Persistent project registry, lifecycle, build/pull, live follow, and project mutations remain outside this status view; session-only imports are described below. |
+| Linux local Docker Compose one-shot service-log snapshots | Read-only CLI/UI; fake-CLI/headless tests; no real service logs were read; native page visual check unavailable | For a service in the current selected-file status snapshot, Ferrum rechecks `compose ps --all --format json` membership before running `compose logs --tail 200 --no-color SERVICE`, using the same selected profiles, Unix socket, ordered files, and base-parent project directory. The safe 1–128 byte ASCII selector and each selected profile are separate arguments. Each command has an eight-second/1 MiB bound; status plus logs may take up to 16 seconds. Compose's tail is per container; Ferrum retains at most the first 200 combined response lines/256 KiB, so replicated output can omit containers and is not globally time-sorted. Output is escaped and transient, excluded from Debug/tracing/audit/files; cancellation/process-group cleanup and stale-result checks apply. There is no live follow or Engine/project mutation. Validate only trusted files; #18 partial/open and #10 blocked/open. |
+| Linux local Docker Compose transient session imports | Read-only in-memory UI; headless/fake tests; no CLI/Engine access or file copying; native page visual check unavailable | Import is enabled only for the current successful validation/profile generation. At most 32 entries retain a bounded escaped local label, absolute base/ordered override paths, and selected profiles for the current app session; the list is lost at exit and no file contents are copied or persisted. Selecting an entry aborts in-flight validation/status/log work, restores the exact ordered paths/profiles, clears derived services/status/logs, and requires explicit revalidation. Local labels remain distinct from Engine discovery and reported Project values; they are not ownership or authorization evidence. Selection itself invokes no CLI/Engine action or lifecycle mutation. Persistent project registry and lifecycle/build/pull/live-follow remain unsupported; #18 partial/open and #10 blocked/open. |
 | Linux local lifecycle and container-event synchronization | Engine integration-tested; lifecycle audit events unit-tested; UI action clicks not visually verified | On 2026-10-08, the opt-in ignored lifecycle test passed against Docker Engine 29.8.2/API 1.56. It exercised Start/Stop/Restart/Pause/Unpause/Remove, observed an external CLI Start event, and verified state, inventory, and removal for one owned disposable container. Ferrum gates actions on known state; Remove is confirmed and does not force-remove or delete volumes. Lifecycle request results emit structured process-tracing events with action, `success` or `request_error`, and a validated full container ID when available; raw errors, names, endpoints, and daemon bodies are excluded. A request error does not prove the engine state remained unchanged. These events are not a persistent audit store. Event processing is bounded, reconnect retries are limited, and manual refresh remains available. |
 | Linux local historical/live container logs | Engine integration-tested; headless Logs controls tested; native surface not visually/screen-reader validated | On 2026-10-08, the opt-in ignored live test passed against the selected local Unix-socket Docker engine using the preinstalled `ghcr.io/catthehacker/ubuntu:rust-latest` image. It decoded timestamped historical and followed stdout/stderr markers, verified TTY mode, dropped the stream, and removed the owned container. A headless egui/accessibility test interacts with the real Logs dialog, exercising Pause/Resume, auto-scroll, Copy output, and Export availability. Native click/screenshot/screen-reader validation remains unavailable because the desktop provider cannot enumerate Ferrum or capture/accessibility state. |
 | Linux local embedded terminal | Experimental; local Docker-compatible Unix sockets only; visual and screen-reader validation not established | On 2026-10-09, the opt-in live terminal test passed against Docker Engine 29.8.2/API 1.56 using the preinstalled `ghcr.io/catthehacker/ubuntu:rust-latest` image. It verified TTY input/output, ANSI and Unicode bytes, resize to 37x101, Ctrl+C, and that dropping the exec session leaves the container running; the test then stopped and removed its own container, and no `ferrum-live-exec-*` container remained. The engine path is live-tested; the native terminal surface remains untested visually and with a screen reader. Terminal output is untrusted; OSC 52 clipboard and title requests are ignored; clipboard controls require explicit user action. Podman/rootless and remote compatibility remain open in issue #10. |
@@ -23,19 +26,23 @@ exercised.
 | Other Linux compositors (GNOME, XFCE, Sway, Hyprland) | Not fully validated | Only the current KDE Plasma host was exercised; other compositors remain untested. |
 | Windows | Not implemented; deferred by current Linux-only scope | Named-pipe support, runtime validation, and packaging are future work tracked by [issue #21](https://github.com/SzymonR1/ferrum-desktop/issues/21). |
 | macOS Apple Silicon and Intel | Not implemented; deferred by current Linux-only scope | Engine integration and packaging are future work tracked by [issue #21](https://github.com/SzymonR1/ferrum-desktop/issues/21). |
-| Podman on Linux | Not validated; no support claim | Docker CLI context presence is not evidence of Podman compatibility. Podman executable/daemon and rootless socket behavior remain unvalidated; see [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10) and [issue #11](https://github.com/SzymonR1/ferrum-desktop/issues/11). |
+| Podman on Linux | Rootless user-socket path discovery implemented; API/runtime compatibility not validated | Automatic discovery checks `$XDG_RUNTIME_DIR/podman/podman.sock` after the Docker user socket and before the system Docker socket. Connecting may activate a service through the user's existing systemd socket unit; Ferrum does not enable or invoke units. The host had no Podman executable or user socket on 2026-10-12. A fake Docker-compatible `/version` response exercises the candidate path and existing handshake only; it is not Podman validation. See [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) and [#11](https://github.com/SzymonR1/ferrum-desktop/issues/11). |
 
-The #10 context-selection slice covers Linux local Unix-socket contexts only.
-Direct remote DOCKER_HOST values and remote contexts are explicitly rejected
-without local fallback; remote transport support remains disabled. Podman/rootless
-validation and a real engine endpoint matrix remain open under issue #10. The
-experimental terminal and lifecycle support do not expand that transport or
-platform scope. Windows named pipes and macOS remain deferred to
-[#21](https://github.com/SzymonR1/ferrum-desktop/issues/21) and M8.
+The #10 context-selection slice covers Linux local Unix-socket Docker CLI
+contexts. Default discovery also checks the documented rootless Podman user
+socket, but this is path discovery only and does not establish Podman API
+compatibility. Direct remote `DOCKER_HOST` values and remote contexts are
+explicitly rejected without local fallback; remote transport support remains
+disabled. Podman/rootless validation and a real engine endpoint matrix remain
+open under issue #10. The experimental terminal and lifecycle support do not
+expand that transport or platform scope. Windows named pipes and macOS remain
+deferred to [#21](https://github.com/SzymonR1/ferrum-desktop/issues/21) and M8.
 
-Image inventory, inspection, read-only layer history, anonymous public-image
-pulls and push, local image tagging, and image removal are limited to Linux
-local Docker Unix sockets.
+Image inventory, inspection, read-only layer history, anonymous-by-default pulls
+and pushes with opt-in helper authentication, local image tagging/removal, and
+local Buildx builds are limited to Linux local Docker Unix sockets. Helper-
+assisted pull and push authentication have not been live-engine/registry
+validated; Buildx remains credential-free.
 
 History is a read-only `GET /v{api}/images/{id}/history` through the negotiated
 API on the selected local socket, using the exact selected ID from the current
@@ -48,15 +55,18 @@ opt-in ignored read-only smoke passed on 2026-10-11 against Docker Engine
 29.9.0/API 1.56 using a preinstalled image and selected local Unix context; it
 listed and inspected the image, read history, and did not mutate it.
 
-Push is anonymous-only: it reads no saved registry credentials and does not
-send `X-Registry-Auth`; registries requiring credentials reject the request.
-It accepts one explicit tag already reported for the selected image and
-reinspects that image ID before submission, but this check is not atomic with
-external Docker clients. Confirmation names the image and target and warns
-that layers/metadata may contain secrets. Push tests use fake sockets and
-headless UI state only; they do not mutate images or contact a registry. No
-live image push is claimed. Closing Ferrum does not guarantee daemon-side
-transfer work stops.
+Push is anonymous by default and may use the configured helper only after a
+separate per-push checkbox in the existing confirmation. Ferrum reads no saved
+Docker credentials, sends `X-Registry-Auth` only for the opted-in request, and
+never falls back anonymously after helper failure. The local Engine receives
+the credential and may forward it through configured registry mirrors; trust
+both the helper and Engine. Anonymous requests omit `X-Registry-Auth`. Push
+accepts one explicit tag already reported for the selected image and reinspects
+that image ID before submission; this check is not atomic with external Docker
+clients. Confirmation names the image/target and warns that layers/metadata may
+contain secrets. Fake-socket and headless UI tests do not mutate images or
+contact a registry; no live helper-authenticated push is claimed. Closing
+Ferrum does not guarantee daemon-side transfer work stops.
 
 Each tag request requires confirmation because Docker Engine v1.56 may reassign
 an existing `repository:tag`; the image data remains. Image-removal confirmation
@@ -72,8 +82,9 @@ current. No live image mutation is claimed; tests do not mutate images.
 Local Buildx invokes the Docker CLI through argument arrays pinned to the
 selected local socket with an empty private config; build output is bounded and
 transient. Buildx tests use controlled helper processes and do not run a live
-build or mutate images. Private-registry authentication, Podman/rootless
-behavior, and remote endpoints remain unsupported or unvalidated. Issues
+build or mutate images. Helper-assisted pull authentication is implemented but
+has not been live-engine/registry validated. Podman/rootless behavior and remote
+endpoints remain unsupported or unvalidated. Issues
 [#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) and
 [#19](https://github.com/SzymonR1/ferrum-desktop/issues/19) remain partial/open;
 [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) remains blocked/open.
@@ -137,18 +148,32 @@ full ID matches the exact generated name. Once armed, both guards use the same
 pinned `EngineClient` socket and exact IDs without force or prune. If identity
 cannot be verified, no stop/remove request is sent and the resource may remain.
 The native Networks page remains unverified visually. Podman/rootless and
-remote endpoints remain unsupported or unvalidated. Issues #17 and #10 remain
-open; this slice does not complete either issue or constitute a release claim.
+remote endpoints remain unsupported or unvalidated under open, blocked issue
+#10. No general platform support or release is claimed.
 
-Compose discovery and ordered multi-file structural validation are limited to
-Linux local Docker Compose CLI. Validation selects one base `.yaml`/`.yml` file
-then up to 15 local override files in user-chosen sequence (one-based order,
-base first; 16 files maximum). Docker merges files in supplied `-f` order.
-Ferrum sets `--project-directory` to the base file's parent; see Docker's
+Compose discovery, ordered multi-file structural validation, and read-only
+container status are limited to Linux local Docker Compose CLI. Validation
+selects one base `.yaml`/`.yml` file followed by up to 15 local overrides in
+user-chosen order (base first; 16 files maximum). Docker merges files in `-f`
+order; Ferrum sets `--project-directory` to the base file's parent. See Docker's
 [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
-for ordered merge and relative path resolution from the first config or
-`--project-directory`, and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
-for `config --quiet --no-interpolate --no-env-resolution`.
+for path and merge behavior, and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
+for structural-validation flags.
+
+After selected files pass structural validation, status runs
+`docker --host unix://<selected-socket> compose --project-directory <base-parent> --file ... ps --all --format json`
+against that same socket. This read-only JSON Lines query includes stopped
+containers and the CLI's default orphan inclusion; it reports only existing
+containers. The separate declared-service inventory comes from the
+engine-independent validation CLI result; an empty status response does not
+imply that no services are declared. Ferrum retains bounded escaped
+name/service/state/health plus optional escaped per-container `Project` metadata.
+Missing metadata is displayed as `Not reported`; mixed values remain attached
+to their rows. The label is untrusted engine-reported metadata, not evidence of
+file ownership or authorization, and has no lifecycle use. IDs, commands, ports,
+and raw diagnostics are discarded. Empty output is distinct from a query error.
+Status is a manually refreshed snapshot and does not mutate project or engine
+resources.
 
 Validation preflights `docker compose version --short` through the private
 isolated Docker config; preflight failure is distinct from config-validation
@@ -166,11 +191,32 @@ sandboxed. Ferrum clears inherited environment, does not pass user environment
 files, uses private Docker config/HOME, and bounds each command to eight
 seconds and 1 MiB stdout.
 
-Prior optional discovery, single-file validation, and remote-loader smokes
-passed. The ordered base/override smoke also passed with Compose v5.6.0 using
-temporary files and no engine; it does not validate arbitrary projects or
-lifecycle operations. Native visual validation is unavailable. Profiles,
-remote references, import, lifecycle/build/pull/logs, and project mutations
-remain unsupported. Issue #18 remains partial/open and issue #10 remains
-blocked/open; no full issue completion, release, or support expansion is
-claimed.
+Status uses the cleared environment/private CLI config and disables the selected
+project's default `.env`; environment-dependent projects may fail or resolve
+differently from a normal shell invocation. Included local files and their
+environment sources may still be read under the logged-in user's permissions.
+
+The read-only temporary-project status smoke passed with Compose v5.6.0 on
+Docker Engine 29.9.0 and created no containers. Discovery, single-file
+validation, ordered base/override, and loopback remote-loader smokes also passed;
+the validation project smokes use temporary files and do not contact the engine.
+These checks do not validate arbitrary projects or lifecycle operations. Native
+Compose-page visual validation is unavailable. One-shot service log snapshots
+are covered by fake-CLI/headless tests only; no real project logs were read.
+Compose profile selection is supported only for structural validation,
+read-only status, and one-shot service logs, including the same-profile status
+recheck immediately before logs. Input is comma-separated and trimmed per
+token; blank means no explicit profiles. Input is limited to 1024 UTF-8 bytes,
+16 profiles, and 64 bytes per name; empty and duplicate entries are rejected.
+Names match `[A-Za-z0-9][A-Za-z0-9_.-]+`, with `*` accepted only alone. Each
+profile is a separate `--profile` argv pair before `config`, `ps`, or `logs`,
+not an environment variable. Invalid or changed selection clears results,
+cancels in-flight work, and requires revalidation. Private Docker config/HOME,
+the cleared environment, disabled selected-project `.env`, and disabled remote
+loaders remain in effect. Session-only import retains validated file/profile
+metadata and a local label; no persistent project registry, lifecycle,
+build/pull, live log follow, or project mutation is added. See
+Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
+and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
+Issue #18 remains partial/open; issue #10 remains blocked/open. No full issue
+completion, release, or broader support claim is made.
