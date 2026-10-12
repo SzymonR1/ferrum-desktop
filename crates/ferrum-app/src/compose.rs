@@ -352,6 +352,21 @@ pub(super) struct ComposeActions {
     pub(super) profiles_changed: bool,
 }
 const MAX_COMPOSE_FILES: usize = 16;
+const MAX_IMPORTED_COMPOSE_PROJECTS: usize = 32;
+const MAX_IMPORTED_COMPOSE_NAME_BYTES: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ImportedComposeProject {
+    name: String,
+    files: Vec<std::path::PathBuf>,
+    profiles: Vec<String>,
+}
+
+fn display_imported_project_name(name: &str) -> String {
+    escape_untrusted_display_text_with_limit(name.to_owned(), MAX_IMPORTED_COMPOSE_NAME_BYTES)
+        .unwrap_or_else(|| "[name omitted]".to_owned())
+}
+
 
 fn display_compose_basename(path: &std::path::Path) -> String {
     let Some(file_name) = path.file_name() else {
@@ -393,6 +408,10 @@ pub(super) struct ComposeView {
     logs_generation: u64,
     logs: ComposeLogsState,
     logs_output: String,
+    validated_generation: Option<u64>,
+    imported_projects: Vec<ImportedComposeProject>,
+    import_name_input: String,
+    import_feedback: Option<&'static str>,
 }
 
 impl ComposeView {
@@ -590,6 +609,7 @@ impl ComposeView {
     }
 
     fn begin_selection(&mut self, override_file: bool) -> u64 {
+        self.validated_generation = None;
         self.validated_services.clear();
         self.validation_generation = self.validation_generation.wrapping_add(1);
         self.invalidate_status();
@@ -604,6 +624,53 @@ impl ComposeView {
     fn selected_profiles(&self) -> Result<Vec<String>, ()> {
         parse_compose_profiles(&self.profile_input)
     }
+    pub(super) fn can_import_current_project(&self) -> bool {
+        !self.selected_files.is_empty()
+            && !self.is_file_selection_running()
+            && !self.is_validation_running()
+            && self.validated_generation == Some(self.validation_generation)
+            && matches!(&self.validation, ComposeValidationState::Succeeded { .. })
+            && self.selected_profiles().is_ok()
+    }
+
+    fn import_current_project(&mut self, name: &str) -> bool {
+        let name = name.trim();
+        if !self.can_import_current_project()
+            || name.is_empty()
+            || name.len() > MAX_IMPORTED_COMPOSE_NAME_BYTES
+            || self.imported_projects.len() >= MAX_IMPORTED_COMPOSE_PROJECTS
+            || self.imported_projects.iter().any(|project| project.name == name)
+        {
+            return false;
+        }
+        let Ok(profiles) = self.selected_profiles() else {
+            return false;
+        };
+        self.imported_projects.push(ImportedComposeProject {
+            name: name.to_owned(),
+            files: self.selected_files.clone(),
+            profiles,
+        });
+        self.import_name_input.clear();
+        self.import_feedback = Some("Imported for this session only.");
+        true
+    }
+
+    fn select_imported_project(&mut self, index: usize) -> bool {
+        let Some(project) = self.imported_projects.get(index).cloned() else {
+            return false;
+        };
+        self.validation_generation = self.validation_generation.wrapping_add(1);
+        self.validated_generation = None;
+        self.invalidate_status();
+        self.validated_services.clear();
+        self.validation = ComposeValidationState::Idle;
+        self.selected_files = project.files;
+        self.profile_input = project.profiles.join(",");
+        self.import_feedback = None;
+        true
+    }
+
 
     pub(super) fn profiles_for_automatic_validation(&mut self) -> Option<Vec<String>> {
         match self.selected_profiles() {
@@ -623,6 +690,7 @@ impl ComposeView {
     }
 
     pub(super) fn profiles_changed(&mut self) {
+        self.validated_generation = None;
         self.validated_services.clear();
         self.validation_generation = self.validation_generation.wrapping_add(1);
         self.invalidate_status();
@@ -652,6 +720,7 @@ impl ComposeView {
         if invalid_file_set {
             self.selected_files.clear();
         }
+        self.validated_generation = result.outcome.is_ok().then_some(generation);
         self.validated_services = if result.outcome.is_ok() {
             result.services
         } else {
@@ -714,6 +783,7 @@ impl ComposeView {
 
     pub(super) fn remove_override(&mut self, index: usize) {
         if index > 0 && index < self.selected_files.len() {
+            self.validated_generation = None;
             self.invalidate_status();
             self.validated_services.clear();
             self.validation_generation = self.validation_generation.wrapping_add(1);
@@ -731,6 +801,7 @@ impl ComposeView {
             return None;
         }
         self.validated_services.clear();
+        self.validated_generation = None;
         let profiles = match self.selected_profiles() {
             Ok(profiles) => profiles,
             Err(()) => {
@@ -749,6 +820,7 @@ impl ComposeView {
     }
 
     pub(super) fn cancel_validation(&mut self) {
+        self.validated_generation = None;
         self.validated_services.clear();
         if let ComposeValidationState::Validating { file_name } =
             std::mem::take(&mut self.validation)
@@ -759,6 +831,7 @@ impl ComposeView {
     }
 
     pub(super) fn invalidate(&mut self) {
+        self.validated_generation = None;
         self.validated_services.clear();
         self.generation = self.generation.wrapping_add(1);
         self.loading = false;
@@ -807,6 +880,9 @@ impl ComposeView {
                 )
                 .labelled_by(label.id);
             actions.profiles_changed = response.changed();
+            if response.changed() {
+                self.validated_generation = None;
+            }
         });
         ui.label("Profiles apply to read-only validation, status, and one-shot logs; * enables all profiles. No project lifecycle operations are available.");
         let profiles_valid = self.selected_profiles().is_ok();
@@ -877,6 +953,53 @@ impl ComposeView {
             }
         } else {
             ui.label("Choose one local Compose YAML base file, then add overrides in order.");
+        }
+        let mut imported_selection = None;
+        ui.separator();
+        ui.heading("Import validated configuration");
+        ui.label("The local label is only for this session; it is not a Compose project identity.");
+        ui.horizontal(|ui| {
+            let label = ui.label("Import name:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.import_name_input)
+                    .char_limit(MAX_IMPORTED_COMPOSE_NAME_BYTES)
+                    .hint_text("local display label")
+                    .desired_width(220.0)
+                    .labelled_by(label.id),
+            );
+            if ui
+                .add_enabled(
+                    self.can_import_current_project()
+                        && !actions.select_base_file
+                        && !actions.add_override_file
+                        && !actions.validate_files
+                        && actions.remove_override.is_none(),
+                )
+                .clicked()
+            {
+                let name = self.import_name_input.clone();
+                if !self.import_current_project(&name) {
+                    self.import_feedback = Some(
+                        "Import rejected: names must be unique, non-empty, and at most 256 UTF-8 bytes; the session holds at most 32 imports.",
+                    );
+                }
+            }
+        });
+        if let Some(feedback) = self.import_feedback {
+            ui.label(feedback);
+        }
+        ui.heading("Imported local projects (this session only)");
+        ui.label("Selecting one restores its ordered files and profiles, clears old results, and requires explicit revalidation.");
+        for (index, project) in self.imported_projects.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(display_imported_project_name(&project.name));
+                if ui.button("Use imported configuration").clicked() {
+                    imported_selection = Some(index);
+                }
+            });
+        }
+        if let Some(index) = imported_selection {
+            self.select_imported_project(index);
         }
         ui.separator();
         ui.heading("Declared services in selected files (all profiles, read-only)");
@@ -4768,6 +4891,190 @@ mod tests {
                 Role::Label,
                 "Could not read the selected Compose service logs.",
             );
+        }
+        #[test]
+        fn compose_import_requires_current_successful_validation() {
+            let file = std::path::Path::new("/private/project/compose.yaml");
+            let mut view = ComposeView::default();
+            let generation = view.begin_file_selection();
+            assert!(view.finish_file_selection(generation, Some(file)));
+            assert!(!view.can_import_current_project());
+            assert!(view.finish_validation(
+                generation,
+                validation_result(Err(ComposeValidationError::ValidationFailed)),
+            ));
+            assert!(!view.import_current_project("project"));
+            let mut changed_profiles = validated_compose_view();
+            changed_profiles.profile_input = "different".to_owned();
+            changed_profiles.profiles_changed();
+            assert!(!changed_profiles.can_import_current_project());
+            assert!(!changed_profiles.import_current_project("stale-profile"));
+
+            let generation = view.begin_file_selection();
+            assert!(view.finish_file_selection(generation, Some(file)));
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
+            assert!(view.can_import_current_project());
+            let mut eligible_harness = harness_for(view);
+            eligible_harness.run();
+            assert!(
+                !eligible_harness
+                    .get_by_role_and_label(Role::Button, "Import validated selection")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            drop(eligible_harness);
+
+            let mut view = ComposeView::default();
+            let generation = view.begin_file_selection();
+            assert!(view.finish_file_selection(generation, Some(file)));
+            assert!(view.finish_validation(generation, validation_result(Ok(()))));
+            view.begin_override_selection();
+            let mut pending_harness = harness_for(view);
+            pending_harness.run();
+            assert!(
+                pending_harness
+                    .get_by_role_and_label(Role::Button, "Import validated selection")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+
+        }
+
+        #[test]
+        fn compose_import_rejects_duplicate_names_and_enforces_bounds() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("Development"));
+            assert!(!view.import_current_project("Development"));
+            assert!(!view.import_current_project(""));
+            assert!(!view.import_current_project(&"é".repeat(129)));
+            for index in 1..MAX_IMPORTED_COMPOSE_PROJECTS {
+                assert!(view.import_current_project(&format!("project-{index}")));
+            }
+            assert_eq!(view.imported_projects.len(), MAX_IMPORTED_COMPOSE_PROJECTS);
+            assert!(!view.import_current_project("overflow"));
+        }
+
+        #[test]
+        fn selecting_import_restores_ordered_files_and_profiles_and_clears_old_results() {
+            let base = std::path::PathBuf::from("/private/base/compose.yaml");
+            let override_file = std::path::PathBuf::from("/private/overrides/dev.yaml");
+            let mut source = ComposeView::default();
+            source.profile_input = "dev".to_owned();
+            let generation = source.begin_file_selection();
+            assert!(source.finish_file_selection(generation, Some(&base)));
+            assert!(source.finish_validation(generation, validation_result(Ok(()))));
+            let generation = source.begin_override_selection();
+            assert!(source.finish_file_selection(generation, Some(&override_file)));
+            assert!(source.finish_validation(generation, validation_result(Ok(()))));
+            source.profile_input = "dev,qa".to_owned();
+            source.profiles_changed();
+            let (generation, _, _) = source.begin_validation().unwrap();
+            assert!(source.finish_validation(generation, validation_result(Ok(()))));
+            assert!(source.import_current_project("Imported"));
+
+            let mut view = validated_compose_view();
+            let (status_generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: vec![ComposeContainer {
+                        name: "api-1".to_owned(),
+                        service: "api".to_owned(),
+                        project: Some("untrusted-label".to_owned()),
+                        state: "running".to_owned(),
+                        health: None,
+                    }],
+                    outcome: Ok(()),
+                },
+            ));
+            let (logs_generation, _, _, _) = view.begin_service_logs("api").unwrap();
+            let picker_generation = view.begin_override_selection();
+            let stale_file = std::path::Path::new("/private/stale/override.yaml");
+            let validation_generation = view.validation_generation;
+            assert!(view.select_imported_project(0));
+            assert!(!view.finish_file_selection(
+                picker_generation,
+                Some(stale_file),
+            ));
+            assert_eq!(view.selected_files, [base, override_file]);
+            assert_eq!(view.imported_projects[0].files, [base.clone(), override_file.clone()]);
+            assert_eq!(
+                view.imported_projects[0].profiles,
+                vec!["dev".to_owned(), "qa".to_owned()],
+            );
+            assert_eq!(view.profile_input, "dev,qa");
+            assert!(!view.can_refresh_containers());
+            assert!(view.containers.is_empty());
+            assert!(view.logs_output.is_empty());
+            assert!(!view.can_request_service_logs("api"));
+            assert!(!view.finish_validation(
+                validation_generation,
+                validation_result(Ok(())),
+            ));
+            assert!(!view.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: Vec::new(),
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(!view.finish_service_logs(
+                logs_generation,
+                ComposeLogsResult {
+                    output: "stale".to_owned(),
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(view.begin_validation().is_some());
+        }
+
+        #[test]
+        fn imported_projects_render_separately_from_engine_discovery() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("Local label"));
+            view.projects = vec![ComposeProject {
+                name: "engine-project".to_owned(),
+                status: "running(1)".to_owned(),
+            }];
+            view.loaded = true;
+            let mut harness = harness_for(view);
+            harness.run();
+            let _import_heading = harness.get_by_role_and_label(Role::Label, "Imported local projects (this session only)");
+            let _local_name = harness.get_by_role_and_label(Role::Label, "Local label");
+            let _discovery_name = harness.get_by_role_and_label(Role::Label, "engine-project");
+        }
+        #[test]
+        fn import_and_selection_buttons_restore_session_configuration_without_running_commands() {
+            let mut harness = harness_for(validated_compose_view());
+            harness.run();
+            harness
+                .get_by_role_and_label(Role::TextInput, "Import name:")
+                .focus();
+            harness.step();
+            harness
+                .get_by_role_and_label(Role::TextInput, "Import name:")
+                .type_text("Imported from UI");
+            harness.step();
+            harness
+                .get_by_role_and_label(Role::Button, "Import validated selection")
+                .click_accesskit();
+            harness.step();
+            assert_eq!(harness.state().view.imported_projects.len(), 1);
+            assert_eq!(
+                harness.state().view.imported_projects[0].name,
+                "Imported from UI"
+            );
+
+            harness
+                .get_by_role_and_label(Role::Button, "Use imported configuration")
+                .click_accesskit();
+            harness.step();
+            assert!(matches!(
+                &harness.state().view.validation,
+                ComposeValidationState::Idle
+            ));
+            assert!(!harness.state().actions.validate_files);
+            assert!(!harness.state().actions.refresh_containers);
         }
     }
 

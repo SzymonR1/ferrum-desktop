@@ -5,8 +5,9 @@ a local base file with ordered overrides, a list of every service declared in
 the selected files (including profile-gated services regardless of active
 profiles), and read-only status for existing containers. The declared-service
 list is local Compose CLI/file-derived and does not query an Engine; it is
-separate from running-container status. The page does not import or persist
-projects.
+separate from running-container status. A validated selection can be imported
+under a local display label for the current application session only; it is
+not persisted or treated as an Engine-discovered project.
 Project discovery uses Docker's Compose CLI:
 
 - `docker compose version --short`
@@ -66,6 +67,27 @@ files. A successful result means structural validation only:
 validation session; Ferrum displays bounded, escaped basenames, a static
 validation result, and the bounded escaped service list, never full paths or
 raw CLI diagnostics.
+
+## Import a validated configuration for this session
+
+After validation succeeds for the current ordered files and profile selection,
+enter a unique local display name and choose **Import validated selection**.
+The name is a label only: it is not passed to Compose as a project name,
+canonical identity, ownership claim, or authorization input. Imported entries
+are shown separately from Engine-discovered Compose projects. The in-memory
+list is limited to 32 entries and each name to 256 UTF-8 bytes; duplicate or
+empty names are rejected.
+
+Selecting an imported entry restores its exact base/override paths and profile
+selection, then clears validation, declared services, container status, and
+logs. Explicitly choose **Validate selected files** before requesting status or
+logs. Importing or selecting an entry does not invoke the CLI, contact the
+Engine, or run Compose up/start/stop/restart/build/pull; it does not copy,
+write, or persist project files. Entries are lost when the application session
+ends. The selected paths remain subject to the trusted-file warning below:
+Compose can read local files referenced by `include` or service `extends.file`,
+including related environment files, under the logged-in user's permissions.
+
 On successful validation, Ferrum retains and displays the bounded service names
 reported by the same `config --services` invocation. Names are escaped before
 display in a virtualized list. Compose returns every service declared in the
@@ -147,14 +169,14 @@ See Docker's [Compose `ps` reference](https://docs.docker.com/reference/cli/dock
 for the JSON Lines format and status command options.
 
 Status is implemented only for Linux local Docker Unix sockets. It does not
-import or persist a project, start/stop/restart containers, build/pull images,
-or mutate project or engine resources. The command uses Ferrum's private Docker
-config/HOME and cleared environment; the selected project's default `.env` is
-disabled, and remote Git/OCI loaders are disabled. If Compose cannot resolve
-the selected project under this isolated environment, Ferrum shows a static
-status error rather than raw CLI output. Compose may still read local files
-referenced by `include` or `extends.file` and included-project environment
-sources under the logged-in user's permissions; validate only trusted files.
+persist a project, start/stop/restart containers, build/pull images, or mutate
+project or Engine resources. The command uses Ferrum's private Docker config/HOME
+and cleared environment; the selected project's default `.env` is disabled, and
+remote Git/OCI loaders are disabled. If Compose cannot resolve the selected
+project under this isolated environment, Ferrum shows a static status error
+rather than raw CLI output. Compose may still read local files referenced by
+`include` or `extends.file` and included-project environment sources under the
+logged-in user's permissions; validate only trusted files.
 The command uses the same subprocess timeout, output cap, and per-process
 resource limits described above.
 
@@ -225,15 +247,16 @@ allowlisted environment, including disabling the selected project's default
 `.env` and remote Git/OCI loaders. Invalid profile input, or changing the
 selection, clears validation, declared services, status, and logs and cancels
 active Compose work; validate again before refreshing status or requesting
-logs. Profile selection does not import or persist projects and does not start,
-stop, restart, build, pull, or otherwise manage project lifecycle.
+logs. Profiles and transient imports do not start, stop, restart, build, pull,
+or otherwise manage project lifecycle.
 
 See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
 and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
 
-Project import/persistence, start/stop/restart, build/pull, live log follow,
-and project mutations remain unsupported. Structural validation skips
-interpolation and service `env_file` resolution; status uses the isolated
+Project persistence, lifecycle management (start/stop/restart/build/pull), live
+log follow, and project mutations remain unsupported. Transient import is
+session-only and does not persist files or project state. Structural validation
+skips interpolation and service `env_file` resolution; status uses the isolated
 environment above and may differ from a normal shell invocation. Profile
 selection applies to structural validation, status, and one-shot service logs.
 The declared-service inventory lists all services in the selected files,
