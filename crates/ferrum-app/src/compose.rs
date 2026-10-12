@@ -4981,8 +4981,10 @@ mod tests {
         fn selecting_import_restores_ordered_files_and_profiles_and_clears_old_results() {
             let base = std::path::PathBuf::from("/private/base/compose.yaml");
             let override_file = std::path::PathBuf::from("/private/overrides/dev.yaml");
-            let mut view = ComposeView::default();
-            view.profile_input = "dev".to_owned();
+            let mut view = ComposeView {
+                profile_input: "dev".to_owned(),
+                ..ComposeView::default()
+            };
             let generation = view.begin_file_selection();
             assert!(view.finish_file_selection(generation, Some(&base)));
             assert!(view.finish_validation(generation, validation_result(Ok(()))));
