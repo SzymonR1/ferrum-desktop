@@ -30,8 +30,9 @@ never persisted.
 
 Compose support includes read-only Docker CLI version/project discovery and
 explicit structural validation of a user-selected local base file followed by
-user-ordered local overrides on Linux. Files are numbered from 1 (the base)
-and limited to 16 total. Docker merges `-f` files in the order supplied;
+ordered local overrides on Linux. It also supports read-only status for
+containers already associated with selected files. Files are numbered from 1
+(the base) and limited to 16 total. Docker merges `-f` files in supplied order;
 relative paths resolve from the first/base config or `--project-directory`,
 which Ferrum sets to the base file's parent. See Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
 for ordered merge and path semantics and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
@@ -45,14 +46,14 @@ file after it is checked. After the Compose version preflight, Compose reopens
 the original selected paths for validation, so the contents read may differ
 from those measured by the check. The check does not include local files read
 through `include` or service `extends.file`.
-Linux Compose subprocesses for version, discovery, and validation receive
+Linux Compose subprocesses for version, discovery, validation, and status have
 per-process `RLIMIT_AS` of 4 GiB and `RLIMIT_DATA` of 512 MiB, preserving lower
 inherited limits. These limits apply while Compose reads selected and included
 files. They are inherited by child processes and bound each process, not
 aggregate process-tree RSS; they are not a sandbox. The private child
 environment sets `GOMEMLIMIT=402653184` (384 MiB), a Go runtime soft target
 that may be exceeded to avoid excessive GC thrashing. Resource exhaustion may
-produce a generic validation failure.
+produce generic validation or status failures.
 
 Compose remains trusted local code, not a sandbox. The point-in-time selected-
 file size check does not eliminate the race with same-UID changes, and neither
@@ -69,6 +70,24 @@ those reads; validate only trusted files. Profiles, `.env`/service
 `env_file` resolution, import, lifecycle/build/pull/logs, and project mutations
 remain unsupported. Issues #18 and #19 remain partial/open; issue #10 remains
 blocked/open. No release or broader support claim is made.
+
+Status is available only after selected files pass structural validation and a
+local Docker Unix socket is connected. Ferrum runs
+`docker --host unix://<selected-socket> compose --project-directory <base-parent> --file ... ps --all --format json`.
+The query is read-only; it does not create, start, stop, remove, or change
+containers or project files. `--all` includes stopped containers and Compose's
+default orphan inclusion is preserved. Ferrum retains only bounded, escaped
+container name, service, state, and optional health; it discards IDs, commands,
+published ports, project labels, exit codes, and unknown fields. Empty output
+means no existing containers matched the isolated project selection, not that
+the file declares no services. Status is a manually refreshed point-in-time
+snapshot.
+
+Status uses a private CLI configuration, clears inherited shell variables, and
+sets `COMPOSE_DISABLE_ENV_FILE=1`. Environment-dependent projects may fail or
+resolve differently than a normal shell invocation. Compose may still read
+local includes and included-project environment sources under the logged-in
+user's permissions; validate only trusted files.
 
 
 ## Trust boundaries
