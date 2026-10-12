@@ -358,6 +358,7 @@ const MAX_IMPORTED_COMPOSE_NAME_BYTES: usize = 256;
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ImportedComposeProject {
     name: String,
+    display_name: String,
     files: Vec<std::path::PathBuf>,
     profiles: Vec<String>,
 }
@@ -650,8 +651,10 @@ impl ComposeView {
         let Ok(profiles) = self.selected_profiles() else {
             return false;
         };
+        let display_name = display_imported_project_name(name);
         self.imported_projects.push(ImportedComposeProject {
             name: name.to_owned(),
+            display_name,
             files: self.selected_files.clone(),
             profiles,
         });
@@ -1010,7 +1013,7 @@ impl ComposeView {
         ui.label("Selecting one restores its ordered files and profiles, clears old results, and requires explicit revalidation.");
         for (index, project) in self.imported_projects.iter().enumerate() {
             ui.horizontal(|ui| {
-                ui.label(display_imported_project_name(&project.name));
+                ui.label(&project.display_name);
                 if ui.button("Use imported configuration").clicked() {
                     imported_selection = Some(index);
                 }
