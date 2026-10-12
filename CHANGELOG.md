@@ -7,6 +7,12 @@ All notable project changes are documented here. The project has not published a
 - Added confirmed Linux local Docker Buildx builds pinned to the selected Unix socket with an empty private CLI config. Confirmations name the selected context or a safe endpoint-source label and lock context switching until completion; no socket path is shown. Client validation rejects uppercase repository characters while Docker CLI validates complete repository grammar. Docker CLI handles `.dockerignore`; credentials, proxy settings, build args/secrets/SSH, push, and remote contexts are excluded, so private bases may fail. Build output is sanitized, bounded, transient, and never persisted; static build outcome metadata is included in the local durable redacted audit when persistence succeeds. Best-effort cancellation refreshes inventory. Issues #16/#19 remain open/ready, #10 open/blocked; no release or broader support claim.
 - Buildx confirmation no longer blocks its own start; other image mutations still gate start. Pre-submission rejected or failed starts record only static `not_submitted` outcomes in the existing best-effort audit.
 
+- Bounded Linux local container, image, network, and volume inventory parsing
+  to 65,536 elements per response array, including container `Names` and image
+  `RepoTags`. Responses over the item cap fail closed as existing typed
+  unavailable/inventory errors; Ferrum never truncates results. Existing
+  16 MiB response-body and eight-second request bounds remain unchanged.
+
 - Added a native Rust workspace with an eframe desktop entry point.
 - Added an asynchronous Linux local Docker-compatible inventory and typed inspection path using negotiated API requests.
 - Added state-gated container lifecycle actions and bounded Docker container-event synchronization with manual refresh fallback.
