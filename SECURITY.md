@@ -82,12 +82,27 @@ tags, endpoints, error text, and daemon response bodies are not included in
 those traces.
 
 Ferrum also maintains a Linux-local, bounded JSONL copy of mutation outcomes
-for container lifecycle, image pull/push/tag/removal and Buildx image builds,
-volume create/removal, and network create/removal/connect/disconnect requests.
-`audit.jsonl` is created lazily in Ferrum's descriptor-anchored config directory
-with directory mode `0700` and file mode `0600`. Schema version 1 records a
-timestamp, static event/action/outcome, and validated full resource IDs only
-where existing traces permit. A build entry contains only the static
+for container lifecycle, confirmed imported Compose start/stop, image
+pull/push/tag/removal and Buildx image builds, volume create/removal, and
+network create/removal/connect/disconnect requests. `audit.jsonl` is created
+lazily in Ferrum's descriptor-anchored config directory with directory mode
+`0700` and file mode `0600`. Schema version 1 records a timestamp, static
+event/action/outcome, and validated full resource IDs only where existing
+traces permit.
+
+A Compose lifecycle entry contains only the static `compose_mutation` event,
+`start`/`stop` action, and `started`, `success`, `not_submitted`, or
+`request_error` outcome; labels, files, profiles, socket values, service names,
+credentials, and raw errors are excluded. Where persisted, `started` records
+that Ferrum began a confirmed attempt before preflight/CLI execution. If it has
+no later terminal outcome, Ferrum exited or final audit persistence failed; it
+does not prove whether Compose reached or changed the engine, so refresh status.
+`not_submitted` covers local preflight/validation or any process-spawn failure
+before the lifecycle process starts; a returned failure or timeout after start
+is `request_error`. During shutdown Ferrum makes a best-effort, up-to-one-second
+flush of the initial marker before aborting the lifecycle worker; a submitted
+child may still be terminated with Engine state uncertain. A build entry
+contains only the static
 `image_mutation` event, `build` action, and outcome. It excludes build output
 and all build-specific metadata, as well as names, image references/tags,
 endpoints, credentials, raw errors, daemon bodies, and terminal/log contents.
@@ -99,9 +114,10 @@ not claim the event was persisted; the engine request outcome is unchanged.
 This is local Ferrum-request history only, mutable by the same-UID user, not
 tamper-proof, and does not prove final engine state or record external engine
 actions.
-Issues #16, #18, and #19 remain open/ready; issue #10 remains open/blocked for
-Podman/rootless and broader endpoint validation. No release or platform/endpoint
-support is claimed.
+
+Issues #16 and #19 remain partial/open; issue #18 remains partial/open; issue
+#10 remains open/blocked for Podman/rootless and broader endpoint validation.
+No release or platform/endpoint support is claimed.
 
 ## Local image builds
 
@@ -287,30 +303,42 @@ The size check covers only explicitly selected files. Local
 limited CLI process under the logged-in user's permissions.
 
 On Linux, each Compose subprocess for version, discovery, validation, status,
-and one-shot logs has `RLIMIT_AS` capped at 4 GiB and `RLIMIT_DATA` capped at
-512 MiB, preserving lower inherited limits. The per-process limits apply while
-selected and included files; child processes inherit them, so they bound each
-process, not aggregate process-tree RSS. The private child environment
+one-shot logs, and start/stop has `RLIMIT_AS` capped at 4 GiB and `RLIMIT_DATA`
+capped at 512 MiB, preserving lower inherited limits. The per-process limits
+apply while selected and included files; child processes inherit them, so they
+bound each process, not aggregate process-tree RSS. The private child environment
 sets `GOMEMLIMIT=402653184` (384 MiB) for Go runtimes. This is a soft runtime
 target, not a hard cap: Go may exceed it to avoid excessive GC thrashing.
-Resource exhaustion can produce generic validation, status, or log-query failures. These
-limits and the point-in-time selected-file check do not make the trusted CLI a
-sandbox or confine local included-file reads.
+Resource exhaustion can produce generic validation, status, log-query, or
+lifecycle failures. These limits and the point-in-time selected-file check do
+not make the trusted CLI a sandbox or confine local included-file reads.
 
 Validation is read-only, does not contact or require an engine socket, and
 Ferrum does not write, modify, delete, or extract project files. Success means
 structural validation only: interpolation and service `env_file` resolution
 are skipped. Ferrum displays bounded escaped basenames, static outcomes, and
 the bounded escaped declared-service rows returned on successful validation;
-Explicit profile selection affects structural validation, read-only status, and
-one-shot service logs only. The declared-service inventory includes every
-declaration in the selected files regardless of active profiles. Transient
-imports retain only validated ordered paths, profiles, and a bounded local
-label in memory for this session. They copy/persist no files, invoke no
-CLI/Engine operation, and do not establish project identity or authorization.
-Persistent project storage and lifecycle operations
-(start/stop/restart/build/pull), live log follow, and project mutation remain
-unavailable.
+Explicit profile selection affects validation, read-only status and one-shot
+service logs, and is passed to imported-project start/stop. The declared-service
+inventory includes every declaration in the selected files regardless of active
+profiles. Transient imports retain only validated ordered paths, profiles, and a
+bounded local label in memory for this session. Import itself copies/persists no
+files and invokes no CLI/Engine operation. The label does not establish project
+identity or authorization. Persistent project storage, restart/build/pull/up/down,
+remove, live log follow, and project-file mutation remain unavailable.
+
+Start/stop are available only for the currently selected, session-imported
+configuration after explicit successful revalidation. Before each mutation
+Ferrum reruns structural validation; a failure prevents the lifecycle command.
+The command uses the selected base/override files, profiles, base-parent project
+directory, and the current local Docker socket through argument arrays. It does
+not use the import label or engine-reported `Project` metadata as identity or
+authorization. Docker Compose `start` starts existing containers only; `stop`
+does not remove them. Outcome errors are static and exclude CLI diagnostics.
+Navigation does not cancel an in-flight lifecycle command because a submitted
+daemon-side mutation may already be accepted; Ferrum keeps a redacted session
+outcome. This scope does not establish file ownership, and selected/include
+files remain trusted local inputs under the logged-in user's permissions.
 
 On successful validation the same bounded CLI invocation returns every
 declared service name via `config --services`, including services gated by
@@ -349,7 +377,7 @@ container `Name`, `Service`, optional per-container `Project`, `State`, and
 optional `Health`; missing project values render as `Not reported`, and rows may
 report different values. The project label is untrusted engine-reported
 metadata only: it does not establish file ownership, canonical identity,
-authentication, or authorization and has no lifecycle use. IDs, command text,
+authentication, or authorization and does not determine lifecycle scope. IDs, command text,
 published ports, exit codes, and other response fields are discarded. Empty
 output means no existing containers matched this isolated project selection,
 not that no services are declared. Status is a manually refreshed point-in-time
@@ -399,8 +427,11 @@ allowlisted environment. If Compose is installed in the standard per-user CLI
 plugin directory, only the `docker-compose` executable is linked into the
 private config; custom `cliPluginsExtraDirs` from saved config are not loaded.
 Saved `config.json` credentials and proxy settings are not read or passed.
-Each command has an eight-second deadline and a 1 MiB stdout cap. Process
-resource exhaustion may cause a generic validation or status failure.
+Discovery, validation, status, and one-shot log subprocesses have an eight-
+second deadline per command. Imported start/stop allows 30 seconds for the
+lifecycle command after bounded validation commands; each command has a 1 MiB
+stdout cap. Process resource exhaustion may cause generic validation, status, or
+lifecycle failure.
 
 Linux local Compose discovery and single-file validation, loopback-loader,
 ordered multi-file temporary-file, and read-only temporary-project status

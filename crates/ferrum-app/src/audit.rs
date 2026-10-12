@@ -202,6 +202,83 @@ pub(super) fn record_container_action_result(
         None,
     )
 }
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+pub(super) enum ComposeMutationAction {
+    Start,
+    Stop,
+}
+
+#[cfg(target_os = "linux")]
+impl ComposeMutationAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+pub(super) enum ComposeMutationOutcome {
+    Started,
+    Success,
+    NotSubmitted,
+    RequestError,
+}
+
+#[cfg(target_os = "linux")]
+impl ComposeMutationOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Success => "success",
+            Self::NotSubmitted => "not_submitted",
+            Self::RequestError => "request_error",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn record_compose_mutation_result(
+    action: ComposeMutationAction,
+    outcome: ComposeMutationOutcome,
+) -> AuditRecord {
+    let outcome_label = outcome.label();
+    match outcome {
+        ComposeMutationOutcome::Started => tracing::info!(
+            target: "ferrum::audit",
+            audit_event = "compose_mutation",
+            action = action.label(),
+            outcome = outcome_label,
+            "Compose lifecycle attempt started"
+        ),
+        ComposeMutationOutcome::Success => tracing::info!(
+            target: "ferrum::audit",
+            audit_event = "compose_mutation",
+            action = action.label(),
+            outcome = outcome_label,
+            "Compose lifecycle command completed"
+        ),
+        ComposeMutationOutcome::NotSubmitted | ComposeMutationOutcome::RequestError => {
+            tracing::warn!(
+                target: "ferrum::audit",
+                audit_event = "compose_mutation",
+                action = action.label(),
+                outcome = outcome_label,
+                "Compose lifecycle command did not complete successfully"
+            )
+        }
+    }
+    AuditRecord::new(
+        "compose_mutation",
+        action.label(),
+        outcome_label,
+        None,
+        None,
+    )
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum NetworkMutation {
@@ -490,6 +567,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::record_volume_remove_result;
     #[cfg(target_os = "linux")]
+    use super::{ComposeMutationAction, ComposeMutationOutcome, record_compose_mutation_result};
+    #[cfg(target_os = "linux")]
     use super::{
         ImageBuildOutcome, ImageMutation, record_image_build_result, record_image_mutation_result,
     };
@@ -618,6 +697,75 @@ mod tests {
             assert!(line.contains(&format!("outcome=\"{outcome}\"")));
         }
         assert!(!output.contains("TOKEN=sentinel"));
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compose_mutation_audit_is_static_and_contains_no_project_metadata() {
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(writer.clone())
+            .finish();
+        let dispatcher = tracing::Dispatch::new(subscriber);
+        let attempts = [
+            (
+                ComposeMutationAction::Start,
+                ComposeMutationOutcome::Started,
+                "start",
+                "started",
+            ),
+            (
+                ComposeMutationAction::Start,
+                ComposeMutationOutcome::Success,
+                "start",
+                "success",
+            ),
+            (
+                ComposeMutationAction::Stop,
+                ComposeMutationOutcome::NotSubmitted,
+                "stop",
+                "not_submitted",
+            ),
+            (
+                ComposeMutationAction::Start,
+                ComposeMutationOutcome::RequestError,
+                "start",
+                "request_error",
+            ),
+        ];
+        let records = tracing::dispatcher::with_default(&dispatcher, || {
+            attempts.map(|(action, outcome, _, _)| {
+                serde_json::to_string(&record_compose_mutation_result(action, outcome))
+                    .expect("the static Compose audit record should serialize")
+            })
+        });
+
+        for ((_, _, action, outcome), record) in attempts.iter().zip(&records) {
+            assert!(record.contains("\"event\":\"compose_mutation\""));
+            assert!(record.contains(&format!("\"action\":\"{action}\"")));
+            assert!(record.contains(&format!("\"outcome\":\"{outcome}\"")));
+            assert!(!record.contains("container_id"));
+            assert!(!record.contains("network_id"));
+            assert!(!record.contains("project"));
+            assert!(!record.contains("path"));
+            assert!(!record.contains("diagnostic"));
+        }
+        let captured = match writer.0.lock() {
+            Ok(output) => output.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let events = String::from_utf8(captured).expect("audit events should be UTF-8");
+        let events = events.lines().collect::<Vec<_>>();
+        assert_eq!(events.len(), attempts.len());
+        for (line, (_, _, action, outcome)) in events.iter().zip(attempts) {
+            assert!(line.contains("audit_event=\"compose_mutation\""));
+            assert!(line.contains(&format!("action=\"{action}\"")));
+            assert!(line.contains(&format!("outcome=\"{outcome}\"")));
+            assert!(!line.contains("label="));
+            assert!(!line.contains("path="));
+            assert!(!line.contains("project="));
+        }
     }
     #[cfg(target_os = "linux")]
     #[test]

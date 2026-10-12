@@ -3,11 +3,11 @@
 The Compose page provides read-only project discovery, structural validation of
 a local base file with ordered overrides, a list of every service declared in
 the selected files (including profile-gated services regardless of active
-profiles), and read-only status for existing containers. The declared-service
-list is local Compose CLI/file-derived and does not query an Engine; it is
-separate from running-container status. A validated selection can be imported
-under a local display label for the current application session only; it is
-not persisted or treated as an Engine-discovered project.
+profiles), and read-only status for existing containers. It also supports
+explicit `start` and `stop` only for the selected, imported, and revalidated
+configuration. The declared-service list is local Compose CLI/file-derived and
+does not query an Engine; it is separate from running-container status. Imports
+are session-only labels, never Engine-discovered project identities.
 Project discovery uses Docker's Compose CLI:
 
 - `docker compose version --short`
@@ -126,9 +126,10 @@ Ferrum clears inherited environment values, sets `COMPOSE_DISABLE_ENV_FILE=1`,
 and sets `COMPOSE_EXPERIMENTAL_GIT_REMOTE=false` and
 `COMPOSE_EXPERIMENTAL_OCI_REMOTE=false`. No user environment files are passed
 by Ferrum itself; included projects may still read their default `.env` and
-explicit `include.env_file` under the logged-in user's permissions. Each CLI
-command has an eight-second deadline and a 1 MiB stdout cap; raw stderr and
-diagnostics are discarded.
+explicit `include.env_file` under the logged-in user's permissions. Discovery,
+validation, status, and one-shot log subprocesses have an eight-second deadline
+per command; imported start/stop has a 30-second command bound after validation.
+Each call has a 1 MiB stdout cap; raw stderr and diagnostics are discarded.
 
 CLI processes use a private isolated Docker config and `HOME` with a cleared
 allowlisted environment. If Compose is installed in the standard per-user CLI
@@ -154,12 +155,11 @@ escaped container name, service, optional per-container `Project` metadata,
 state, and reported health. When Compose omits `Project`, the row shows
 `Not reported`; rows may report different values. This engine-reported label is
 untrusted metadata: it does not establish file ownership, canonical project
-identity, authentication, or authorization, and it is not used by lifecycle
-operations (none are available). Ferrum discards container IDs, command text,
-published ports, exit-code data, and other response fields. No output means no
-existing containers for that selection; it does not mean the Compose file
-declares no services. The page does not poll automatically; refresh status when
-needed.
+identity, authentication, or authorization, and it does not determine lifecycle
+scope. Ferrum discards container IDs, command text, published ports, exit-code
+data, and other response fields. No output means no existing containers for that
+selection; it does not mean the Compose file declares no services. The page does
+not poll automatically; refresh status when needed.
 Status also clears inherited environment values and disables the selected
 project's default `.env`. Values normally supplied by the shell or that file may
 therefore resolve differently; status can fail or match a different project
@@ -169,17 +169,73 @@ snapshot, not proof that another environment or context has no containers.
 See Docker's [Compose `ps` reference](https://docs.docker.com/reference/cli/docker/compose/ps/)
 for the JSON Lines format and status command options.
 
-Status is implemented only for Linux local Docker Unix sockets. It does not
-persist a project, start/stop/restart containers, build/pull images, or mutate
-project or Engine resources. The command uses Ferrum's private Docker config/HOME
-and cleared environment; the selected project's default `.env` is disabled, and
-remote Git/OCI loaders are disabled. If Compose cannot resolve the selected
-project under this isolated environment, Ferrum shows a static status error
-rather than raw CLI output. Compose may still read local files referenced by
-`include` or `extends.file` and included-project environment sources under the
-logged-in user's permissions; validate only trusted files.
-The command uses the same subprocess timeout, output cap, and per-process
-resource limits described above.
+Status is implemented only for Linux local Docker Unix sockets. The status query
+itself is read-only; lifecycle actions are separately documented below. It uses
+Ferrum's private Docker config/HOME and cleared environment; the selected
+project's default `.env` is disabled, and remote Git/OCI loaders are disabled.
+If Compose cannot resolve the selected project under this isolated environment,
+Ferrum shows a static status error rather than raw CLI output. Compose may still
+read local files referenced by `include` or `extends.file` and included-project
+environment sources under the logged-in user's permissions; validate only
+trusted files. The command uses the same subprocess timeout, output cap, and
+per-process resource limits described above.
+
+## Start and stop an imported configuration
+
+The Linux local Docker-socket page exposes **Start imported project** and
+**Stop imported project** only when the current selection was imported for this
+session and then explicitly validated successfully. Selecting an import clears
+old validation/status/log data; revalidate before either action. The local
+import label is display-only and is never passed as `--project-name`. The
+untrusted per-container `Project` metadata is also not used to choose or
+authorize the target. Scope is the selected ordered files/profiles and the
+currently selected local socket.
+
+Before each action, Ferrum revalidates the current files and profiles with the
+same structural validation command. The confirmation names the imported local
+label, ordered safe file basenames, selected profiles, and requested action;
+cancelling it sends no command. Confirmation is rejected if the imported label,
+ordered files, profiles, or successful validation no longer match its snapshot.
+If validation fails, no lifecycle command is sent. On success, Ferrum invokes
+the installed Docker Compose CLI with argument arrays:
+
+```text
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... start
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... stop
+```
+
+Only `start` and `stop` are supported in this slice. Docker Compose `start` starts
+existing containers; it does not create, build, or pull. `stop` stops running
+containers without removing them. The commands preserve the selected file
+ordering, active profile arguments, and base-parent project directory; Ferrum
+does not add an import-label project name. Commands use Ferrum's private Docker
+CLI config/HOME, cleared environment, disabled selected project `.env`,
+disabled remote Git/OCI loaders, an eight-second per-command validation bound,
+and a 30-second lifecycle-command deadline, 1 MiB output cap, and Linux
+process resource limits. As with validation and status, Compose may still read
+trusted local `include`/`extends.file` files and included-project environment
+files under the logged-in user's permissions; this is not a sandbox.
+
+Lifecycle tasks remain owned by the app when navigating away; leaving Compose
+does not cancel a command that may already have been accepted by the Engine.
+Context switching is blocked while a lifecycle command is pending. After
+completion Ferrum refreshes read-only status only if the same imported files,
+profiles, validation, and selected context remain current; otherwise refresh
+manually after returning to that configuration. Ferrum records only static
+`start`/`stop` action and `started`, `success`, `not_submitted`, or
+`request_error` outcomes in its best-effort local audit history. A `started`
+record is written before preflight; with no later terminal outcome, Ferrum exited
+or final audit persistence failed, and the Engine result is unknown. `not_submitted`
+means preflight/validation or any process-spawn failure before the lifecycle
+process starts; a returned failure or timeout after process start is
+`request_error`. Audit persistence failure does not change the operation result.
+During shutdown Ferrum makes a best-effort, up-to-one-second flush of the
+initial audit marker before aborting the lifecycle worker. A submitted child
+may still be terminated, leaving Engine state uncertain; refresh after restart.
+Raw diagnostics, paths, labels, profiles, endpoint values, and service names
+are not audited or shown as command diagnostics. `up`, `down`, restart, create,
+build, pull, remove,
+persistence, and live log follow remain outside this partial Issue #18 slice.
 
 ## One-shot service log snapshot
 
@@ -239,34 +295,34 @@ docker --host unix://<selected-socket> compose --project-directory <base-parent>
 ```
 
 Selected profiles are passed to structural validation, existing-container
-status, and one-shot service logs. The `config --services` inventory includes
-every service declared in the selected files regardless of the active profile
-set. The status recheck immediately before logs uses the same profiles as the
-earlier status query. Profile flags are separate argument-array entries, never
-environment variables. CLI invocations retain Ferrum's private Docker config/HOME and cleared
-allowlisted environment, including disabling the selected project's default
-`.env` and remote Git/OCI loaders. Invalid profile input, or changing the
-selection, clears validation, declared services, status, and logs and cancels
-active Compose work; validate again before refreshing status or requesting
-logs. Profiles and transient imports do not start, stop, restart, build, pull,
-or otherwise manage project lifecycle.
+status, one-shot service logs, and imported-configuration start/stop. The
+`config --services` inventory includes every service declared in the selected
+files regardless of the active profile set. The status recheck immediately
+before logs uses the same profiles as the earlier status query. Profile flags
+are separate argument-array entries, never environment variables. CLI
+invocations retain Ferrum's private Docker config/HOME and cleared allowlisted
+environment, including disabling the selected project's default `.env` and
+remote Git/OCI loaders. Invalid profile input or changing the selection clears
+validation, declared services, status, and logs and cancels their in-flight
+tasks; validate again before refreshing status or requesting logs. Lifecycle
+operations already submitted are not cancelled by selection or navigation.
 
 See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
 and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
 
-Project persistence, lifecycle management (start/stop/restart/build/pull), live
-log follow, and project mutations remain unsupported. Transient import is
-session-only and does not persist files or project state. Structural validation
-skips interpolation and service `env_file` resolution; status uses the isolated
-environment above and may differ from a normal shell invocation. Profile
-selection applies to structural validation, status, and one-shot service logs.
-The declared-service inventory lists all services in the selected files,
-including services whose profiles are not selected.
-Status reports only existing containers; the separately shown declared-service
+Project persistence, restart/build/pull/up/down/removal, live log follow, and
+project-file mutation remain unsupported. Transient import is session-only and
+does not persist files or project state. Structural validation skips
+interpolation and service `env_file` resolution; status uses the isolated
+environment above and may differ from a normal shell invocation. Start/stop
+use only the currently selected imported and revalidated configuration, as
+described above. The declared-service inventory lists all services in the
+selected files, including services whose profiles are not selected. Status
+reports only existing containers; the separately shown declared-service
 inventory comes from local Compose configuration and does not query the Engine.
 Issue [#18](https://github.com/SzymonR1/ferrum-desktop/issues/18)
-remains open/partial; [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10)
-remains blocked. This is not a full-issue, release, or broader platform claim.
+remains partial/open; [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10)
+remains open/blocked. This is not a full-issue, release, or broader platform claim.
 
 The direct CLI probe and discovery smoke, single-file and ordered base/override
 temporary-file validation smokes, and loopback remote-loader safety smoke

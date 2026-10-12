@@ -3,6 +3,28 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Implemented (not live-engine validated) a confirmed Compose lifecycle slice
+  for a currently selected, session-imported configuration after successful
+  explicit revalidation. The
+  Linux-only `start`/`stop` commands use the selected ordered `--file` and
+  `--profile` argv, base project directory, isolated CLI environment, and
+  pinned local socket, and revalidate before mutation. The confirmation names
+  the imported local label, safe ordered file basenames, profiles, and action;
+  cancellation submits nothing. `start` only starts existing containers and
+  `stop` does not remove them. The import label and Engine-reported `Project`
+  field are not passed as project identity or used for scope. Pending work
+  survives page navigation, blocks context switching, and refreshes status on
+  completion only when the same selection/context remains current. Audit stores
+  only static action/outcome values; where the initial write succeeds, a
+  `started` record remains if shutdown interrupts before a terminal result, but
+  does not prove Engine submission or completion. Returned failures/timeouts or
+  application shutdown may leave Engine state uncertain; refresh status. No
+  live lifecycle command or resource mutation was tested. Issue #18 remains
+  partial/open; Issue #10 remains open/blocked.
+- Fixed imported-configuration selection so choosing a session entry restores
+  its ordered files/profiles and invalidates stale validation. An unsubmitted
+  confirmation is cleared on page invalidation and cannot be confirmed while
+  the engine or Compose configuration is unavailable.
 - Added transient in-memory Compose configuration imports for a currently
   validated ordered file/profile selection. Unique local display labels (up to
   256 UTF-8 bytes) and absolute file/profile selections are retained for this
@@ -12,19 +34,17 @@ All notable project changes are documented here. The project has not published a
   treated as canonical identity, file ownership, or authorization. Selecting
   an import cancels in-flight validation/status/log tasks, restores exact file
   order and profiles, and invalidates old results; explicit revalidation is
-  required before status/log queries. Import starts no CLI/Engine operation;
-  selection starts no new command or Engine request. Neither action mutates,
-  copies, or persists files or manages project lifecycle. Documentation preserves
-  the warning that Compose `include` and `extends.file` can read trusted local
-  files outside the explicit selection.
+  required before status/log or lifecycle actions. Import itself starts no
+  CLI/Engine operation; neither import nor selection mutates, copies, or
+  persists files. Documentation preserves the warning that Compose `include`
+  and `extends.file` can read trusted local files outside the explicit selection.
 - Added bounded, escaped optional per-container `Project` metadata to the
   read-only Compose status parser and virtualized container rows. Missing values
   render as `Not reported`; rows remain independent, and the label is untrusted
   engine-reported metadata that proves neither file ownership nor authorization
-  and has no lifecycle use. No project lifecycle support is added. Deterministic
-  parser and headless UI regressions cover mixed, omitted, invalid, escaped,
-  stale, and cleared values. The real-engine status smoke returned no rows, so
-  this field was not observed from an engine in this cycle.
+  and does not scope lifecycle actions. Deterministic parser and headless UI
+  regressions cover mixed, omitted, invalid, escaped, stale, and cleared values.
+  This field was not observed from an engine in this cycle.
 - Added explicit Compose profile selection for structural validation,
   read-only status, and one-shot service-log snapshots. Input is
   comma-separated, trims outer whitespace per token, and blank means no
@@ -35,10 +55,9 @@ All notable project changes are documented here. The project has not published a
   `logs`, never via an environment variable, and reuses the selection for the
   status recheck before logs. Invalid or changed selection clears results,
   cancels in-flight work, and requires revalidation. Private Docker config/HOME
-  and the cleared environment remain in effect. No persistent project import,
-  start/stop/restart, build/pull, live log follow, or project mutation is added.
-  See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
-  and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
+  and the cleared environment remain in effect. No persistent project storage,
+  build/pull, live log follow, or project file mutation is added. Imported
+  configurations may use the separately documented start/stop slice.
   Issue #18 remains partial/open.
 - Added a bounded read-only declared-service inventory to successful Linux
   Compose validation using the same `config --services` command, selected
