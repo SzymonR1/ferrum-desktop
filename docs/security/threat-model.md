@@ -89,12 +89,16 @@ local Docker Unix socket is connected. Ferrum runs
 `docker --host unix://<selected-socket> compose --project-directory <base-parent> --file ... ps --all --format json`.
 The query is read-only; it does not create, start, stop, remove, or change
 containers or project files. `--all` includes stopped containers and Compose's
-default orphan inclusion is preserved. Ferrum retains only bounded, escaped
-container name, service, state, and optional health; it discards IDs, commands,
-published ports, project labels, exit codes, and unknown fields. Empty output
-means no existing containers matched the isolated project selection, not that
-the file declares no services. Status is a manually refreshed point-in-time
-snapshot.
+default orphan inclusion is preserved. Ferrum retains bounded, escaped
+container name, service, optional per-container `Project` metadata, state, and
+optional health; when `Project` is omitted, the UI shows `Not reported`. Values
+may vary row by row. The Project value is untrusted engine-reported display
+metadata only; it does not establish file ownership, canonical identity,
+authentication, or authorization and is never used for lifecycle operations.
+Ferrum discards IDs, commands, published ports, exit codes, and unknown fields.
+Empty output means no existing containers matched the isolated project
+selection, not that the file declares no services. Status is a manually
+refreshed point-in-time snapshot.
 
 Status uses a private CLI configuration, clears inherited shell variables, and
 sets `COMPOSE_DISABLE_ENV_FILE=1`. Environment-dependent projects may fail or

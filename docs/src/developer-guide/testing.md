@@ -415,6 +415,13 @@ are escaped and shown separately from container status in a virtualized list
 with success, empty, error, loading, and stale-result headless coverage. The
 inventory is not a running-container list and listing does not trigger status
 or logs.
+Container-status parser regressions cover optional per-row `Project` metadata,
+missing versus reported values, mixed rows, escaping, required nonempty strings,
+the field-byte cap, wrong types/null, duplicate keys, and all-or-nothing output.
+Headless status coverage verifies per-container `Project` labels and the
+`Not reported` marker alongside existing empty, cancellation, clear, and
+stale-result behavior. These fixtures do not establish that a live Engine
+reported the field.
 
 Compose profile coverage uses controlled CLI fixtures and headless state checks;
 it does not contact a live engine or user project. Unit tests cover blank input

@@ -126,12 +126,17 @@ docker --host unix://<selected-socket> compose --project-directory <base-parent>
 ```
 
 This is a read-only status snapshot. `--all` includes stopped containers; the
-Compose CLI's default orphan inclusion is preserved. Ferrum displays only
-bounded, escaped container name, service, state, and reported health. It discards
-container IDs, command text, published ports, project labels, exit-code data,
-and other response fields. No output means no existing containers for that
-selection; it does not mean the Compose file declares no services. The page
-does not poll automatically; refresh status when needed.
+Compose CLI's default orphan inclusion is preserved. Ferrum displays bounded,
+escaped container name, service, optional per-container `Project` metadata,
+state, and reported health. When Compose omits `Project`, the row shows
+`Not reported`; rows may report different values. This engine-reported label is
+untrusted metadata: it does not establish file ownership, canonical project
+identity, authentication, or authorization, and it is not used by lifecycle
+operations (none are available). Ferrum discards container IDs, command text,
+published ports, exit-code data, and other response fields. No output means no
+existing containers for that selection; it does not mean the Compose file
+declares no services. The page does not poll automatically; refresh status when
+needed.
 Status also clears inherited environment values and disables the selected
 project's default `.env`. Values normally supplied by the shell or that file may
 therefore resolve differently; status can fail or match a different project
