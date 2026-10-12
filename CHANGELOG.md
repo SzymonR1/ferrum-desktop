@@ -3,6 +3,10 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Corrected the threat model, settings, architecture diagram, and Engine API docs
+  to distinguish anonymous-by-default Linux local-Docker pull and push flows
+  with separate per-operation helper opt-ins from deferred credential
+  persistence, other engines, and remote identity support.
 - Extended the confirmed imported-configuration Compose lifecycle slice with
   service-scoped `restart --no-deps SERVICE` on Linux local Docker Unix sockets.
   Restart is offered only beside a service in the current successful status

@@ -72,8 +72,8 @@ const MAX_REGISTRY_AUTH_SECRET_BYTES: usize = 32 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_REGISTRY_AUTH_SERVER_ADDRESS_BYTES: usize = 512;
 
-/// Opaque pull-only registry authorization value. Its contents are never
-/// included in `Debug` output.
+/// Opaque per-operation registry authorization value for an explicitly opted-in
+/// pull or push request. Its contents are never included in `Debug` output.
 #[cfg(target_os = "linux")]
 pub struct RegistryAuth {
     encoded: Zeroizing<String>,
