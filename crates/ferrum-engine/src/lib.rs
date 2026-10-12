@@ -46,6 +46,8 @@ use contexts::{
 };
 
 #[cfg(target_os = "linux")]
+use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+#[cfg(target_os = "linux")]
 use ferrum_core::ImagePushTarget;
 use ferrum_core::{
     ContainerAction, ContainerChange, ContainerDetails, ContainerMount, ContainerState,
@@ -60,6 +62,94 @@ use serde::{
     de::{DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 use thiserror::Error;
+#[cfg(target_os = "linux")]
+use zeroize::Zeroizing;
+
+#[cfg(target_os = "linux")]
+const MAX_REGISTRY_AUTH_USERNAME_BYTES: usize = 4 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_REGISTRY_AUTH_SECRET_BYTES: usize = 32 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_REGISTRY_AUTH_SERVER_ADDRESS_BYTES: usize = 512;
+
+/// Opaque pull-only registry authorization value. Its contents are never
+/// included in `Debug` output.
+#[cfg(target_os = "linux")]
+pub struct RegistryAuth {
+    encoded: Zeroizing<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for RegistryAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RegistryAuth([REDACTED])")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RegistryAuth {
+    /// Builds a Docker Engine AuthConfig from credential-helper `Username`,
+    /// `Secret`, and the canonical registry server key. Docker Hub's canonical
+    /// key includes its `https://index.docker.io/v1/` URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImagePullCredentialUnavailable` when a field is empty,
+    /// oversized, or contains an invalid server-address character.
+    pub fn from_helper_credentials(
+        username: String,
+        secret: String,
+        server_address: &str,
+    ) -> Result<Self, EngineError> {
+        #[derive(Serialize)]
+        struct UserPassword<'a> {
+            username: &'a str,
+            password: &'a str,
+            serveraddress: &'a str,
+        }
+        #[derive(Serialize)]
+        struct IdentityToken<'a> {
+            #[serde(rename = "identitytoken")]
+            identity_token: &'a str,
+            serveraddress: &'a str,
+        }
+        let username = Zeroizing::new(username);
+        let secret = Zeroizing::new(secret);
+        if username.is_empty()
+            || secret.is_empty()
+            || username.len() > MAX_REGISTRY_AUTH_USERNAME_BYTES
+            || secret.len() > MAX_REGISTRY_AUTH_SECRET_BYTES
+            || server_address.is_empty()
+            || server_address.len() > MAX_REGISTRY_AUTH_SERVER_ADDRESS_BYTES
+            || !server_address.is_ascii()
+            || server_address
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        {
+            return Err(EngineError::ImagePullCredentialUnavailable);
+        }
+        let json = if username.as_str() == "<token>" {
+            serde_json::to_vec(&IdentityToken {
+                identity_token: secret.as_str(),
+                serveraddress: server_address,
+            })
+        } else {
+            serde_json::to_vec(&UserPassword {
+                username: username.as_str(),
+                password: secret.as_str(),
+                serveraddress: server_address,
+            })
+        }
+        .map_err(|_| EngineError::ImagePullCredentialUnavailable)?;
+        let json = Zeroizing::new(json);
+        let encoded = Zeroizing::new(URL_SAFE.encode(json.as_slice()));
+        Ok(Self { encoded })
+    }
+
+    fn header_value(&self) -> &str {
+        self.encoded.as_str()
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,8 +175,11 @@ const MAX_INSPECT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_NETWORK_MEMBERSHIP_ENTRIES: usize = 16_384;
 #[cfg(target_os = "linux")]
 const MAX_LIST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ENGINE_LIST_ITEMS: usize = 65_536;
 #[cfg(target_os = "linux")]
-const MAX_IMAGE_HISTORY_ROWS: usize = 65_536;
+const MAX_ENGINE_LIST_TOTAL_ITEMS: usize = MAX_ENGINE_LIST_ITEMS * 4;
+#[cfg(target_os = "linux")]
+const MAX_IMAGE_HISTORY_ROWS: usize = MAX_ENGINE_LIST_ITEMS;
 #[cfg(target_os = "linux")]
 const MAX_VERSION_RESPONSE_BYTES: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
@@ -100,6 +193,258 @@ const MAX_VOLUME_CREATE_REQUEST_BYTES: usize = 16 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_VOLUME_CREATE_RESPONSE_BYTES: usize = 64 * 1024;
 
+struct BoundedSequence<T>(Vec<T>);
+impl<T> Default for BoundedSequence<T> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<'de, T> Deserialize<'de> for BoundedSequence<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BoundedSequenceVisitor<T>(std::marker::PhantomData<T>);
+
+        impl<'de, T> Visitor<'de> for BoundedSequenceVisitor<T>
+        where
+            T: Deserialize<'de>,
+        {
+            type Value = BoundedSequence<T>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an array with a bounded number of items")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let capacity = sequence
+                    .size_hint()
+                    .unwrap_or_default()
+                    .min(MAX_ENGINE_LIST_ITEMS);
+                let mut items = Vec::with_capacity(capacity);
+                for _ in 0..MAX_ENGINE_LIST_ITEMS {
+                    let Some(item) = sequence.next_element()? else {
+                        return Ok(BoundedSequence(items));
+                    };
+                    items.push(item);
+                }
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(<A::Error as serde::de::Error>::custom(
+                        "too many engine inventory items",
+                    ));
+                }
+                Ok(BoundedSequence(items))
+            }
+        }
+
+        deserializer.deserialize_seq(BoundedSequenceVisitor(std::marker::PhantomData))
+    }
+}
+
+fn deserialize_optional_bounded_sequence<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<BoundedSequence<T>>::deserialize(deserializer)
+        .map(|sequence| sequence.map(|sequence| sequence.0))
+}
+#[cfg(target_os = "linux")]
+struct JsonArrayItemCounter<'a>(&'a mut usize);
+
+#[cfg(target_os = "linux")]
+impl<'de> DeserializeSeed<'de> for JsonArrayItemCounter<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(JsonArrayItemCounterVisitor(self.0))
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct JsonArrayItemSeed<'a>(&'a mut usize);
+
+#[cfg(target_os = "linux")]
+impl<'de> DeserializeSeed<'de> for JsonArrayItemSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if *self.0 == 0 {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "too many engine inventory array items",
+            ));
+        }
+        *self.0 -= 1;
+        JsonArrayItemCounter(self.0).deserialize(deserializer)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct JsonArrayItemCounterVisitor<'a>(&'a mut usize);
+
+#[cfg(target_os = "linux")]
+impl<'de> Visitor<'de> for JsonArrayItemCounterVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let remaining = self.0;
+        while sequence
+            .next_element_seed(JsonArrayItemSeed(&mut *remaining))?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let remaining = self.0;
+        while map.next_key::<IgnoredAny>()?.is_some() {
+            map.next_value_seed(JsonArrayItemCounter(&mut *remaining))?;
+        }
+        Ok(())
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i128<E>(self, _value: i128) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u128<E>(self, _value: u128) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_borrowed_str<E>(self, _value: &'de str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn enforce_json_array_item_budget(body: &[u8], maximum: usize) -> Result<(), RequestJsonError> {
+    let mut remaining = maximum;
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    JsonArrayItemCounter(&mut remaining)
+        .deserialize(&mut deserializer)
+        .map_err(|_| RequestJsonError::JsonDecode)?;
+    deserializer.end().map_err(|_| RequestJsonError::JsonDecode)
+}
+
+#[cfg(target_os = "linux")]
+async fn request_bounded_inventory_json<T: DeserializeOwned>(
+    socket_path: &std::path::Path,
+    request_path: &str,
+) -> Result<T, RequestJsonError> {
+    request_json_with_decoder(
+        socket_path,
+        request_path,
+        MAX_LIST_RESPONSE_BYTES,
+        REQUEST_TIMEOUT,
+        |body| {
+            enforce_json_array_item_budget(body, MAX_ENGINE_LIST_TOTAL_ITEMS)?;
+            serde_json::from_slice(body).map_err(|_| RequestJsonError::JsonDecode)
+        },
+    )
+    .await
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod json_array_item_budget_tests {
+    use super::*;
+
+    #[test]
+    fn counts_nested_array_entries_and_rejects_the_first_excess_item() {
+        let body = br#"{"rows":[{"Names":["one","two"]}]}"#;
+        assert!(enforce_json_array_item_budget(body, 3).is_ok());
+        assert_eq!(
+            enforce_json_array_item_budget(body, 2),
+            Err(RequestJsonError::JsonDecode)
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn inventory_rows_json(count: usize, mut row: impl FnMut(usize) -> String) -> Vec<u8> {
+    let mut body = Vec::with_capacity(count.saturating_mul(64).saturating_add(2));
+    body.push(b'[');
+    for index in 0..count {
+        if index > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(row(index).as_bytes());
+    }
+    body.push(b']');
+    body
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod bounded_sequence_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_exact_limit_and_rejects_one_additional_item() {
+        let exact = inventory_rows_json(MAX_ENGINE_LIST_ITEMS, |_| "0".to_owned());
+        let decoded = serde_json::from_slice::<BoundedSequence<u8>>(&exact)
+            .expect("the exact inventory item limit is accepted");
+        assert_eq!(decoded.0.len(), MAX_ENGINE_LIST_ITEMS);
+
+        let over = inventory_rows_json(MAX_ENGINE_LIST_ITEMS + 1, |_| "0".to_owned());
+        assert!(
+            serde_json::from_slice::<BoundedSequence<u8>>(&over).is_err(),
+            "one extra item rejects the complete sequence"
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -112,6 +457,7 @@ struct VersionResponse {
 #[serde(rename_all = "PascalCase")]
 struct ContainerListItem {
     id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_bounded_sequence")]
     names: Option<Vec<String>>,
     image: Option<String>,
     state: Option<String>,
@@ -123,6 +469,7 @@ struct ContainerListItem {
 #[serde(rename_all = "PascalCase")]
 struct ImageListItem {
     id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_bounded_sequence")]
     repo_tags: Option<Vec<String>>,
     created: Option<i64>,
     size: Option<u64>,
@@ -197,7 +544,7 @@ impl<'de> Deserialize<'de> for ImageHistoryResponseList {
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct VolumeListResponse {
-    volumes: Option<Vec<VolumeResponse>>,
+    volumes: Option<BoundedSequence<VolumeResponse>>,
 }
 #[cfg(target_os = "linux")]
 #[derive(Deserialize)]
@@ -1679,6 +2026,13 @@ pub enum EngineError {
         /// HTTP response status.
         status: u16,
     },
+    /// Credential helper use failed before an image pull request was submitted.
+    #[cfg(target_os = "linux")]
+    #[error(
+        "Ferrum could not obtain or use credentials from the configured helper. Check the helper, or disable authentication for an anonymous pull."
+    )]
+    ImagePullCredentialUnavailable,
+
     /// The engine could not open the image pull progress stream.
     #[cfg(target_os = "linux")]
     #[error("Image pull progress is unavailable at the {endpoint_label}.")]
@@ -1727,6 +2081,12 @@ pub enum EngineError {
         /// Non-secret description of the endpoint kind.
         endpoint_label: &'static str,
     },
+    /// The configured credential helper failed before an image push was submitted.
+    #[cfg(target_os = "linux")]
+    #[error(
+        "Ferrum could not obtain or use credentials from the configured helper for this image push."
+    )]
+    ImagePushCredentialUnavailable,
     /// The image-push request could not reach the local engine.
     #[cfg(target_os = "linux")]
     #[error("Image pushing is unavailable at the {endpoint_label}.")]
@@ -1772,7 +2132,7 @@ pub enum EngineError {
     },
     /// The engine reported that the image push failed.
     #[cfg(target_os = "linux")]
-    #[error("The engine could not complete the anonymous image push.")]
+    #[error("The engine could not complete the image push.")]
     ImagePushFailed,
     /// An image inspection response omitted its required engine identifier.
     #[cfg(target_os = "linux")]
@@ -1996,34 +2356,38 @@ impl EngineClient {
             })
         }
     }
-    /// Opens an anonymous Docker image pull and streams bounded progress.
+    /// Opens a Docker image pull and streams bounded progress.
     ///
-    /// The reference must be nonempty, at most 512 bytes, and contain no ASCII
-    /// whitespace or control characters. Registry credentials are never read
-    /// or sent. Dropping the returned stream cancels Ferrum's HTTP response
-    /// stream, but does not guarantee that the daemon-side pull stops. Progress
-    /// reads use a 60-second idle timeout.
+    /// `registry_auth`, when supplied, is an opaque `RegistryAuth` containing
+    /// the Moby-compatible padded base64url `X-Registry-Auth` JSON value.
+    /// `None` preserves the anonymous request. Dropping the stream closes
+    /// Ferrum's response stream but does not guarantee daemon-side cancellation.
+    /// Progress reads use a 60-second idle timeout.
     ///
     /// # Errors
     ///
     /// Returns `InvalidImageReference` for an invalid reference,
-    /// `ImagePullRejected` when the engine rejects the request, or a safe
-    /// availability/timeout error when the stream cannot be opened.
+    /// `ImagePullRejected` when the selected engine rejects the request, or a
+    /// safe availability/timeout error when the stream cannot be opened.
     #[cfg(target_os = "linux")]
-    pub async fn open_image_pull(&self, reference: &str) -> Result<ImagePullStream, EngineError> {
-        image_pull::open_image_pull(self, reference).await
+    pub async fn open_image_pull(
+        &self,
+        reference: &str,
+        registry_auth: Option<&RegistryAuth>,
+    ) -> Result<ImagePullStream, EngineError> {
+        image_pull::open_image_pull(self, reference, registry_auth).await
     }
-    /// Opens an anonymous push for one explicitly tagged local image.
+    /// Opens a push for one explicitly tagged local image.
     ///
     /// The target must be an existing repository:tag reference on the selected
     /// image. Ferrum reinspects the image before pushing and refuses if the tag
     /// no longer belongs to that image. The request includes the explicit tag,
-    /// so it never invokes Docker's all-tags push behavior. No registry
-    /// credential store or helper is read; the anonymous request omits
-    /// X-Registry-Auth and sends only an empty JSON auth fallback body.
+    /// so it never invokes Docker's all-tags push behavior. When `registry_auth`
+    /// is present, its opaque value is sent in `X-Registry-Auth`; otherwise the
+    /// request omits that header. Both paths send an empty JSON auth fallback
+    /// body. This method never reads a credential helper or store.
     /// Progress text is bounded and sanitized. Dropping the stream closes
-    /// Ferrum's response stream but does not guarantee the daemon-side transfer
-    /// stops.
+    /// Ferrum's response stream but does not guarantee daemon-side cancellation.
     ///
     /// # Errors
     ///
@@ -2038,8 +2402,9 @@ impl EngineClient {
         &self,
         image_id: &str,
         target: &ImagePushTarget,
+        registry_auth: Option<&RegistryAuth>,
     ) -> Result<ImagePushStream, EngineError> {
-        image_push::open_image_push(self, image_id, target).await
+        image_push::open_image_push(self, image_id, target, registry_auth).await
     }
 }
 impl EngineClient {
@@ -2049,7 +2414,10 @@ impl EngineClient {
     /// A non-empty `DOCKER_CONTEXT` takes precedence and must name a local
     /// Unix-socket context. Otherwise `DOCKER_HOST` retains its existing local
     /// Unix-socket behavior; absent that, a current non-default CLI context is
-    /// used before checking `$XDG_RUNTIME_DIR/docker.sock` and `/var/run/docker.sock`.
+    /// used before checking `$XDG_RUNTIME_DIR/docker.sock`,
+    /// `$XDG_RUNTIME_DIR/podman/podman.sock`, and `/var/run/docker.sock` in that
+    /// order. The Podman path is a discovery candidate only; compatibility is
+    /// unvalidated.
     /// Socket permissions are left to the operating system; this method never
     /// elevates privileges.
     ///
@@ -2261,30 +2629,31 @@ impl EngineClient {
     /// Returns every container, including stopped containers, from the
     /// connected engine.
     ///
+    /// The 16 MiB response limit is combined with a 65,536-item cap per
+    /// array and a 262,144-item budget across the response. Excess data rejects
+    /// the complete inventory; Ferrum does not return a partial list.
+    ///
     /// # Errors
     ///
-    /// Returns an API error when the engine cannot provide the inventory or a
-    /// response omits a container identifier.
+    /// Returns a safe typed error when the engine cannot provide a bounded
+    /// inventory or a response omits a container identifier.
     pub async fn list_containers(&self) -> Result<Vec<ContainerSummary>, EngineError> {
         #[cfg(target_os = "linux")]
         {
             let endpoint_label = self.info.endpoint_label;
             let path = format!("/v{}/containers/json?all=true", self.api_version);
-            let containers: Vec<ContainerListItem> = request_json(
-                &self.socket_path,
-                &path,
-                MAX_LIST_RESPONSE_BYTES,
-                REQUEST_TIMEOUT,
-            )
-            .await
-            .map_err(|_| {
-                if self.selected_context.is_some() {
-                    EngineError::ContextInventoryRequest
-                } else {
-                    EngineError::InventoryRequest { endpoint_label }
-                }
-            })?;
+            let containers: BoundedSequence<ContainerListItem> =
+                request_bounded_inventory_json(&self.socket_path, &path)
+                    .await
+                    .map_err(|_| {
+                        if self.selected_context.is_some() {
+                            EngineError::ContextInventoryRequest
+                        } else {
+                            EngineError::InventoryRequest { endpoint_label }
+                        }
+                    })?;
             containers
+                .0
                 .into_iter()
                 .map(|container| map_container_summary(container, endpoint_label))
                 .collect()
@@ -2297,26 +2666,25 @@ impl EngineClient {
     /// Returns all images, including images unused by containers.
     ///
     /// Only the image identifier, repository tags, creation time, and size are
-    /// retained from the engine response.
+    /// retained from the engine response. The 16 MiB body limit is combined
+    /// with a 65,536-item cap per array and a 262,144-item response-wide budget;
+    /// excess data rejects the complete inventory.
     ///
     /// # Errors
     ///
-    /// Returns a safe typed error if the inventory request fails, the response
-    /// is invalid or oversized, or an image omits its identifier.
+    /// Returns a safe typed error if the request fails, the response is invalid
+    /// or over a configured bound, or an image omits its identifier.
     pub async fn list_images(&self) -> Result<Vec<ImageSummary>, EngineError> {
         #[cfg(target_os = "linux")]
         {
             let endpoint_label = self.info.endpoint_label;
             let path = format!("/v{}/images/json?all=true", self.api_version);
-            let images: Vec<ImageListItem> = request_json(
-                &self.socket_path,
-                &path,
-                MAX_LIST_RESPONSE_BYTES,
-                REQUEST_TIMEOUT,
-            )
-            .await
-            .map_err(|_| EngineError::ImageInventoryUnavailable { endpoint_label })?;
+            let images: BoundedSequence<ImageListItem> =
+                request_bounded_inventory_json(&self.socket_path, &path)
+                    .await
+                    .map_err(|_| EngineError::ImageInventoryUnavailable { endpoint_label })?;
             images
+                .0
                 .into_iter()
                 .map(|image| map_image_summary(image, endpoint_label))
                 .collect()
@@ -2330,28 +2698,26 @@ impl EngineClient {
     ///
     /// Only identity and the allowlisted scalar network fields are retained.
     /// Attached-container counts are not provided by the network list endpoint
-    /// and are available only as a point-in-time count from inspection.
+    /// and are available only as a point-in-time count from inspection. The
+    /// 16 MiB body limit is combined with a 65,536-item cap per array and a
+    /// 262,144-item response-wide array budget; excess data rejects the list.
     ///
     /// # Errors
     ///
-    /// Returns a safe typed error if the bounded local Unix-socket request
-    /// fails, the response is invalid or oversized, or any item lacks a
-    /// non-empty ID or name. Unsupported platforms return
-    /// `UnsupportedPlatform`.
+    /// Returns a safe typed error if the request fails, the response is invalid
+    /// or over a configured bound, or any item lacks a non-empty ID or name.
+    /// Unsupported platforms return `UnsupportedPlatform`.
     pub async fn list_networks(&self) -> Result<Vec<NetworkSummary>, EngineError> {
         #[cfg(target_os = "linux")]
         {
             let endpoint_label = self.info.endpoint_label;
             let path = format!("/v{}/networks", self.api_version);
-            let networks: Vec<NetworkResponse> = request_json(
-                &self.socket_path,
-                &path,
-                MAX_LIST_RESPONSE_BYTES,
-                REQUEST_TIMEOUT,
-            )
-            .await
-            .map_err(|_| EngineError::NetworkInventoryUnavailable { endpoint_label })?;
+            let networks: BoundedSequence<NetworkResponse> =
+                request_bounded_inventory_json(&self.socket_path, &path)
+                    .await
+                    .map_err(|_| EngineError::NetworkInventoryUnavailable { endpoint_label })?;
             networks
+                .0
                 .into_iter()
                 .map(|network| {
                     map_network(network)
@@ -2669,29 +3035,27 @@ impl EngineClient {
     /// Lists local volumes. Only name, driver, and scope are retained.
     ///
     /// A missing or null `Volumes` field is treated as an empty inventory, as
-    /// permitted by the Docker Engine API schema. Request failures and invalid
-    /// or oversized responses remain errors.
+    /// permitted by the Docker Engine API schema. The response has a 16 MiB
+    /// body cap, a 65,536-item per-array cap, and a 262,144-item aggregate
+    /// array-item budget; excess data rejects the complete inventory.
     ///
     /// # Errors
     ///
-    /// Returns a safe typed error if the bounded local-socket request fails or
-    /// the response is invalid or oversized. Unsupported platforms return
+    /// Returns a safe typed error if the request fails or the response is
+    /// invalid or over a configured bound. Unsupported platforms return
     /// `UnsupportedPlatform`.
     pub async fn list_volumes(&self) -> Result<Vec<VolumeSummary>, EngineError> {
         #[cfg(target_os = "linux")]
         {
             let endpoint_label = self.info.endpoint_label;
             let path = format!("/v{}/volumes", self.api_version);
-            let response: VolumeListResponse = request_json(
-                &self.socket_path,
-                &path,
-                MAX_LIST_RESPONSE_BYTES,
-                REQUEST_TIMEOUT,
-            )
-            .await
-            .map_err(|_| EngineError::VolumeInventoryUnavailable { endpoint_label })?;
+            let response: VolumeListResponse =
+                request_bounded_inventory_json(&self.socket_path, &path)
+                    .await
+                    .map_err(|_| EngineError::VolumeInventoryUnavailable { endpoint_label })?;
             response
                 .volumes
+                .map(|volumes| volumes.0)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|volume| {
@@ -3162,7 +3526,7 @@ impl EngineClient {
         }
     }
 
-    /// Opens the engine's incremental container event stream.
+    /// Opens an incremental container event stream starting at the current local time.
     ///
     /// # Errors
     ///
@@ -3170,8 +3534,13 @@ impl EngineClient {
     #[cfg(target_os = "linux")]
     pub async fn subscribe_container_changes(&self) -> Result<ContainerChangeStream, EngineError> {
         let endpoint_label = self.info.endpoint_label;
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| EngineError::ContainerEventsUnavailable { endpoint_label })?
+            .as_secs();
+        // Historical events are covered by the caller's inventory snapshot.
         let path = format!(
-            "/v{}/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D",
+            "/v{}/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D&since={since}",
             self.api_version
         );
         let result = timeout(REQUEST_TIMEOUT, async {
@@ -3412,11 +3781,22 @@ fn parse_container_event(line: &[u8]) -> Result<Option<ContainerChange>, ()> {
 
 #[cfg(target_os = "linux")]
 fn local_socket_candidates() -> Vec<(&'static str, PathBuf)> {
-    let mut candidates = Vec::with_capacity(2);
-    if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR") {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    local_socket_candidates_for(runtime_dir.as_deref())
+}
+#[cfg(target_os = "linux")]
+fn local_socket_candidates_for(
+    runtime_dir: Option<&std::path::Path>,
+) -> Vec<(&'static str, PathBuf)> {
+    let mut candidates = Vec::with_capacity(3);
+    if let Some(runtime_dir) = runtime_dir {
         candidates.push((
             "user runtime Docker socket",
-            PathBuf::from(runtime_dir).join("docker.sock"),
+            runtime_dir.join("docker.sock"),
+        ));
+        candidates.push((
+            "user runtime Podman socket",
+            runtime_dir.join("podman/podman.sock"),
         ));
     }
     candidates.push((
@@ -4263,6 +4643,138 @@ mod container_inspection_tests {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+mod container_inventory_api_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixListener,
+    };
+
+    static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_directory() -> std::path::PathBuf {
+        let sequence = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "ferrum-container-list-{}-{}-{sequence}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&directory).expect("temporary directory should be created");
+        directory
+    }
+
+    fn client(socket_path: std::path::PathBuf) -> EngineClient {
+        EngineClient {
+            info: EngineInfo {
+                version: "fixture".to_owned(),
+                api_version: "1.45".to_owned(),
+                endpoint_label: "test endpoint",
+            },
+            api_version: "1.45".to_owned(),
+            selected_context: None,
+            socket_path,
+        }
+    }
+
+    fn response(body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    async fn fixture(
+        response: Vec<u8>,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        tokio::task::JoinHandle<String>,
+    ) {
+        let directory = temporary_directory();
+        let socket_path = directory.join("engine.sock");
+        let listener = UnixListener::bind(&socket_path).expect("Unix socket should bind");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("request should be readable");
+                assert_ne!(count, 0, "client should send HTTP headers");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8(request).expect("request should be UTF-8");
+            let _ = stream.write_all(&response).await;
+            request
+        });
+        (socket_path, directory, server)
+    }
+
+    fn cleanup(socket_path: &std::path::Path, directory: &std::path::Path) {
+        std::fs::remove_file(socket_path).expect("socket should be removed");
+        std::fs::remove_dir(directory).expect("directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn rejects_container_inventory_over_decoded_row_limit() {
+        let body = inventory_rows_json(MAX_ENGINE_LIST_ITEMS + 1, |index| {
+            format!(r#"{{"Id":"container-{index}"}}"#)
+        });
+        assert!(body.len() < MAX_LIST_RESPONSE_BYTES);
+        let (socket, directory, server) = fixture(response(&body)).await;
+
+        let result = client(socket.clone()).list_containers().await;
+        let request = server.await.expect("fixture server should finish");
+        cleanup(&socket, &directory);
+        assert!(request.starts_with("GET /v1.45/containers/json?all=true HTTP/1.1\r\n"));
+        assert!(matches!(result, Err(EngineError::InventoryRequest { .. })));
+    }
+
+    #[tokio::test]
+    async fn rejects_container_names_over_decoded_item_limit() {
+        let names = inventory_rows_json(MAX_ENGINE_LIST_ITEMS + 1, |index| {
+            format!("\"/container-{index}\"")
+        });
+        let mut body = b"[{\"Id\":\"container-id\",\"Names\":".to_vec();
+        body.extend_from_slice(&names);
+        body.extend_from_slice(b"}]");
+        assert!(body.len() < MAX_LIST_RESPONSE_BYTES);
+        let (socket, directory, server) = fixture(response(&body)).await;
+
+        let result = client(socket.clone()).list_containers().await;
+        let request = server.await.expect("fixture server should finish");
+        cleanup(&socket, &directory);
+        assert!(request.starts_with("GET /v1.45/containers/json?all=true HTTP/1.1\r\n"));
+        assert!(matches!(result, Err(EngineError::InventoryRequest { .. })));
+    }
+    #[tokio::test]
+    async fn rejects_container_inventory_with_excessive_aggregate_nested_items() {
+        let names = std::iter::repeat_n("\"\"", 60)
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = inventory_rows_json(MAX_ENGINE_LIST_ITEMS, |index| {
+            format!(r#"{{"Id":"container-{index}","Names":[{names}]}}"#)
+        });
+        assert!(body.len() < MAX_LIST_RESPONSE_BYTES);
+        let (socket, directory, server) = fixture(response(&body)).await;
+
+        let result = client(socket.clone()).list_containers().await;
+        server.await.expect("fixture server should finish");
+        cleanup(&socket, &directory);
+        assert!(matches!(result, Err(EngineError::InventoryRequest { .. })));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
 mod image_api_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4385,6 +4897,82 @@ mod image_api_tests {
         assert!(!debug.contains("private-label"));
         assert!(!debug.contains("credential"));
         cleanup(&socket, &directory);
+    }
+    #[tokio::test]
+    async fn accepts_image_inventory_at_decoded_item_limit() {
+        let body = inventory_rows_json(MAX_ENGINE_LIST_ITEMS, |index| {
+            format!(r#"{{"Id":"image-{index}","RepoTags":[]}}"#)
+        });
+        assert!(body.len() < MAX_LIST_RESPONSE_BYTES);
+        let (socket, directory, server) = fixture(http_response("200 OK", &body)).await;
+
+        let result = client(socket.clone()).list_images().await;
+        let request = server.await.expect("fixture server should finish");
+        cleanup(&socket, &directory);
+        assert!(request.starts_with("GET /v1.45/images/json?all=true HTTP/1.1\r\n"));
+        let images = result.expect("the exact decoded-item limit is accepted");
+        assert_eq!(images.len(), MAX_ENGINE_LIST_ITEMS);
+    }
+    #[tokio::test]
+    async fn rejects_image_inventory_over_decoded_row_limit() {
+        let body = inventory_rows_json(MAX_ENGINE_LIST_ITEMS + 1, |index| {
+            format!(r#"{{"Id":"image-{index}","RepoTags":[]}}"#)
+        });
+        assert!(
+            body.len() < MAX_LIST_RESPONSE_BYTES,
+            "the fixture must stay under the existing response-byte limit"
+        );
+        let (socket, directory, server) = fixture(http_response("200 OK", &body)).await;
+
+        let result = client(socket.clone()).list_images().await;
+        let request = server.await.expect("fixture server should finish");
+        cleanup(&socket, &directory);
+        assert!(
+            request.starts_with("GET /v1.45/images/json?all=true HTTP/1.1\r\n"),
+            "unexpected image list request"
+        );
+        assert!(
+            matches!(result, Err(EngineError::ImageInventoryUnavailable { .. })),
+            "an over-limit image list must fail as one unavailable inventory"
+        );
+    }
+    #[tokio::test]
+    async fn rejects_image_inventory_with_over_limit_repo_tags() {
+        let repo_tags = inventory_rows_json(MAX_ENGINE_LIST_ITEMS + 1, |index| {
+            format!("\"registry.example/app:tag-{index}\"")
+        });
+        let mut body = b"[{\"Id\":\"image-id\",\"RepoTags\":".to_vec();
+        body.extend_from_slice(&repo_tags);
+        body.extend_from_slice(b"}]");
+        assert!(body.len() < MAX_LIST_RESPONSE_BYTES);
+        let (socket, directory, server) = fixture(http_response("200 OK", &body)).await;
+
+        let result = client(socket.clone()).list_images().await;
+        server.await.expect("fixture server should finish");
+        cleanup(&socket, &directory);
+        assert!(matches!(
+            result,
+            Err(EngineError::ImageInventoryUnavailable { .. })
+        ));
+    }
+    #[tokio::test]
+    async fn rejects_image_inventory_with_excessive_aggregate_repo_tags() {
+        let tags = std::iter::repeat_n("\"\"", 60)
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = inventory_rows_json(MAX_ENGINE_LIST_ITEMS, |index| {
+            format!(r#"{{"Id":"image-{index}","RepoTags":[{tags}]}}"#)
+        });
+        assert!(body.len() < MAX_LIST_RESPONSE_BYTES);
+        let (socket, directory, server) = fixture(http_response("200 OK", &body)).await;
+
+        let result = client(socket.clone()).list_images().await;
+        server.await.expect("fixture server should finish");
+        cleanup(&socket, &directory);
+        assert!(matches!(
+            result,
+            Err(EngineError::ImageInventoryUnavailable { .. })
+        ));
     }
 
     #[tokio::test]
@@ -5462,6 +6050,26 @@ mod volume_api_tests {
         server.await.expect("server");
         cleanup(&socket, &directory);
     }
+    #[tokio::test]
+    async fn rejects_volume_inventory_over_decoded_row_limit() {
+        let volumes = inventory_rows_json(MAX_ENGINE_LIST_ITEMS + 1, |index| {
+            format!(r#"{{"Name":"volume-{index}"}}"#)
+        });
+        let mut body = b"{\"Volumes\":".to_vec();
+        body.extend_from_slice(&volumes);
+        body.push(b'}');
+        assert!(body.len() < MAX_LIST_RESPONSE_BYTES);
+        let (socket, directory, server) = fixture(response("200 OK", &body)).await;
+
+        let result = client(socket.clone()).list_volumes().await;
+        let request = server.await.expect("server");
+        cleanup(&socket, &directory);
+        assert!(request.starts_with("GET /v1.45/volumes HTTP/1.1\r\n"));
+        assert!(matches!(
+            result,
+            Err(EngineError::VolumeInventoryUnavailable { .. })
+        ));
+    }
 
     #[tokio::test]
     async fn inspects_volume_rejects_http_and_oversized_responses_safely() {
@@ -6230,11 +6838,39 @@ mod container_change_stream_tests {
             assert_ne!(count, 0, "client should send HTTP headers");
             request.extend_from_slice(&buffer[..count]);
         }
-        assert!(
-            request.starts_with(
-                b"GET /v1.45/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D HTTP/1.1\r\n"
-            ),
+        let request_line = String::from_utf8_lossy(
+            request
+                .split(|byte| *byte == b'\n')
+                .next()
+                .expect("HTTP request line should exist"),
+        );
+        let request_target = request_line
+            .split_whitespace()
+            .nth(1)
+            .expect("event request target should exist");
+        let (path, query) = request_target
+            .split_once('?')
+            .expect("event subscription query should exist");
+        assert_eq!(path, "/v1.45/events");
+        let mut parameters = query.split('&');
+        assert_eq!(
+            parameters.next(),
+            Some("filters=%7B%22type%22%3A%5B%22container%22%5D%7D"),
             "event subscription must filter to container events"
+        );
+        let since = parameters
+            .find_map(|parameter| parameter.strip_prefix("since="))
+            .expect("event subscription must exclude retained pre-connection events");
+        let since = since
+            .parse::<u64>()
+            .expect("event start time should be Unix seconds");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_secs();
+        assert!(
+            since.abs_diff(now) <= 2,
+            "event start time should be captured when subscribing"
         );
     }
 
@@ -6455,6 +7091,105 @@ mod context_selection_tests {
                 .expect("a local Unix socket is supported"),
             PathBuf::from("/tmp/docker.sock")
         );
+    }
+    #[test]
+    fn local_discovery_prefers_the_documented_rootless_podman_user_socket_after_docker_user_socket()
+    {
+        let runtime_dir = std::path::Path::new("/run/user/1000");
+
+        assert_eq!(
+            local_socket_candidates_for(Some(runtime_dir)),
+            [
+                (
+                    "user runtime Docker socket",
+                    runtime_dir.join("docker.sock"),
+                ),
+                (
+                    "user runtime Podman socket",
+                    runtime_dir.join("podman/podman.sock"),
+                ),
+                (
+                    "system Docker socket",
+                    PathBuf::from("/var/run/docker.sock"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn local_discovery_without_runtime_dir_does_not_add_a_podman_system_socket() {
+        assert_eq!(
+            local_socket_candidates_for(None),
+            [(
+                "system Docker socket",
+                PathBuf::from("/var/run/docker.sock")
+            )]
+        );
+    }
+    #[tokio::test]
+    async fn podman_user_socket_candidate_reaches_the_version_endpoint() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::UnixListener,
+        };
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let runtime_dir =
+            std::env::temp_dir().join(format!("ferrum-podman-{}-{nonce}", std::process::id()));
+        let podman_directory = runtime_dir.join("podman");
+        std::fs::create_dir_all(&podman_directory).expect("runtime fixture should be created");
+        let socket_path = podman_directory.join("podman.sock");
+        let listener = UnixListener::bind(&socket_path).expect("fake API socket should bind");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 512];
+            loop {
+                let count = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("version request should be readable");
+                assert_ne!(count, 0, "client should send an HTTP request");
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(
+                request.starts_with(b"GET /version HTTP/1.1\r\n"),
+                "discovered socket should receive only the read-only API version request"
+            );
+            let body = br#"{"Version":"5.6.0","ApiVersion":"1.40"}"#;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("response headers should be writable");
+            stream
+                .write_all(body)
+                .await
+                .expect("version response should be writable");
+        });
+
+        let (endpoint_label, candidate_path) = local_socket_candidates_for(Some(&runtime_dir))
+            .into_iter()
+            .find(|(label, _)| *label == "user runtime Podman socket")
+            .expect("rootless Podman socket should be a discovery candidate");
+        assert_eq!(candidate_path, socket_path);
+        let client = EngineClient::connect_unix_socket(&candidate_path, endpoint_label)
+            .await
+            .expect("the candidate should use Ferrum's existing read-only version handshake");
+        assert_eq!(client.info.endpoint_label, "user runtime Podman socket");
+        assert_eq!(client.info.version, "5.6.0");
+
+        server.await.expect("fake API server should finish");
+        std::fs::remove_dir_all(&runtime_dir).expect("runtime fixture should be removed");
     }
 }
 #[cfg(all(test, target_os = "linux"))]
@@ -7245,6 +7980,23 @@ mod network_api_tests {
             server.await.expect("server");
             cleanup(&socket, &directory);
         }
+    }
+    #[tokio::test]
+    async fn rejects_network_inventory_over_decoded_row_limit() {
+        let body = inventory_rows_json(MAX_ENGINE_LIST_ITEMS + 1, |index| {
+            format!(r#"{{"Id":"{:064x}","Name":"network-{index}"}}"#, index)
+        });
+        assert!(body.len() < MAX_LIST_RESPONSE_BYTES);
+        let (socket, directory, server) = fixture(response("200 OK", &body)).await;
+
+        let result = client(socket.clone()).list_networks().await;
+        let request = server.await.expect("server");
+        cleanup(&socket, &directory);
+        assert!(request.starts_with("GET /v1.45/networks HTTP/1.1\r\n"));
+        assert!(matches!(
+            result,
+            Err(EngineError::NetworkInventoryUnavailable { .. })
+        ));
     }
 }
 

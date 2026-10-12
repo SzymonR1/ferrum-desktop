@@ -23,6 +23,8 @@ retained output in memory, and never persist build output to logs or audit
 storage. Build outcomes have process traces and are also included in the
 existing best-effort durable redacted JSONL audit as only the static event,
 action, and outcome; no build output or build-specific metadata is persisted.
+A process-spawn failure is `not_submitted`; failures after the child starts are
+`request_error` because builder-side image/tag state may be uncertain.
 Cancellation is best effort: terminate the Docker CLI process group, then
 refresh image inventory after every terminal or cancellation result because
 builder execution and image/tag state may be uncertain.

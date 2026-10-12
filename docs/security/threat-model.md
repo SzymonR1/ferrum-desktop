@@ -1,6 +1,6 @@
 # Ferrum threat model
 
-**Status:** Initial scope documented; this is not a security audit. Ferrum provides container inventory and inspection, volume list/inspect/usage with name-only creation and dependency-gated removal, image listing/inspection and bounded read-only history plus anonymous pulls/tagging/removal and confirmed local Buildx builds, scoped container lifecycle actions, network list/inspect/create/removal/connect/disconnect on the Linux local-engine path with aggregate IPAM allocation counts when reported, logs, and an experimental embedded terminal.
+**Status:** Initial scope documented; this is not a security audit. Ferrum provides container inventory and inspection, volume list/inspect/usage with name-only creation and dependency-gated removal, image listing/inspection and bounded read-only history, anonymous-by-default pulls and pushes with opt-in Linux helper authentication, tagging/removal and confirmed local Buildx builds, scoped container lifecycle actions, network list/inspect/create/removal/connect/disconnect on the Linux local-engine path with aggregate IPAM allocation counts when reported, logs, and an experimental embedded terminal.
 
 Local builds use Docker CLI Buildx on Linux only. Invoke it with argument
 arrays, explicitly pinned to `--host unix://<EngineClient::local_socket_path()>`;
@@ -21,19 +21,46 @@ or build is active. Stream only sanitized bounded plain text in memory; do not
 persist output. Best-effort cancellation terminates the CLI process group;
 refresh inventory after every terminal/cancel result because state may be
 uncertain. Build traces contain only static action and outcome, excluding
-context path, tag, and output. Their redacted outcome is also written to the
-existing best-effort durable JSONL audit; only static event/action/outcome are
-persisted for builds. Build output remains bounded transient UI data and is
+context path, tag, and output. A Buildx spawn failure is `not_submitted`;
+an unsuccessful outcome after a child starts is `request_error` because
+builder-side state may be uncertain. The redacted outcome is also written to
+the existing best-effort durable JSONL audit; only static event/action/outcome
+are persisted for builds. Build output remains bounded transient UI data and is
 never persisted.
 
-Compose support includes read-only Docker CLI version/project discovery and
+Compose support includes read-only Docker CLI version/project discovery,
 explicit structural validation of a user-selected local base file followed by
-user-ordered local overrides on Linux. Files are numbered from 1 (the base)
-and limited to 16 total. Docker merges `-f` files in the order supplied;
-relative paths resolve from the first/base config or `--project-directory`,
-which Ferrum sets to the base file's parent. See Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
-for ordered merge and path semantics and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
-for validation flags.
+ordered local overrides, and a bounded declared-service inventory from the
+successful validation command on Linux. `config --services` includes every
+service declared in the selected files, including inactive profile-gated
+services; it is not filtered by selected profiles. It also supports read-only
+status for containers already associated with selected files. Files are limited
+to 16 total. Docker merges `-f` files in supplied order; relative paths resolve
+from the first/base config or `--project-directory`, which Ferrum sets to the
+base file's parent. See Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
+for ordered merge/path semantics and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
+for `config --no-interpolate --no-env-resolution --services`.
+On Linux, explicitly selected base and override files have a combined 16 MiB
+byte limit (exactly 16 MiB is accepted); larger selections are rejected before
+any Docker/Compose process is launched. This is a point-in-time check, not an
+atomic security boundary: a same-UID process may change or replace a selected
+file after it is checked. After the Compose version preflight, Compose reopens
+the original selected paths for validation, so the contents read may differ
+from those measured by the check. The check does not include local files read
+through `include` or service `extends.file`.
+Linux Compose subprocesses for version, discovery, validation, and status have
+per-process `RLIMIT_AS` of 4 GiB and `RLIMIT_DATA` of 512 MiB, preserving lower
+inherited limits. These limits apply while Compose reads selected and included
+files. They are inherited by child processes and bound each process, not
+aggregate process-tree RSS; they are not a sandbox. The private child
+environment sets `GOMEMLIMIT=402653184` (384 MiB), a Go runtime soft target
+that may be exceeded to avoid excessive GC thrashing. Resource exhaustion may
+produce generic validation or status failures.
+
+Compose remains trusted local code, not a sandbox. The point-in-time selected-
+file size check does not eliminate the race with same-UID changes, and neither
+it nor the process limits confine included local-file reads or eliminate the
+need to validate only trusted files.
 
 Validation skips interpolation and service `env_file` resolution, uses no
 engine, and does not mutate project files. Compose can still recursively read
@@ -41,19 +68,77 @@ local `include`/`extends.file` Compose files and included projects' default
 `.env` and explicit `include.env_file` paths under the logged-in user's
 permissions, potentially outside the base directory. Remote Git/OCI loaders
 are disabled. The selected files and private CLI environment do not sandbox
-those reads; validate only trusted files. Profiles, `.env`/service
-`env_file` resolution, import, lifecycle/build/pull/logs, and project mutations
-remain unsupported. Issue #18 remains partial/open; issue #10 remains
-blocked/open. No release or broader support claim is made.
+those reads; validate only trusted files. Explicit profiles affect structural
+validation, read-only status, and one-shot service logs; the declared-service
+inventory includes all declarations in selected files regardless of profiles.
+`.env` / service `env_file` resolution, import, lifecycle/build/pull, live log
+follow, and project mutations remain unsupported. Issues #18 and #19 remain
+partial/open; issue #10 remains blocked/open.
 
+The service inventory comes from that same validation command, so no additional
+CLI process or Engine request is made. It accepts at most 128 KiB of service
+output, 1024 rows, and 128 bytes per name; malformed or duplicate output fails
+with a static error. Escaped service names are shown in a bounded virtualized
+list. This is a local CLI/file-derived list of every service declared in the
+selected files, including profile-gated services regardless of the active
+profile set; it is not container status. An empty list means no service names
+were returned for these selected files. It never triggers status/log queries or
+Engine requests.
+No release or broader support claim is made.
 
-## Trust boundaries
+Status is available only after selected files pass structural validation and a
+local Docker Unix socket is connected. Ferrum runs
+`docker --host unix://<selected-socket> compose --project-directory <base-parent> --file ... ps --all --format json`.
+The query is read-only; it does not create, start, stop, remove, or change
+containers or project files. `--all` includes stopped containers and Compose's
+default orphan inclusion is preserved. Ferrum retains bounded, escaped
+container name, service, optional per-container `Project` metadata, state, and
+optional health; when `Project` is omitted, the UI shows `Not reported`. Values
+may vary row by row. The Project value is untrusted engine-reported display
+metadata only; it does not establish file ownership, canonical identity,
+authentication, or authorization and is never used for lifecycle operations.
+Ferrum discards IDs, commands, published ports, exit codes, and unknown fields.
+Empty output means no existing containers matched the isolated project
+selection, not that the file declares no services. Status is a manually
+refreshed point-in-time snapshot.
+
+Status uses a private CLI configuration, clears inherited shell variables, and
+sets `COMPOSE_DISABLE_ENV_FILE=1`. Environment-dependent projects may fail or
+resolve differently than a normal shell invocation. Compose may still read
+local includes and included-project environment sources under the logged-in
+user's permissions; validate only trusted files.
+
+One-shot Compose service logs are available only after structural validation
+and a successful status snapshot. Immediately before `logs`, Ferrum repeats a
+read-only `compose ps --all --format json` query with the same selected files
+and socket, and refuses if the service is no longer present. The `--tail 200`
+option is per container; Ferrum displays at most the first 200 combined CLI
+output lines and 256 KiB, so replicas may be truncated and output is not a
+global chronological tail. Only a bounded safe ASCII selector (1–128 bytes,
+letter/digit first, then ASCII letters/digits/`_`/`-`/`.`) is accepted.
+
+Logs may contain secrets and are displayed only after explicit user action.
+They are treated as untrusted text, escaped before rendering, and kept only in
+transient UI state; no log content enters tracing, audit, error strings, or
+disk. Each of the fresh status and logs subprocesses is bounded to eight
+seconds and 1 MiB stdout and inherits the private CLI environment and process
+resource limits above. The selected local files may change between the two
+calls, and local includes remain within the trusted-Compose caveat. The command
+does not follow logs or mutate project/engine state. Tests use fake CLI output;
+no real user project logs are read.
 
 Ferrum runs as the logged-in desktop user and communicates with a Docker-compatible engine through a local Linux Unix socket. Access to a Docker socket is effectively host-level control; UI action gating and confirmation do not make the endpoint unprivileged. Windows/macOS engine APIs are not implemented here. Engine responses, container names, image references, state strings, status text, and mount paths are untrusted input.
 
 ## Current mitigations
 
 - Do not elevate privileges, install services, change socket permissions, or start an engine automatically.
+- Default Linux discovery checks `$XDG_RUNTIME_DIR/docker.sock`,
+  `$XDG_RUNTIME_DIR/podman/podman.sock`, then `/var/run/docker.sock`. The
+  Podman path is a rootless user-socket discovery candidate only; no Podman API
+  compatibility is claimed. Ferrum does not add a dedicated rootful Podman
+  socket candidate or change socket permissions. Connecting to an existing
+  socket may trigger its user-configured systemd socket activation; Ferrum does
+  not invoke Podman or systemd, or enable a unit.
 - Keep direct remote `DOCKER_HOST` TCP/HTTP/HTTPS/SSH and remote Docker context transports disabled. Return typed unsupported errors without fallback to local discovery, and do not read remote TLS/SSH credentials.
 - Do not log or display raw `DOCKER_HOST` values, which may contain sensitive endpoint data.
 - Keep Docker CLI context selection session-only; do not log or display raw context endpoints. Linux `EngineClient::local_socket_path` exposes the already-connected local socket only so trusted local tooling can target the same daemon; it does not change socket permissions and must not be logged or displayed.
@@ -76,16 +161,23 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   Preflight Compose with `docker compose version --short` through the private
   isolated Docker config and distinguish preflight failure from config failure.
   Invoke Compose with the base `--file` first and each override afterward,
-  plus `--project-directory <base-parent> config --quiet --no-interpolate
-  --no-env-resolution`. Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
+  plus `--project-directory <base-parent> config --no-interpolate
+  --no-env-resolution --services`. The same invocation returns declared
+  service names; it does not use `--quiet` or start a second service-listing
+  process. Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
   specifies ordered `-f` merge and path resolution relative to the first config
   or `--project-directory`; the [`config` reference](https://docs.docker.com/reference/cli/docker/compose/config)
-  documents the validation flags.
+  documents these options.
 
 - Keep validation read-only, engine-independent, and bounded to eight seconds
-  and 1 MiB stdout per command. Success is structural validation only;
-  interpolation and service `env_file` resolution are skipped. Do not mutate,
-  extract, or write project files.
+  and 1 MiB stdout per command. Before launching any Docker/Compose process,
+  reject a combined selected base-and-override file size above 16 MiB; exactly
+  16 MiB is accepted. This is a point-in-time size check, not atomic against
+  same-UID changes; Compose reopens the original paths after preflight. This
+  applies only to explicitly selected files, not local `include`/`extends.file`
+  files. Success is structural validation only; interpolation and service
+  `env_file` resolution are skipped. Do not mutate, extract, or write project
+  files.
 
 - Treat Compose references as untrusted filesystem reads. Compose may
   recursively read local files referenced by `include` or service
@@ -100,14 +192,32 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   not a sandbox; validate only trusted files. Keep selected paths and raw
   diagnostics private; display only a bounded escaped basename and static result.
 
-- Keep profiles, `.env`/service `env_file` resolution, file import, project
-  start/stop/restart, build/pull/logs, and project mutations unsupported.
-  Remote references remain disabled and are not fetched. Linux local discovery,
-  single-file validation, ordered temporary base/override, and remote-loader
-  safety smokes passed with Compose v5.6.0; they do not validate arbitrary
-  projects or lifecycle behavior. The native page visual check is unavailable.
-  Issue #18 remains partial/open and #10 remains blocked/open; no release or
-  support expansion is claimed.
+- Accept optional comma-separated Compose profiles only for structural
+  validation, read-only status, and one-shot service logs. Limit the input to
+  1024 UTF-8 bytes, 16 profiles, and 64 UTF-8 bytes per name. Trim outer
+  whitespace per token; blank means no explicit profiles. Reject empty entries
+  and duplicate names. Accept names matching
+  `[A-Za-z0-9][A-Za-z0-9_.-]+`, plus standalone `*` to enable every profile
+  for these read-only queries. Pass each selected name as a separate
+  `--profile <name>` argument before `config`, `ps`, or `logs`; never pass
+  profiles through an environment variable. Reuse the same selection for the
+  status recheck immediately before logs. Invalid or changed selection clears
+  validation/status/log state, cancels in-flight Compose work, and requires
+  revalidation. Keep private Docker config/HOME,
+  the cleared allowlisted environment, selected-project `.env` disabled, and
+  remote Git/OCI loaders disabled. Transient import retains only validated
+  ordered file paths, profile names, and a bounded local label in memory for
+  this session; it invokes no CLI/Engine operation and copies or persists no
+  files. It is not a project identity or authorization mechanism. Persistent
+  project storage, start/stop/restart, build/pull, live log follow, and project
+  mutations remain unavailable. See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
+  and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
+  Remote references remain disabled and are not fetched. Linux local
+  discovery, single-file validation, ordered temporary base/override, and
+  remote-loader safety smokes passed with Compose v5.6.0; they do not validate
+  arbitrary projects or lifecycle behavior. The native page visual check is
+  unavailable. No full issue completion, release, or support expansion is
+  claimed.
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
 - Escape selected control, bidi, zero-width, invisible-format, Hangul-filler,
   and Unicode-tag characters in engine-provided container inventory/inspection
@@ -120,12 +230,19 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   comparisons and requests; never access the mountpoint. This is display
   hardening, not secret detection or redaction.
 - Use private bounded request paths for version, API negotiation, inventory, inspection, lifecycle, volume usage, and network creation/removal. Version/inventory/inspection and event-subscription setup use an 8-second timeout; lifecycle requests use a bounded 30-second timeout for graceful Stop/Restart; only the filtered volume-usage request uses a 30-second timeout with a 16 MiB response limit. Network creation uses bounded JSON `POST /v{negotiated}/networks/create` with only `Name`, a 1 KiB request-body limit, a 64 KiB success-response limit, and a safe typed response/error path. Network removal uses a bounded eight-second `DELETE /v{negotiated}/networks/{id}` after validating a full 64-character hexadecimal ID; it has no force/prune parameters, does not consume daemon response bodies, and exposes only safe typed errors. Timed-out or transport-interrupted mutations may still change state; never log or expose raw response bodies. Container Remove requires confirmation and sends neither force nor volume-removal parameters.
+- Limit each typed inventory sequence to 65,536 entries, reserving at most the
+  smaller of its size hint and cap. Before decoding a container, image,
+  network, or volume list into typed DTOs, count array entries recursively
+  across the response and reject totals above 262,144. This prevents per-row
+  `Names` and `RepoTags` arrays from multiplying the memory limit; do not
+  truncate. Keep the existing 16 MiB body and eight-second request limits.
+  Errors remain static and exclude response contents.
 - Restrict volume listing, inspection, and usage to the selected local Docker Unix socket on Linux. Retain/display only volume name, driver, scope, creation time, and mountpoint as untrusted plain text; never access the mountpoint. Apply the shared 4 KiB raw-or-escaped UI display bound to names and each optional driver, scope, creation-time, and host-mountpoint detail, showing `[display text omitted]` when over limit; preserve raw names for identity comparisons and API request values. The separate filtered read-only `GET /v{api}/system/df?verbose=true&type=volume` provides usage only for an exact inventory-matched volume; retain/display only `Size` in bytes and point-in-time `RefCount` when reported. Missing, negative, or unknown metric values remain unavailable, and usage failures appear separately while successful inspect metadata remains visible. Discard unknown daemon fields, labels, options, status, and raw response bodies. A reference count is not a deletion-safety guarantee.
   EngineClient also omits optional volume metadata above the same 4 KiB
   raw-or-escaped limit before retaining it, so the page shows those fields as
   unavailable. The UI applies the display cap again before rendering.
   Create only by sending `Name` to the negotiated `POST /v{api}/volumes/create` endpoint. Validate nonblank names of at most 4096 UTF-8 bytes, reject control or selected invisible formatting characters and `.`/`..`, and send no driver, labels, or options. Bound the request body to 16 KiB, response to 64 KiB, and total request to eight seconds. Require the response name to match the submitted name exactly; escape selected control, bidi, and invisible formatting characters in optional display fields as visible `\u{...}` text.
-  Remove only a selected listed volume whose matching inspection reports the exact name and whose exact-name usage snapshot reports `Some(0)` references. Require explicit confirmation naming the volume; positive or unavailable counts cannot be submitted. Send only the negotiated `DELETE /v{api}/volumes/{name}` without `force`, bound it to eight seconds, and do not consume or expose daemon response bodies. The usage count is not atomic with deletion; Docker may reject the request if dependencies change. Timeouts or transport errors may follow a successful removal. Permit one volume mutation at a time, block context switching while pending, and refresh inventory after every result. Do not offer pruning, modification, connection, disconnection, or filesystem browsing. Podman/rootless remains unvalidated and remote endpoints remain unsupported; issues #17 and #10 stay open.
+  Remove only a selected listed volume whose matching inspection reports the exact name and whose exact-name usage snapshot reports `Some(0)` references. Require explicit confirmation naming the volume; positive or unavailable counts cannot be submitted. Send only the negotiated `DELETE /v{api}/volumes/{name}` without `force`, bound it to eight seconds, and do not consume or expose daemon response bodies. The usage count is not atomic with deletion; Docker may reject the request if dependencies change. Timeouts or transport errors may follow a successful removal. Permit one volume mutation at a time, block context switching while pending, and refresh inventory after every result. Do not offer pruning, modification, connection, disconnection, or filesystem browsing. Podman/rootless remains unvalidated and remote endpoints remain unsupported; issue #10 remains open and blocked for the broader endpoint matrix.
 - Treat duplicate/conflicting volume-usage `VolumeUsage`, `Items`, `Name`, or
   `UsageData` keys and repeated exact-name items as ambiguous; their usage is
   unavailable and cannot satisfy the `RefCount == 0` removal gate.
@@ -136,31 +253,53 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   rather than returning a partial count or membership set, bounding retained
   attached-container IDs from an engine-controlled map.
 - Request verbose network inspection only on the selected Linux local Docker Unix socket. Validate each subnet key as an IPv4/IPv6 CIDR and normalize its network address/prefix before duplicate detection; invalid CIDRs or duplicate normalized subnet keys make both aggregate metrics unavailable. Retain only aggregate point-in-time `IPsInUse` and `DynamicIPsAvailable` allocation counts across reported subnets, aggregate with checked arithmetic, and leave only the corresponding metric unavailable when its count is missing, malformed, ambiguous, negative, or overflowing, or its checked sum overflows; the other metric may remain available. Never retain subnet/CIDR keys, addresses, endpoint data, or raw status. These are allocation counts, not traffic totals; per-container/interface counters are not aggregated into per-network traffic.
-- Anonymous image pulls are restricted to the selected local Unix-socket Docker
-  engine and send no `X-Registry-Auth` header or stored credentials. Progress
-  responses are bounded to 1 MiB per HTTP frame and 64 KiB per JSON record;
-  displayed status is capped at 256 bytes; control characters and selected
-  invisible formatting characters (bidi marks, zero-width marks/joiners, and
-  soft hyphens) are replaced before rendering. Only status and optional byte
-  counts are exposed. Daemon error details are discarded, never logged or displayed.
-  At Hide progress, Ferrum stops forwarding UI progress but continues draining
-  the response until a terminal event, keeping the image-mutation gate closed.
-  Page/context invalidation hides stale progress without aborting the reader.
-  Closing Ferrum still does not guarantee that daemon-side pull work stops.
+- Image pulls and pushes use the selected local Docker Unix socket. Both are
+  anonymous by default and omit `X-Registry-Auth`; each operation requires its
+  own explicit UI opt-in before using helper credentials. Persist only the
+  `None`/`SecretService`/`pass` helper enum in settings, never credential values.
+  Invoke only the corresponding Docker credential-helper binary with argv
+  `get`, a validated normalized Docker registry key on stdin, a 30-second
+  deadline, and a 64 KiB stdout bound. Clear the child environment except for
+  `PATH`, `HOME`, optional `PASSWORD_STORE_DIR`, and the minimum session,
+  keyring, and GPG variables needed by the selected helper. Discard stderr and
+  output, parsed secret strings, serialized AuthConfig, and encoded auth
+  buffers. Do not read Docker `config.json` or credentials. Helper failure,
+  malformed protocol, invalid registry authority, timeout, or excess output
+  returns a static safe error before Engine submission; never fall back
+  anonymously after explicit helper use fails.
 
-- Anonymous image push is limited to one existing `repository:tag` on the
-  selected image and the selected Linux local Docker Unix socket. Ferrum
-  reinspects the selected ID and verifies that tag before submitting the push;
-  this point-in-time check is not atomic with another Docker client. Require
-  confirmation naming the image ID and target, and warn that layers and
-  metadata may contain secrets. Never read Docker config, credential helpers,
-  or stored credentials. The generated API schema marks `X-Registry-Auth`
-  required, but the Docker/Moby client omits it for anonymous access and sends
-  an empty JSON object body; Ferrum follows that path without credentials. A
-  registry requiring auth rejects the operation. Always pass one explicit tag,
-  never the daemon's all-tags behavior. Use bounded, sanitized progress and
-  discard daemon error details and response bodies. Hiding progress or
-  invalidating the page suppresses UI updates but continues draining until a
+- Construct Docker Engine AuthConfig JSON only from helper username/secret or
+  `<token>` identity token plus the canonical registry server key, then send
+  Moby-compatible padded base64url `X-Registry-Auth` only on an opted-in pull
+  or push. The Engine receives this credential; Ferrum does not persist or log
+  it. Treat both the selected host helper and local Engine as trusted
+  components. Docker Engine registry mirrors may forward credentials according
+  to daemon configuration; Ferrum does not control or validate downstream
+  routing. Users should opt in only when they trust the Engine and its mirror
+  configuration. HTTP-stack `HeaderValue` copies cannot be guaranteed wiped.
+
+- Buildx remains credential-free; image pulls and pushes are anonymous unless
+  their own per-operation opt-in is selected. Pull/push progress responses
+  remain bounded to 1 MiB per HTTP frame and 64 KiB per JSON record; displayed
+  status is capped at 256 bytes and selected invisible formatting characters
+  are replaced before rendering. Daemon error details are discarded. Hiding
+  progress continues draining until terminal response; page/context
+  invalidation hides stale progress without aborting the reader. Closing Ferrum
+  does not guarantee daemon-side transfer work stops.
+- Image push is limited to one existing `repository:tag` on the selected image
+  and the selected Linux local Docker Unix socket. Ferrum reinspects the
+  selected ID and verifies that tag before submission; this point-in-time check
+  is not atomic with another Docker client. Require confirmation naming the
+  image ID and target, and warn that layers and metadata may contain secrets.
+  Anonymous pushes omit `X-Registry-Auth` and send the empty JSON fallback
+  body. When a helper is configured, expose a separate unchecked per-push
+  opt-in in the existing confirmation and disclose that the local Engine
+  receives the credential and may forward it to registry mirrors. Never read
+  Docker config or saved credential entries. Helper failure must stop before
+  Engine submission and must not downgrade to anonymous. Always pass one
+  explicit tag, never the daemon's all-tags behavior. Use bounded, sanitized
+  progress and discard daemon error details and response bodies. Hiding progress
+  or invalidating the page suppresses UI updates but continues draining until a
   terminal event, keeping the image-mutation gate closed. If the request or
   stream fails ambiguously without a terminal response, latch the image-mutation
   gate for the rest of the application session. An interrupted push may have
@@ -217,10 +356,10 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
 - Emit local structured tracing events when image pull, push, tag, or removal
   requests return, containing only the static action and `success`,
   `not_submitted`, or `request_error` outcome. `not_submitted` identifies local
-  validation rejection before HTTP submission. Do not log image IDs,
-  references, repository tags, endpoints, raw errors, or daemon bodies. A
-  `request_error` does not prove that engine state remained unchanged; the
-  durable copy is described below.
+  validation rejection or credential-helper failure before Engine HTTP
+  submission. Do not log image IDs, references, repository tags, endpoints, raw
+  errors, or daemon bodies. A `request_error` does not prove that engine state
+  remained unchanged; the durable copy is described below.
 
 - Maintain a Linux-local bounded JSONL copy of Ferrum-originated mutation
   outcomes for container lifecycle, image pull/push/tag/removal and Buildx
@@ -309,9 +448,12 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
 
 - Remote TCP/HTTP/TLS/SSH transport trust, credentials, and identity validation.
 - Podman API compatibility and rootless endpoint discovery; issue #10 remains open for these and the broader engine matrix.
-- Compose profiles, `.env`/service `env_file` resolution, remote OCI/Git inputs
-  (remote loaders are disabled during validation), file import, project
-  lifecycle actions, build/pull/logs, and project mutations.
+- Compose `.env`/service `env_file` resolution and remote OCI/Git inputs (remote
+  loaders are disabled during validation) remain trust risks. The transient
+  configuration import stores only session-local path/profile metadata and a
+  local label; file-content import, persistent project registration, project
+  lifecycle, build/pull, live log follow, and project mutations remain deferred.
+  The bounded one-shot service log snapshot is implemented as described above.
 - The explicit local Docker CLI Buildx invocation is an added external build process. Other external process integrations, archive extraction, and file-path surfaces remain deferred.
 - Credential stores, registry authentication, managed engines, and update delivery.
 
@@ -362,19 +504,21 @@ connect/disconnect confirmation and cancel, stale selections/results, and
 single-flight/context-switch gates. They do not contact a live engine; native
 UI click/visual validation remains unverified. IPAM allocation counts are
 implemented as described above; per-network traffic totals are not implemented.
-Issues #17 and #10 remain open; Podman/rootless and remote behavior are not
-claimed.
-Fake-Unix-socket image protocol tests and headless Images UI tests cover tag/removal and anonymous push request/confirmation behavior without contacting a real engine or registry, and without mutating image resources. Push tests verify exact image/tag preflight, one explicit target tag, the empty anonymous JSON body with no auth header, bounded progress, safe HTTP rejection, and daemon error redaction. No live image push, deletion, or other image mutation test is claimed. Fake-socket image protocol tests, headless Images UI tests, and controlled helper-process Buildx tests do not contact a real engine or mutate images. There is no live pull, tag, removal, image build, or image-mutation test. Separate opt-in ignored lifecycle, logs, and terminal tests mutate engine state using one uniquely named disposable container and only its validated full ID as cleanup authority. Logs and terminal tests require locally installed images and never pull, tag, push, or delete images. See [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
+Podman/rootless and remote behavior remain unsupported or unvalidated under open, blocked issue #10. No broader endpoint or platform support is claimed.
+
+Fake-Unix-socket image protocol tests and headless Images UI tests cover tag/removal and anonymous plus explicitly authenticated push request/confirmation behavior without contacting a real engine or registry, and without mutating image resources. Push tests verify exact image/tag preflight, one explicit target tag, the empty anonymous JSON body without an auth header, the opt-in `X-Registry-Auth` header without a plaintext credential, bounded progress, safe HTTP rejection, and daemon error redaction. Controlled helper-process tests use fake binaries; UI/audit regressions verify one-operation opt-in and a redacted `not_submitted` failure outcome. Controlled helper-process Buildx tests also do not contact a real engine or mutate images. No live image pull, push, tag, removal, build, or other image-mutation test is claimed. Separate opt-in ignored lifecycle, logs, and terminal tests mutate engine state using one uniquely named disposable container and only its validated full ID as cleanup authority. Logs and terminal tests require locally installed images and never pull, tag, push, or delete images. See [issue #19](https://github.com/SzymonR1/ferrum-desktop/issues/19).
 
 The optional ignored volume create/remove test uses the current local Docker
-context's parsed Unix socket path for EngineClient operations. It preflights a
-generated name, then arms cleanup only after the create response and inventory
-confirm that exact name; the test also requires the exact-name usage snapshot
-to report `RefCount == 0`. It disarms the guard before calling
-`EngineClient::remove_volume` and confirms the name is absent. The Drop fallback
-uses Docker CLI `--host unix://...` on the same pinned socket without force only
-if the test unwinds before the removal request is submitted. There is no
-name-based retry after submission; a failed request may leave the volume. If
-ownership cannot be confirmed, no removal is sent. The separate
-`FERRUM_TEST_VOLUME` live test is read-only. Default fake-socket and headless UI
-tests do not contact a live engine.
+context's parsed Unix socket path for EngineClient operations and must run only
+against a disposable local Docker Engine. It preflights a generated name,
+checks the create response and inventory, and requires an exact-name usage
+snapshot reporting `RefCount == 0`. Docker volume operations are name-addressed
+here and expose no immutable ID; a concurrent delete/recreate under the same
+name cannot be distinguished by those checks. The generated-name verification
+is best-effort, not a stable ownership proof, and cleanup by name may target a
+same-name replacement if another actor races the test. The Drop fallback uses
+the same pinned socket without force only if the test unwinds before removal
+submission. There is no name-based retry after submission, and a failed request
+may leave the volume. If initial preflight/response checks fail, no cleanup is
+sent. The separate `FERRUM_TEST_VOLUME` live test is read-only. Default
+fake-socket and headless UI tests do not contact a live engine.
