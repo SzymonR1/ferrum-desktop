@@ -22,15 +22,17 @@ exercised.
 | Other Linux compositors (GNOME, XFCE, Sway, Hyprland) | Not fully validated | Only the current KDE Plasma host was exercised; other compositors remain untested. |
 | Windows | Not implemented; deferred by current Linux-only scope | Named-pipe support, runtime validation, and packaging are future work tracked by [issue #21](https://github.com/SzymonR1/ferrum-desktop/issues/21). |
 | macOS Apple Silicon and Intel | Not implemented; deferred by current Linux-only scope | Engine integration and packaging are future work tracked by [issue #21](https://github.com/SzymonR1/ferrum-desktop/issues/21). |
-| Podman on Linux | Not validated; no support claim | Docker CLI context presence is not evidence of Podman compatibility. Podman executable/daemon and rootless socket behavior remain unvalidated; see [issue #10](https://github.com/SzymonR1/ferrum-desktop/issues/10) and [issue #11](https://github.com/SzymonR1/ferrum-desktop/issues/11). |
+| Podman on Linux | Rootless user-socket path discovery implemented; API/runtime compatibility not validated | Automatic discovery checks `$XDG_RUNTIME_DIR/podman/podman.sock` after the Docker user socket and before the system Docker socket. Connecting may activate a service through the user's existing systemd socket unit; Ferrum does not enable or invoke units. The host had no Podman executable or user socket on 2026-10-12. A fake Docker-compatible `/version` response exercises the candidate path and existing handshake only; it is not Podman validation. See [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10) and [#11](https://github.com/SzymonR1/ferrum-desktop/issues/11). |
 
-The #10 context-selection slice covers Linux local Unix-socket contexts only.
-Direct remote DOCKER_HOST values and remote contexts are explicitly rejected
-without local fallback; remote transport support remains disabled. Podman/rootless
-validation and a real engine endpoint matrix remain open under issue #10. The
-experimental terminal and lifecycle support do not expand that transport or
-platform scope. Windows named pipes and macOS remain deferred to
-[#21](https://github.com/SzymonR1/ferrum-desktop/issues/21) and M8.
+The #10 context-selection slice covers Linux local Unix-socket Docker CLI
+contexts. Default discovery also checks the documented rootless Podman user
+socket, but this is path discovery only and does not establish Podman API
+compatibility. Direct remote `DOCKER_HOST` values and remote contexts are
+explicitly rejected without local fallback; remote transport support remains
+disabled. Podman/rootless validation and a real engine endpoint matrix remain
+open under issue #10. The experimental terminal and lifecycle support do not
+expand that transport or platform scope. Windows named pipes and macOS remain
+deferred to [#21](https://github.com/SzymonR1/ferrum-desktop/issues/21) and M8.
 
 Image inventory, inspection, read-only layer history, anonymous public-image
 pulls and push, local image tagging, and image removal are limited to Linux
