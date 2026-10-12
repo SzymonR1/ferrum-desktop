@@ -10,7 +10,7 @@ use hyperlocal::{UnixConnector, Uri};
 use serde::{Deserialize, de::IgnoredAny};
 use tokio::time::timeout;
 
-use crate::{EngineClient, EngineError};
+use crate::{EngineClient, EngineError, RegistryAuth};
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(8);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -19,7 +19,7 @@ const MAX_JSON_LINE_BYTES: usize = 64 * 1024;
 const MAX_IMAGE_REFERENCE_BYTES: usize = 512;
 const MAX_STATUS_BYTES: usize = 256;
 
-/// Incremental, cancellable progress stream for an anonymous image pull.
+/// Incremental, cancellable progress stream for a Docker image pull.
 ///
 /// HTTP data frames are limited to 1 MiB, JSON Lines records to 64 KiB, and
 /// each wait for new progress data to 60 seconds. Dropping this stream closes
@@ -149,6 +149,7 @@ struct ProgressDetail {
 pub(crate) async fn open_image_pull(
     engine: &EngineClient,
     reference: &str,
+    registry_auth: Option<&RegistryAuth>,
 ) -> Result<ImagePullStream, EngineError> {
     if !valid_reference(reference) {
         return Err(EngineError::InvalidImageReference);
@@ -161,9 +162,13 @@ pub(crate) async fn open_image_pull(
     );
     let response = timeout(OPEN_TIMEOUT, async {
         let client = Client::builder(TokioExecutor::new()).build(UnixConnector);
-        let request = Request::builder()
+        let mut builder = Request::builder()
             .method(Method::POST)
-            .uri(Uri::new(&engine.socket_path, &path))
+            .uri(Uri::new(&engine.socket_path, &path));
+        if let Some(registry_auth) = registry_auth {
+            builder = builder.header("x-registry-auth", registry_auth.header_value());
+        }
+        let request = builder
             .body(Empty::<Bytes>::new())
             .map_err(|_| EngineError::ImagePullUnavailable { endpoint_label })?;
         client
@@ -467,7 +472,7 @@ mod tests {
             stream.write_all(b"0\r\n\r\n").await.unwrap();
         });
         let mut pull = engine(socket.clone())
-            .open_image_pull("registry.example:5000/team/app:latest")
+            .open_image_pull("registry.example:5000/team/app:latest", None)
             .await
             .unwrap();
         assert_eq!(
@@ -499,6 +504,164 @@ mod tests {
         cleanup(&socket, &directory);
     }
 
+    async fn authenticated_pull_with_fake_engine(
+        reference: &str,
+        auth: &RegistryAuth,
+    ) -> (serde_json::Value, String) {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+
+        let (socket, directory) = temporary_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            let headers = String::from_utf8_lossy(&request);
+            let encoded = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .starts_with("x-registry-auth:")
+                        .then(|| line.split_once(':').unwrap().1.trim().to_owned())
+                })
+                .unwrap();
+            let decoded = URL_SAFE.decode(encoded.as_bytes()).unwrap();
+            let auth: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            (auth, encoded)
+        });
+        let mut pull = engine(socket.clone())
+            .open_image_pull(reference, Some(auth))
+            .await
+            .unwrap();
+        assert_eq!(pull.next_progress().await.unwrap(), None);
+        let result = server.await.unwrap();
+        cleanup(&socket, &directory);
+        result
+    }
+
+    #[tokio::test]
+    async fn posts_exact_registry_auth_config_when_supplied() {
+        let auth = RegistryAuth::from_helper_credentials(
+            "alice".to_owned(),
+            "not-a-real-secret".to_owned(),
+            "registry.example",
+        )
+        .unwrap();
+        assert_eq!(format!("{auth:?}"), "RegistryAuth([REDACTED])");
+        let (observed, encoded) =
+            authenticated_pull_with_fake_engine("registry.example/team/app:latest", &auth).await;
+        assert_eq!(
+            observed,
+            serde_json::json!({
+                "username": "alice",
+                "password": "not-a-real-secret",
+                "serveraddress": "registry.example",
+            })
+        );
+        assert!(encoded.ends_with('='));
+    }
+
+    #[test]
+    fn serializes_helper_token_with_canonical_server_address() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+
+        let auth = RegistryAuth::from_helper_credentials(
+            "<token>".to_owned(),
+            "synthetic-token".to_owned(),
+            "https://index.docker.io/v1/",
+        )
+        .unwrap();
+        let decoded = URL_SAFE.decode(auth.header_value()).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "identitytoken": "synthetic-token",
+                "serveraddress": "https://index.docker.io/v1/",
+            })
+        );
+    }
+    #[tokio::test]
+    async fn posts_identity_token_config_to_fake_engine() {
+        let auth = RegistryAuth::from_helper_credentials(
+            "<token>".to_owned(),
+            "synthetic-token".to_owned(),
+            "https://index.docker.io/v1/",
+        )
+        .unwrap();
+        let (observed, _) = authenticated_pull_with_fake_engine("alpine:latest", &auth).await;
+        assert_eq!(
+            observed,
+            serde_json::json!({
+                "identitytoken": "synthetic-token",
+                "serveraddress": "https://index.docker.io/v1/",
+            })
+        );
+    }
+
+    #[test]
+    fn padded_url_safe_auth_encoding_round_trips_all_length_remainders() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+
+        let mut seen = [false; 3];
+        for length in 1..=3 {
+            let secret = "s".repeat(length);
+            let auth = RegistryAuth::from_helper_credentials(
+                "alice".to_owned(),
+                secret.clone(),
+                "registry.example",
+            )
+            .unwrap();
+            let encoded = auth.header_value();
+            let decoded = URL_SAFE.decode(encoded).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "username": "alice",
+                    "password": secret,
+                    "serveraddress": "registry.example",
+                })
+            );
+            let remainder = decoded.len() % 3;
+            seen[remainder] = true;
+            assert_eq!(encoded.ends_with('='), remainder != 0);
+        }
+        assert_eq!(seen, [true, true, true]);
+    }
+
+    #[test]
+    fn rejects_oversized_registry_auth_fields_without_exposing_values() {
+        let oversized_username = "u".repeat(crate::MAX_REGISTRY_AUTH_USERNAME_BYTES + 1);
+        let oversized_secret = format!(
+            "secret-sentinel{}",
+            "s".repeat(crate::MAX_REGISTRY_AUTH_SECRET_BYTES)
+        );
+        let oversized_server = "r".repeat(crate::MAX_REGISTRY_AUTH_SERVER_ADDRESS_BYTES + 1);
+        for (username, secret, server) in [
+            (oversized_username.as_str(), "password", "registry.example"),
+            ("alice", oversized_secret.as_str(), "registry.example"),
+            ("alice", "password", oversized_server.as_str()),
+            ("alice", "password", "registry.\u{202e}example"),
+        ] {
+            let error = RegistryAuth::from_helper_credentials(
+                username.to_owned(),
+                secret.to_owned(),
+                server,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                &error,
+                EngineError::ImagePullCredentialUnavailable
+            ));
+            assert!(!error.to_string().contains("secret-sentinel"));
+            assert!(!format!("{error:?}").contains("secret-sentinel"));
+        }
+    }
+
     #[tokio::test]
     async fn rejects_invalid_references_without_contacting_engine() {
         let (socket, directory) = temporary_socket();
@@ -511,7 +674,9 @@ mod tests {
             too_long.as_str(),
         ] {
             assert!(matches!(
-                engine(socket.clone()).open_image_pull(reference).await,
+                engine(socket.clone())
+                    .open_image_pull(reference, None)
+                    .await,
                 Err(EngineError::InvalidImageReference)
             ));
         }
@@ -541,7 +706,7 @@ mod tests {
             stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
         });
         let mut pull = engine(socket.clone())
-            .open_image_pull("public/image:latest")
+            .open_image_pull("public/image:latest", None)
             .await
             .unwrap();
         let error = pull.next_progress().await.unwrap_err();
@@ -568,7 +733,7 @@ mod tests {
             stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
         });
         let error = engine(socket.clone())
-            .open_image_pull("public/image:latest")
+            .open_image_pull("public/image:latest", None)
             .await
             .err()
             .expect("HTTP error status should reject the pull");
@@ -602,7 +767,7 @@ mod tests {
                 }
             });
             let mut pull = engine(socket.clone())
-                .open_image_pull("public/image:latest")
+                .open_image_pull("public/image:latest", None)
                 .await
                 .unwrap();
             assert!(matches!(

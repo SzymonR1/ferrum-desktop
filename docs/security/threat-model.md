@@ -1,6 +1,6 @@
 # Ferrum threat model
 
-**Status:** Initial scope documented; this is not a security audit. Ferrum provides container inventory and inspection, volume list/inspect/usage with name-only creation and dependency-gated removal, image listing/inspection and bounded read-only history plus anonymous pulls/tagging/removal and confirmed local Buildx builds, scoped container lifecycle actions, network list/inspect/create/removal/connect/disconnect on the Linux local-engine path with aggregate IPAM allocation counts when reported, logs, and an experimental embedded terminal.
+**Status:** Initial scope documented; this is not a security audit. Ferrum provides container inventory and inspection, volume list/inspect/usage with name-only creation and dependency-gated removal, image listing/inspection and bounded read-only history, anonymous-by-default pulls with opt-in Linux helper-authenticated pulls, tagging/removal and confirmed local Buildx builds, scoped container lifecycle actions, network list/inspect/create/removal/connect/disconnect on the Linux local-engine path with aggregate IPAM allocation counts when reported, logs, and an experimental embedded terminal.
 
 Local builds use Docker CLI Buildx on Linux only. Invoke it with argument
 arrays, explicitly pinned to `--host unix://<EngineClient::local_socket_path()>`;
@@ -161,18 +161,38 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
 - Emit local structured process traces for volume create/removal with only static action and `success`, `not_submitted`, or `request_error` outcome. Do not log volume names, mountpoints, endpoints, raw errors, or daemon bodies. A request error does not prove engine state remained unchanged; these are not a persistent or tamper-proof audit store, and the separate durable redacted copy is described below.
 - Keep network listing and inspection allowlisted on the selected Linux local Docker Unix socket; create networks with bounded `POST /v{negotiated}/networks/create` containing only non-whitespace, at-most-255-byte `Name`, with no driver, IPAM, or options controls. Retain/display only allowlisted network metadata and the aggregate IPAM counts described in the next bullet; discard raw IPAM and `Status` fields. From inspect, retain the point-in-time `Containers` count and its keys only when every key is a full 64-character hexadecimal ID; discard endpoint values. The UI permits connect/disconnect only for a selected local custom network with a fresh complete membership set and a target full ID in current inventory whose state is `Running`; stopped, paused, and unknown states are disabled. Container-change events invalidate cached state; Networks refreshes both inventories and disables attachment actions until container inventory is current. Require explicit confirmation naming the exact network and container; send only `Container`, no endpoint configuration or `Force`, with an eight-second deadline and no retry. Disconnect uses Docker's default `Force=false`. Refresh network/container inventory and re-inspect after every result; treat transport errors/timeouts as potentially state-changing and stale refresh as requiring new inspection. Removal excludes `bridge`, `host`, and `none`, requires fresh matching inspection with `Some(0)` attached containers and explicit full-ID confirmation, and sends an eight-second DELETE without force/prune. Counts are not atomic with mutations. Keep one mutation in flight and block context switching; Podman/rootless and remote support remain unvalidated.
 - Request verbose network inspection only on the selected Linux local Docker Unix socket. Validate each subnet key as an IPv4/IPv6 CIDR and normalize its network address/prefix before duplicate detection; invalid CIDRs or duplicate normalized subnet keys make both aggregate metrics unavailable. Retain only aggregate point-in-time `IPsInUse` and `DynamicIPsAvailable` allocation counts across reported subnets, aggregate with checked arithmetic, and leave only the corresponding metric unavailable when its count is missing, malformed, ambiguous, negative, or overflowing, or its checked sum overflows; the other metric may remain available. Never retain subnet/CIDR keys, addresses, endpoint data, or raw status. These are allocation counts, not traffic totals; per-container/interface counters are not aggregated into per-network traffic.
-- Anonymous image pulls are restricted to the selected local Unix-socket Docker
-  engine and send no `X-Registry-Auth` header or stored credentials. Progress
-  responses are bounded to 1 MiB per HTTP frame and 64 KiB per JSON record;
-  displayed status is capped at 256 bytes; control characters and selected
-  invisible formatting characters (bidi marks, zero-width marks/joiners, and
-  soft hyphens) are replaced before rendering. Only status and optional byte
-  counts are exposed. Daemon error details are discarded, never logged or displayed.
-  At Hide progress, Ferrum stops forwarding UI progress but continues draining
-  the response until a terminal event, keeping the image-mutation gate closed.
-  Page/context invalidation hides stale progress without aborting the reader.
-  Closing Ferrum still does not guarantee that daemon-side pull work stops.
+- Image pulls use the selected local Docker Unix socket. The default path is
+  anonymous and omits `X-Registry-Auth`; opt-in helper credentials are obtained
+  only for the current pull after explicit UI selection. Persist only the
+  `None`/`SecretService`/`pass` helper enum in settings, never credential values.
+  Invoke only the corresponding Docker credential-helper binary with argv
+  `get`, a validated normalized Docker registry key on stdin, a 30-second
+  deadline, and a 64 KiB stdout bound. Clear the child environment except for
+  `PATH`, `HOME`, optional `PASSWORD_STORE_DIR`, and the minimum session,
+  keyring, and GPG variables needed by the selected helper. Discard stderr and
+  output, parsed secret strings, serialized AuthConfig, and encoded auth
+  buffers. Do not read Docker `config.json` or credentials. Helper failure,
+  malformed protocol, invalid registry authority, timeout, or excess output
+  returns a static safe error before Engine submission; never fall back
+  anonymously after explicit helper use fails.
 
+- Construct Docker Engine AuthConfig JSON only from helper username/secret or
+  `<token>` identity token plus the canonical registry server key, then send
+  Moby-compatible padded base64url `X-Registry-Auth` only on the opted-in pull.
+  The Engine receives this credential; Ferrum does not persist or log it. Treat
+  both the selected host helper and local Engine as trusted components. Docker
+  Engine registry mirrors may forward credentials according to daemon
+  configuration; Ferrum does not control or validate downstream routing. Users
+  should opt in only when they trust the Engine and its mirror configuration.
+  HTTP-stack `HeaderValue` copies cannot be guaranteed wiped.
+
+- Push and Buildx remain anonymous/credential-free and do not use pull helper
+  settings. Pull progress responses remain bounded to 1 MiB per HTTP frame and
+  64 KiB per JSON record; displayed status is capped at 256 bytes and selected
+  invisible formatting characters are replaced before rendering. Daemon error
+  details are discarded. Hide progress continues draining until terminal
+  response; page/context invalidation hides stale progress without aborting the
+  reader. Closing Ferrum does not guarantee daemon-side pull work stops.
 - Anonymous image push is limited to one existing `repository:tag` on the
   selected image and the selected Linux local Docker Unix socket. Ferrum
   reinspects the selected ID and verifies that tag before submitting the push;
@@ -242,10 +262,10 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
 - Emit local structured tracing events when image pull, push, tag, or removal
   requests return, containing only the static action and `success`,
   `not_submitted`, or `request_error` outcome. `not_submitted` identifies local
-  validation rejection before HTTP submission. Do not log image IDs,
-  references, repository tags, endpoints, raw errors, or daemon bodies. A
-  `request_error` does not prove that engine state remained unchanged; the
-  durable copy is described below.
+  validation rejection or credential-helper failure before Engine HTTP
+  submission. Do not log image IDs, references, repository tags, endpoints, raw
+  errors, or daemon bodies. A `request_error` does not prove that engine state
+  remained unchanged; the durable copy is described below.
 
 - Maintain a Linux-local bounded JSONL copy of Ferrum-originated mutation
   outcomes for container lifecycle, image pull/push/tag/removal and Buildx

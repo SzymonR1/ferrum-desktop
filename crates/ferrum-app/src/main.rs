@@ -48,6 +48,8 @@ mod images;
 mod inventory;
 mod logs;
 mod networks;
+#[cfg(target_os = "linux")]
+mod registry_auth;
 mod retry;
 mod search;
 mod volumes;
@@ -2130,16 +2132,28 @@ impl FerrumApp {
         let Some(engine) = self.engine.clone() else {
             return;
         };
-        let Some((generation, reference)) = self.images.begin_pull() else {
+        let Some(request) = self.images.begin_pull() else {
             return;
         };
+        let generation = request.generation;
+        let reference = request.reference;
+        let auth_opted_in = request.use_registry_credentials;
+        let credential_helper = self.settings.registry_credential_helper;
         let sender = self.sender.clone();
         let audit_store = self.audit_store.clone();
         let progress_reporting = Arc::new(AtomicBool::new(true));
         self.image_pull_progress_reporting = Some(Arc::clone(&progress_reporting));
         self.image_pull_task = Some(self.runtime.spawn(async move {
             let result = async {
-                let mut stream = engine.open_image_pull(&reference).await?;
+                let registry_auth = if auth_opted_in {
+                    Some(registry_auth::authorization(credential_helper, &reference).await?)
+                } else {
+                    None
+                };
+                let mut stream = engine
+                    .open_image_pull(&reference, registry_auth.as_ref())
+                    .await?;
+                drop(registry_auth);
                 // Progress reporting may stop, but the reader must drain through the terminal response.
                 while let Some(progress) = stream.next_progress().await? {
                     if progress_reporting.load(Ordering::Acquire) {
@@ -3587,6 +3601,12 @@ impl FerrumApp {
                 .engine
                 .as_ref()
                 .is_some_and(|engine| !engine.local_socket_path().as_os_str().is_empty());
+        let configured_helper = if cfg!(target_os = "linux") {
+            self.settings.registry_credential_helper
+        } else {
+            settings::RegistryCredentialHelper::None
+        };
+        self.images.set_registry_helper(configured_helper);
         let inspection = self.images.show(
             ui,
             connected,
@@ -4444,7 +4464,29 @@ impl FerrumApp {
                     &mut self.settings_draft.auto_connect_on_startup,
                     "Connect automatically on startup",
                 );
-                ui.label("This setting applies the next time Ferrum starts.");
+                ui.label("The startup connection preference applies the next time Ferrum starts.");
+                #[cfg(target_os = "linux")]
+                {
+                    ui.label("Registry credential helper (Linux pulls)");
+                    ui.radio_value(
+                        &mut self.settings_draft.registry_credential_helper,
+                        settings::RegistryCredentialHelper::None,
+                        "None (anonymous pulls only)",
+                    );
+                    ui.radio_value(
+                        &mut self.settings_draft.registry_credential_helper,
+                        settings::RegistryCredentialHelper::SecretService,
+                        "Secret Service",
+                    );
+                    ui.radio_value(
+                        &mut self.settings_draft.registry_credential_helper,
+                        settings::RegistryCredentialHelper::Pass,
+                        "pass",
+                    );
+                    ui.label("Ferrum invokes only the selected Docker credential-helper binary after you opt in for one pull. Install and configure the helper in your Linux user session. Credentials are never stored in Ferrum settings.");
+                }
+                #[cfg(not(target_os = "linux"))]
+                ui.label("Registry credential-helper pulls are not available on this platform.");
                 if let Some(error) = self.settings_error {
                     ui.colored_label(Color32::from_rgb(227, 113, 102), error.message());
                 }
@@ -4453,6 +4495,8 @@ impl FerrumApp {
                         match self.settings_store.save(&self.settings_draft) {
                             Ok(()) => {
                                 self.settings = self.settings_draft.clone();
+                                self.images
+                                    .set_registry_helper(self.settings.registry_credential_helper);
                                 self.settings_error = None;
                                 close_requested = true;
                             }
@@ -7009,7 +7053,7 @@ mod event_reconciliation_tests {
         let (mut app, sender) = app_with_open_inspection();
         app.page = images::AppPage::Images;
         app.images.set_pull_reference("alpine:latest".to_owned());
-        let (generation, _) = app.images.begin_pull().unwrap();
+        let generation = app.images.begin_pull().unwrap().generation;
         let (task_finish, task_wait) = tokio::sync::oneshot::channel();
         let (task_started, task_started_wait) = tokio::sync::oneshot::channel();
         let task = app.runtime.spawn(async move {
@@ -7127,7 +7171,7 @@ mod event_reconciliation_tests {
         let (mut app, sender) = app_with_open_inspection();
         app.page = images::AppPage::Images;
         app.images.set_pull_reference("alpine:latest".to_owned());
-        let (generation, _) = app.images.begin_pull().unwrap();
+        let generation = app.images.begin_pull().unwrap().generation;
         app.images.update_pull(
             generation,
             ImagePullProgress {
