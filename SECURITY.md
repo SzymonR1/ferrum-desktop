@@ -91,19 +91,19 @@ tags, endpoints, error text, and daemon response bodies are not included in
 those traces.
 
 Ferrum also maintains a Linux-local, bounded JSONL copy of mutation outcomes
-for container lifecycle, confirmed imported Compose start/stop/service restart
-and `up`, Compose pulls, image pull/push/tag/removal and Buildx image builds,
-volume create/removal, and network create/removal/connect/disconnect requests.
-`audit.jsonl` is created
-lazily in Ferrum's descriptor-anchored config directory with directory mode
-`0700` and file mode `0600`. Schema version 1 records a timestamp, static
+for container lifecycle, confirmed imported Compose start/stop/service
+restart/pause/unpause and `up`, Compose pulls, image pull/push/tag/removal and
+Buildx image builds, volume create/removal, and network
+create/removal/connect/disconnect requests. `audit.jsonl` is created lazily in
+Ferrum's descriptor-anchored config directory with directory mode `0700` and
+file mode `0600`. Schema version 1 records a timestamp, static
 event/action/outcome, and validated full resource IDs only where existing
 traces permit.
 
 A Compose lifecycle entry contains only the static `compose_mutation` event,
-`start`/`stop`/`restart`/`up` action, and `started`, `success`,
-`not_submitted`, `request_error`, or `uncertain` outcomes; labels, files,
-profiles, socket values, service names, credentials, and raw errors are
+`start`/`stop`/`restart`/`pause`/`unpause`/`up` action, and `started`,
+`success`, `not_submitted`, `request_error`, or `uncertain` outcomes; labels,
+files, profiles, socket values, service names, credentials, and raw errors are
 excluded. An `up` confirmation requires a successful current status snapshot
 for the selected imported files and remains disabled after an uncertain result
 until refresh succeeds, including after navigation. Where persisted, `started`
@@ -113,14 +113,16 @@ write to configured volumes and host mounts. The operation does not remove
 volumes.
 If there is no later terminal outcome, Ferrum exited or final audit persistence
 failed; it does not prove whether Compose reached or changed the Engine, so
-refresh status. `not_submitted`
-covers local preflight/validation or any process-spawn failure before the
-lifecycle process starts; a returned failure or timeout after start is
-`request_error` for start/stop/restart and `uncertain` for `up`. During
-shutdown Ferrum makes a best-effort, up-to-one-second flush of the initial
-marker before aborting the lifecycle worker; a submitted child may still be
-terminated with Engine state uncertain. A build entry contains only the static
-`image_mutation` event, `build` action, and outcome. It excludes build output
+refresh status. `not_submitted` covers local preflight/validation or process
+spawn failure before the lifecycle process starts. A returned failure or
+timeout after process start is `request_error` for start/stop/restart and
+`uncertain` for `up`, `pause`, or `unpause`; pause/unpause retries remain
+blocked until a successful status refresh. During shutdown Ferrum makes a
+best-effort, up-to-one-second flush of the initial marker before aborting the
+lifecycle worker; a submitted child may still be terminated with Engine state
+uncertain.
+A build entry contains only the static `image_mutation` event, `build` action,
+and outcome. It excludes build output
 and all build-specific metadata, as well as names, image references/tags,
 endpoints, credentials, raw errors, daemon bodies, and terminal/log contents.
 Each record is synced; the file has a 16 MiB hard cap and is not automatically
@@ -132,6 +134,10 @@ This is local Ferrum-request history only, mutable by the same-UID user, not
 tamper-proof, and does not prove final engine state or record external engine
 actions.
 
+Pause/unpause coverage is controlled fake-CLI and headless only. No live
+mutation was run because no disposable Engine is designated, and native visual
+validation was not performed. Podman, remote, Windows/macOS, and full Issue
+#18/#19 completion are not claimed.
 Issues #16 and #19 remain partial/open; issue #18 remains partial/open; issue
 #10 remains open/blocked for Podman/rootless and broader endpoint validation.
 No release or platform/endpoint support is claimed.
@@ -333,10 +339,10 @@ inputs; builds also consume live Dockerfiles and build contexts. Only trusted
 project trees should be used. Same-UID and privileged processes remain inside
 Ferrum's trust boundary; Compose and builder execution are not sandboxed.
 On Linux, each Compose subprocess for version, discovery, validation, status,
-one-shot and live service-log queries, and start/stop/restart/up has
+one-shot and live service-log queries, and start/stop/restart/pause/unpause/up has
 `RLIMIT_AS` capped at 4 GiB and `RLIMIT_DATA` capped at 512 MiB, preserving
-lower inherited limits. The
-per-process limits apply while selected and included files; child processes
+lower inherited limits.
+The per-process limits apply while selected and included files; child processes
 inherit them, so they bound each process, not aggregate process-tree RSS. The
 private child environment sets `GOMEMLIMIT=402653184` (384 MiB) for Go runtimes.
 This is a soft runtime target, not a hard cap: Go may exceed it to avoid
@@ -351,8 +357,9 @@ structural validation only: interpolation and service `env_file` resolution
 are skipped. Ferrum displays bounded escaped basenames, static outcomes, and
 the bounded escaped declared-service rows returned on successful validation;
 explicit profile selection affects validation, read-only status, one-shot and
-live service logs, and is passed to imported-project start/stop/restart/up. The
-declared-service inventory includes every declaration in the selected files
+live service logs, and is passed to imported-project start/stop/restart/
+pause/unpause/up.
+The declared-service inventory includes every declaration in the selected files
 regardless of active profiles. Session imports retain validated ordered paths,
 profiles, and a bounded local label in memory. An explicit opt-in can persist a
 registration containing only that label, absolute ordered UTF-8 paths, and
@@ -377,18 +384,27 @@ identity or authorize scope.
 Before each confirmed mutation, Ferrum opens each selected file without
 following a final-component symlink, captures the ordered bytes in write-sealed
 Linux memfds under a 16 MiB aggregate limit, and validates those snapshots. The
-submitted start/stop/restart command uses the same `/proc/self/fd/N` descriptor
-paths and original base-parent project directory. Restart's fresh read-only
-`compose ps --all --format json` query also uses those descriptors and the
-selected local Docker Unix socket; it submits no restart if the service is
-absent or the query fails. Snapshot or validation failure submits no mutation.
-No on-disk copy of the selected YAML is created.
+submitted start/stop/restart/pause/unpause command uses the same
+`/proc/self/fd/N` descriptor paths and original base-parent project directory.
+Each service action's fresh read-only `compose ps --all --format json` query
+also uses those snapshots and the selected local Docker Unix socket; it submits
+no mutation if the service is no longer eligible or status fails. Snapshot or
+validation failure submits no mutation. No on-disk copy of the selected YAML is
+created.
 
 Docker Compose `start` starts existing containers only; `stop` does not remove
 them. Ferrum invokes only `restart --no-deps <SERVICE>` for restart; it does
 not apply Compose configuration changes, and dependent services are not
-restarted. Confirmation names service, imported label, ordered safe basenames,
-profiles, and action; cancel submits nothing.
+restarted. Pause is offered only for a declared service with a successful
+current status row exactly `running`; unpause requires exactly `paused`.
+Stopped, unknown, absent, and undeclared services are ineligible. Each invokes
+only `pause <SERVICE>` or `unpause <SERVICE>` for the validated service on the
+selected local socket. Pause suspends its processes; unpause resumes them.
+Neither creates or removes containers, networks, or volumes. Confirmation
+names the service, imported label, ordered safe basenames, profiles, and action,
+states the effect and that project resources are not removed; cancel submits
+nothing. A successful current status is required before confirmation and is
+rechecked by the worker after sealed-snapshot validation.
 
 The separately confirmed **Create and start (local images)** operation is
 limited to the current imported, successfully revalidated ordered files and

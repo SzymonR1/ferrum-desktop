@@ -3,6 +3,24 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Added confirmed service-scoped Compose pause/unpause for the current imported,
+  successfully revalidated ordered files/profiles on the selected Linux local
+  Docker Unix socket. Pause is offered only for a declared service with a
+  successful current status row exactly `running`; unpause requires exactly
+  `paused`. Stopped, unknown, missing, or undeclared services are ineligible.
+  Both require successful current status before confirmation and a fresh
+  read-only status recheck by the worker after validating the selected-file
+  sealed snapshots. Commands target only the validated service using argument
+  arrays and the existing isolated Compose environment. Confirmation identifies
+  the service, import label, ordered safe basenames, and profiles, explains that
+  pause suspends processes and unpause resumes them, and states neither action
+  creates or removes containers, networks, or volumes. A post-spawn failure or
+  timeout is uncertain; retry remains blocked until status refresh succeeds.
+  Audit stores only static pause/unpause action/outcome values, without service,
+  path, or project metadata. Controlled fake-CLI/headless tests only; no live
+  mutation was run because no disposable Engine is designated, and native
+  visual validation was not performed. No Podman, remote, Windows/macOS, or
+  full Issue #18/#19 completion claim; Issue #18 remains open/partial.
 - Added confirmed Compose **Create and start (local images)** for the current
   imported, successfully revalidated ordered file/profile selection and a
   successful current status refresh on the selected Linux local Docker socket.

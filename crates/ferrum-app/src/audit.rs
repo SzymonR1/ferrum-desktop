@@ -209,6 +209,8 @@ pub(super) enum ComposeMutationAction {
     Start,
     Stop,
     Restart,
+    Pause,
+    Unpause,
 }
 
 #[cfg(target_os = "linux")]
@@ -219,6 +221,8 @@ impl ComposeMutationAction {
             Self::Start => "start",
             Self::Stop => "stop",
             Self::Restart => "restart",
+            Self::Pause => "pause",
+            Self::Unpause => "unpause",
         }
     }
 }
@@ -905,6 +909,24 @@ mod tests {
                 ComposeMutationOutcome::Uncertain,
                 "up",
                 "uncertain",
+            ),
+            (
+                ComposeMutationAction::Pause,
+                ComposeMutationOutcome::Started,
+                "pause",
+                "started",
+            ),
+            (
+                ComposeMutationAction::Pause,
+                ComposeMutationOutcome::Uncertain,
+                "pause",
+                "uncertain",
+            ),
+            (
+                ComposeMutationAction::Unpause,
+                ComposeMutationOutcome::Success,
+                "unpause",
+                "success",
             ),
         ];
         let records = tracing::dispatcher::with_default(&dispatcher, || {

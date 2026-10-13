@@ -136,7 +136,7 @@ impl ComposeOperationError {
                 "The selected service is no longer present in the current Compose status; refresh and retry."
             }
             Self::StatusUnavailable => {
-                "Could not verify current Compose status; no restart command was run. Refresh and retry."
+                "Could not verify current Compose status; no lifecycle command was run. Refresh and retry."
             }
             Self::OperationFailed => "Compose operation failed.",
             Self::OperationCancelledBeforeSpawn => {
@@ -242,6 +242,8 @@ pub(super) enum ComposeOperationAction {
     Start,
     Stop,
     Restart,
+    Pause,
+    Unpause,
     Pull,
     Build,
 }
@@ -254,6 +256,8 @@ impl ComposeOperationAction {
             Self::Stop => "stop",
             Self::Restart => "restart",
             Self::Pull => "pull",
+            Self::Pause => "pause",
+            Self::Unpause => "unpause",
             Self::Build => "build",
         }
     }
@@ -515,6 +519,8 @@ pub(super) struct ComposeActions {
     pub(super) cancel_follow: bool,
     pub(super) restart_service: Option<String>,
     pub(super) cancel_status: bool,
+    pub(super) pause_service: Option<String>,
+    pub(super) unpause_service: Option<String>,
     pub(super) up_imported: bool,
     pub(super) start_imported: bool,
     pub(super) stop_imported: bool,
@@ -650,22 +656,34 @@ impl ComposeView {
         self.set_operation_confirmation(action, None)
     }
 
+    pub(super) fn request_service_action_confirmation(
+        &mut self,
+        service: &str,
+        action: ComposeOperationAction,
+    ) -> bool {
+        let expected_state = match action {
+            ComposeOperationAction::Pause => "running",
+            ComposeOperationAction::Unpause => "paused",
+            _ => return false,
+        };
+        let Some(service) = validate_service_selector(service) else {
+            return false;
+        };
+        if !self.can_request_service_action(service, expected_state) {
+            return false;
+        }
+        self.set_operation_confirmation(action, Some(service.to_owned()))
+    }
+
     pub(super) fn request_service_restart_confirmation(&mut self, service: &str) -> bool {
         let Some(service) = validate_service_selector(service) else {
             return false;
         };
-        if !matches!(&self.status, ComposeStatusState::Succeeded { .. })
-            || !matches!(&self.validation, ComposeValidationState::Succeeded { .. })
-            || !self
-                .containers
-                .iter()
-                .any(|container| container.service == service)
-        {
+        if !self.can_request_service_restart(service) {
             return false;
         }
         self.set_operation_confirmation(ComposeOperationAction::Restart, Some(service.to_owned()))
     }
-
     fn set_operation_confirmation(
         &mut self,
         action: ComposeOperationAction,
@@ -712,6 +730,11 @@ impl ComposeView {
         };
         let action = confirmation.action;
         let service = confirmation.service.clone();
+        let expected_state = match action {
+            ComposeOperationAction::Pause => Some("running"),
+            ComposeOperationAction::Unpause => Some("paused"),
+            _ => None,
+        };
         if !self.current_imported_selection_validated()
             || (action == ComposeOperationAction::Up && !self.has_current_status_snapshot())
             || self.selected_import_label.as_deref()
@@ -721,10 +744,16 @@ impl ComposeView {
                 != Some(confirmation.selection.profiles.as_slice())
             || service.as_ref().is_some_and(|service| {
                 !matches!(&self.status, ComposeStatusState::Succeeded { .. })
-                    || !self
-                        .containers
-                        .iter()
-                        .any(|container| &container.service == service)
+                    || expected_state.is_some_and(|_| {
+                        !self
+                            .validated_services
+                            .iter()
+                            .any(|candidate| candidate == service)
+                    })
+                    || !self.containers.iter().any(|container| {
+                        &container.service == service
+                            && expected_state.is_none_or(|state| container.state == state)
+                    })
             })
         {
             self.operation = ComposeOperationState::Idle;
@@ -892,6 +921,25 @@ impl ComposeView {
                 .containers
                 .iter()
                 .any(|container| container.service == service)
+            && !matches!(
+                &self.operation,
+                ComposeOperationState::Confirming(_) | ComposeOperationState::Running { .. }
+            )
+    }
+    fn can_request_service_action(&self, service: &str, expected_state: &str) -> bool {
+        validate_service_selector(service).is_some()
+            && self.current_imported_selection_validated()
+            && matches!(&self.status, ComposeStatusState::Succeeded { .. })
+            && self.selected_profiles().is_ok()
+            && matches!(&self.validation, ComposeValidationState::Succeeded { .. })
+            && self
+                .validated_services
+                .iter()
+                .any(|candidate| candidate == service)
+            && self
+                .containers
+                .iter()
+                .any(|container| container.service == service && container.state == expected_state)
             && !matches!(
                 &self.operation,
                 ComposeOperationState::Confirming(_) | ComposeOperationState::Running { .. }
@@ -1537,7 +1585,7 @@ impl ComposeView {
                 self.validated_generation = None;
             }
         });
-        ui.label("Profiles apply to validation, status, one-shot logs, and imported-project start/stop/restart; * enables all profiles.");
+        ui.label("Profiles apply to validation, status, one-shot logs, and imported-project start/stop/restart/pause/unpause; * enables all profiles.");
         let profiles_valid = self.selected_profiles().is_ok();
         if !profiles_valid {
             ui.colored_label(
@@ -1805,7 +1853,7 @@ impl ComposeView {
                 ui.label("No existing containers for the selected Compose files.");
             }
             ComposeStatusState::Succeeded { .. } => {
-                ui.columns(8, |columns| {
+                ui.columns(10, |columns| {
                     columns[0].strong("Container");
                     columns[1].strong("Service");
                     columns[2].strong("Project");
@@ -1814,6 +1862,8 @@ impl ComposeView {
                     columns[5].strong("Recent logs");
                     columns[6].strong("Follow logs");
                     columns[7].strong("Restart");
+                    columns[8].strong("Pause");
+                    columns[9].strong("Unpause");
                 });
                 ui.separator();
                 egui::ScrollArea::vertical()
@@ -1826,7 +1876,7 @@ impl ComposeView {
                         |ui, rows| {
                             for row in rows {
                                 let container = &self.containers[row];
-                                ui.columns(8, |columns| {
+                                ui.columns(10, |columns| {
                                     columns[0]
                                         .add(egui::Label::new(container.name.as_str()).truncate());
                                     columns[1].add(
@@ -1885,6 +1935,40 @@ impl ComposeView {
                                         .clicked()
                                     {
                                         actions.restart_service = Some(container.service.clone());
+                                    }
+                                    if container.state == "running"
+                                        && self.can_request_service_action(
+                                            &container.service,
+                                            "running",
+                                        )
+                                        && columns[8]
+                                            .add_enabled(
+                                                status_enabled,
+                                                egui::Button::new(format!(
+                                                    "Pause service {}",
+                                                    container.service
+                                                )),
+                                            )
+                                            .clicked()
+                                    {
+                                        actions.pause_service = Some(container.service.clone());
+                                    }
+                                    if container.state == "paused"
+                                        && self.can_request_service_action(
+                                            &container.service,
+                                            "paused",
+                                        )
+                                        && columns[9]
+                                            .add_enabled(
+                                                status_enabled,
+                                                egui::Button::new(format!(
+                                                    "Unpause service {}",
+                                                    container.service
+                                                )),
+                                            )
+                                            .clicked()
+                                    {
+                                        actions.unpause_service = Some(container.service.clone());
                                     }
                                 });
                             }
@@ -1954,6 +2038,7 @@ impl ComposeView {
         }
         ui.heading("Imported configuration operations");
         ui.label("Create and start uses only existing local images and may create or recreate containers and networks. Start requires existing containers; it does not create. Stop does not remove containers. Restart targets a service in the current status snapshot.");
+        ui.label("Pause suspends a running service; unpause resumes it. Neither operation removes or creates project resources or volumes.");
         let operation_enabled = status_enabled && self.can_start_operation();
         let up_enabled = status_enabled && self.can_start_up();
         ui.horizontal(|ui| {
@@ -2029,6 +2114,15 @@ impl ComposeView {
                         ui.label("Volume safety warning");
                         ui.label("Compose may create missing project volumes. Running services can write to volumes and host mounts configured by the project.");
                         ui.label("Only images already present locally are used: --no-build and --pull never prevent builds and registry access. Prepare missing images separately. Up does not remove orphan containers or volumes.");
+                    } else if matches!(
+                        confirmation.action,
+                        ComposeOperationAction::Pause | ComposeOperationAction::Unpause
+                    ) {
+                        ui.label(if confirmation.action == ComposeOperationAction::Pause {
+                            "Pause suspends a running service. It does not remove or create project resources or volumes."
+                        } else {
+                            "Unpause resumes a paused service. It does not remove or create project resources or volumes."
+                        });
                     }
                     if !status_enabled {
                         ui.label(
@@ -2050,7 +2144,9 @@ impl ComposeView {
                         ComposeOperationAction::Up => "Cancel up confirmation",
                         ComposeOperationAction::Start
                         | ComposeOperationAction::Stop
-                        | ComposeOperationAction::Restart => "Cancel lifecycle action",
+                        | ComposeOperationAction::Restart
+                        | ComposeOperationAction::Pause
+                        | ComposeOperationAction::Unpause => "Cancel lifecycle action",
                     };
                     actions.cancel_operation_confirmation = ui.button(cancel_label).clicked();
                 });
@@ -3791,6 +3887,8 @@ async fn lifecycle_with_binary(
     if matches!(
         action,
         ComposeOperationAction::Restart
+            | ComposeOperationAction::Pause
+            | ComposeOperationAction::Unpause
             | ComposeOperationAction::Pull
             | ComposeOperationAction::Build
     ) {
@@ -4148,6 +4246,7 @@ struct PreparedComposeOperation {
     isolated: PrivateDockerConfig,
     files: Vec<std::path::PathBuf>,
     project_directory: std::path::PathBuf,
+    services: Vec<String>,
 }
 #[cfg(target_os = "linux")]
 fn compose_validation_operation_error(error: ComposeValidationError) -> ComposeOperationError {
@@ -4215,6 +4314,7 @@ async fn prepare_compose_operation(
         isolated,
         files: snapshot_files,
         project_directory: project_directory.to_path_buf(),
+        services: validation.services,
     })
 }
 
@@ -4406,12 +4506,13 @@ pub(super) async fn compose_pull(
     .await
 }
 #[cfg(target_os = "linux")]
-async fn service_restart_with_binary(
+async fn service_action_with_binary(
     binary: &std::path::Path,
     socket_path: &std::path::Path,
     files: &[std::path::PathBuf],
     profiles: &[String],
     service: &str,
+    action: ComposeOperationAction,
     search_path: &std::ffi::OsStr,
     user_compose_plugin: Option<&std::path::Path>,
 ) -> ComposeOperationResult {
@@ -4422,6 +4523,14 @@ async fn service_restart_with_binary(
     let Some(service) = validate_service_selector(service) else {
         return failure(ComposeOperationError::ServiceUnavailable);
     };
+    if !matches!(
+        action,
+        ComposeOperationAction::Restart
+            | ComposeOperationAction::Pause
+            | ComposeOperationAction::Unpause
+    ) {
+        return failure(ComposeOperationError::ServiceUnavailable);
+    }
     let prepared =
         match prepare_compose_operation(binary, files, profiles, search_path, user_compose_plugin)
             .await
@@ -4451,9 +4560,20 @@ async fn service_restart_with_binary(
             return failure(ComposeOperationError::StatusUnavailable);
         }
     };
-    if !containers
-        .iter()
-        .any(|container| container.service == service)
+    let expected_state = match action {
+        ComposeOperationAction::Pause => Some("running"),
+        ComposeOperationAction::Unpause => Some("paused"),
+        _ => None,
+    };
+    if (expected_state.is_some()
+        && !prepared
+            .services
+            .iter()
+            .any(|candidate| candidate == service))
+        || !containers.iter().any(|container| {
+            container.service == service
+                && expected_state.is_none_or(|state| container.state == state)
+        })
     {
         return failure(ComposeOperationError::ServiceUnavailable);
     }
@@ -4474,16 +4594,24 @@ async fn service_restart_with_binary(
     for profile in profiles {
         command.arg("--profile").arg(profile);
     }
-    command.args(["restart", "--no-deps"]).arg(service);
+    if action == ComposeOperationAction::Restart {
+        command.args(["restart", "--no-deps"]).arg(service);
+    } else {
+        command.arg(action.label()).arg(service);
+    }
     prepared
         .isolated
         .configure_compose_file_descriptors(&mut command);
-    run_lifecycle_command_with_timeout(
-        &mut command,
-        LIFECYCLE_COMMAND_TIMEOUT,
-        ComposeOperationError::OperationFailed,
-    )
-    .await
+    let submitted_failure = if matches!(
+        action,
+        ComposeOperationAction::Pause | ComposeOperationAction::Unpause
+    ) {
+        ComposeOperationError::OperationOutcomeUncertain
+    } else {
+        ComposeOperationError::OperationFailed
+    };
+    run_lifecycle_command_with_timeout(&mut command, LIFECYCLE_COMMAND_TIMEOUT, submitted_failure)
+        .await
 }
 
 #[cfg(target_os = "linux")]
@@ -4511,6 +4639,8 @@ pub(super) async fn compose_operation(
     if matches!(
         action,
         ComposeOperationAction::Restart
+            | ComposeOperationAction::Pause
+            | ComposeOperationAction::Unpause
             | ComposeOperationAction::Pull
             | ComposeOperationAction::Build
     ) {
@@ -4554,11 +4684,12 @@ pub(super) async fn compose_operation(
 }
 
 #[cfg(target_os = "linux")]
-pub(super) async fn compose_service_restart(
+pub(super) async fn compose_service_action(
     socket_path: &std::path::Path,
     files: &[std::path::PathBuf],
     profiles: &[String],
     service: &str,
+    action: ComposeOperationAction,
 ) -> ComposeOperationResult {
     let Some(search_path) = std::env::var_os("PATH") else {
         return ComposeOperationResult {
@@ -4573,12 +4704,13 @@ pub(super) async fn compose_service_restart(
         };
     };
     let plugin = user_compose_plugin();
-    service_restart_with_binary(
+    service_action_with_binary(
         &binary,
         socket_path,
         files,
         profiles,
         service,
+        action,
         &search_path,
         plugin.as_deref(),
     )
@@ -7115,12 +7247,13 @@ exit 85
 
             let files = [base.clone(), overlay.clone()];
             let profiles = ["frontend".to_owned(), "qa".to_owned()];
-            let result = service_restart_with_binary(
+            let result = service_action_with_binary(
                 &binary,
                 &socket,
                 &files,
                 &profiles,
                 "web",
+                ComposeOperationAction::Restart,
                 OsStr::new("/usr/bin"),
                 None,
             )
@@ -7257,12 +7390,13 @@ exit 85
                 fs::write(&binary, script).unwrap();
                 fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
 
-                let result = service_restart_with_binary(
+                let result = service_action_with_binary(
                     &binary,
                     &directory.path().join("socket.sock"),
                     &[file],
                     &[],
                     "web",
+                    ComposeOperationAction::Restart,
                     OsStr::new("/usr/bin"),
                     None,
                 )
@@ -7275,6 +7409,188 @@ exit 85
                     "no restart command may follow failed/absent status"
                 );
             }
+        }
+        #[tokio::test]
+        async fn service_pause_and_unpause_use_selected_snapshots_and_exact_state() {
+            for (action, state, verb) in [
+                (ComposeOperationAction::Pause, "running", "pause"),
+                (ComposeOperationAction::Unpause, "paused", "unpause"),
+            ] {
+                let directory = FixtureDirectory::new();
+                let project = directory.path().join("project");
+                fs::create_dir(&project).unwrap();
+                let file = project.join("compose.yaml");
+                let overlay = project.join("override.yaml");
+                fs::write(&file, "services:\n  web:\n    image: busybox\n").unwrap();
+                fs::write(&overlay, "services:\n  web:\n    environment: {}\n").unwrap();
+                let socket = directory.path().join("selected.sock");
+                let operation_trace = directory.path().join("operation-argv");
+                let binary = directory.path().join("docker-service-control-fixture");
+                let status =
+                    format!("{{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"{state}\"}}\n");
+                let status_trace = directory.path().join("status-argv");
+                let script = format!(
+                    "#!/bin/sh\n\
+                     case \"$*\" in\n\
+                       *' version --short'* ) printf 'v5.6.0\\n'; exit 0 ;;\n\
+                       *' config '* ) printf 'web\\n'; exit 0 ;;\n\
+                       *' ps '* ) printf '%s' {}; printf '%s\\n' \"$@\" > {}; exit 0 ;;\n\
+                       *' pause '*|*' unpause '* ) printf '%s\\n' \"$@\" > {}; exit 0 ;;\n\
+                     esac\n\
+                     exit 94\n",
+                    shell_quote(&status),
+                    shell_quote(status_trace.to_str().unwrap()),
+                    shell_quote(operation_trace.to_str().unwrap()),
+                );
+                fs::write(&binary, script).unwrap();
+                fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+                let result = service_action_with_binary(
+                    &binary,
+                    &socket,
+                    &[file, overlay],
+                    &["frontend".to_owned(), "qa".to_owned()],
+                    "web",
+                    action,
+                    OsStr::new("/usr/bin"),
+                    None,
+                )
+                .await;
+                assert_eq!(result.outcome, Ok(()));
+                assert!(result.submitted);
+
+                let arguments = fs::read_to_string(operation_trace)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                assert_eq!(arguments[0], "--host");
+                assert_eq!(arguments[1], format!("unix://{}", socket.display()));
+                assert_eq!(arguments[2], "compose");
+                assert_eq!(arguments[3], "--project-directory");
+                assert_eq!(arguments[4], project.display().to_string());
+                assert_eq!(arguments[5], "--file");
+                assert!(arguments[6].starts_with("/proc/self/fd/"));
+                assert_eq!(arguments[7], "--file");
+                assert!(arguments[8].starts_with("/proc/self/fd/"));
+                assert_eq!(
+                    &arguments[9..],
+                    ["--profile", "frontend", "--profile", "qa", verb, "web"]
+                );
+                let status_arguments = fs::read_to_string(status_trace)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                assert_eq!(status_arguments[0], "--host");
+                assert_eq!(status_arguments[1], format!("unix://{}", socket.display()));
+                assert_eq!(status_arguments[2], "compose");
+                assert_eq!(status_arguments[3], "--project-directory");
+                assert_eq!(status_arguments[4], project.display().to_string());
+                assert_eq!(status_arguments[5], "--file");
+                assert_eq!(status_arguments[6], arguments[6]);
+                assert_eq!(status_arguments[7], "--file");
+                assert_eq!(status_arguments[8], arguments[8]);
+                assert_eq!(
+                    &status_arguments[9..],
+                    [
+                        "--profile",
+                        "frontend",
+                        "--profile",
+                        "qa",
+                        "ps",
+                        "--all",
+                        "--format",
+                        "json",
+                    ]
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn service_pause_refuses_missing_or_ineligible_fresh_status() {
+            for status in [
+                "",
+                "{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"paused\"}\n",
+                "{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"exited\"}\n",
+                "{\"Name\":\"orphan-1\",\"Service\":\"orphan\",\"State\":\"running\"}\n",
+                "{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"Running\"}\n",
+            ] {
+                let directory = FixtureDirectory::new();
+                let project = directory.path().join("project");
+                fs::create_dir(&project).unwrap();
+                let file = project.join("compose.yaml");
+                fs::write(&file, "services:\n  web:\n    image: busybox\n").unwrap();
+                let marker = directory.path().join("pause-invoked");
+                let binary = directory.path().join("docker-pause-guard");
+                let script = format!(
+                    "#!/bin/sh\n\
+                     case \"$*\" in\n\
+                       *' version --short'* ) printf 'v5.6.0\\n'; exit 0 ;;\n\
+                       *' config '* ) printf 'web\\n'; exit 0 ;;\n\
+                       *' ps '* ) printf '%s' {}; exit 0 ;;\n\
+                       *' pause '* ) : > {}; exit 0 ;;\n\
+                     esac\n\
+                     exit 94\n",
+                    shell_quote(status),
+                    shell_quote(marker.to_str().unwrap()),
+                );
+                fs::write(&binary, script).unwrap();
+                fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+                let result = service_action_with_binary(
+                    &binary,
+                    &directory.path().join("socket.sock"),
+                    &[file],
+                    &[],
+                    "web",
+                    ComposeOperationAction::Pause,
+                    OsStr::new("/usr/bin"),
+                    None,
+                )
+                .await;
+                assert_eq!(
+                    result.outcome,
+                    Err(ComposeOperationError::ServiceUnavailable)
+                );
+                assert!(!result.submitted);
+                assert!(!marker.exists());
+            }
+        }
+        #[tokio::test]
+        async fn service_pause_command_failure_is_uncertain_after_submission() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("project");
+            fs::create_dir(&project).unwrap();
+            let file = project.join("compose.yaml");
+            fs::write(&file, "services:\n  web:\n    image: busybox\n").unwrap();
+            let binary = directory.path().join("docker-pause-failure");
+            let script = concat!(
+                "#!/bin/sh\n",
+                "case \"$*\" in\n",
+                "  *' version --short'* ) printf 'v5.6.0\\n'; exit 0 ;;\n",
+                "  *' config '* ) printf 'web\\n'; exit 0 ;;\n",
+                "  *' ps '* ) printf '{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"running\"}\\n'; exit 0 ;;\n",
+                "  *' pause '* ) exit 17 ;;\n",
+                "esac\n",
+                "exit 94\n",
+            );
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let result = service_action_with_binary(
+                &binary,
+                &directory.path().join("selected.sock"),
+                &[file],
+                &[],
+                "web",
+                ComposeOperationAction::Pause,
+                OsStr::new("/usr/bin"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                result.outcome,
+                Err(ComposeOperationError::OperationOutcomeUncertain)
+            );
+            assert!(result.submitted);
         }
         #[tokio::test]
         async fn invalid_configuration_prevents_lifecycle_command_and_hides_diagnostics() {
@@ -8979,6 +9295,127 @@ exit 85
             assert!(view.confirm_operation().is_none());
         }
 
+        #[test]
+        fn service_pause_and_unpause_require_exact_current_state_at_confirmation() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("Local label"));
+            view.validated_services = vec!["web".to_owned()];
+            assert!(
+                !view.request_service_action_confirmation("web", ComposeOperationAction::Pause),
+                "missing successful status cannot authorize pause"
+            );
+            let (generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                generation,
+                ComposeStatusResult {
+                    containers: vec![ComposeContainer {
+                        name: "web-1".to_owned(),
+                        service: "web".to_owned(),
+                        project: None,
+                        state: "running".to_owned(),
+                        health: None,
+                    }],
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(!view.request_service_action_confirmation(
+                "not-declared",
+                ComposeOperationAction::Pause
+            ));
+            assert!(view.request_service_action_confirmation("web", ComposeOperationAction::Pause));
+            view.containers[0].state = "paused".to_owned();
+            assert!(view.confirm_operation().is_none());
+            assert!(
+                view.request_service_action_confirmation("web", ComposeOperationAction::Unpause)
+            );
+            let task = view.confirm_operation().unwrap();
+            assert_eq!(task.action, ComposeOperationAction::Unpause);
+            assert_eq!(task.service.as_deref(), Some("web"));
+        }
+
+        #[test]
+        fn pause_and_unpause_controls_are_accessible_and_state_gated() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("Local label"));
+            view.validated_services = vec!["web".to_owned(), "worker".to_owned()];
+            let (generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                generation,
+                ComposeStatusResult {
+                    containers: vec![
+                        ComposeContainer {
+                            name: "web-1".to_owned(),
+                            service: "web".to_owned(),
+                            project: None,
+                            state: "running".to_owned(),
+                            health: None,
+                        },
+                        ComposeContainer {
+                            name: "worker-1".to_owned(),
+                            service: "worker".to_owned(),
+                            project: None,
+                            state: "paused".to_owned(),
+                            health: None,
+                        },
+                        ComposeContainer {
+                            name: "unknown-1".to_owned(),
+                            service: "unknown".to_owned(),
+                            project: None,
+                            state: "restarting".to_owned(),
+                            health: None,
+                        },
+                    ],
+                    outcome: Ok(()),
+                },
+            ));
+            let mut harness = harness_for(view);
+            harness.run();
+            assert!(
+                !harness
+                    .get_by_role_and_label(Role::Button, "Pause service web")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            assert!(
+                !harness
+                    .get_by_role_and_label(Role::Button, "Unpause service worker")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+        }
+        #[test]
+        fn pause_confirmation_names_scope_and_explains_reversible_effect() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("Local label"));
+            view.validated_services = vec!["web".to_owned()];
+            let (generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                generation,
+                ComposeStatusResult {
+                    containers: vec![ComposeContainer {
+                        name: "web-1".to_owned(),
+                        service: "web".to_owned(),
+                        project: None,
+                        state: "running".to_owned(),
+                        health: None,
+                    }],
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(view.request_service_action_confirmation("web", ComposeOperationAction::Pause));
+            let mut harness = harness_for(view);
+            harness.run();
+            let _service = harness.get_by_role_and_label(Role::Label, "Service: web");
+            let _import_label =
+                harness.get_by_role_and_label(Role::Label, "Imported local label: Local label");
+            let _files = harness.get_by_role_and_label(Role::Label, "Ordered files: compose.yaml");
+            let _profiles = harness.get_by_role_and_label(Role::Label, "Profiles: default");
+            let _confirm = harness.get_by_role_and_label(Role::Button, "Confirm pause");
+            let _warning = harness.get_by_role_and_label(
+                Role::Label,
+                "Pause suspends a running service. It does not remove or create project resources or volumes.",
+            );
+        }
         #[test]
         fn service_restart_control_is_visible_but_disabled_without_imported_revalidated_scope() {
             let mut view = validated_compose_view();
