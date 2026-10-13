@@ -1582,9 +1582,7 @@ impl FerrumApp {
         }
 
         let (persisted, receiver) = tokio::sync::oneshot::channel();
-        let Some(sender) = self.compose_operation_audit_sender.as_ref() else {
-            return None;
-        };
+        let sender = self.compose_operation_audit_sender.as_ref()?;
         if sender
             .try_send(PendingComposeAuditRecord { record, persisted })
             .is_err()
