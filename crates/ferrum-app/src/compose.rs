@@ -9,6 +9,7 @@ use crate::display::escape_untrusted_display_text;
 use crate::display::escape_untrusted_display_text_with_limit;
 use crate::settings::{SavedComposeProject, valid_saved_compose_project};
 use eframe::egui;
+use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
@@ -57,6 +58,13 @@ fn service_instance_count(containers: &[ComposeContainer], service: &str) -> usi
         .iter()
         .filter(|container| container.service == service)
         .count()
+}
+fn count_service_instances_by_name(containers: &[ComposeContainer]) -> HashMap<String, usize> {
+    let mut counts = HashMap::with_capacity(containers.len());
+    for container in containers {
+        *counts.entry(container.service.clone()).or_insert(0) += 1;
+    }
+    counts
 }
 
 #[cfg(target_os = "linux")]
@@ -629,6 +637,7 @@ pub(super) struct ComposeView {
     profile_input: String,
     status_generation: u64,
     status: ComposeStatusState,
+    service_instance_counts: HashMap<String, usize>,
     containers: Vec<ComposeContainer>,
     logs_generation: u64,
     logs: ComposeLogsState,
@@ -1060,6 +1069,7 @@ impl ComposeView {
         self.status_generation = self.status_generation.wrapping_add(1);
         self.invalidate_logs();
         self.containers.clear();
+        self.service_instance_counts.clear();
         let file_name = display_compose_file_list(&self.selected_files);
         self.status = ComposeStatusState::Loading { file_name };
         Some((
@@ -1086,10 +1096,12 @@ impl ComposeView {
         match result.outcome {
             Ok(()) => {
                 self.containers = result.containers;
+                self.service_instance_counts = count_service_instances_by_name(&self.containers);
                 self.status = ComposeStatusState::Succeeded { file_name };
             }
             Err(error) => {
                 self.containers.clear();
+                self.service_instance_counts.clear();
                 self.status = ComposeStatusState::Failed { file_name, error };
             }
         }
@@ -1100,6 +1112,7 @@ impl ComposeView {
         if let ComposeStatusState::Loading { file_name } = std::mem::take(&mut self.status) {
             self.status_generation = self.status_generation.wrapping_add(1);
             self.containers.clear();
+            self.service_instance_counts.clear();
             self.status = ComposeStatusState::Cancelled { file_name };
         }
     }
@@ -1108,6 +1121,7 @@ impl ComposeView {
         self.status_generation = self.status_generation.wrapping_add(1);
         self.status = ComposeStatusState::Idle;
         self.containers.clear();
+        self.service_instance_counts.clear();
         self.invalidate_logs();
         self.invalidate_follow();
     }
@@ -1989,15 +2003,19 @@ impl ComposeView {
             if !valid_scale_target {
                 ui.label("Enter a whole number from 1 to 32 to enable scaling.");
             }
+            let scale_actions_enabled =
+                status_enabled && valid_scale_target && self.can_request_service_operation();
             for service in &self.all_declared_services {
-                let count = self.service_instance_count(service);
+                let count = self
+                    .service_instance_counts
+                    .get(service)
+                    .copied()
+                    .unwrap_or_default();
                 ui.horizontal(|ui| {
                     ui.label(format!("{service}: {count} observed instance(s)"));
                     if ui
                         .add_enabled(
-                            status_enabled
-                                && valid_scale_target
-                                && self.can_request_service_scale(service),
+                            scale_actions_enabled && validate_service_selector(service).is_some(),
                             egui::Button::new(if self.scale_target.is_empty() {
                                 format!("Scale service {service}")
                             } else {
