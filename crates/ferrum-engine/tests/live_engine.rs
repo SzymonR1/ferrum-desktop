@@ -7,12 +7,12 @@ use ferrum_engine::ContainerLogsOptions;
 
 #[cfg(target_os = "linux")]
 use std::{
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(target_os = "linux")]
@@ -598,7 +598,7 @@ async fn local_engine_loopback_registry_pull_reports_progress_and_cleans_only_te
     disposable.arm();
     let cleanup = disposable.remove();
     assert!(
-        cleanup.is_ok_and(|output| output.status.success()),
+        cleanup.is_ok_and(|status| status.success()),
         "Docker CLI should remove only the generated tag without force"
     );
     let remaining_images = engine
@@ -1831,14 +1831,80 @@ async fn drain_pull_progress(
 }
 
 #[cfg(target_os = "linux")]
+fn wait_for_child_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+        if Instant::now() >= deadline {
+            let timeout_error = std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "cleanup child exceeded its deadline",
+            );
+            return match child.kill() {
+                Ok(()) => {
+                    let _ = child.wait();
+                    Err(timeout_error)
+                }
+                Err(kill_error) => match child.try_wait() {
+                    Ok(Some(status)) => Ok(status),
+                    Ok(None) | Err(_) => Err(kill_error),
+                },
+            };
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn wait_for_child_with_timeout_kills_a_long_running_process() {
+    let mut child = Command::new("sleep")
+        .arg("60")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the Linux test environment should provide sleep");
+    let started = Instant::now();
+    let result = wait_for_child_with_timeout(&mut child, Duration::from_millis(20));
+
+    assert!(
+        result.is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut),
+        "the child should be reported as timed out"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the bounded wait should return promptly"
+    );
+    assert!(
+        child.try_wait().is_ok_and(|status| status.is_some()),
+        "the timed-out child should be reaped"
+    );
+}
+
+#[cfg(target_os = "linux")]
 fn docker_remove_disposable_image_tag(
     context_name: &str,
     reference: &str,
-) -> std::io::Result<std::process::Output> {
-    Command::new("docker")
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut child = Command::new("docker")
         .args(["--context", context_name, "image", "rm", "--no-prune"])
         .arg(reference)
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    wait_for_child_with_timeout(&mut child, Duration::from_secs(5))
 }
 
 #[cfg(target_os = "linux")]
@@ -1866,7 +1932,7 @@ impl DisposableImageTag {
         self.cleanup_required = false;
     }
 
-    fn remove(&self) -> std::io::Result<std::process::Output> {
+    fn remove(&self) -> std::io::Result<std::process::ExitStatus> {
         docker_remove_disposable_image_tag(&self.context_name, &self.reference)
     }
 }

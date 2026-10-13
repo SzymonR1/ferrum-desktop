@@ -268,12 +268,14 @@ rejected, and leave both references absent. Each Engine progress stream has a
 a non-empty status was observed. On a completed pull, cleanup is armed only
 after inventory confirms a full SHA-256 image ID and exactly the generated tag.
 It removes only that tag using `docker image rm --no-prune` without force. If
-inventory cannot confirm ownership, the test does not remove the tag. No
-container, external registry, credentials, user image, daemon setting, or prune
-operation is used. A failed pull stream is dropped and the loopback fixture is
-stopped, but Engine-side cancellation is not guaranteed; interrupted pulls may
-leave untagged blob data or an unknown outcome.
-
+inventory cannot confirm ownership, the test does not attempt removal. The
+explicit cleanup and Drop fallback use a CLI child with a five-second deadline;
+the helper attempts to kill and reap it on timeout. A failed explicit cleanup
+fails the test; no force or prune is attempted. No container, external registry,
+credentials, user image, or daemon setting is used. A failed pull stream is
+dropped and the loopback fixture is stopped, but Engine-side cancellation is
+not guaranteed; interrupted pulls may leave untagged blob data or an unknown
+outcome.
 Run only against a disposable local Docker Engine:
 
 ```sh
