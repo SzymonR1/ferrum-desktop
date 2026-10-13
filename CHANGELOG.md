@@ -3,6 +3,27 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Added confirmed Compose **Create and start (local images)** for the current
+  imported, successfully revalidated ordered file/profile selection and a
+  successful current status refresh on the selected Linux local Docker socket.
+  It submits sealed file snapshots
+  with fixed `up --detach --no-build --pull never` arguments, creates/starts
+  containers and networks and may create missing project volumes. It may
+  recreate existing containers when configuration/image changes require it and
+  uses local images only: no build, pull, orphan removal, volume removal, or
+  force recreation. Project services may write to configured volumes and host
+  mounts. Missing images require separate Build/Pull actions; Compose pulls are
+  anonymous-only. Confirmation warns about trusted files, resource creation,
+  recreation, and the local-image limit.
+  Compose project configuration and service code run on the selected Engine
+  without a sandbox. The 30-second command records only static `up` and
+  `started`, `success`, `not_submitted`, `request_error`, or `uncertain`
+  outcomes without paths or project metadata; any post-spawn failure/timeout is
+  uncertain. A successful current status snapshot is required before every
+  confirmation and keeps the action disabled while status is pending or failed.
+  Fake-CLI/headless coverage only; no live mutating test ran because no disposable
+  Engine is designated. No Podman, remote, Windows/macOS, or full Issue #18/#19
+  support is claimed.
 - Hardened confirmed local Compose mutations against selected-file path races.
   Each operation snapshots the explicitly selected ordered YAML files into
   write-sealed Linux memfds, validates and submits using the same descriptors,

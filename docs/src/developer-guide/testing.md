@@ -46,6 +46,20 @@ or user project:
 cargo test -p ferrum-app compose::tests::subprocess::local_compose_validation_reads_the_sealed_operation_snapshot -- --exact --ignored
 ```
 
+## Compose up with local images
+
+The confirmed Compose `up` path has controlled fake-CLI and headless UI
+coverage. Regressions exercise selected ordered files/profiles and socket
+arguments, sealed-snapshot submission, confirmation gating, and warnings about
+volume creation and writes to mounted data. They also cover static audit
+outcomes and post-spawn failure classification without changing Engine
+resources. Headless state tests require a successful status snapshot before
+`up`, reject confirmation while status is pending or failed, and keep retries
+blocked until status succeeds after an uncertain outcome and page
+invalidation/re-import. No live mutating integration test ran because no
+disposable Engine is designated; fixtures do not establish live Engine or
+broader platform behavior.
+
 Settings tests cover missing/corrupt settings, file-symlink rejection without
 changing target permissions, non-regular and hard-linked file rejection, and
 refusal to chmod or write through symlinked settings directories. The hard-link

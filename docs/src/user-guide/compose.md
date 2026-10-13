@@ -144,7 +144,7 @@ and sets `COMPOSE_EXPERIMENTAL_GIT_REMOTE=false` and
 by Ferrum itself; included projects may still read their default `.env` and
 explicit `include.env_file` under the logged-in user's permissions. Discovery,
 validation, status, and one-shot log subprocesses have an eight-second deadline
-per command; imported start/stop/restart mutations have a 30-second command
+per command; imported start/stop/restart/up mutations have a 30-second command
 bound after validation (restart also has a separate eight-second status check).
 Each call has a 1 MiB stdout cap; raw stderr and diagnostics are discarded.
 
@@ -265,23 +265,25 @@ does not cancel a command that may already have been accepted by the Engine.
 Context switching is blocked while a lifecycle command is pending. After
 completion Ferrum refreshes read-only status only if the same imported files,
 profiles, validation, and selected context remain current; otherwise refresh
-manually after returning to that configuration. Ferrum records only static
-`start`/`stop`/`restart` action and `started`, `success`, `not_submitted`, or
-`request_error` outcomes in its best-effort local audit history. A `started`
-record is written before preflight; with no later terminal outcome, Ferrum
-exited or final audit persistence failed, and the Engine result is unknown.
-`not_submitted` means preflight/validation, service-membership query, or
-process-spawn failure before the mutation process starts; a returned failure or
-timeout after process start is `request_error`. Audit persistence failure does
-not change the operation result. During shutdown Ferrum makes a best-effort,
+manually after returning to that configuration. For these `start`, `stop`, and
+`restart` actions, Ferrum records only the static action and `started`,
+`success`, `not_submitted`, or `request_error` outcomes in its best-effort local
+audit history. A `started` record is written before preflight; with no later
+terminal outcome, Ferrum exited or final audit persistence failed, and the
+Engine result is unknown. `not_submitted` means preflight/validation,
+service-membership query, or process-spawn failure before the mutation starts;
+a returned failure or timeout after process start is `request_error`. `up`
+instead records post-spawn failures as `uncertain`, as described below. Audit
+persistence failure does not change the operation result.
+During shutdown Ferrum makes a best-effort,
 up-to-one-second flush of the initial audit marker before aborting the lifecycle
 worker. A submitted child may still be terminated, leaving Engine state
 uncertain; refresh after restart. Service names, paths, labels, profiles,
 endpoint values, raw diagnostics, and project metadata are never audited.
-`up`, `down`, create, build, remove, and project-file mutation remain outside
-this partial Issue #18 slice. Compose pull is separately constrained as
-documented above. Explicitly saved local registrations are the only persistent
-Compose-project metadata and are described above.
+`down`, remove, and project-file mutation remain outside this partial Issue #18
+slice. Compose pull is separately constrained as documented above. Explicitly
+saved local registrations are the only persistent Compose-project metadata and
+are described above.
 
 ## Pull images for an imported configuration
 
@@ -373,7 +375,57 @@ snapshot. An opt-in smoke uses the installed Compose CLI and owned temporary
 base, override, and include files with `config --services` only; it does not
 contact an Engine, registry, or user project.
 
+## Create and start (local images)
 
+After explicit confirmation, **Create and start (local images)** is available
+only for the current imported selection after its ordered files and profiles
+have been successfully revalidated and the current Compose status refresh has
+succeeded. Refresh status before the first `up` and after any uncertain result;
+if navigation skips automatic refresh, a successful manual refresh is needed.
+Ferrum uses the selected Linux local Docker Unix socket and sealed snapshots
+of those selected files. Its fixed Compose operation is:
+
+```text
+docker compose ... up --detach --no-build --pull never
+```
+
+Ferrum also pins the command to the selected socket and supplies the base
+project directory, ordered snapshot file descriptors, and selected profiles.
+Compose creates and starts project containers and networks and may create
+missing project volumes, as described in Docker's
+[Compose volume documentation](https://docs.docker.com/reference/compose-file/volumes/).
+It may recreate existing containers when configuration or image changes require it.
+With `--detach`, Compose returns while containers
+continue running; use the existing status and service-log views to monitor them.
+Project services can write to volumes and host mounts described by the trusted
+project. It uses locally present images
+only: this operation does not build or pull images, remove orphan containers,
+remove volumes, or force recreation. If an image is missing,
+use the separate **Build imported images** or **Pull images** action as
+appropriate. Compose pulls are anonymous-only and may fail for private
+registries requiring credentials.
+
+The confirmation warns to use only trusted project files because containers
+and missing project volumes may be created and existing containers may be
+recreated; required images must already exist locally. Compose runs trusted
+service code on the selected Engine; this is not a sandbox. Ferrum uses its
+private Docker config/HOME and cleared environment, and does not pass saved
+Docker credentials or invoke Build/Pull as part of `up`.
+
+The command has a 30-second deadline and a 1 MiB stdout cap; raw stdout is
+discarded and stderr is suppressed. Best-effort audit records only static `up`
+action and `started`, `success`, `not_submitted`, `request_error`, or
+`uncertain` outcomes, without paths or project metadata. A failure after the
+process starts, including timeout, is uncertain.
+A successful current status snapshot is required before every `up` confirmation.
+The control stays disabled while refresh is pending or failed. Ferrum refreshes
+status automatically after completion only while the same page and selection
+remain current; if refresh fails or navigation skips it, refresh successfully
+before trying again. Fake-CLI/headless coverage does not establish live Engine
+behavior; no disposable Engine is designated for a mutating integration test.
+
+This slice is limited to Linux local Docker Unix sockets. It does not claim
+Podman, remote Engine, Windows, macOS, or full Issue #18/#19 support.
 
 
 ## One-shot service log snapshot
@@ -466,7 +518,8 @@ docker --host unix://<selected-socket> compose --project-directory <base-parent>
 ```
 
 Selected profiles are passed to structural validation, existing-container
-status, one-shot snapshots, live service-log follow, and imported-configuration start/stop/restart.
+status, one-shot snapshots, live service-log follow, and imported-configuration
+start/stop/restart/up.
 `config --services` inventory includes every service declared in the selected
 files regardless of active profiles. Before either one-shot logs or follow,
 the fresh status recheck uses the selected profiles. Profile flags

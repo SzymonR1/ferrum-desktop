@@ -92,8 +92,8 @@ those traces.
 
 Ferrum also maintains a Linux-local, bounded JSONL copy of mutation outcomes
 for container lifecycle, confirmed imported Compose start/stop/service restart
-and Compose pulls, image pull/push/tag/removal and Buildx image builds, volume
-create/removal, and network create/removal/connect/disconnect requests.
+and `up`, Compose pulls, image pull/push/tag/removal and Buildx image builds,
+volume create/removal, and network create/removal/connect/disconnect requests.
 `audit.jsonl` is created
 lazily in Ferrum's descriptor-anchored config directory with directory mode
 `0700` and file mode `0600`. Schema version 1 records a timestamp, static
@@ -101,18 +101,25 @@ event/action/outcome, and validated full resource IDs only where existing
 traces permit.
 
 A Compose lifecycle entry contains only the static `compose_mutation` event,
-`start`/`stop`/`restart` action, and `started`, `success`, `not_submitted`, or
-`request_error` outcome; labels, files, profiles, socket values, service names,
-credentials, and raw errors are excluded. Where persisted, `started` records
-that Ferrum began a confirmed attempt before preflight/CLI execution. If it has
-no later terminal outcome, Ferrum exited or final audit persistence failed; it
-does not prove whether Compose reached or changed the engine, so refresh status.
-`not_submitted` covers local preflight/validation or any process-spawn failure
-before the lifecycle process starts; a returned failure or timeout after start
-is `request_error`. During shutdown Ferrum makes a best-effort, up-to-one-second
-flush of the initial marker before aborting the lifecycle worker; a submitted
-child may still be terminated with Engine state uncertain. A build entry
-contains only the static
+`start`/`stop`/`restart`/`up` action, and `started`, `success`,
+`not_submitted`, `request_error`, or `uncertain` outcomes; labels, files,
+profiles, socket values, service names, credentials, and raw errors are
+excluded. An `up` confirmation requires a successful current status snapshot
+for the selected imported files and remains disabled after an uncertain result
+until refresh succeeds, including after navigation. Where persisted, `started`
+records that Ferrum began a confirmed attempt before preflight/CLI execution.
+The `up` command may create missing project volumes; trusted service code can
+write to configured volumes and host mounts. The operation does not remove
+volumes.
+If there is no later terminal outcome, Ferrum exited or final audit persistence
+failed; it does not prove whether Compose reached or changed the Engine, so
+refresh status. `not_submitted`
+covers local preflight/validation or any process-spawn failure before the
+lifecycle process starts; a returned failure or timeout after start is
+`request_error` for start/stop/restart and `uncertain` for `up`. During
+shutdown Ferrum makes a best-effort, up-to-one-second flush of the initial
+marker before aborting the lifecycle worker; a submitted child may still be
+terminated with Engine state uncertain. A build entry contains only the static
 `image_mutation` event, `build` action, and outcome. It excludes build output
 and all build-specific metadata, as well as names, image references/tags,
 endpoints, credentials, raw errors, daemon bodies, and terminal/log contents.
@@ -326,7 +333,7 @@ inputs; builds also consume live Dockerfiles and build contexts. Only trusted
 project trees should be used. Same-UID and privileged processes remain inside
 Ferrum's trust boundary; Compose and builder execution are not sandboxed.
 On Linux, each Compose subprocess for version, discovery, validation, status,
-one-shot and live service-log queries, and start/stop/restart has
+one-shot and live service-log queries, and start/stop/restart/up has
 `RLIMIT_AS` capped at 4 GiB and `RLIMIT_DATA` capped at 512 MiB, preserving
 lower inherited limits. The
 per-process limits apply while selected and included files; child processes
@@ -344,7 +351,7 @@ structural validation only: interpolation and service `env_file` resolution
 are skipped. Ferrum displays bounded escaped basenames, static outcomes, and
 the bounded escaped declared-service rows returned on successful validation;
 explicit profile selection affects validation, read-only status, one-shot and
-live service logs, and is passed to imported-project start/stop/restart. The
+live service logs, and is passed to imported-project start/stop/restart/up. The
 declared-service inventory includes every declaration in the selected files
 regardless of active profiles. Session imports retain validated ordered paths,
 profiles, and a bounded local label in memory. An explicit opt-in can persist a
@@ -358,8 +365,9 @@ entry and leaves the current session entry available. Neither selection nor
 persistence reads project contents or confines paths.
 Project lifecycle commands use selected files/profiles and the selected local
 socket; the local label does not establish project identity or authorization.
-Build/pull are separate confirmed image operations described below; `up`/`down`,
-remove, and project-file mutations remain unavailable.
+Build/pull are separate confirmed image operations described below; `up` is a
+separately confirmed operation, while `down`, remove, and project-file mutations
+remain unavailable.
 
 Start/stop are available only for the currently selected imported entry
 (session-only or explicitly saved) after explicit successful revalidation.
@@ -381,6 +389,28 @@ them. Ferrum invokes only `restart --no-deps <SERVICE>` for restart; it does
 not apply Compose configuration changes, and dependent services are not
 restarted. Confirmation names service, imported label, ordered safe basenames,
 profiles, and action; cancel submits nothing.
+
+The separately confirmed **Create and start (local images)** operation is
+limited to the current imported, successfully revalidated ordered files and
+profiles, their sealed snapshots, and the selected Linux local Docker Unix
+socket. It invokes fixed `up --detach --no-build --pull never` arguments,
+creating and starting project containers and networks. Compose may recreate
+existing containers when configuration or image changes require it. Only
+locally present images are used; it does not build, pull, remove orphans,
+remove volumes, or force recreation. Missing images require separate Build or
+Pull actions; Compose pulls are anonymous-only.
+
+The confirmation warns to use only trusted project files, that containers may
+be created or recreated, and that the required images must already be local
+because the operation does not build or pull. Compose project configuration
+and service code run on the selected Engine without a sandbox. Ferrum's private
+Docker config/HOME and cleared environment do not pass saved credentials.
+The command deadline is 30 seconds. Any failure after process spawn, including
+timeout, is uncertain and requires refreshing status before retrying. The audit
+records only static `up` and outcome values, never paths, labels, or project
+metadata. No live mutating integration test has run because no disposable
+Engine is designated; Podman, remote, Windows/macOS, and full Issue #18/#19
+support are not claimed.
 
 These commands are Linux local Docker Unix-socket only. Outcome errors are
 static and exclude CLI diagnostics. Navigation does not cancel an in-flight
@@ -559,7 +589,7 @@ plugin directory, only the `docker-compose` executable is linked into the
 private config; custom `cliPluginsExtraDirs` from saved config are not loaded.
 Saved `config.json` credentials and proxy settings are not read or passed.
 Discovery, validation, status, and one-shot log subprocesses have an eight-
-second deadline per command. Imported start/stop/restart allows 30 seconds for
+second deadline per command. Imported start/stop/restart/up allows 30 seconds for
 the lifecycle command after bounded validation commands; restart's fresh status
 query is also bounded to eight seconds. Each command has a 1 MiB stdout cap.
 Process resource exhaustion may cause generic validation, status, or lifecycle
