@@ -8174,7 +8174,7 @@ mod tests {
                     .is_disabled()
             );
             harness
-                .get_by_role_and_label(Role::Button, "Cancel lifecycle action")
+                .get_by_role_and_label(Role::Button, "Cancel pull")
                 .click_accesskit();
             harness.step();
             assert!(harness.state().actions.cancel_lifecycle);
