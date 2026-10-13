@@ -671,7 +671,12 @@ impl ComposeView {
         action: ComposeOperationAction,
         service: Option<String>,
     ) -> bool {
-        if !self.can_start_operation() {
+        let can_start = if action == ComposeOperationAction::Up {
+            self.can_start_up()
+        } else {
+            self.can_start_operation()
+        };
+        if !can_start {
             return false;
         }
         if service.is_some() && !matches!(&self.status, ComposeStatusState::Succeeded { .. }) {
@@ -708,6 +713,7 @@ impl ComposeView {
         let action = confirmation.action;
         let service = confirmation.service.clone();
         if !self.current_imported_selection_validated()
+            || (action == ComposeOperationAction::Up && !self.has_current_status_snapshot())
             || self.selected_import_label.as_deref()
                 != Some(confirmation.selection.imported_label.as_str())
             || self.selected_files != confirmation.selection.files
@@ -869,6 +875,12 @@ impl ComposeView {
                 &self.operation,
                 ComposeOperationState::Confirming(_) | ComposeOperationState::Running { .. }
             )
+    }
+    fn has_current_status_snapshot(&self) -> bool {
+        matches!(&self.status, ComposeStatusState::Succeeded { .. })
+    }
+    fn can_start_up(&self) -> bool {
+        self.can_start_operation() && self.has_current_status_snapshot()
     }
     fn can_request_service_restart(&self, service: &str) -> bool {
         validate_service_selector(service).is_some()
@@ -1943,6 +1955,7 @@ impl ComposeView {
         ui.heading("Imported configuration operations");
         ui.label("Create and start uses only existing local images and may create or recreate containers and networks. Start requires existing containers; it does not create. Stop does not remove containers. Restart targets a service in the current status snapshot.");
         let operation_enabled = status_enabled && self.can_start_operation();
+        let up_enabled = status_enabled && self.can_start_up();
         ui.horizontal(|ui| {
             actions.start_imported = ui
                 .add_enabled(
@@ -1960,11 +1973,16 @@ impl ComposeView {
         ui.horizontal(|ui| {
             actions.up_imported = ui
                 .add_enabled(
-                    operation_enabled,
+                    up_enabled,
                     egui::Button::new("Create and start (local images)"),
                 )
                 .clicked();
         });
+        if operation_enabled && !self.has_current_status_snapshot() {
+            ui.label(
+                "A successful status refresh is required before creating and starting a project.",
+            );
+        }
         ui.horizontal(|ui| {
             actions.pull_imported = ui
                 .add_enabled(operation_enabled, egui::Button::new("Pull imported images"))
@@ -9132,6 +9150,37 @@ exit 85
             assert!(view.import_current_project("Local label"));
             let mut harness = harness_for(view);
             harness.run();
+            assert!(
+                harness
+                    .get_by_role_and_label(Role::Button, "Create and start (local images)")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            assert!(
+                !harness
+                    .state_mut()
+                    .view
+                    .request_operation_confirmation(ComposeOperationAction::Up)
+            );
+            let (status_generation, _, _) = harness
+                .state_mut()
+                .view
+                .begin_status_refresh()
+                .expect("the validated selection should allow a status refresh");
+            assert!(harness.state_mut().view.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: Vec::new(),
+                    outcome: Ok(()),
+                },
+            ));
+            harness.step();
+            assert!(
+                !harness
+                    .get_by_role_and_label(Role::Button, "Create and start (local images)")
+                    .accesskit_node()
+                    .is_disabled()
+            );
             harness
                 .get_by_role_and_label(Role::Button, "Create and start (local images)")
                 .click_accesskit();
@@ -9179,6 +9228,60 @@ exit 85
             assert_eq!(task.action, ComposeOperationAction::Up);
             assert!(task.cancellation.is_none());
             assert!(task.cancellation_sender.is_none());
+        }
+        #[test]
+        fn uncertain_up_requires_successful_status_refresh_after_retry_and_navigation() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("Local label"));
+            assert!(!view.request_operation_confirmation(ComposeOperationAction::Up));
+
+            let (status_generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(!view.request_operation_confirmation(ComposeOperationAction::Up));
+            assert!(view.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: Vec::new(),
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(view.request_operation_confirmation(ComposeOperationAction::Up));
+            let task = view.confirm_operation().unwrap();
+            assert!(!view.request_operation_confirmation(ComposeOperationAction::Up));
+            assert!(view.finish_operation(
+                task.generation,
+                ComposeOperationResult {
+                    outcome: Err(ComposeOperationError::OperationOutcomeUncertain),
+                    submitted: true,
+                },
+            ));
+            assert!(!view.request_operation_confirmation(ComposeOperationAction::Up));
+
+            let (status_generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(!view.request_operation_confirmation(ComposeOperationAction::Up));
+            assert!(view.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: Vec::new(),
+                    outcome: Err(ComposeStatusError::QueryFailed),
+                },
+            ));
+            assert!(!view.request_operation_confirmation(ComposeOperationAction::Up));
+
+            view.invalidate();
+            assert!(!view.request_operation_confirmation(ComposeOperationAction::Up));
+            assert!(view.select_imported_project(0));
+            let (validation_generation, _, _) = view.begin_validation().unwrap();
+            assert!(view.finish_validation(validation_generation, validation_result(Ok(())),));
+            assert!(!view.request_operation_confirmation(ComposeOperationAction::Up));
+            let (status_generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: Vec::new(),
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(view.request_operation_confirmation(ComposeOperationAction::Up));
         }
 
         #[test]
@@ -9323,6 +9426,16 @@ exit 85
                 for change in 0..4 {
                     let mut view = validated_compose_view();
                     assert!(view.import_current_project("Local label"));
+                    if action == ComposeOperationAction::Up {
+                        let (status_generation, _, _) = view.begin_status_refresh().unwrap();
+                        assert!(view.finish_status_refresh(
+                            status_generation,
+                            ComposeStatusResult {
+                                containers: Vec::new(),
+                                outcome: Ok(()),
+                            },
+                        ));
+                    }
                     assert!(view.request_operation_confirmation(action));
                     match change {
                         0 => {

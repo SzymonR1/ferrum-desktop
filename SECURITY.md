@@ -102,10 +102,12 @@ traces permit.
 
 A Compose lifecycle entry contains only the static `compose_mutation` event,
 `start`/`stop`/`restart`/`up` action, and `started`, `success`,
-`not_submitted`, `request_error`, or `uncertain` outcome; labels, files,
+`not_submitted`, `request_error`, or `uncertain` outcomes; labels, files,
 profiles, socket values, service names, credentials, and raw errors are
-excluded. Where persisted, `started` records that Ferrum began a confirmed
-attempt before preflight/CLI execution. If it has no later terminal outcome,
+excluded. An `up` confirmation requires a successful current status snapshot
+for the selected imported files and remains disabled after an uncertain result
+until refresh succeeds, including after navigation. Where persisted, `started`
+records that Ferrum began a confirmed attempt before preflight/CLI execution.
 Ferrum exited or final audit persistence failed; it does not prove whether
 Compose reached or changed the engine, so refresh status. `not_submitted`
 covers local preflight/validation or any process-spawn failure before the

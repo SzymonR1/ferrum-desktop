@@ -49,12 +49,15 @@ cargo test -p ferrum-app compose::tests::subprocess::local_compose_validation_re
 ## Compose up with local images
 
 The confirmed Compose `up` path has controlled fake-CLI and headless UI
-coverage. These regressions exercise the selected ordered file/profile and
-socket arguments, sealed-snapshot submission, confirmation gating, static
-audit outcomes, and failure classification without changing Engine resources.
-The command is not live-validated: no mutating integration test ran because no
-disposable Engine is designated. Fake fixtures do not establish live Docker
-Engine behavior or broader platform support.
+coverage. Regressions exercise selected ordered files/profiles and socket
+arguments, sealed-snapshot submission, confirmation gating, static audit
+outcomes, and post-spawn failure classification without changing Engine
+resources. Headless state tests require a successful status snapshot before
+`up`, reject confirmation while status is pending or failed, and keep retries
+blocked until status succeeds after an uncertain outcome and page
+invalidation/re-import. No live mutating integration test ran because no
+disposable Engine is designated; fixtures do not establish live Engine or
+broader platform behavior.
 
 Settings tests cover missing/corrupt settings, file-symlink rejection without
 changing target permissions, non-regular and hard-linked file rejection, and

@@ -311,36 +311,33 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   `compose_build`/`build` start and outcome values. Fake-CLI/temp-fixture tests
   do not mutate Engine resources or contact registries/remote contexts.
 - Allow confirmed Compose `up` only for the current imported selection after
-  successful revalidation of its ordered files/profiles, using the sealed
-  snapshot descriptors and selected Linux local Docker Unix socket. Submit
-  fixed `up --detach --no-build --pull never` arguments. It creates and starts
-  project containers and networks, may recreate existing containers when
-  configuration or image changes, and uses locally present images only. Do not
-  build, pull, remove orphans, remove volumes, or force recreation. Missing
-  images require separate Build/Pull actions; Compose pulls remain anonymous
-  only. Confirmation warns only about using trusted project files,
-  creation/recreation, and the no-build/no-pull local-image limitation.
-  Compose runs trusted project configuration and service code on the selected
-  Engine; private CLI config/HOME and the cleared environment are not a sandbox
-  and no saved credentials are passed.
+  its ordered files/profiles have been revalidated and a current status query
+  has succeeded. Use sealed snapshot descriptors and the selected Linux local
+  Docker Unix socket with fixed `up --detach --no-build --pull never` arguments.
+  It creates/starts project containers and networks, may recreate existing
+  containers when configuration/image changes, and uses only local images.
+  It does not build, pull, remove orphans, remove volumes, or force recreation.
+  Missing images require separate Build/Pull actions; Compose pulls are
+  anonymous only. Confirmation warns to use trusted project files and explains
+  creation/recreation and the local-image requirement. Compose runs trusted
+  project configuration and service code on the selected Engine; it is not a
+  sandbox and no saved credentials are passed.
   Use a 30-second deadline and 1 MiB stdout cap; raw stdout is discarded and
-  stderr is suppressed. Audit only static `up` action and
-  `started`, `success`, `not_submitted`, `request_error`, or `uncertain`
-  outcomes, excluding paths, labels, and project metadata. Any failure after
-  spawn, including timeout, is uncertain; require status refresh before retry.
-  Controlled fake-CLI/headless coverage does not validate real Engine mutation;
-  no disposable Engine is designated for live mutating integration tests.
-  This slice does not claim Podman, remote, Windows/macOS, or full Issue #18/#19
-  support.
-  Controlled fake-CLI/headless tests cover imported lifecycle actions,
-  including `up`; no live Compose lifecycle mutation was performed. See Docker's
-  [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
-  and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
-  Remote references remain disabled and are not fetched. Linux local
-  discovery, single-file validation, ordered temporary base/override, and
-  remote-loader safety smokes passed with Compose v5.6.0; they do not validate
-  arbitrary projects. The native page visual check is unavailable. No full issue
-  completion, release, or support expansion is claimed.
+  stderr is suppressed. Audit only static `up` action and the `started`,
+  `success`, `not_submitted`, `request_error`, or `uncertain` outcomes; exclude
+  paths, labels, and project metadata. Any post-spawn failure, including
+  timeout, is uncertain. Require a successful current status snapshot before
+  each confirmation; keep the action disabled while refresh is pending or
+  failed. Automatic refresh runs only after completion while the same page and
+  selection remain current; refresh successfully after navigation or failure.
+  Controlled fake-CLI/headless tests cover command semantics and the status
+  retry gate; no live mutation ran because no disposable Engine is designated.
+  This slice does not claim Podman, remote, Windows/macOS, full issue completion,
+  support expansion. See the official
+  [Compose `up` reference](https://docs.docker.com/reference/cli/docker/compose/up/).
+  Remote references remain disabled and are not fetched. Existing temporary-
+  file/status smokes do not validate arbitrary projects. Native page visual
+  check is unavailable.
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
 - Escape selected control, bidi, zero-width, invisible-format, Hangul-filler,
   and Unicode-tag characters in engine-provided container inventory/inspection

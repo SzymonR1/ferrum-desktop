@@ -379,9 +379,11 @@ contact an Engine, registry, or user project.
 
 After explicit confirmation, **Create and start (local images)** is available
 only for the current imported selection after its ordered files and profiles
-have been successfully revalidated. Ferrum uses the selected Linux local
-Docker Unix socket and the sealed snapshots of those selected files. Its fixed
-Compose operation is:
+have been successfully revalidated and the current Compose status refresh has
+succeeded. Refresh status before the first `up` and after any uncertain result;
+if navigation skips automatic refresh, a successful manual refresh is needed.
+Ferrum uses the selected Linux local Docker Unix socket and sealed snapshots
+of those selected files. Its fixed Compose operation is:
 
 ```text
 docker compose ... up --detach --no-build --pull never
@@ -407,13 +409,16 @@ private Docker config/HOME and cleared environment, and does not pass saved
 Docker credentials or invoke Build/Pull as part of `up`.
 
 The command has a 30-second deadline and a 1 MiB stdout cap; raw stdout is
-discarded and stderr is suppressed. Ferrum records only static `up` action
-and `started`, `success`, `not_submitted`, `request_error`, or `uncertain`
-outcomes in its best-effort audit; no paths, labels, or project metadata are
-recorded. A failure after the process starts, including timeout, is uncertain:
-refresh Compose status before retrying. Fake-CLI/headless coverage does not
-constitute live Engine validation; no disposable Engine is designated for a
-mutating integration test.
+discarded and stderr is suppressed. Best-effort audit records only static `up`
+action and `started`, `success`, `not_submitted`, `request_error`, or
+`uncertain` outcomes, without paths or project metadata. A failure after the
+process starts, including timeout, is uncertain.
+A successful current status snapshot is required before every `up` confirmation.
+The control stays disabled while refresh is pending or failed. Ferrum refreshes
+status automatically after completion only while the same page and selection
+remain current; if refresh fails or navigation skips it, refresh successfully
+before trying again. Fake-CLI/headless coverage does not establish live Engine
+behavior; no disposable Engine is designated for a mutating integration test.
 
 This slice is limited to Linux local Docker Unix sockets. It does not claim
 Podman, remote Engine, Windows, macOS, or full Issue #18/#19 support.

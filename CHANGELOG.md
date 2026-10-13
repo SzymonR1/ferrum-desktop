@@ -4,8 +4,9 @@ All notable project changes are documented here. The project has not published a
 
 ## Unreleased
 - Added confirmed Compose **Create and start (local images)** for the current
-  imported, successfully revalidated ordered file/profile selection on the
-  selected Linux local Docker Unix socket. It submits sealed file snapshots
+  imported, successfully revalidated ordered file/profile selection and a
+  successful current status refresh on the selected Linux local Docker socket.
+  It submits sealed file snapshots
   with fixed `up --detach --no-build --pull never` arguments, creates/starts
   containers and networks, and may recreate containers when configuration or
   image changes require it. It uses local images only: no build, pull, orphan
@@ -15,11 +16,12 @@ All notable project changes are documented here. The project has not published a
   Compose project configuration and service code run on the selected Engine
   without a sandbox. The 30-second command records only static `up` and
   `started`, `success`, `not_submitted`, `request_error`, or `uncertain`
-  outcomes without paths or project metadata; post-spawn failures/timeouts are
-  uncertain and require status refresh before retry. Fake-CLI/headless coverage
-  only; no live mutating integration test ran because no disposable Engine is
-  designated. No Podman, remote, Windows/macOS, or full Issue #18/#19 support
-  is claimed.
+  outcomes without paths or project metadata; any post-spawn failure/timeout is
+  uncertain. A successful current status snapshot is required before every
+  confirmation and keeps the action disabled while status is pending or failed.
+  Fake-CLI/headless coverage only; no live mutating test ran because no disposable
+  Engine is designated. No Podman, remote, Windows/macOS, or full Issue #18/#19
+  support is claimed.
 - Hardened confirmed local Compose mutations against selected-file path races.
   Each operation snapshots the explicitly selected ordered YAML files into
   write-sealed Linux memfds, validates and submits using the same descriptors,
