@@ -262,6 +262,13 @@ impl ComposeOperationAction {
         }
     }
 }
+fn service_action_expected_state(action: ComposeOperationAction) -> Option<&'static str> {
+    match action {
+        ComposeOperationAction::Pause => Some("running"),
+        ComposeOperationAction::Unpause => Some("paused"),
+        _ => None,
+    }
+}
 
 pub(super) struct ComposeOperationTask {
     pub(super) generation: u64,
@@ -661,10 +668,8 @@ impl ComposeView {
         service: &str,
         action: ComposeOperationAction,
     ) -> bool {
-        let expected_state = match action {
-            ComposeOperationAction::Pause => "running",
-            ComposeOperationAction::Unpause => "paused",
-            _ => return false,
+        let Some(expected_state) = service_action_expected_state(action) else {
+            return false;
         };
         let Some(service) = validate_service_selector(service) else {
             return false;
@@ -730,11 +735,7 @@ impl ComposeView {
         };
         let action = confirmation.action;
         let service = confirmation.service.clone();
-        let expected_state = match action {
-            ComposeOperationAction::Pause => Some("running"),
-            ComposeOperationAction::Unpause => Some("paused"),
-            _ => None,
-        };
+        let expected_state = service_action_expected_state(action);
         if !self.current_imported_selection_validated()
             || (action == ComposeOperationAction::Up && !self.has_current_status_snapshot())
             || self.selected_import_label.as_deref()
@@ -4560,11 +4561,7 @@ async fn service_action_with_binary(
             return failure(ComposeOperationError::StatusUnavailable);
         }
     };
-    let expected_state = match action {
-        ComposeOperationAction::Pause => Some("running"),
-        ComposeOperationAction::Unpause => Some("paused"),
-        _ => None,
-    };
+    let expected_state = service_action_expected_state(action);
     if (expected_state.is_some()
         && !prepared
             .services
