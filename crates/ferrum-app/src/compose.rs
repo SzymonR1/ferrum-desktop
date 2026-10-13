@@ -34,6 +34,8 @@ const COMPOSE_SERVICE_ROW_HEIGHT: f32 = 24.0;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(target_os = "linux")]
 const LIFECYCLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
+const PULL_COMMAND_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const MAX_COMPOSE_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const CHILD_ADDRESS_SPACE_LIMIT: libc::rlim_t = 4 * 1024 * 1024 * 1024;
@@ -112,6 +114,8 @@ pub(super) enum ComposeLifecycleError {
     ServiceUnavailable,
     StatusUnavailable,
     OperationFailed,
+    PullCancelledBeforeSpawn,
+    PullOutcomeUncertain,
 }
 
 impl ComposeLifecycleError {
@@ -123,10 +127,10 @@ impl ComposeLifecycleError {
                 "Could not prepare an isolated Docker CLI environment."
             }
             Self::ValidationFailed => {
-                "Compose configuration validation failed; no lifecycle command was run."
+                "Compose configuration validation failed; no Compose operation was run."
             }
             Self::EngineUnavailable => {
-                "The engine or Compose configuration is not ready; no lifecycle command was run."
+                "The engine or Compose configuration is not ready; no Compose operation was run."
             }
             Self::ServiceUnavailable => {
                 "The selected service is no longer present in the current Compose status; refresh and retry."
@@ -135,6 +139,12 @@ impl ComposeLifecycleError {
                 "Could not verify current Compose status; no restart command was run. Refresh and retry."
             }
             Self::OperationFailed => "Compose lifecycle operation failed.",
+            Self::PullCancelledBeforeSpawn => {
+                "Compose pull was cancelled before the pull command was submitted."
+            }
+            Self::PullOutcomeUncertain => {
+                "Pull outcome uncertain; images may be partial or still downloading. Refresh before retrying."
+            }
         }
     }
 }
@@ -143,6 +153,41 @@ impl ComposeLifecycleError {
 pub(super) struct ComposeLifecycleResult {
     pub(super) outcome: Result<(), ComposeLifecycleError>,
     pub(super) submitted: bool,
+}
+#[cfg(target_os = "linux")]
+pub(super) const COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY: usize = 8;
+#[cfg(target_os = "linux")]
+const COMPOSE_PULL_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(target_os = "linux")]
+const COMPOSE_PULL_PROGRESS_LINE_BYTES: usize = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ComposePullProgressPhase {
+    Pulling,
+    Downloading,
+    Extracting,
+    Verifying,
+    Waiting,
+    Pulled,
+}
+
+impl ComposePullProgressPhase {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Pulling => "Pulling",
+            Self::Downloading => "Downloading",
+            Self::Extracting => "Extracting",
+            Self::Verifying => "Verifying",
+            Self::Waiting => "Waiting",
+            Self::Pulled => "Pulled",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ComposePullProgress {
+    pub(super) phase: ComposePullProgressPhase,
+    pub(super) recognized_records: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,6 +214,8 @@ enum ComposeLifecycleState {
         action: ComposeLifecycleAction,
         file_name: String,
         service: Option<String>,
+        pull_progress: Option<ComposePullProgress>,
+        cancel_requested: bool,
     },
     Succeeded {
         action: ComposeLifecycleAction,
@@ -188,6 +235,7 @@ pub(super) enum ComposeLifecycleAction {
     Start,
     Stop,
     Restart,
+    Pull,
 }
 
 impl ComposeLifecycleAction {
@@ -196,6 +244,7 @@ impl ComposeLifecycleAction {
             Self::Start => "start",
             Self::Stop => "stop",
             Self::Restart => "restart",
+            Self::Pull => "pull",
         }
     }
 }
@@ -205,8 +254,9 @@ pub(super) struct ComposeLifecycleTask {
     pub(super) action: ComposeLifecycleAction,
     pub(super) selection: ComposeLifecycleSelection,
     pub(super) service: Option<String>,
+    pub(super) pull_cancellation: Option<tokio::sync::oneshot::Receiver<()>>,
+    pub(super) pull_cancellation_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ComposeLogsError {
     DockerCliMissing,
@@ -458,6 +508,8 @@ pub(super) struct ComposeActions {
     pub(super) start_imported: bool,
     pub(super) stop_imported: bool,
     pub(super) confirm_lifecycle: bool,
+    pub(super) pull_imported: bool,
+    pub(super) cancel_pull: bool,
     pub(super) cancel_lifecycle: bool,
     pub(super) profiles_changed: bool,
     pub(super) save_imported: Option<usize>,
@@ -666,16 +718,24 @@ impl ComposeView {
         self.lifecycle_generation = self.lifecycle_generation.wrapping_add(1);
         let generation = self.lifecycle_generation;
         let file_name = display_compose_file_list(&selection.files);
+        let (pull_cancellation_sender, pull_cancellation) = (action
+            == ComposeLifecycleAction::Pull)
+            .then(tokio::sync::oneshot::channel)
+            .unzip();
         self.lifecycle = ComposeLifecycleState::Running {
             action,
             file_name,
             service: service.clone(),
+            pull_progress: None,
+            cancel_requested: false,
         };
         Some(ComposeLifecycleTask {
             generation,
             action,
             selection,
             service,
+            pull_cancellation,
+            pull_cancellation_sender,
         })
     }
 
@@ -712,6 +772,41 @@ impl ComposeView {
                 .selected_profiles()
                 .is_ok_and(|current| current == selection.profiles)
     }
+    pub(super) fn note_pull_progress(
+        &mut self,
+        generation: u64,
+        progress: ComposePullProgress,
+    ) -> bool {
+        if generation != self.lifecycle_generation {
+            return false;
+        }
+        let ComposeLifecycleState::Running {
+            action: ComposeLifecycleAction::Pull,
+            pull_progress,
+            ..
+        } = &mut self.lifecycle
+        else {
+            return false;
+        };
+        *pull_progress = Some(progress);
+        true
+    }
+
+    pub(super) fn request_pull_cancellation(&mut self) -> bool {
+        let ComposeLifecycleState::Running {
+            action: ComposeLifecycleAction::Pull,
+            cancel_requested,
+            ..
+        } = &mut self.lifecycle
+        else {
+            return false;
+        };
+        if *cancel_requested {
+            return false;
+        }
+        *cancel_requested = true;
+        true
+    }
 
     pub(super) fn finish_lifecycle(
         &mut self,
@@ -727,6 +822,7 @@ impl ComposeView {
             action,
             file_name,
             service,
+            ..
         } = std::mem::take(&mut self.lifecycle)
         else {
             return false;
@@ -1830,8 +1926,8 @@ impl ComposeView {
                 ui.label("Log follow cancelled.");
             }
         }
-        ui.heading("Imported configuration lifecycle");
-        ui.label("Start or stop affects only the currently selected, imported, and explicitly revalidated local files. Start requires existing containers; it does not create, build, or pull. Stop does not remove containers. Restart is offered only for a service in the current successful status snapshot.");
+        ui.heading("Imported configuration operations");
+        ui.label("Start or stop affects only the currently selected, imported, and explicitly revalidated local files. Start requires existing containers; it does not create or build. Stop does not remove containers. Restart is offered only for a service in the current successful status snapshot.");
         let lifecycle_enabled = status_enabled && self.can_start_lifecycle();
         ui.horizontal(|ui| {
             actions.start_imported = ui
@@ -1845,6 +1941,11 @@ impl ComposeView {
                     lifecycle_enabled,
                     egui::Button::new("Stop imported project"),
                 )
+                .clicked();
+        });
+        ui.horizontal(|ui| {
+            actions.pull_imported = ui
+                .add_enabled(lifecycle_enabled, egui::Button::new("Pull imported images"))
                 .clicked();
         });
         match &self.lifecycle {
@@ -1868,6 +1969,9 @@ impl ComposeView {
                             confirmation.selection.profiles.join(", ")
                         }
                     ));
+                    if confirmation.action == ComposeLifecycleAction::Pull {
+                        ui.label("Downloads eligible images to the selected local Docker Engine image store. This uses bandwidth and disk space; downloads may continue after cancellation. Only anonymous public pulls are supported; private-registry credentials are not imported.");
+                    }
                     if !status_enabled {
                         ui.label(
                             "The engine or Compose configuration is not ready; reconnect or wait before confirming.",
@@ -1882,23 +1986,49 @@ impl ComposeView {
                             )),
                         )
                         .clicked();
-                    actions.cancel_lifecycle = ui.button("Cancel lifecycle action").clicked();
+                    let cancel_label = if confirmation.action == ComposeLifecycleAction::Pull {
+                        "Cancel pull"
+                    } else {
+                        "Cancel lifecycle action"
+                    };
+                    actions.cancel_lifecycle = ui.button(cancel_label).clicked();
                 });
             }
             ComposeLifecycleState::Running {
                 action,
                 file_name,
                 service,
+                pull_progress,
+                cancel_requested,
             } => {
                 ui.spinner();
                 ui.label(format!(
-                    "Compose {}{} running for {file_name}…",
+                    "Compose {}{} preparing or running for {file_name}…",
                     action.label(),
                     service
                         .as_deref()
                         .map(|service| format!(" service {service}"))
                         .unwrap_or_default()
                 ));
+                if *action == ComposeLifecycleAction::Pull {
+                    if let Some(progress) = pull_progress {
+                        ui.label(format!(
+                            "Compose pull: {} ({} recognized progress updates; details hidden).",
+                            progress.phase.label(),
+                            progress.recognized_records
+                        ));
+                    } else {
+                        ui.label(
+                            "Waiting for Compose pull progress; revalidation or the pull may still be running.",
+                        );
+                    }
+                    actions.cancel_pull = ui
+                        .add_enabled(!cancel_requested, egui::Button::new("Cancel pull"))
+                        .clicked();
+                    if *cancel_requested {
+                        ui.label("Stopping Ferrum's local Compose CLI. Engine downloads may continue if pulling already started.");
+                    }
+                }
             }
             ComposeLifecycleState::Succeeded {
                 action,
@@ -1921,7 +2051,7 @@ impl ComposeView {
                 error,
             } => {
                 ui.label(format!(
-                    "Compose {}{} failed for {file_name}.",
+                    "Compose {}{} did not complete for {file_name}.",
                     action.label(),
                     service
                         .as_deref()
@@ -3412,9 +3542,16 @@ async fn lifecycle_with_binary(
     search_path: &std::ffi::OsStr,
     user_compose_plugin: Option<&std::path::Path>,
 ) -> ComposeLifecycleResult {
-    if action == ComposeLifecycleAction::Restart {
+    if matches!(
+        action,
+        ComposeLifecycleAction::Restart | ComposeLifecycleAction::Pull
+    ) {
         return ComposeLifecycleResult {
-            outcome: Err(ComposeLifecycleError::ServiceUnavailable),
+            outcome: Err(if action == ComposeLifecycleAction::Pull {
+                ComposeLifecycleError::ValidationFailed
+            } else {
+                ComposeLifecycleError::ServiceUnavailable
+            }),
             submitted: false,
         };
     }
@@ -3482,6 +3619,398 @@ async fn lifecycle_with_binary(
     }
     command.arg(action.label());
     run_lifecycle_command_with_timeout(&mut command, LIFECYCLE_COMMAND_TIMEOUT).await
+}
+#[cfg(target_os = "linux")]
+fn classify_compose_pull_progress_line(line: &[u8]) -> Option<ComposePullProgressPhase> {
+    line.split(|byte| !byte.is_ascii_alphabetic())
+        .find_map(|token| {
+            if token.eq_ignore_ascii_case(b"pulling") {
+                Some(ComposePullProgressPhase::Pulling)
+            } else if token.eq_ignore_ascii_case(b"downloading") {
+                Some(ComposePullProgressPhase::Downloading)
+            } else if token.eq_ignore_ascii_case(b"extracting") {
+                Some(ComposePullProgressPhase::Extracting)
+            } else if token.eq_ignore_ascii_case(b"verifying") {
+                Some(ComposePullProgressPhase::Verifying)
+            } else if token.eq_ignore_ascii_case(b"waiting") {
+                Some(ComposePullProgressPhase::Waiting)
+            } else if token.eq_ignore_ascii_case(b"pulled") {
+                Some(ComposePullProgressPhase::Pulled)
+            } else {
+                None
+            }
+        })
+}
+
+#[cfg(target_os = "linux")]
+struct ComposePullProgressAccumulator {
+    line: [u8; COMPOSE_PULL_PROGRESS_LINE_BYTES],
+    line_len: usize,
+    dropping_line: bool,
+    phase: Option<ComposePullProgressPhase>,
+    recognized_records: u32,
+    pending: bool,
+    last_sent: Option<std::time::Instant>,
+}
+
+#[cfg(target_os = "linux")]
+impl ComposePullProgressAccumulator {
+    fn new() -> Self {
+        Self {
+            line: [0; COMPOSE_PULL_PROGRESS_LINE_BYTES],
+            line_len: 0,
+            dropping_line: false,
+            phase: None,
+            recognized_records: 0,
+            pending: false,
+            last_sent: None,
+        }
+    }
+
+    fn consume(&mut self, bytes: &[u8], sender: &tokio::sync::mpsc::Sender<ComposePullProgress>) {
+        for byte in bytes {
+            if matches!(*byte, b'\n' | b'\r') {
+                if !self.dropping_line
+                    && let Some(phase) =
+                        classify_compose_pull_progress_line(&self.line[..self.line_len])
+                {
+                    self.phase = Some(phase);
+                    self.recognized_records = self.recognized_records.saturating_add(1);
+                    self.pending = true;
+                    self.emit_if_due(sender, false);
+                }
+                self.line[..self.line_len].fill(0);
+                self.line_len = 0;
+                self.dropping_line = false;
+            } else if !self.dropping_line {
+                if self.line_len == self.line.len() {
+                    self.line.fill(0);
+                    self.line_len = 0;
+                    self.dropping_line = true;
+                } else {
+                    self.line[self.line_len] = *byte;
+                    self.line_len += 1;
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self, sender: &tokio::sync::mpsc::Sender<ComposePullProgress>) {
+        if !self.dropping_line
+            && self.line_len > 0
+            && let Some(phase) = classify_compose_pull_progress_line(&self.line[..self.line_len])
+        {
+            self.phase = Some(phase);
+            self.recognized_records = self.recognized_records.saturating_add(1);
+            self.pending = true;
+        }
+        self.line[..self.line_len].fill(0);
+        self.line_len = 0;
+        self.emit_if_due(sender, true);
+    }
+    fn emit_if_due(
+        &mut self,
+        sender: &tokio::sync::mpsc::Sender<ComposePullProgress>,
+        flush: bool,
+    ) {
+        if !self.pending {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due = flush
+            || self.last_sent.is_none_or(|last_sent| {
+                now.duration_since(last_sent) >= COMPOSE_PULL_PROGRESS_INTERVAL
+            });
+        if !due {
+            return;
+        }
+        self.last_sent = Some(now);
+        if let Some(phase) = self.phase
+            && sender
+                .try_send(ComposePullProgress {
+                    phase,
+                    recognized_records: self.recognized_records,
+                })
+                .is_ok()
+        {
+            self.pending = false;
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+async fn run_pull_with_progress(
+    command: &mut tokio::process::Command,
+    mut cancellation: tokio::sync::oneshot::Receiver<()>,
+    progress: &tokio::sync::mpsc::Sender<ComposePullProgress>,
+) -> ComposeLifecycleResult {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    #[cfg(test)]
+    let _test_subprocess_guard = crate::TEST_SUBPROCESS_LOCK.lock().await;
+
+    if matches!(cancellation.try_recv(), Ok(())) {
+        return ComposeLifecycleResult {
+            outcome: Err(ComposeLifecycleError::PullCancelledBeforeSpawn),
+            submitted: false,
+        };
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0);
+    apply_compose_child_resource_limits(command);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return ComposeLifecycleResult {
+                outcome: Err(if error.kind() == std::io::ErrorKind::NotFound {
+                    ComposeLifecycleError::DockerCliMissing
+                } else {
+                    ComposeLifecycleError::CommandStartFailed
+                }),
+                submitted: false,
+            };
+        }
+    };
+    let Some(process_id) = child.id().and_then(|id| libc::pid_t::try_from(id).ok()) else {
+        let _ = child.kill().await;
+        return ComposeLifecycleResult {
+            outcome: Err(ComposeLifecycleError::PullOutcomeUncertain),
+            submitted: true,
+        };
+    };
+    let mut process_group = ProcessGroupGuard {
+        id: process_id,
+        active: true,
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        process_group.terminate();
+        let _ = child.wait().await;
+        return ComposeLifecycleResult {
+            outcome: Err(ComposeLifecycleError::PullOutcomeUncertain),
+            submitted: true,
+        };
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        process_group.terminate();
+        let _ = child.wait().await;
+        return ComposeLifecycleResult {
+            outcome: Err(ComposeLifecycleError::PullOutcomeUncertain),
+            submitted: true,
+        };
+    };
+    let mut progress_accumulator = ComposePullProgressAccumulator::new();
+    let process_result = tokio::time::timeout(PULL_COMMAND_TIMEOUT, async {
+        let mut stdout_buffer = [0_u8; 4096];
+        let mut stderr_buffer = [0_u8; 4096];
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let mut received_bytes = 0_usize;
+        while stdout_open || stderr_open {
+            tokio::select! {
+                cancellation = &mut cancellation => {
+                    let _ = cancellation;
+                    return Err(ComposeLifecycleError::PullOutcomeUncertain);
+                }
+                count = stdout.read(&mut stdout_buffer), if stdout_open => {
+                    match count {
+                        Ok(0) => stdout_open = false,
+                        Ok(count) => {
+                            received_bytes = received_bytes.saturating_add(count);
+                            if received_bytes > MAX_COMMAND_OUTPUT_BYTES {
+                                return Err(ComposeLifecycleError::PullOutcomeUncertain);
+                            }
+                            progress_accumulator.consume(&stdout_buffer[..count], progress);
+                        }
+                        Err(_) => return Err(ComposeLifecycleError::PullOutcomeUncertain),
+                    }
+                }
+                count = stderr.read(&mut stderr_buffer), if stderr_open => {
+                    match count {
+                        Ok(0) => stderr_open = false,
+                        Ok(count) => {
+                            received_bytes = received_bytes.saturating_add(count);
+                            if received_bytes > MAX_COMMAND_OUTPUT_BYTES {
+                                return Err(ComposeLifecycleError::PullOutcomeUncertain);
+                            }
+                            progress_accumulator.consume(&stderr_buffer[..count], progress);
+                        }
+                        Err(_) => return Err(ComposeLifecycleError::PullOutcomeUncertain),
+                    }
+                }
+            }
+        }
+        let status = tokio::select! {
+            status = child.wait() => {
+                status.map_err(|_| ComposeLifecycleError::PullOutcomeUncertain)?
+            }
+            cancellation = &mut cancellation => {
+                let _ = cancellation;
+                return Err(ComposeLifecycleError::PullOutcomeUncertain);
+            }
+        };
+        if status.success() {
+            Ok(())
+        } else {
+            Err(ComposeLifecycleError::PullOutcomeUncertain)
+        }
+    })
+    .await;
+    progress_accumulator.finish(progress);
+    let outcome = match process_result {
+        Ok(Ok(())) => {
+            process_group.disarm();
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            process_group.terminate();
+            let _ = child.wait().await;
+            Err(error)
+        }
+        Err(_) => {
+            process_group.terminate();
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(ComposeLifecycleError::PullOutcomeUncertain)
+        }
+    };
+    ComposeLifecycleResult {
+        submitted: true,
+        outcome,
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ComposePullRequest<'a> {
+    binary: &'a std::path::Path,
+    socket_path: &'a std::path::Path,
+    files: &'a [std::path::PathBuf],
+    profiles: &'a [String],
+    search_path: &'a std::ffi::OsStr,
+    plugin: Option<&'a std::path::Path>,
+}
+
+#[cfg(target_os = "linux")]
+async fn compose_pull_with_binary(
+    request: ComposePullRequest<'_>,
+    mut cancellation: tokio::sync::oneshot::Receiver<()>,
+    progress: &tokio::sync::mpsc::Sender<ComposePullProgress>,
+) -> ComposeLifecycleResult {
+    let ComposePullRequest {
+        binary,
+        socket_path,
+        files,
+        profiles,
+        search_path,
+        plugin,
+    } = request;
+    let failure = |error| ComposeLifecycleResult {
+        outcome: Err(error),
+        submitted: false,
+    };
+    if !valid_profile_list(profiles)
+        || !selected_compose_files_are_valid(files)
+        || selected_compose_files_size_exceeds_limit(files)
+    {
+        return failure(ComposeLifecycleError::ValidationFailed);
+    }
+    let validation = tokio::select! {
+        validation = validate_with_profiles_report(
+            binary,
+            files,
+            profiles,
+            search_path,
+            plugin,
+            COMMAND_TIMEOUT,
+        ) => validation,
+        _ = &mut cancellation => {
+            return failure(ComposeLifecycleError::PullCancelledBeforeSpawn);
+        }
+    };
+    if let Err(error) = validation.outcome {
+        return failure(match error {
+            ComposeValidationError::DockerCliMissing
+            | ComposeValidationError::ComposePluginUnavailable => {
+                ComposeLifecycleError::DockerCliMissing
+            }
+            ComposeValidationError::CommandStartFailed => ComposeLifecycleError::CommandStartFailed,
+            ComposeValidationError::PrivateConfigSetupFailed => {
+                ComposeLifecycleError::PrivateConfigSetupFailed
+            }
+            _ => ComposeLifecycleError::ValidationFailed,
+        });
+    }
+    let isolated = match PrivateDockerConfig::new(plugin) {
+        Ok(isolated) => isolated,
+        Err(_) => return failure(ComposeLifecycleError::PrivateConfigSetupFailed),
+    };
+    let Some(socket_path) = socket_path.to_str() else {
+        return failure(ComposeLifecycleError::OperationFailed);
+    };
+    let Some(parent) = files.first().and_then(|file| file.parent()) else {
+        return failure(ComposeLifecycleError::ValidationFailed);
+    };
+    let mut command = tokio::process::Command::new(binary);
+    isolated.configure(&mut command, search_path);
+    command
+        .env("COMPOSE_DISABLE_ENV_FILE", "1")
+        .arg("--host")
+        .arg(format!("unix://{socket_path}"))
+        .args([
+            "compose",
+            "--progress",
+            "plain",
+            "--parallel",
+            "4",
+            "--project-directory",
+        ])
+        .arg(parent);
+    for file in files {
+        command.arg("--file").arg(file);
+    }
+    for profile in profiles {
+        command.arg("--profile").arg(profile);
+    }
+    command.args(["pull", "--ignore-buildable"]);
+    run_pull_with_progress(&mut command, cancellation, progress).await
+}
+
+#[cfg(target_os = "linux")]
+pub(super) async fn compose_pull(
+    socket_path: &std::path::Path,
+    files: &[std::path::PathBuf],
+    profiles: &[String],
+    cancellation: tokio::sync::oneshot::Receiver<()>,
+    progress: &tokio::sync::mpsc::Sender<ComposePullProgress>,
+) -> ComposeLifecycleResult {
+    let Some(search_path) = std::env::var_os("PATH") else {
+        return ComposeLifecycleResult {
+            outcome: Err(ComposeLifecycleError::DockerCliMissing),
+            submitted: false,
+        };
+    };
+    let Some(binary) = docker_binary(&search_path) else {
+        return ComposeLifecycleResult {
+            outcome: Err(ComposeLifecycleError::DockerCliMissing),
+            submitted: false,
+        };
+    };
+    let plugin = user_compose_plugin();
+    compose_pull_with_binary(
+        ComposePullRequest {
+            binary: &binary,
+            socket_path,
+            files,
+            profiles,
+            search_path: &search_path,
+            plugin: plugin.as_deref(),
+        },
+        cancellation,
+        progress,
+    )
+    .await
 }
 #[cfg(target_os = "linux")]
 async fn service_restart_with_binary(
@@ -3605,9 +4134,16 @@ pub(super) async fn compose_lifecycle(
     profiles: &[String],
     action: ComposeLifecycleAction,
 ) -> ComposeLifecycleResult {
-    if action == ComposeLifecycleAction::Restart {
+    if matches!(
+        action,
+        ComposeLifecycleAction::Restart | ComposeLifecycleAction::Pull
+    ) {
         return ComposeLifecycleResult {
-            outcome: Err(ComposeLifecycleError::ServiceUnavailable),
+            outcome: Err(if action == ComposeLifecycleAction::Pull {
+                ComposeLifecycleError::ValidationFailed
+            } else {
+                ComposeLifecycleError::ServiceUnavailable
+            }),
             submitted: false,
         };
     }
@@ -5386,7 +5922,7 @@ mod tests {
             assert!(!format!("{result:?}").contains("secret-diagnostic"));
         }
         #[tokio::test]
-        async fn lifecycle_uses_only_explicit_ordered_files_profiles_and_start_stop_commands() {
+        async fn lifecycle_and_pull_use_explicit_ordered_files_profiles_and_isolated_environment() {
             let directory = FixtureDirectory::new();
             let project_directory = directory.path().join("project with spaces");
             fs::create_dir(&project_directory).expect("the project directory should exist");
@@ -5422,6 +5958,18 @@ mod tests {
                    check_environment\n\
                    printf 'web\\n'; exit 0\n\
                  fi\n\
+                 if [ \"$1\" = --host ] && [ \"$4\" = --progress ]; then\n\
+                   [ \"$#\" -eq 19 ] || exit 83\n\
+                   [ \"$1\" = --host ] && [ \"$2\" = {} ] && [ \"$3\" = compose ] && [ \"$4\" = --progress ] && [ \"$5\" = plain ] || exit 84\n\
+                   [ \"$6\" = --parallel ] && [ \"$7\" = 4 ] && [ \"$8\" = --project-directory ] && [ \"$9\" = {} ] || exit 85\n\
+                   [ \"${{10}}\" = --file ] && [ \"${{11}}\" = {} ] && [ \"${{12}}\" = --file ] && [ \"${{13}}\" = {} ] || exit 86\n\
+                   [ \"${{14}}\" = --profile ] && [ \"${{15}}\" = web ] && [ \"${{16}}\" = --profile ] && [ \"${{17}}\" = qa ] || exit 87\n\
+                   [ \"${{18}}\" = pull ] && [ \"${{19}}\" = --ignore-buildable ] || exit 88\n\
+                   check_environment\n\
+                   printf 'Pulling fixture image\\nDownloading fixture image\\nPulled fixture image\\n'\n\
+                   printf '%s\\n' pull >> {}\n\
+                   exit 0\n\
+                 fi\n\
                  [ \"$#\" -eq 14 ] || exit 77\n\
                  [ \"$1\" = --host ] && [ \"$2\" = {} ] && [ \"$3\" = compose ] || exit 78\n\
                  [ \"$4\" = --project-directory ] && [ \"$5\" = {} ] && [ \"$6\" = --file ] && [ \"$7\" = {} ] && [ \"$8\" = --file ] && [ \"$9\" = {} ] || exit 79\n\
@@ -5437,6 +5985,11 @@ mod tests {
                 shell_quote(&file.to_string_lossy()),
                 shell_quote(&override_file.to_string_lossy()),
                 shell_quote(&lifecycle_marker.to_string_lossy()),
+                shell_quote(&format!("unix://{}", socket.to_string_lossy())),
+                shell_quote(&project_directory.to_string_lossy()),
+                shell_quote(&file.to_string_lossy()),
+                shell_quote(&override_file.to_string_lossy()),
+                shell_quote(&lifecycle_marker.to_string_lossy()),
             );
             fs::write(&binary, script).expect("the fake Docker CLI should be written");
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
@@ -5445,17 +5998,50 @@ mod tests {
             for (action, expected) in [
                 (ComposeLifecycleAction::Start, "start"),
                 (ComposeLifecycleAction::Stop, "stop"),
+                (ComposeLifecycleAction::Pull, "pull"),
             ] {
-                let result = lifecycle_with_binary(
-                    &binary,
-                    &socket,
-                    &files,
-                    &profiles,
-                    action,
-                    OsStr::new("/usr/bin"),
-                    None,
-                )
-                .await;
+                let result = if action == ComposeLifecycleAction::Pull {
+                    let (_cancel_sender, cancellation) = tokio::sync::oneshot::channel();
+                    let (progress_sender, mut progress_receiver) =
+                        tokio::sync::mpsc::channel(COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+                    let result = compose_pull_with_binary(
+                        ComposePullRequest {
+                            binary: &binary,
+                            socket_path: &socket,
+                            files: &files,
+                            profiles: &profiles,
+                            search_path: OsStr::new("/usr/bin"),
+                            plugin: None,
+                        },
+                        cancellation,
+                        &progress_sender,
+                    )
+                    .await;
+                    let progress = std::iter::from_fn(|| progress_receiver.try_recv().ok())
+                        .collect::<Vec<_>>();
+                    assert!(progress.len() <= COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+                    assert!(!format!("{progress:?}").contains("fixture"));
+                    assert!(progress.len() >= 2);
+                    assert_eq!(progress[0].phase, ComposePullProgressPhase::Pulling);
+                    assert_eq!(progress[0].recognized_records, 1);
+                    assert_eq!(
+                        progress.last().unwrap().phase,
+                        ComposePullProgressPhase::Pulled
+                    );
+                    assert_eq!(progress.last().unwrap().recognized_records, 3);
+                    result
+                } else {
+                    lifecycle_with_binary(
+                        &binary,
+                        &socket,
+                        &files,
+                        &profiles,
+                        action,
+                        OsStr::new("/usr/bin"),
+                        None,
+                    )
+                    .await
+                };
                 assert_eq!(result.outcome, Ok(()));
                 assert!(result.submitted, "the lifecycle process started");
                 assert_eq!(
@@ -5466,6 +6052,176 @@ mod tests {
                     Some(expected)
                 );
             }
+        }
+        #[tokio::test]
+        async fn compose_pull_cancellation_before_spawn_is_not_submitted_and_after_spawn_is_uncertain()
+         {
+            let directory = FixtureDirectory::new();
+            let marker = directory.path().join("pull-started");
+            let binary = directory.path().join("docker-pull-cancel");
+            let script = format!(
+                "#!/bin/sh\n\
+                 : > {}\n\
+                 printf 'private/image:tag Pulling\\n'\n\
+                 sleep 60\n",
+                shell_quote(&marker.to_string_lossy()),
+            );
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let (progress_sender, mut progress_receiver) =
+                tokio::sync::mpsc::channel(COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+
+            let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+            cancel_sender.send(()).unwrap();
+            let mut command = tokio::process::Command::new(&binary);
+            let before_spawn =
+                run_pull_with_progress(&mut command, cancel_receiver, &progress_sender).await;
+            assert_eq!(
+                before_spawn.outcome,
+                Err(ComposeLifecycleError::PullCancelledBeforeSpawn)
+            );
+            assert!(!before_spawn.submitted);
+            assert!(!marker.exists());
+
+            let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+            let progress_sender_for_task = progress_sender.clone();
+            let binary_for_task = binary.clone();
+            let task = tokio::spawn(async move {
+                let mut command = tokio::process::Command::new(binary_for_task);
+                run_pull_with_progress(&mut command, cancel_receiver, &progress_sender_for_task)
+                    .await
+            });
+            let first_progress =
+                tokio::time::timeout(Duration::from_secs(3), progress_receiver.recv())
+                    .await
+                    .expect("the controlled CLI should emit a recognized progress record")
+                    .expect("the bounded progress summary should be delivered");
+            assert_eq!(first_progress.phase, ComposePullProgressPhase::Pulling);
+            assert_eq!(first_progress.recognized_records, 1);
+            cancel_sender.send(()).unwrap();
+            let after_spawn = tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("cancellation should reap the CLI process promptly")
+                .unwrap();
+            assert_eq!(
+                after_spawn.outcome,
+                Err(ComposeLifecycleError::PullOutcomeUncertain)
+            );
+            assert!(after_spawn.submitted);
+        }
+        #[tokio::test]
+        async fn cancelling_during_pull_validation_prevents_pull_submission() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("project");
+            fs::create_dir(&project).unwrap();
+            let file = project.join("compose.yaml");
+            fs::write(&file, "services:\n  web:\n    image: busybox\n").unwrap();
+            let files = [file];
+            let profiles = Vec::new();
+            let socket = directory.path().join("selected.sock");
+            let validation_started = directory.path().join("validation-started");
+            let pull_started = directory.path().join("pull-started");
+            let binary = directory.path().join("docker-pull-validation-cancel");
+            let script = format!(
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                   *' version --short'*) printf 'v5.6.0\\n'; exit 0 ;;\n\
+                   *' config '*) : > {}; sleep 60; exit 0 ;;\n\
+                   *' pull '*) : > {}; exit 0 ;;\n\
+                 esac\n\
+                 exit 98\n",
+                shell_quote(&validation_started.to_string_lossy()),
+                shell_quote(&pull_started.to_string_lossy()),
+            );
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let (progress_sender, _progress_receiver) =
+                tokio::sync::mpsc::channel(COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+            let (cancel_sender, cancellation) = tokio::sync::oneshot::channel();
+            let binary_for_task = binary.clone();
+            let socket_for_task = socket.clone();
+            let files_for_task = files.clone();
+            let task = tokio::spawn(async move {
+                compose_pull_with_binary(
+                    ComposePullRequest {
+                        binary: &binary_for_task,
+                        socket_path: &socket_for_task,
+                        files: &files_for_task,
+                        profiles: &profiles,
+                        search_path: OsStr::new("/usr/bin"),
+                        plugin: None,
+                    },
+                    cancellation,
+                    &progress_sender,
+                )
+                .await
+            });
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while !validation_started.exists() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                validation_started.exists(),
+                "the fake CLI should enter the bounded preflight validation"
+            );
+            cancel_sender.send(()).unwrap();
+
+            let result = tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("cancellation should stop preflight promptly")
+                .unwrap();
+            assert_eq!(
+                result.outcome,
+                Err(ComposeLifecycleError::PullCancelledBeforeSpawn)
+            );
+            assert!(!result.submitted);
+            assert!(!pull_started.exists());
+        }
+
+        #[tokio::test]
+        async fn compose_pull_output_over_limit_is_uncertain_and_not_retained() {
+            let directory = FixtureDirectory::new();
+            let binary = directory.path().join("docker-pull-output-limit");
+            fs::write(&binary, "#!/bin/sh\nhead -c 1048577 /dev/zero\n").unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let (_cancel_sender, cancellation) = tokio::sync::oneshot::channel();
+            let (progress_sender, mut progress_receiver) =
+                tokio::sync::mpsc::channel(COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+            let mut command = tokio::process::Command::new(binary);
+            let result = run_pull_with_progress(&mut command, cancellation, &progress_sender).await;
+            assert_eq!(
+                result.outcome,
+                Err(ComposeLifecycleError::PullOutcomeUncertain)
+            );
+            assert!(result.submitted);
+            assert!(progress_receiver.try_recv().is_err());
+        }
+        #[test]
+        fn compose_pull_progress_summary_recognizes_only_bounded_status_tokens() {
+            let (sender, mut receiver) =
+                tokio::sync::mpsc::channel(COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+            let mut accumulator = ComposePullProgressAccumulator::new();
+            let mut overlong = vec![b'x'; COMPOSE_PULL_PROGRESS_LINE_BYTES + 32];
+            overlong.extend_from_slice(b" Pulling\n");
+            accumulator.consume(&overlong, &sender);
+            accumulator.finish(&sender);
+            assert!(receiver.try_recv().is_err());
+
+            let mut accumulator = ComposePullProgressAccumulator::new();
+            for _ in 0..32 {
+                accumulator.consume(b"private/image:tag Downloading layer\n", &sender);
+            }
+            accumulator.finish(&sender);
+            let summaries = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+            assert!(!summaries.is_empty());
+            assert!(summaries.len() <= COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+            assert!(
+                summaries
+                    .iter()
+                    .all(|summary| summary.phase == ComposePullProgressPhase::Downloading)
+            );
+            assert!(!format!("{summaries:?}").contains("private/image"));
         }
         #[tokio::test]
         async fn service_restart_revalidates_checks_fresh_membership_and_scopes_restart() {
@@ -7395,25 +8151,25 @@ mod tests {
             let mut harness = harness_for(view);
             harness.run();
             harness
-                .get_by_role_and_label(Role::Button, "Start imported project")
+                .get_by_role_and_label(Role::Button, "Pull imported images")
                 .click_accesskit();
             harness.step();
-            assert!(harness.state().actions.start_imported);
+            assert!(harness.state().actions.pull_imported);
             assert!(
                 harness
                     .state_mut()
                     .view
-                    .request_lifecycle_confirmation(ComposeLifecycleAction::Start)
+                    .request_lifecycle_confirmation(ComposeLifecycleAction::Pull)
             );
             harness.step();
             let _label =
                 harness.get_by_role_and_label(Role::Label, "Imported local label: Local label");
             let _files = harness.get_by_role_and_label(Role::Label, "Ordered files: compose.yaml");
             let _profiles = harness.get_by_role_and_label(Role::Label, "Profiles: default");
-            let _confirm = harness.get_by_role_and_label(Role::Button, "Confirm start");
+            let _confirm = harness.get_by_role_and_label(Role::Button, "Confirm pull");
             assert!(
                 harness
-                    .get_by_role_and_label(Role::Button, "Start imported project")
+                    .get_by_role_and_label(Role::Button, "Pull imported images")
                     .accesskit_node()
                     .is_disabled()
             );
@@ -7432,6 +8188,49 @@ mod tests {
             assert!(harness.state_mut().view.confirm_lifecycle().is_none());
         }
 
+        #[test]
+        fn confirmed_pull_shows_live_progress_and_cancel_keeps_operation_running() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("Local label"));
+            assert!(view.request_lifecycle_confirmation(ComposeLifecycleAction::Pull));
+            let task = view.confirm_lifecycle().unwrap();
+            let generation = task.generation;
+            let mut cancellation = task.pull_cancellation.unwrap();
+            let cancellation_sender = task.pull_cancellation_sender.unwrap();
+            let mut harness = harness_for(view);
+            harness.run();
+            let _progress = harness.get_by_role_and_label(
+                Role::Label,
+                "Waiting for Compose pull progress; revalidation or the pull may still be running.",
+            );
+            assert!(harness.state_mut().view.note_pull_progress(
+                generation,
+                ComposePullProgress {
+                    phase: ComposePullProgressPhase::Downloading,
+                    recognized_records: 3,
+                },
+            ));
+            harness.step();
+            let _summary = harness.get_by_role_and_label(
+                Role::Label,
+                "Compose pull: Downloading (3 recognized progress updates; details hidden).",
+            );
+            harness
+                .get_by_role_and_label(Role::Button, "Cancel pull")
+                .click_accesskit();
+            harness.step();
+            assert!(harness.state().actions.cancel_pull);
+            assert!(harness.state_mut().view.request_pull_cancellation());
+            assert!(matches!(
+                &harness.state().view.lifecycle,
+                ComposeLifecycleState::Running {
+                    action: ComposeLifecycleAction::Pull,
+                    ..
+                }
+            ));
+            cancellation_sender.send(()).unwrap();
+            assert!(cancellation.try_recv().is_ok());
+        }
         #[test]
         fn unavailable_engine_disables_lifecycle_confirmation() {
             let mut view = validated_compose_view();
@@ -7526,7 +8325,7 @@ mod tests {
             for change in 0..4 {
                 let mut view = validated_compose_view();
                 assert!(view.import_current_project("Local label"));
-                assert!(view.request_lifecycle_confirmation(ComposeLifecycleAction::Stop));
+                assert!(view.request_lifecycle_confirmation(ComposeLifecycleAction::Pull));
                 match change {
                     0 => view.selected_files[0] = std::path::PathBuf::from("/private/changed.yaml"),
                     1 => view.profile_input = "qa".to_owned(),

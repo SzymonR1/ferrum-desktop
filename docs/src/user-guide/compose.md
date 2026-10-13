@@ -262,9 +262,53 @@ up-to-one-second flush of the initial audit marker before aborting the lifecycle
 worker. A submitted child may still be terminated, leaving Engine state
 uncertain; refresh after restart. Service names, paths, labels, profiles,
 endpoint values, raw diagnostics, and project metadata are never audited.
-`up`, `down`, create, build, pull, remove, and project-file mutation remain
-outside this partial Issue #18 slice. Explicitly saved local registrations are
-the only persistent Compose-project metadata and are described above.
+`up`, `down`, create, build, remove, and project-file mutation remain outside
+this partial Issue #18 slice. Compose pull is separately constrained as
+documented above. Explicitly saved local registrations are the only persistent
+Compose-project metadata and are described above.
+
+## Pull images for an imported configuration
+
+After confirmation, **Pull images** is available for the current imported,
+successfully revalidated file/profile selection. Ferrum invokes:
+
+```text
+docker --host unix://<selected-socket> compose --progress plain --parallel 4 --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... pull --ignore-buildable
+```
+
+The pull is limited to Linux local Docker Unix sockets. Ferrum uses a private
+Docker config/HOME and cleared environment; it does not read saved Docker
+credentials or use credential helpers for Compose pulls. Authentication is
+anonymous only, so private registries requiring credentials may reject the
+pull. The command uses the selected ordered files, profiles, and base-parent
+project directory. `--ignore-buildable` prevents pulling services that require
+a build; Ferrum does not build images, start or create containers, or bring
+the project up. The pull changes only the selected Engine's image store; it
+does not create, start, stop, or remove project containers, networks, or
+volumes. Pulled images may consume network bandwidth and disk space.
+
+At most four service pulls run concurrently through Compose `--parallel 4`.
+Once the pull command starts, its two-hour deadline and combined 1 MiB stdout/
+stderr cap bound the CLI. Exceeding either stops Ferrum's process and leaves
+image-store state uncertain. The UI shows a bounded, rate-limited summary of
+recognized progress phases/counts; raw CLI lines, image names, paths, and
+diagnostics are never shown. Cancellation kills only Ferrum's local Compose CLI
+process group; Engine-side downloads may continue if the pull was submitted.
+Refresh the image inventory or Compose status rather than assuming cancellation
+undid the pull.
+
+Ferrum's best-effort audit records only the static `compose_pull` event, `pull`
+action, and `started`, `success`, `not_submitted`, `request_error`, or `uncertain`
+outcome; it excludes labels, file paths, services, image references, credentials,
+and command output. A `started` marker is recorded before process spawn; without
+a later terminal outcome, Ferrum exited or final audit persistence failed and
+the final Engine result is unknown.
+
+Pull uses the isolated CLI environment described above. Compose may read local
+selected or included configuration/environment files with the logged-in user's
+permissions; validate only trusted files. This slice does not add support for
+Podman, remote engines, or non-Linux platforms.
+
 
 
 ## One-shot service log snapshot

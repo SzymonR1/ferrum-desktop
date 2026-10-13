@@ -3,6 +3,23 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Added confirmed image pulls for the current imported, successfully revalidated
+  Compose file/profile selection on Linux local Docker Unix sockets using
+  `docker --host unix://<selected-socket> compose --progress plain
+  --parallel 4 --project-directory <base-parent> --file ... --profile ...
+  pull --ignore-buildable`. Compose caps concurrency at four service pulls; the
+  process has a two-hour deadline and a combined 1 MiB stdout/stderr cap.
+  Exceeding either terminates the CLI with an uncertain image-store result. The
+  UI shows a bounded, rate-limited summary of recognized progress phases/counts,
+  never raw CLI output or image names. Pulls are anonymous only through private
+  Docker config/HOME and a cleared environment; saved Docker credentials and
+  credential helpers are not used. Pulls do not build images or start/create
+  services; only the Engine image store changes, consuming bandwidth and disk.
+  Cancellation kills only Ferrum's CLI process group; daemon-side work may
+  continue and image state may be uncertain. Best-effort audit records only
+  static `compose_pull`/`pull` and `started`, `success`, `not_submitted`,
+  `request_error`, or `uncertain` values, never file/project/service/image/
+  credential/output data. Issue #18 remains partial/open.
 - Added explicit saved Compose registrations through the existing bounded,
   descriptor-pinned SettingsStore. Schema v2 migrates v1/versionless files with
   an empty registry, enforces a 256 KiB serialized settings cap and 32-entry
