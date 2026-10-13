@@ -254,6 +254,38 @@ The 2026-10-11 read-only history smoke passed against Docker Engine 29.9.0/API
 1.56 using the preinstalled `ghcr.io/catthehacker/ubuntu:rust-latest` image
 and current local Unix context; it read history without mutating the image.
 
+## Opt-in local Docker image-pull progress smoke
+
+`local_engine_loopback_registry_pull_reports_progress_and_cleans_only_test_tag`
+is an ignored Linux integration test for the Engine pull stream, not the Images
+page or credential-helper path. It requires the current Docker context to use a
+local Unix socket and the daemon's existing loopback-insecure-registry policy.
+The test starts an in-process OCI registry bound only to `127.0.0.1` on an
+ephemeral port and changes no daemon configuration. It preflights the generated
+repository:tag as absent, then requests an intentionally missing manifest to
+verify the daemon reaches the fixture without creating an image. Only then does
+it pull a generated, content-addressed OCI image and check for non-empty Engine
+status progress. It removes only the generated tag using
+`docker image rm --no-prune` without force. Cleanup is armed only after inventory
+confirms a full SHA-256 image ID and the sole generated tag; ownership
+uncertainty causes no removal. No container, external registry, credentials,
+user image, daemon setting, or prune operation is used. A failed transfer can
+leave untagged blob data; the test never runs image prune.
+
+Run only against a disposable local Docker Engine:
+
+```sh
+env -u DOCKER_HOST DOCKER_CONTEXT=default cargo test -p ferrum-engine --test live_engine local_engine_loopback_registry_pull_reports_progress_and_cleans_only_test_tag -- --exact --ignored
+```
+
+This smoke is one local anonymous pull path, not registry-helper auth, external
+registry, push, Ferrum image removal, Podman/rootless, or broader platform
+validation.
+
+On 2026-10-13, this smoke passed on Fedora Linux 44 x86_64 against Docker
+Engine 29.9.0/API 1.56 through the local `default` context. The Engine returned
+non-empty status/progress records; this response did not include byte counters.
+
 Image-build regressions exercise only temporary files and controlled helper
 processes. They do not invoke Docker or Buildx against an engine, build an image,
 or mutate image resources. Tests cover local-context and target validation,

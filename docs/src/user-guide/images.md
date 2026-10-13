@@ -180,10 +180,13 @@ Podman/rootless behavior and broader endpoint or platform compatibility remain
 unvalidated under open, blocked
 [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10). Issue
 [#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) remains partial/open.
-No release or broader support claim is made. No live pull, authenticated or
-anonymous push, tag, removal, or build was performed during validation. Native
-Images-page visual validation remains unverified. Fake-socket and headless
-tests do not contact a real engine or mutate image resources. See the
+One opt-in anonymous pull smoke used a generated OCI image from an in-process
+loopback registry on Docker Engine 29.9.0/API 1.56. It returned Engine status
+progress and removed only the preflighted generated image tag without force or
+prune; it does not validate external registry access or helper authentication.
+No live push, Ferrum tag/removal, or build was performed. Native Images-page
+visual validation remains unverified. Default fake-socket/headless tests do not
+contact a real engine or mutate images. See the
 [platform support matrix](../platform-support.md).
 
 ## Building a local image
