@@ -43,11 +43,32 @@ All notable project changes are documented here. The project has not published a
   synthetic Basic credential directly as Engine AuthConfig and verifies the
   fixture accepted its exact authorization. Both use the existing loopback
   HTTP/insecure-registry setup, preflight references, probe a missing manifest,
-  and remove only the generated tag after inventory confirms its full image ID
-  and sole exact tag. Neither changes daemon configuration. The authenticated
-  smoke does not validate helper selection, per-pull UI opt-in, real secrets,
-  TLS, external/private registry deployment, or production authentication.
+  and arm cleanup only after inventory confirms a full image ID and its sole
+  exact tag. Cleanup is pinned to the same validated local Unix socket and
+  removes by verified full image ID without force or prune. If another tag is
+  added, Docker refuses non-forced removal and the image may remain for manual
+  cleanup. Neither smoke changes daemon configuration. The authenticated smoke
+  does not validate helper selection, per-pull UI opt-in, real secrets, TLS,
+  external/private registry deployment, or production authentication.
   Issues #16 and #19 remain partial/open; no broader support is claimed.
+- Extracted the generated OCI fixture and loopback registry into the
+  test-only `ferrum-test-support` workspace crate, shared by Engine and app
+  tests as dev-dependencies only. Added an ignored Linux fake-helper-to-real-
+  Engine pull smoke that exercises `FakeHelper` through
+  `authorization_with_binary` into the current local Docker Unix socket and
+  synthetic Basic-auth loopback registry. It probes a missing manifest, checks
+  exact synthetic authorization, bounds pull progress, and removes the image
+  only by the verified full SHA-256 image ID, after confirming the generated
+  tag is its sole tag. Cleanup uses the same validated local Unix socket as
+  the `EngineClient`, without force or prune; if another tag is added, Docker
+  refuses removal and the generated image may remain for manual cleanup.
+  The smoke passed on 2026-10-14 on Fedora Linux 44 x86_64 with Docker Engine
+  29.9.0/API 1.56 through the default local Unix context. It imports only a
+  generated image and uses synthetic credentials; Settings selection,
+  per-pull UI consent, real credentials, TLS, and external registries remain
+  unvalidated. Run with:
+  `cargo test -p ferrum-app --bin ferrum registry_auth::tests::fake_helper_authenticates_generated_loopback_pull_through_local_engine -- --exact --ignored`.
+  Issues #16 and #19 remain partial/open.
 - Added confirmed service-scoped Compose pause/unpause for the current imported,
   successfully revalidated ordered files/profiles on the selected Linux local
   Docker Unix socket. Pause is offered only for a declared service with a

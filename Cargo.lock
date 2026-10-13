@@ -1108,14 +1108,17 @@ checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
 name = "ferrum-app"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "eframe",
  "egui_kittest",
  "ferrum-core",
  "ferrum-engine",
+ "ferrum-test-support",
  "libc",
  "rfd",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
@@ -1135,14 +1138,24 @@ dependencies = [
  "base64",
  "bollard",
  "ferrum-core",
+ "ferrum-test-support",
  "http-body-util",
  "hyper",
  "hyper-util",
  "hyperlocal",
  "serde",
  "serde_json",
- "sha2",
  "thiserror 2.0.21",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "ferrum-test-support"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
  "tokio",
  "zeroize",
 ]

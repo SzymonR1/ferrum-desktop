@@ -30,4 +30,7 @@ zeroize.workspace = true
 vt100 = "0.16.2"
 
 [dev-dependencies]
+base64.workspace = true
 egui_kittest = "0.36.2"
+ferrum-test-support = { path = "../ferrum-test-support" }
+tempfile = "3.27.0"

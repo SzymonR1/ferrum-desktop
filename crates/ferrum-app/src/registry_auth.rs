@@ -297,57 +297,252 @@ async fn run_helper_with_deadline(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        os::unix::fs::PermissionsExt,
-        path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
-    };
-
     use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+    /// Live loopback smoke for the fake-helper execution seam using synthetic Basic credentials.
+    ///
+    /// This checks helper invocation and Engine pull behavior only; it does not
+    /// validate UI helper selection or consent, TLS, or production credentials.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires current local Docker Unix context with loopback insecure-registry support; fake-helper seam and synthetic Basic credentials only; no UI selection/consent, TLS, or production credentials"]
+    async fn fake_helper_authenticates_generated_loopback_pull_through_local_engine() {
+        use std::{
+            sync::atomic::{AtomicU64, Ordering},
+            time::{Duration, SystemTime, UNIX_EPOCH},
+        };
 
-    static NEXT_HELPER: AtomicU64 = AtomicU64::new(0);
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use ferrum_engine::{ContextTransport, EngineClient, ImagePullStream};
+        use ferrum_test_support::{DisposableImageTag, LivePullImageFixture, LoopbackRegistry};
+        use zeroize::Zeroizing;
+
+        const MAX_PROGRESS_RECORDS: usize = 1_024;
+        static NEXT_LIVE_PULL: AtomicU64 = AtomicU64::new(0);
+
+        let contexts = EngineClient::available_contexts()
+            .await
+            .expect("discover Docker contexts");
+        let context = contexts
+            .iter()
+            .find(|context| context.is_current())
+            .expect("Docker CLI should report its current context");
+        assert_eq!(context.transport(), ContextTransport::LocalUnix);
+        let context_name = context.name().to_owned();
+        let engine = EngineClient::connect_context(&context_name)
+            .await
+            .expect("connect current local Docker context");
+        use std::os::unix::fs::FileTypeExt;
+        let socket_metadata = std::fs::metadata(engine.local_socket_path())
+            .expect("current Docker context should resolve to an existing local socket");
+        assert!(socket_metadata.file_type().is_socket());
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let sequence = NEXT_LIVE_PULL.fetch_add(1, Ordering::Relaxed);
+        let nonce = format!("{}-{timestamp}-{sequence}", std::process::id());
+        let repository = format!("ferrum-helper-smoke-{nonce}");
+        let missing_tag = format!("missing-{nonce}");
+        let username = Zeroizing::new(format!("ferrum-{nonce}"));
+        let secret = Zeroizing::new(format!("synthetic-{nonce}"));
+        let payload = Zeroizing::new(format!("{}:{}", username.as_str(), secret.as_str()));
+        let encoded = Zeroizing::new(STANDARD.encode(payload.as_bytes()));
+        let expected_authorization = Zeroizing::new(format!("Basic {}", encoded.as_str()));
+        let registry = LoopbackRegistry::start(
+            repository.clone(),
+            nonce.clone(),
+            missing_tag.clone(),
+            LivePullImageFixture::new(&nonce),
+            Some(expected_authorization),
+        )
+        .await;
+        let registry_host = format!("127.0.0.1:{}", registry.port());
+        let target_reference = format!("{registry_host}/{repository}:{nonce}");
+        let missing_reference = format!("{registry_host}/{repository}:{missing_tag}");
+        let helper_response = Zeroizing::new(format!(
+            "{{\"ServerURL\":\"{registry_host}\",\"Username\":\"{}\",\"Secret\":\"{}\"}}",
+            username.as_str(),
+            secret.as_str(),
+        ));
+        let fake = FakeHelper::new(&helper_response);
+        let auth = authorization_with_binary(&target_reference, fake.path.as_os_str())
+            .await
+            .expect("the fake-helper execution seam should return Engine auth");
+        assert_eq!(
+            fs::read_to_string(&fake.input).expect("fake-helper input should be recorded"),
+            format!("{registry_host}\n"),
+            "the helper should receive the exact generated registry authority"
+        );
+
+        let before = engine
+            .list_images()
+            .await
+            .expect("preflight image inventory");
+        assert!(!tag_is_present(&before, &target_reference));
+        assert!(!tag_is_present(&before, &missing_reference));
+        let missing_rejected = match engine
+            .open_image_pull(&missing_reference, Some(&auth))
+            .await
+        {
+            Err(_) => true,
+            Ok(mut stream) => match drain_progress(&mut stream, MAX_PROGRESS_RECORDS).await {
+                Ok((_, Some(_))) => true,
+                Ok((_, None)) => false,
+                Err(error) => panic!("missing-manifest probe exceeded bounds: {error}"),
+            },
+        };
+        assert!(registry.missing_manifest_was_requested());
+        assert!(registry.valid_authorization_was_observed());
+        assert!(
+            missing_rejected,
+            "the Engine should reject the missing manifest"
+        );
+        let after_probe = engine
+            .list_images()
+            .await
+            .expect("post-probe image inventory");
+        assert!(!tag_is_present(&after_probe, &target_reference));
+        assert!(!tag_is_present(&after_probe, &missing_reference));
+
+        let mut stream = engine
+            .open_image_pull(&target_reference, Some(&auth))
+            .await
+            .expect("real Engine should open the generated loopback pull");
+        let progress = drain_progress(&mut stream, MAX_PROGRESS_RECORDS).await;
+        drop(stream);
+        let (saw_progress, stream_error) = progress.unwrap_or_else(|error| (false, Some(error)));
+        let images = engine
+            .list_images()
+            .await
+            .expect("post-pull image inventory");
+        let mut matching_images = images
+            .iter()
+            .filter(|image| tag_is_present(std::slice::from_ref(*image), &target_reference));
+        let Some(image) = matching_images.next() else {
+            panic!(
+                "pull should create the generated image tag; stream error: {}",
+                stream_error.as_deref().unwrap_or("none")
+            );
+        };
+        assert!(
+            matching_images.next().is_none(),
+            "ambiguous generated tag ownership must not trigger cleanup"
+        );
+        let mut cleanup = DisposableImageTag::new(
+            engine.local_socket_path().to_owned(),
+            target_reference.clone(),
+        );
+        assert!(
+            cleanup.arm_if_verified(&image.id, &image.repo_tags),
+            "cleanup requires a full SHA-256 inventory ID and exactly the generated tag"
+        );
+        let status = cleanup
+            .remove()
+            .expect("bounded verified-image-ID cleanup command should run");
+        assert!(
+            status.success(),
+            "verified generated image should be removed without force"
+        );
+        let remaining = engine.list_images().await.expect("post-cleanup inventory");
+        assert!(!tag_is_present(&remaining, &target_reference));
+        cleanup.disarm();
+        assert!(registry.valid_authorization_was_observed());
+        if let Some(error) = stream_error {
+            panic!("Engine pull progress stream should complete: {error}");
+        }
+        assert!(saw_progress, "Engine should report non-empty pull progress");
+
+        async fn drain_progress(
+            stream: &mut ImagePullStream,
+            max_records: usize,
+        ) -> Result<(bool, Option<String>), String> {
+            let drain = tokio::time::timeout(Duration::from_secs(30), async {
+                let mut records = 0;
+                let mut saw_status = false;
+                loop {
+                    match stream.next_progress().await {
+                        Ok(Some(update)) => {
+                            records += 1;
+                            if records > max_records {
+                                return Err(format!("Engine pull exceeded {max_records} records"));
+                            }
+                            saw_status |= !update.status.trim().is_empty();
+                        }
+                        Ok(None) => return Ok((saw_status, None)),
+                        Err(error) => return Ok((saw_status, Some(error.to_string()))),
+                    }
+                }
+            })
+            .await;
+            match drain {
+                Ok(result) => result,
+                Err(_) => Err("Engine pull progress exceeded the 30-second deadline".to_owned()),
+            }
+        }
+
+        fn tag_is_present(images: &[ferrum_core::ImageSummary], reference: &str) -> bool {
+            images
+                .iter()
+                .any(|image| image.repo_tags.iter().any(|tag| tag == reference))
+        }
+    }
 
     struct FakeHelper {
         path: PathBuf,
         input: PathBuf,
+        _directory: tempfile::TempDir,
     }
 
     impl FakeHelper {
         fn new(body: &str) -> Self {
-            let id = NEXT_HELPER.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir();
-            let stem = format!("ferrum-credential-helper-{}-{id}", std::process::id());
-            let path = root.join(&stem);
-            let input = root.join(format!("{stem}-input"));
-            let script = format!(
-                "#!/bin/sh\ntest \"$1\" = get || exit 7\ncat > '{}'\nprintf '%s' '{}'\n",
-                input.display(),
-                body,
-            );
-            fs::write(&path, script).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-            Self { path, input }
+            let directory = tempfile::Builder::new()
+                .prefix("ferrum-credential-helper-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let path = directory.path().join("helper");
+            let input = path.with_extension("input");
+            let response = path.with_extension("response");
+            write_private_file(&response, body.as_bytes(), 0o600);
+            let script = b"#!/bin/sh\ntest \"$1\" = get || exit 7\nIFS= read -r authority || exit 8\nprintf '%s\\n' \"$authority\" > \"$0.input\"\nIFS= read -r response < \"$0.response\" || [ -n \"$response\" ] || exit 9\nprintf '%s' \"$response\"\n";
+            write_private_file(&path, script, 0o700);
+            Self {
+                path,
+                input,
+                _directory: directory,
+            }
         }
 
         fn from_script(script: &str) -> Self {
-            let id = NEXT_HELPER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "ferrum-credential-helper-{}-{id}",
-                std::process::id()
-            ));
+            let directory = tempfile::Builder::new()
+                .prefix("ferrum-credential-helper-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let path = directory.path().join("helper");
             let input = path.with_extension("input");
-            fs::write(&path, script).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-            Self { path, input }
+            write_private_file(&path, script.as_bytes(), 0o700);
+            Self {
+                path,
+                input,
+                _directory: directory,
+            }
         }
     }
 
-    impl Drop for FakeHelper {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.path);
-            let _ = fs::remove_file(&self.input);
-        }
+    fn write_private_file(path: &Path, contents: &[u8], mode: u32) {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(path)
+            .unwrap();
+        file.write_all(contents).unwrap();
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .unwrap();
     }
 
     #[test]
@@ -389,6 +584,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fake_helper_files_are_private_and_tempdir_is_cleaned_on_drop() {
+        let fake = FakeHelper::new(
+            r#"{"ServerURL":"registry.example","Username":"synthetic-user","Secret":"synthetic-secret"}"#,
+        );
+        let directory = fake.path.parent().unwrap().to_owned();
+        let response = fake.path.with_extension("response");
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&fake.path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&response).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read(&response).unwrap(),
+            br#"{"ServerURL":"registry.example","Username":"synthetic-user","Secret":"synthetic-secret"}"#
+        );
+        drop(fake);
+        assert!(!directory.exists());
+    }
     #[tokio::test]
     async fn helper_get_receives_exact_server_key_and_parses_credentials() {
         let fake = FakeHelper::new(
@@ -457,10 +678,9 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_helper_wait_kills_its_process_group() {
-        let id = NEXT_HELPER.fetch_add(1, Ordering::Relaxed);
-        let stem = format!("ferrum-helper-cancel-{}-{id}", std::process::id());
-        let started = std::env::temp_dir().join(format!("{stem}-started"));
-        let finished = std::env::temp_dir().join(format!("{stem}-finished"));
+        let markers = tempfile::tempdir().unwrap();
+        let started = markers.path().join("started");
+        let finished = markers.path().join("finished");
         let script = format!(
             "#!/bin/sh\n(sleep 0.5; printf done > '{}') &\nprintf started > '{}'\ncat >/dev/null\nwait\n",
             finished.display(),
@@ -487,12 +707,9 @@ mod tests {
         let _ = task.await;
         tokio::time::sleep(Duration::from_millis(700)).await;
 
-        let child_finished = finished.exists();
-        let _ = fs::remove_file(started);
-        let _ = fs::remove_file(finished);
         assert!(helper_started);
         assert!(
-            !child_finished,
+            !finished.exists(),
             "a helper child outlived cancellation and wrote its marker"
         );
     }

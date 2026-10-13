@@ -1,6 +1,6 @@
 # Images
 
-**Status:** Linux local Docker Unix-socket image listing/inspection and bounded read-only layer history, anonymous-by-default pulls and pushes with explicit per-operation Secret Service/pass helper authentication, local tagging/removal, and confirmed local Buildx builds are implemented. Opt-in live smokes verified anonymous Engine pull progress and synthetic direct Engine Basic-auth pull progress from an in-process loopback registry, with exact cleanup of generated tags on Docker Engine 29.9.0/API 1.56. No live helper-authenticated pull/push, external registry push, Ferrum UI tag/removal/build, or native Images-page visual validation is claimed.
+**Status:** Linux local Docker Unix-socket image listing/inspection and bounded read-only layer history, anonymous-by-default pulls and pushes with explicit per-operation Secret Service/pass helper authentication, local tagging/removal, and confirmed local Buildx builds are implemented. Opt-in live smokes verified anonymous Engine pull progress and synthetic direct Engine Basic-auth pull progress from an in-process loopback registry, with cleanup of generated images by verified full image ID on Docker Engine 29.9.0/API 1.56. The ignored fake-helper-to-real-Engine authenticated-pull smoke passed on 2026-10-14 using only the test fake helper and synthetic credentials. Cleanup is pinned to the same validated local Unix socket and uses the verified full image ID without force or prune; if another tag is added, Docker refuses removal and may leave the generated image for manual cleanup. No real helper/credential, external registry, TLS, per-pull UI consent, push, Ferrum UI tag/removal/build, or native Images-page visual validation is claimed.
 
 Open **Images** in the sidebar to view images returned by the connected local
 Docker engine. Search is case-insensitive across repository tags and image IDs.
@@ -174,19 +174,28 @@ Image listing, inspection, read-only history, pulls, pushes, tagging, removal,
 and builds are limited to the selected local Docker Unix socket on Linux. Pulls
 and pushes are anonymous unless a configured Secret Service or `pass` helper is
 explicitly enabled for that single operation. Buildx remains credential-free;
-private base-image authentication is unsupported. Helper-assisted pull/push
-authentication has not been validated against a live engine or registry.
-Podman/rootless behavior and broader endpoint or platform compatibility remain
-unvalidated under open, blocked
-[#10](https://github.com/SzymonR1/ferrum-desktop/issues/10). Issue
-[#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) remains partial/open.
-Two opt-in pull smokes used generated OCI images from an in-process loopback
-registry on Docker Engine 29.9.0/API 1.56 and removed only preflighted generated
-tags without force or prune. The synthetic-auth smoke sends a nonce-generated
-Basic credential directly as Engine AuthConfig; it exercises only the existing
-loopback HTTP/insecure-registry setup. It does not validate helper selection,
-per-pull UI opt-in, real secrets, TLS, external/private registry deployment, or
-production authentication. Issues #16 and #19 remain partial/open.
+private base-image authentication is unsupported. Fake-helper protocol tests and
+fake Unix-engine request tests are separate from live evidence. The direct
+Engine AuthConfig smoke uses synthetic credentials and does not exercise a
+helper. The new ignored app smoke runs the fake-helper execution seam through a
+real local Engine to the shared test-only loopback registry. It passed on
+2026-10-14 on Fedora Linux 44 x86_64 with Docker Engine 29.9.0/API 1.56 through
+the default local Unix context. The test pulls a nonce-generated image into the
+local image store and arms cleanup only after verifying its full image ID and
+sole generated tag. Cleanup is pinned to the same validated local Unix socket
+and removes by full ID without force or prune; if another tag is added, Docker
+refuses removal and the image may remain for manual cleanup. The helper is
+synthetic and the registry uses loopback HTTP with the existing
+insecure-registry setup. It does not validate Settings helper selection,
+per-pull UI consent, real credentials, TLS, production registry configuration,
+or external registries. Issues #16 and #19 remain partial/open.
+Run the ignored app smoke only with a disposable local Docker Unix context and
+existing loopback insecure-registry support:
+
+```sh
+env -u DOCKER_HOST DOCKER_CONTEXT=default cargo test -p ferrum-app --bin ferrum registry_auth::tests::fake_helper_authenticates_generated_loopback_pull_through_local_engine -- --exact --ignored
+```
+
 No live push, Ferrum tag/removal, or build was performed. Native Images-page
 visual validation remains unverified. Default fake-socket/headless tests do not
 contact a real engine or mutate images. See the

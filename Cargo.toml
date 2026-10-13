@@ -4,6 +4,7 @@ members = [
     "crates/ferrum-app",
     "crates/ferrum-core",
     "crates/ferrum-engine",
+    "crates/ferrum-test-support",
 ]
 
 [workspace.package]

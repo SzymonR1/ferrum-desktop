@@ -660,7 +660,18 @@ store but does not build or change project containers, networks, or volumes.
   Linux Secret Service/`pass` choices; authenticated Podman/remote-engine
   operations; managed engines; and update delivery remain deferred. Linux
   local-Docker pulls and pushes have separate per-operation opt-ins through
-  those helpers; live helper/registry authentication is not validated.
+  those helpers. Direct synthetic Engine AuthConfig evidence and the fake-
+  helper-to-real-Engine loopback pull smoke are distinct coverage. The ignored
+  app smoke passed on 2026-10-14 on Fedora Linux 44 x86_64 with Docker Engine
+  29.9.0/API 1.56 through the default local Unix context. It pulls a
+  nonce-generated image into the local image store and verifies that its
+  generated tag is the sole tag for a full image ID before arming cleanup.
+  Cleanup uses the same validated local Unix socket and removes only the
+  retained full image ID without force or prune; another tag causes Docker to
+  refuse removal and may leave the generated image for manual cleanup. It uses
+  a fake helper and synthetic credentials over loopback HTTP; Settings
+  selection, per-pull UI consent, real credentials, TLS, external registries,
+  and production auth remain unvalidated.
 
 These remaining surfaces require explicit design and tests before implementation or broader support claims. Engine access should be treated as privileged throughout; API version negotiation is not a security boundary. UI state gating and confirmation reduce accidental destructive operations but cannot constrain a compromised or malicious engine endpoint.
 
@@ -711,7 +722,7 @@ UI click/visual validation remains unverified. IPAM allocation counts are
 implemented as described above; per-network traffic totals are not implemented.
 Podman/rootless and remote behavior remain unsupported or unvalidated under open, blocked issue #10. No broader endpoint or platform support is claimed.
 
-Fake-Unix-socket image protocol tests and headless Images UI tests cover tag/removal and anonymous plus explicitly authenticated push request/confirmation behavior without contacting a real engine or registry, and without mutating image resources. Push tests verify exact image/tag preflight, one explicit target tag, the empty anonymous JSON body without an auth header, the opt-in `X-Registry-Auth` header without a plaintext credential, bounded progress, safe HTTP rejection, and daemon error redaction. Controlled helper-process tests use fake binaries; UI/audit regressions verify one-operation opt-in and a redacted `not_submitted` failure outcome. Controlled helper-process Buildx tests also do not contact a real engine or mutate images. Separate anonymous and synthetic-auth opt-in smokes pull generated OCI images through Docker Engine from an in-process registry bound only to `127.0.0.1`, then remove only their verified unique tags without force/prune. The synthetic test uses a nonce-generated Basic credential directly as Engine AuthConfig and verifies only a boolean that the exact authorization was accepted. It uses the existing loopback HTTP/insecure-registry setup and does not validate helper selection, per-pull UI opt-in, real secrets, TLS, external/private registry deployment, production authentication, Images UI, push, Ferrum tag/removal, or builds. Issues #16 and #19 remain partial/open.
+Fake-Unix-socket image protocol tests and headless Images UI tests cover tag/removal and anonymous plus explicitly authenticated push request/confirmation behavior without contacting a real engine or registry, and without mutating image resources. Push tests verify exact image/tag preflight, one explicit target tag, the empty anonymous JSON body without an auth header, the opt-in `X-Registry-Auth` header without a plaintext credential, bounded progress, safe HTTP rejection, and daemon error redaction. Controlled helper-process tests use fake binaries; UI/audit regressions verify one-operation opt-in and a redacted `not_submitted` failure outcome. Controlled helper-process Buildx tests also do not contact a real engine or mutate images. Separate anonymous and synthetic direct-auth opt-in smokes pull generated OCI images through Docker Engine from the shared test-only registry bound only to `127.0.0.1`. A separate ignored app test runs the fake helper through `authorization_with_binary`, passes its returned `RegistryAuth` to the real local Engine, probes a missing manifest, and pulls the generated OCI image. This smoke passed on 2026-10-14 on Fedora Linux 44 x86_64 with Docker Engine 29.9.0/API 1.56 through the default local Unix context. Cleanup is pinned to the same validated local Unix socket and uses the verified full image ID without force or prune. Docker refuses non-forced removal by ID if another tag references the image; cleanup then fails safely and may leave the generated image for manual cleanup. The helper and synthetic nonce credentials use loopback HTTP/insecure-registry only. These smokes do not validate Settings enum/helper selection, per-pull UI opt-in, real secrets, TLS, external/private registry deployment, production authentication, Images UI, push, Ferrum tag/removal, or builds. Issues #16 and #19 remain partial/open.
 
 The optional ignored volume create/remove test uses the current local Docker
 context's parsed Unix socket path for EngineClient operations and must run only
