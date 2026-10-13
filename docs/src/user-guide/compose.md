@@ -309,6 +309,52 @@ selected or included configuration/environment files with the logged-in user's
 permissions; validate only trusted files. This slice does not add support for
 Podman, remote engines, or non-Linux platforms.
 
+## Build images for an imported configuration
+
+After explicit confirmation, **Build imported images** is available only for
+the selected imported project after successful revalidation of its same ordered
+Compose files and profiles, using the selected Linux local Docker Unix socket.
+The import label is display-only and does not select or authorize scope.
+Ferrum invokes only this fixed argv shape:
+
+```text
+docker --host unix://<selected-socket> compose --progress plain --parallel 2 --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... build
+```
+
+Ferrum adds no `--push`, command-line `--ssh`, user-selected builder options, or
+extra command-line build arguments. Compose-file `build.args` remain active and
+may expose secrets; do not put credentials there. Compose-file `build.ssh` may
+grant SSH-agent access, and `build.secrets` may expose configured secret
+contents to build instructions. Inspect both, and build only trusted projects.
+Saved Docker credentials/helpers, proxy environment, and user Docker
+config are not forwarded. Ferrum uses private
+Docker config/HOME and a cleared allowlisted environment; selected-project
+`.env` and remote Compose Git/OCI includes are disabled. Linux child resource
+limits, a two-hour deadline, and a combined 1 MiB stdout/stderr cap apply.
+Output is untrusted: only bounded, rate-limited phase/count summaries appear.
+Raw lines, image references, paths, and diagnostics are never shown or
+persisted.
+
+Build runs project-controlled Dockerfile instructions with access to the
+Compose-defined contexts; it may read files beyond the selected YAML, fetch
+remote build contexts/base images, execute arbitrary builder/network code,
+consume CPU/disk/network, change the selected Engine image store, and may
+reassign existing local image tags. Review `.dockerignore` and build only
+trusted project files. This is not sandboxed or path-contained. Only anonymous
+registry access is available; private registries that need credentials may
+reject requests.
+
+Cancellation during preflight terminates the validation CLI process group and
+submits no build. After build submission, cancellation kills only Ferrum's CLI
+process group; the builder/daemon may continue and image state is uncertain.
+Timeout or output overflow has the same uncertain result. There is no automatic
+retry. Static best-effort audit records only `compose_build`/`build` and
+`started`, `success`, `not_submitted`, `request_error`, or `uncertain` values.
+No project/file/service/context/image/credential/output data is recorded.
+Tests use fake CLI and temporary Compose fixtures only; no Engine, registry,
+remote context, user project, or image mutation is performed.
+
+
 
 
 ## One-shot service log snapshot

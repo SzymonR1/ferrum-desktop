@@ -20,6 +20,32 @@ All notable project changes are documented here. The project has not published a
   static `compose_pull`/`pull` and `started`, `success`, `not_submitted`,
   `request_error`, or `uncertain` values, never file/project/service/image/
   credential/output data. Issue #18 remains partial/open.
+- Added explicitly confirmed Compose builds for the current imported,
+  successfully revalidated ordered files/profiles on a selected Linux local
+  Docker Unix socket. The fixed command is
+  `docker --host unix://<selected-socket> compose --progress plain --parallel 2
+  --project-directory <base-parent> --file ... --profile ... build`; Ferrum adds
+  no `--push`, command-line `--ssh`, builder options, or extra command-line build
+  args. Compose-file `build.args` remain active and may expose secrets; do not
+  store credentials there. Compose-file `build.ssh` may grant SSH-agent access,
+  and `build.secrets` may expose configured secret contents to build instructions.
+  Inspect both and build only trusted projects. Saved Docker credentials/helpers,
+  proxy environment, and user Docker config are not passed.
+  Private Docker config/HOME, cleared environment,
+  disabled `.env`/remote Git/OCI loaders, Linux child limits, two-hour deadline,
+  and combined 1 MiB output cap apply. Only bounded, rate-limited phase/count
+  summaries are shown; raw output is not persisted. Builds execute
+  project-controlled instructions
+  with access to Compose-defined contexts, may read beyond selected YAML, fetch
+  remote contexts/base images, execute arbitrary builder/network code, consume
+  resources, and change the selected Engine image store; existing local image tags
+  may be reassigned. Review `.dockerignore`; build only trusted files; this is not
+  sandboxed or path-contained. Anonymous registry access only; credentialed private
+  registries may fail.
+  Preflight cancellation prevents build submission; post-submit cancellation
+  kills only Ferrum's CLI process group and builder/daemon work may continue,
+  leaving state uncertain. No automatic retry. Static audit stores only
+  `compose_build`/`build` start/outcome values. Issue #18 remains partial/open.
 - Added explicit saved Compose registrations through the existing bounded,
   descriptor-pinned SettingsStore. Schema v2 migrates v1/versionless files with
   an empty registry, enforces a 256 KiB serialized settings cap and 32-entry

@@ -200,14 +200,14 @@ enum EngineEvent {
         generation: u64,
         result: compose::ComposeLogsResult,
     },
-    ComposePullProgress {
+    ComposeOperationProgress {
         generation: u64,
-        progress: compose::ComposePullProgress,
+        progress: compose::ComposeOperationProgress,
     },
-    ComposeLifecycleFinished {
+    ComposeOperationFinished {
         generation: u64,
-        selection: compose::ComposeLifecycleSelection,
-        result: compose::ComposeLifecycleResult,
+        selection: compose::ComposeOperationSelection,
+        result: compose::ComposeOperationResult,
     },
     NetworkCreated {
         generation: u64,
@@ -892,9 +892,9 @@ struct FerrumApp {
     compose_follow_task: Option<JoinHandle<()>>,
     #[cfg(target_os = "linux")]
     compose_follow_receiver: Option<mpsc::Receiver<(u64, compose::ComposeFollowEvent)>>,
-    compose_lifecycle_task: Option<JoinHandle<()>>,
-    compose_pull_cancellation: Option<tokio::sync::oneshot::Sender<()>>,
-    compose_lifecycle_audit_task: Option<JoinHandle<()>>,
+    compose_operation_task: Option<JoinHandle<()>>,
+    compose_operation_cancellation: Option<tokio::sync::oneshot::Sender<()>>,
+    compose_operation_audit_task: Option<JoinHandle<()>>,
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
     // Hold the reader until the terminal response event releases the mutation gate.
@@ -1107,9 +1107,9 @@ impl FerrumApp {
             compose_follow_task: None,
             #[cfg(target_os = "linux")]
             compose_follow_receiver: None,
-            compose_lifecycle_task: None,
-            compose_pull_cancellation: None,
-            compose_lifecycle_audit_task: None,
+            compose_operation_task: None,
+            compose_operation_cancellation: None,
+            compose_operation_audit_task: None,
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
@@ -1549,9 +1549,9 @@ impl FerrumApp {
         self.compose.cancel_service_follow();
     }
     #[cfg(target_os = "linux")]
-    fn start_compose_lifecycle(
+    fn start_compose_operation(
         &mut self,
-        task: compose::ComposeLifecycleTask,
+        task: compose::ComposeOperationTask,
         context: egui::Context,
     ) {
         if let Some(task) = self.compose_status_task.take() {
@@ -1568,42 +1568,45 @@ impl FerrumApp {
             .as_ref()
             .map(|engine| engine.local_socket_path().to_path_buf());
         let precondition_error = (precondition_failed || socket_path.is_none())
-            .then_some(compose::ComposeLifecycleError::EngineUnavailable);
+            .then_some(compose::ComposeOperationError::EngineUnavailable);
         let sender = self.sender.clone();
         let audit_store = self.audit_store.clone();
         let selection = task.selection.clone();
         let service = task.service.clone();
-        let pull_cancellation_receiver = task.pull_cancellation;
-        self.compose_pull_cancellation = task.pull_cancellation_sender;
+        let cancellation_receiver = task.cancellation;
+        self.compose_operation_cancellation = task.cancellation_sender;
         let audit_action = match task.action {
-            compose::ComposeLifecycleAction::Start => Some(audit::ComposeMutationAction::Start),
-            compose::ComposeLifecycleAction::Stop => Some(audit::ComposeMutationAction::Stop),
-            compose::ComposeLifecycleAction::Restart => Some(audit::ComposeMutationAction::Restart),
-            compose::ComposeLifecycleAction::Pull => None,
+            compose::ComposeOperationAction::Start => Some(audit::ComposeMutationAction::Start),
+            compose::ComposeOperationAction::Stop => Some(audit::ComposeMutationAction::Stop),
+            compose::ComposeOperationAction::Restart => Some(audit::ComposeMutationAction::Restart),
+            compose::ComposeOperationAction::Pull | compose::ComposeOperationAction::Build => None,
         };
         let started_record = match audit_action {
             Some(action) => audit::record_compose_mutation_result(
                 action,
                 audit::ComposeMutationOutcome::Started,
             ),
+            None if task.action == compose::ComposeOperationAction::Build => {
+                audit::record_compose_build_result(audit::ComposeBuildOutcome::Started)
+            }
             None => audit::record_compose_pull_result(audit::ComposePullOutcome::Started),
         };
         let started_audit_store = audit_store.clone();
         let (audit_started_sender, audit_started_receiver) = tokio::sync::oneshot::channel();
-        self.compose_lifecycle_audit_task = Some(self.runtime.spawn(async move {
+        self.compose_operation_audit_task = Some(self.runtime.spawn(async move {
             persist_audit_record(&started_audit_store, started_record).await;
             let _ = audit_started_sender.send(());
         }));
         context.request_repaint();
-        self.compose_lifecycle_task = Some(self.runtime.spawn(async move {
-            let (pull_progress_sender, mut pull_progress_receiver) =
-                mpsc::channel(compose::COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+        self.compose_operation_task = Some(self.runtime.spawn(async move {
+            let (operation_progress_sender, mut operation_progress_receiver) =
+                mpsc::channel(compose::COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
             let progress_event_sender = sender.clone();
             let progress_generation = task.generation;
             let progress_forwarder = tokio::spawn(async move {
-                while let Some(progress) = pull_progress_receiver.recv().await {
+                while let Some(progress) = operation_progress_receiver.recv().await {
                     if progress_event_sender
-                        .send(EngineEvent::ComposePullProgress {
+                        .send(EngineEvent::ComposeOperationProgress {
                             generation: progress_generation,
                             progress,
                         })
@@ -1618,12 +1621,12 @@ impl FerrumApp {
                 return;
             }
             let result = match (precondition_error, socket_path) {
-                (Some(error), _) => compose::ComposeLifecycleResult {
+                (Some(error), _) => compose::ComposeOperationResult {
                     outcome: Err(error),
                     submitted: false,
                 },
                 (None, Some(socket_path)) => {
-                    if task.action == compose::ComposeLifecycleAction::Restart {
+                    if task.action == compose::ComposeOperationAction::Restart {
                         if let Some(service) = service.as_deref() {
                             compose::compose_service_restart(
                                 &socket_path,
@@ -1633,30 +1636,47 @@ impl FerrumApp {
                             )
                             .await
                         } else {
-                            compose::ComposeLifecycleResult {
-                                outcome: Err(compose::ComposeLifecycleError::ServiceUnavailable),
+                            compose::ComposeOperationResult {
+                                outcome: Err(compose::ComposeOperationError::ServiceUnavailable),
                                 submitted: false,
                             }
                         }
-                    } else if task.action == compose::ComposeLifecycleAction::Pull {
-                        match pull_cancellation_receiver {
+                    } else if task.action == compose::ComposeOperationAction::Pull {
+                        match cancellation_receiver {
                             Some(cancellation) => {
                                 compose::compose_pull(
                                     &socket_path,
                                     &task.selection.files,
                                     &task.selection.profiles,
                                     cancellation,
-                                    &pull_progress_sender,
+                                    &operation_progress_sender,
                                 )
                                 .await
                             }
-                            None => compose::ComposeLifecycleResult {
-                                outcome: Err(compose::ComposeLifecycleError::CommandStartFailed),
+                            None => compose::ComposeOperationResult {
+                                outcome: Err(compose::ComposeOperationError::CommandStartFailed),
+                                submitted: false,
+                            },
+                        }
+                    } else if task.action == compose::ComposeOperationAction::Build {
+                        match cancellation_receiver {
+                            Some(cancellation) => {
+                                compose::compose_build(
+                                    &socket_path,
+                                    &task.selection.files,
+                                    &task.selection.profiles,
+                                    cancellation,
+                                    &operation_progress_sender,
+                                )
+                                .await
+                            }
+                            None => compose::ComposeOperationResult {
+                                outcome: Err(compose::ComposeOperationError::CommandStartFailed),
                                 submitted: false,
                             },
                         }
                     } else {
-                        compose::compose_lifecycle(
+                        compose::compose_operation(
                             &socket_path,
                             &task.selection.files,
                             &task.selection.profiles,
@@ -1665,12 +1685,12 @@ impl FerrumApp {
                         .await
                     }
                 }
-                (None, None) => compose::ComposeLifecycleResult {
-                    outcome: Err(compose::ComposeLifecycleError::EngineUnavailable),
+                (None, None) => compose::ComposeOperationResult {
+                    outcome: Err(compose::ComposeOperationError::EngineUnavailable),
                     submitted: false,
                 },
             };
-            drop(pull_progress_sender);
+            drop(operation_progress_sender);
             let _ = progress_forwarder.await;
             let record = if let Some(action) = audit_action {
                 let outcome = if result.outcome.is_ok() {
@@ -1681,13 +1701,26 @@ impl FerrumApp {
                     audit::ComposeMutationOutcome::NotSubmitted
                 };
                 audit::record_compose_mutation_result(action, outcome)
+            } else if task.action == compose::ComposeOperationAction::Build {
+                let outcome = if result.outcome.is_ok() {
+                    audit::ComposeBuildOutcome::Success
+                } else if !result.submitted {
+                    audit::ComposeBuildOutcome::NotSubmitted
+                } else if result.outcome
+                    == Err(compose::ComposeOperationError::OperationOutcomeUncertain)
+                {
+                    audit::ComposeBuildOutcome::Uncertain
+                } else {
+                    audit::ComposeBuildOutcome::RequestError
+                };
+                audit::record_compose_build_result(outcome)
             } else {
                 let outcome = if result.outcome.is_ok() {
                     audit::ComposePullOutcome::Success
                 } else if !result.submitted {
                     audit::ComposePullOutcome::NotSubmitted
                 } else if result.outcome
-                    == Err(compose::ComposeLifecycleError::PullOutcomeUncertain)
+                    == Err(compose::ComposeOperationError::OperationOutcomeUncertain)
                 {
                     audit::ComposePullOutcome::Uncertain
                 } else {
@@ -1697,7 +1730,7 @@ impl FerrumApp {
             };
             persist_audit_record(&audit_store, record).await;
             if sender
-                .send(EngineEvent::ComposeLifecycleFinished {
+                .send(EngineEvent::ComposeOperationFinished {
                     generation: task.generation,
                     selection,
                     result,
@@ -2880,7 +2913,7 @@ impl FerrumApp {
             || self.network_mutation_busy()
             || self.volume_mutation_busy()
             || self.image_build_busy()
-            || self.compose_lifecycle_task.is_some()
+            || self.compose_operation_task.is_some()
         {
             return;
         }
@@ -3111,32 +3144,32 @@ impl FerrumApp {
                         self.compose_logs_task = None;
                     }
                 }
-                EngineEvent::ComposePullProgress {
+                EngineEvent::ComposeOperationProgress {
                     generation,
                     progress,
                 } => {
-                    if self.compose.note_pull_progress(generation, progress) {
+                    if self.compose.note_operation_progress(generation, progress) {
                         context.request_repaint();
                     }
                 }
-                EngineEvent::ComposeLifecycleFinished {
+                EngineEvent::ComposeOperationFinished {
                     generation,
                     selection,
                     result,
                 } => {
-                    if self.compose.current_lifecycle_selection_matches(&selection)
+                    if self.compose.current_operation_selection_matches(&selection)
                         && self.page == images::AppPage::Compose
                     {
-                        if self.compose.finish_lifecycle(generation, result) {
-                            self.compose_lifecycle_task = None;
-                            self.compose_lifecycle_audit_task = None;
-                            self.compose_pull_cancellation = None;
+                        if self.compose.finish_operation(generation, result) {
+                            self.compose_operation_task = None;
+                            self.compose_operation_audit_task = None;
+                            self.compose_operation_cancellation = None;
                             self.start_compose_status_refresh(context.clone());
                         }
-                    } else if self.compose.finish_lifecycle(generation, result) {
-                        self.compose_lifecycle_task = None;
-                        self.compose_lifecycle_audit_task = None;
-                        self.compose_pull_cancellation = None;
+                    } else if self.compose.finish_operation(generation, result) {
+                        self.compose_operation_task = None;
+                        self.compose_operation_audit_task = None;
+                        self.compose_operation_cancellation = None;
                     }
                 }
                 EngineEvent::VolumeInspected {
@@ -4203,7 +4236,7 @@ impl FerrumApp {
                             && !network_mutation_in_flight
                             && !volume_mutation_in_flight
                             && !image_build_busy
-                            && self.compose_lifecycle_task.is_none(),
+                            && self.compose_operation_task.is_none(),
                         |ui| {
                             let selected_name = match self.selected_context.as_deref() {
                                 Some(name) => self
@@ -5042,7 +5075,7 @@ impl Drop for FerrumApp {
         self.cancel_image_build();
         self.cancel_image_read_tasks();
         self.invalidate_compose();
-        if let Some(audit_task) = self.compose_lifecycle_audit_task.take()
+        if let Some(audit_task) = self.compose_operation_audit_task.take()
             && !audit_task.is_finished()
             && tokio::runtime::Handle::try_current().is_err()
         {
@@ -5052,7 +5085,7 @@ impl Drop for FerrumApp {
                 tokio::time::timeout(std::time::Duration::from_secs(1), audit_task).await
             });
         }
-        if let Some(task) = self.compose_lifecycle_task.take() {
+        if let Some(task) = self.compose_operation_task.take() {
             task.abort();
         }
         self.pending_resource_read = None;
@@ -5197,27 +5230,30 @@ impl eframe::App for FerrumApp {
         }
         if compose_actions.start_imported {
             self.compose
-                .request_lifecycle_confirmation(compose::ComposeLifecycleAction::Start);
+                .request_operation_confirmation(compose::ComposeOperationAction::Start);
         } else if compose_actions.stop_imported {
             self.compose
-                .request_lifecycle_confirmation(compose::ComposeLifecycleAction::Stop);
+                .request_operation_confirmation(compose::ComposeOperationAction::Stop);
         } else if compose_actions.pull_imported {
             self.compose
-                .request_lifecycle_confirmation(compose::ComposeLifecycleAction::Pull);
+                .request_operation_confirmation(compose::ComposeOperationAction::Pull);
+        } else if compose_actions.build_imported {
+            self.compose
+                .request_operation_confirmation(compose::ComposeOperationAction::Build);
         }
-        if compose_actions.cancel_pull
-            && self.compose.request_pull_cancellation()
-            && let Some(cancellation) = self.compose_pull_cancellation.take()
+        if compose_actions.cancel_operation
+            && self.compose.request_operation_cancellation()
+            && let Some(cancellation) = self.compose_operation_cancellation.take()
         {
             let _ = cancellation.send(());
         }
-        if compose_actions.cancel_lifecycle {
-            self.compose.cancel_lifecycle_confirmation();
+        if compose_actions.cancel_operation_confirmation {
+            self.compose.cancel_operation_confirmation();
         }
-        if compose_actions.confirm_lifecycle {
+        if compose_actions.confirm_operation {
             #[cfg(target_os = "linux")]
-            if let Some(task) = self.compose.confirm_lifecycle() {
-                self.start_compose_lifecycle(task, context.clone());
+            if let Some(task) = self.compose.confirm_operation() {
+                self.start_compose_operation(task, context.clone());
             }
         }
         if compose_actions.refresh {
@@ -5780,9 +5816,9 @@ mod event_reconciliation_tests {
             compose_follow_task: None,
             #[cfg(target_os = "linux")]
             compose_follow_receiver: None,
-            compose_lifecycle_task: None,
-            compose_pull_cancellation: None,
-            compose_lifecycle_audit_task: None,
+            compose_operation_task: None,
+            compose_operation_cancellation: None,
+            compose_operation_audit_task: None,
             pending_resource_read: None,
             image_list_task: None,
             image_inspection_task: None,
@@ -7278,7 +7314,7 @@ mod event_reconciliation_tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn confirmed_imported_compose_lifecycle(app: &mut FerrumApp) -> compose::ComposeLifecycleTask {
+    fn confirmed_imported_compose_operation(app: &mut FerrumApp) -> compose::ComposeOperationTask {
         let generation = app.compose.begin_file_selection();
         assert!(app.compose.finish_file_selection(
             generation,
@@ -7295,16 +7331,16 @@ mod event_reconciliation_tests {
         assert!(app.compose.import_current_project("Local label"));
         assert!(
             app.compose
-                .request_lifecycle_confirmation(compose::ComposeLifecycleAction::Start)
+                .request_operation_confirmation(compose::ComposeOperationAction::Start)
         );
         app.compose
-            .confirm_lifecycle()
+            .confirm_operation()
             .expect("the imported configuration should request a lifecycle action")
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn unavailable_compose_lifecycle_finishes_and_persists_not_submitted_outcome() {
+    fn unavailable_compose_operation_finishes_and_persists_not_submitted_outcome() {
         let (mut app, _) = app_with_open_inspection();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7318,25 +7354,25 @@ mod event_reconciliation_tests {
         app.audit_store = audit::AuditStore::new(Arc::new(settings::SettingsStore::at(
             root.join("settings.toml"),
         )));
-        let lifecycle = confirmed_imported_compose_lifecycle(&mut app);
+        let operation = confirmed_imported_compose_operation(&mut app);
         app.page = images::AppPage::Compose;
-        app.start_compose_lifecycle(lifecycle, egui::Context::default());
+        app.start_compose_operation(operation, egui::Context::default());
 
         let worker = app
-            .compose_lifecycle_task
+            .compose_operation_task
             .take()
             .expect("the unavailable operation should finish asynchronously");
         app.runtime
             .block_on(worker)
-            .expect("lifecycle task should complete");
+            .expect("the operation task should complete");
         app.receive_events(egui::Context::default());
 
         assert!(
             app.compose
-                .request_lifecycle_confirmation(compose::ComposeLifecycleAction::Stop),
+                .request_operation_confirmation(compose::ComposeOperationAction::Stop),
             "the rejected operation must not leave the UI stuck in a running state"
         );
-        app.compose.cancel_lifecycle_confirmation();
+        app.compose.cancel_operation_confirmation();
         let contents = std::fs::read_to_string(root.join("audit.jsonl")).unwrap();
         let records = contents
             .lines()
@@ -7353,7 +7389,7 @@ mod event_reconciliation_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn dropping_app_before_lifecycle_worker_poll_persists_started_audit_marker() {
+    fn dropping_app_before_operation_worker_poll_persists_started_audit_marker() {
         let (mut app, _) = app_with_open_inspection();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7367,9 +7403,9 @@ mod event_reconciliation_tests {
         app.audit_store = audit::AuditStore::new(Arc::new(settings::SettingsStore::at(
             root.join("settings.toml"),
         )));
-        let lifecycle = confirmed_imported_compose_lifecycle(&mut app);
+        let operation = confirmed_imported_compose_operation(&mut app);
         app.page = images::AppPage::Compose;
-        app.start_compose_lifecycle(lifecycle, egui::Context::default());
+        app.start_compose_operation(operation, egui::Context::default());
 
         drop(app);
 

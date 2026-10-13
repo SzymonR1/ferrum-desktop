@@ -343,10 +343,10 @@ restored entries remain unselected and unvalidated. Selecting one clears stale
 data and requires explicit revalidation. Forget removes only the registry
 entry and leaves the current session entry available. Neither selection nor
 persistence reads project contents or confines paths.
-Project lifecycle commands still use the selected files/profiles and local
+Project lifecycle commands use selected files/profiles and the selected local
 socket; the local label does not establish project identity or authorization.
-Build/up/down, remove, and project-file mutations remain unavailable. Compose
-pull is a separate anonymous-only operation described below.
+Build/pull are separate confirmed image operations described below; `up`/`down`,
+remove, and project-file mutations remain unavailable.
 
 Start/stop are available only for the currently selected imported entry
 (session-only or explicitly saved) after explicit successful revalidation.
@@ -415,6 +415,36 @@ outcome, Ferrum exited or final audit persistence failed and the final Engine
 result is unknown.
 This slice applies only to Linux local Docker Unix sockets; it does not claim
 Podman, remote Docker, Windows, or macOS support.
+
+Confirmed Compose builds run only for the same selected, imported,
+successfully revalidated ordered files/profiles and selected Linux local Docker
+Unix socket. The fixed argv is `docker --host unix://<selected-socket> compose
+--progress plain --parallel 2 --project-directory <base-parent> --file ...
+`--profile ... build`; Ferrum adds no `--push`, command-line `--ssh`, builder
+options, or extra command-line build arguments. Compose-file `build.args` remain
+active and may expose secrets; do not store credentials there. Compose-file
+`build.ssh` may grant SSH-agent access, and `build.secrets` may expose
+configured secret contents to build instructions. Inspect both, and only build
+trusted projects. Saved Docker credentials/helpers, proxy environment, and user
+config are not passed. Ferrum uses private
+Docker config/HOME, a cleared allowlisted environment, disabled selected `.env`
+and remote Compose Git/OCI includes, Linux limits, a two-hour deadline, and a
+combined 1 MiB stdout/stderr cap. The UI exposes only bounded/rate-limited
+allowlisted phase/count summaries; raw output, paths, references, and
+diagnostics are neither shown nor persisted.
+
+Build executes project-controlled Dockerfile instructions with access to
+Compose-defined contexts and may read files beyond the selected YAML, fetch
+remote contexts/base images, run arbitrary builder/network code, consume
+resources, and change the selected Engine image store; existing local image tags
+may be reassigned. Review `.dockerignore`; build only trusted project files.
+This is neither sandboxed nor path-contained. Anonymous auth only is available;
+credential-required private registries may fail. Preflight cancellation kills
+before build submission; post-submit cancellation kills only Ferrum's CLI
+group, so builder/daemon work may continue and state is uncertain. Timeout and
+output overflow also leave state uncertain; no retries are automatic. Audit
+stores only static `compose_build`/`build` start and outcome values, excluding
+project, file, service, context, image, credential, and output data.
 
 On successful validation the same bounded CLI invocation returns every
 declared service name via `config --services`, including services gated by
