@@ -50,8 +50,9 @@ cargo test -p ferrum-app compose::tests::subprocess::local_compose_validation_re
 
 The confirmed Compose `up` path has controlled fake-CLI and headless UI
 coverage. Regressions exercise selected ordered files/profiles and socket
-arguments, sealed-snapshot submission, confirmation gating, static audit
-outcomes, and post-spawn failure classification without changing Engine
+arguments, sealed-snapshot submission, confirmation gating, and warnings about
+volume creation and writes to mounted data. They also cover static audit
+outcomes and post-spawn failure classification without changing Engine
 resources. Headless state tests require a successful status snapshot before
 `up`, reject confirmation while status is pending or failed, and keep retries
 blocked until status succeeds after an uncertain outcome and page

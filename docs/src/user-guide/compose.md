@@ -391,19 +391,23 @@ docker compose ... up --detach --no-build --pull never
 
 Ferrum also pins the command to the selected socket and supplies the base
 project directory, ordered snapshot file descriptors, and selected profiles.
-Compose creates and starts project containers and networks. It may recreate
-existing containers when configuration or image changes require it. With
-`--detach`, Compose returns while containers continue running; use the existing
-status and service-log views to monitor them. It uses locally present images
-only: this operation does not build or pull images,
-remove orphans, remove volumes, or force recreation. If an image is missing,
+Compose creates and starts project containers and networks and may create
+missing project volumes, as described in Docker's
+[Compose volume documentation](https://docs.docker.com/reference/compose-file/volumes/).
+It may recreate existing containers when configuration or image changes require it.
+With `--detach`, Compose returns while containers
+continue running; use the existing status and service-log views to monitor them.
+Project services can write to volumes and host mounts described by the trusted
+project. It uses locally present images
+only: this operation does not build or pull images, remove orphan containers,
+remove volumes, or force recreation. If an image is missing,
 use the separate **Build imported images** or **Pull images** action as
 appropriate. Compose pulls are anonymous-only and may fail for private
 registries requiring credentials.
 
-The confirmation warns to use only trusted project files, that containers may
-be created or recreated, and that no-build/no-pull requires the needed images
-to be available locally. Compose runs trusted project configuration and
+The confirmation warns to use only trusted project files because containers
+and missing project volumes may be created and existing containers may be
+recreated; required images must already exist locally. Compose runs trusted
 service code on the selected Engine; this is not a sandbox. Ferrum uses its
 private Docker config/HOME and cleared environment, and does not pass saved
 Docker credentials or invoke Build/Pull as part of `up`.

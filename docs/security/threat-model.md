@@ -314,14 +314,16 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   its ordered files/profiles have been revalidated and a current status query
   has succeeded. Use sealed snapshot descriptors and the selected Linux local
   Docker Unix socket with fixed `up --detach --no-build --pull never` arguments.
-  It creates/starts project containers and networks, may recreate existing
-  containers when configuration/image changes, and uses only local images.
-  It does not build, pull, remove orphans, remove volumes, or force recreation.
-  Missing images require separate Build/Pull actions; Compose pulls are
-  anonymous only. Confirmation warns to use trusted project files and explains
-  creation/recreation and the local-image requirement. Compose runs trusted
-  project configuration and service code on the selected Engine; it is not a
-  sandbox and no saved credentials are passed.
+  It creates/starts project containers and networks and may create missing
+  project volumes. It may recreate existing containers when configuration or
+  image changes and uses only local images. It does not build or pull images,
+  remove orphan containers, remove volumes, or force recreation. Missing images
+  require separate Build/Pull actions; Compose pulls are anonymous only.
+  Running services may write to configured volumes and host mounts.
+  Confirmation warns to use only trusted project files and discloses
+  container/network/volume creation, container recreation, and local-image
+  requirements. Project configuration and service code run on the selected
+  Engine; this is not a sandbox and no saved credentials are passed.
   Use a 30-second deadline and 1 MiB stdout cap; raw stdout is discarded and
   stderr is suppressed. Audit only static `up` action and the `started`,
   `success`, `not_submitted`, `request_error`, or `uncertain` outcomes; exclude
@@ -333,8 +335,8 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   Controlled fake-CLI/headless tests cover command semantics and the status
   retry gate; no live mutation ran because no disposable Engine is designated.
   This slice does not claim Podman, remote, Windows/macOS, full issue completion,
-  support expansion. See the official
-  [Compose `up` reference](https://docs.docker.com/reference/cli/docker/compose/up/).
+  support expansion. See Docker's [official Compose `up` reference](https://docs.docker.com/reference/cli/docker/compose/up/) and
+  [volume documentation](https://docs.docker.com/reference/compose-file/volumes/).
   Remote references remain disabled and are not fetched. Existing temporary-
   file/status smokes do not validate arbitrary projects. Native page visual
   check is unavailable.

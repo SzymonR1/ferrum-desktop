@@ -8,11 +8,13 @@ All notable project changes are documented here. The project has not published a
   successful current status refresh on the selected Linux local Docker socket.
   It submits sealed file snapshots
   with fixed `up --detach --no-build --pull never` arguments, creates/starts
-  containers and networks, and may recreate containers when configuration or
-  image changes require it. It uses local images only: no build, pull, orphan
-  removal, volume removal, or force recreation. Missing images require separate
-  Build/Pull actions; Compose pulls are anonymous-only. Confirmation warns about
-  trusted project files, creation/recreation, and the local-image limitation.
+  containers and networks and may create missing project volumes. It may
+  recreate existing containers when configuration/image changes require it and
+  uses local images only: no build, pull, orphan removal, volume removal, or
+  force recreation. Project services may write to configured volumes and host
+  mounts. Missing images require separate Build/Pull actions; Compose pulls are
+  anonymous-only. Confirmation warns about trusted files, resource creation,
+  recreation, and the local-image limit.
   Compose project configuration and service code run on the selected Engine
   without a sandbox. The 30-second command records only static `up` and
   `started`, `success`, `not_submitted`, `request_error`, or `uncertain`

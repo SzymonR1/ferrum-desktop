@@ -108,8 +108,12 @@ excluded. An `up` confirmation requires a successful current status snapshot
 for the selected imported files and remains disabled after an uncertain result
 until refresh succeeds, including after navigation. Where persisted, `started`
 records that Ferrum began a confirmed attempt before preflight/CLI execution.
-Ferrum exited or final audit persistence failed; it does not prove whether
-Compose reached or changed the engine, so refresh status. `not_submitted`
+The `up` command may create missing project volumes; trusted service code can
+write to configured volumes and host mounts. The operation does not remove
+volumes.
+If there is no later terminal outcome, Ferrum exited or final audit persistence
+failed; it does not prove whether Compose reached or changed the Engine, so
+refresh status. `not_submitted`
 covers local preflight/validation or any process-spawn failure before the
 lifecycle process starts; a returned failure or timeout after start is
 `request_error` for start/stop/restart and `uncertain` for `up`. During

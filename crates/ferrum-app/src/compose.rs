@@ -2026,7 +2026,9 @@ impl ComposeView {
                     } else if confirmation.action == ComposeOperationAction::Up {
                         ui.label("Create/start safety warning");
                         ui.label("Compose up creates containers and networks and may recreate existing containers when configuration or images change. It runs project configuration and service code on the selected Engine; use only trusted project files.");
-                        ui.label("Only images already present locally are used: --no-build and --pull never prevent builds and registry access. Prepare missing images separately. This command does not remove orphans or volumes.");
+                        ui.label("Volume safety warning");
+                        ui.label("Compose may create missing project volumes. Running services can write to volumes and host mounts configured by the project.");
+                        ui.label("Only images already present locally are used: --no-build and --pull never prevent builds and registry access. Prepare missing images separately. Up does not remove orphan containers or volumes.");
                     }
                     if !status_enabled {
                         ui.label(
@@ -9195,9 +9197,15 @@ exit 85
             harness.step();
             let _warning =
                 harness.get_by_role_and_label(Role::Label, "Create/start safety warning");
+            let _volume_warning =
+                harness.get_by_role_and_label(Role::Label, "Volume safety warning");
+            let _volume_details = harness.get_by_role_and_label(
+                Role::Label,
+                "Compose may create missing project volumes. Running services can write to volumes and host mounts configured by the project.",
+            );
             let _local_images = harness.get_by_role_and_label(
                 Role::Label,
-                "Only images already present locally are used: --no-build and --pull never prevent builds and registry access. Prepare missing images separately. This command does not remove orphans or volumes.",
+                "Only images already present locally are used: --no-build and --pull never prevent builds and registry access. Prepare missing images separately. Up does not remove orphan containers or volumes.",
             );
             let _confirmation = harness.get_by_role_and_label(Role::Button, "Confirm up");
             harness
