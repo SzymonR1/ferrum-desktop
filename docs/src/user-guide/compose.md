@@ -247,8 +247,8 @@ up-to-one-second flush of the initial audit marker before aborting the lifecycle
 worker. A submitted child may still be terminated, leaving Engine state
 uncertain; refresh after restart. Service names, paths, labels, profiles,
 endpoint values, raw diagnostics, and project metadata are never audited.
-`up`, `down`, create, build, pull, remove, persistence, and live log follow
-remain outside this partial Issue #18 slice.
+`up`, `down`, create, build, pull, remove, persistent project registration,
+and project-file mutation remain outside this partial Issue #18 slice.
 
 
 ## One-shot service log snapshot
@@ -289,6 +289,37 @@ files.
 See Docker's [Compose `logs` reference](https://docs.docker.com/reference/cli/docker/compose/logs/)
 for CLI options and per-container tail semantics.
 
+## Live service-log follow
+
+Use **Follow logs for SERVICE** beside a service in the current successful
+status snapshot. Follow requires the current session import and explicit
+successful validation. Immediately before starting, Ferrum repeats a read-only
+`compose ps --all --format json` query with the same ordered files, profiles,
+and selected local Docker Unix socket; it refuses if the service is absent or
+the query fails.
+
+```text
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... logs --follow --tail 200 --no-color <SERVICE>
+```
+
+Compose's `--tail 200` applies per container. Ferrum retains a rolling maximum
+of 200 combined lines/256 KiB and does not globally time-sort replicated output.
+Raw lines are capped at 4096 bytes; when a line exceeds the cap, Ferrum discards
+its remainder through newline and displays `[line omitted: exceeds 4096 bytes]`.
+Output is escaped, transient, and excluded from files, audit, tracing, and
+debug output. A dedicated 16-event queue applies backpressure; there is no
+overall stream deadline or automatic retry. A clean EOF ends the session and a
+static error is shown on failure.
+
+**Stop log follow**, changing the imported files or profiles, refreshing status,
+switching context/page, and closing Ferrum cancel the local Compose CLI
+process group and discard queued/stale output. Follow is read-only and does not
+stop or alter containers. It uses the same private Docker config/HOME, cleared
+environment, and process limits described above. Selected and included Compose
+files remain trusted local inputs under the logged-in user's permissions.
+No real service logs or native visual workflow were validated.
+
+
 ## Select Compose profiles
 
 Enter a comma-separated list of Compose profile names. Ferrum trims outer
@@ -298,34 +329,36 @@ name. Empty entries (including leading, trailing, or repeated commas) and
 duplicate names are rejected. A name must match
 `[A-Za-z0-9][A-Za-z0-9_.-]+`. The special value `*` is accepted only by itself
 and enables every profile in the Compose model. It does not start services:
-status still lists existing containers, and each log snapshot still targets one
-selected service. Ferrum passes each selected profile as its own `--profile <name>`
+status still lists existing containers, and each log query targets one selected
+service. Ferrum passes each selected profile as its own `--profile <name>`
 argument before the Compose subcommand:
 
 ```text
 docker compose --file <base-file> ... --profile <name> config --no-interpolate --no-env-resolution --services
 docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> ... --profile <name> ps --all --format json
 docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> ... --profile <name> logs --tail 200 --no-color <service>
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> ... --profile <name> logs --follow --tail 200 --no-color <service>
 ```
 
 Selected profiles are passed to structural validation, existing-container
-status, one-shot service logs, and imported-configuration start/stop/restart.
+status, one-shot snapshots, live service-log follow, and imported-configuration start/stop/restart.
 `config --services` inventory includes every service declared in the selected
-files regardless of the active profile set. The status recheck immediately
-before logs uses the same profiles as the earlier status query. Profile flags
+files regardless of active profiles. Before either one-shot logs or follow,
+the fresh status recheck uses the selected profiles. Profile flags
 are separate argument-array entries, never environment variables. CLI
 invocations retain Ferrum's private Docker config/HOME and cleared allowlisted
 environment, including disabling the selected project's default `.env` and
 remote Git/OCI loaders. Invalid profile input or changing the selection clears
-validation, declared services, status, and logs and cancels their in-flight
-tasks; validate again before refreshing status or requesting logs. Lifecycle
-operations already submitted are not cancelled by selection or navigation.
+validation, declared services, status, and snapshot/follow output and cancels
+their in-flight tasks; validate again before refreshing status, requesting a
+snapshot, or following logs. Lifecycle operations already submitted are not
+cancelled by selection or navigation.
 
 See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
 and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
 
-Project persistence, build/pull/up/down/removal, live log follow, and
-project-file mutation remain unsupported. Transient import is session-only and
+Project persistence, build/pull/up/down/removal, and project-file mutation
+remain unsupported. Transient import is session-only and
 does not persist files or project state. Structural validation skips
 interpolation and service `env_file` resolution; status uses the isolated
 environment above and may differ from a normal shell invocation. Start/stop/

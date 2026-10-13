@@ -324,6 +324,56 @@ enum ComposeLogsState {
         service: String,
     },
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum ComposeFollowState {
+    #[default]
+    Idle,
+    Following {
+        service: String,
+    },
+    Ended {
+        service: String,
+    },
+    Failed {
+        service: String,
+        error: ComposeLogsError,
+    },
+    Cancelled {
+        service: String,
+    },
+}
+
+#[cfg(target_os = "linux")]
+pub(super) struct ComposeFollowLaunch {
+    pub(super) generation: u64,
+    pub(super) files: Vec<std::path::PathBuf>,
+    pub(super) profiles: Vec<String>,
+    pub(super) service: String,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) enum ComposeFollowEvent {
+    Line(String),
+    Ended,
+    Failed(ComposeLogsError),
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for ComposeFollowEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Line(line) => formatter
+                .debug_struct("ComposeFollowEvent::Line")
+                .field("line_bytes", &line.len())
+                .finish(),
+            Self::Ended => formatter.write_str("ComposeFollowEvent::Ended"),
+            Self::Failed(error) => formatter
+                .debug_tuple("ComposeFollowEvent::Failed")
+                .field(error)
+                .finish(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ComposeProject {
@@ -460,6 +510,8 @@ pub(super) struct ComposeActions {
     pub(super) cancel_validation: bool,
     pub(super) cancel_logs: bool,
     pub(super) logs_service: Option<String>,
+    pub(super) follow_service: Option<String>,
+    pub(super) cancel_follow: bool,
     pub(super) restart_service: Option<String>,
     pub(super) cancel_status: bool,
     pub(super) start_imported: bool,
@@ -525,6 +577,9 @@ pub(super) struct ComposeView {
     logs_generation: u64,
     logs: ComposeLogsState,
     logs_output: String,
+    follow_generation: u64,
+    follow: ComposeFollowState,
+    follow_output: ComposeFollowBuffer,
     validated_generation: Option<u64>,
     imported_projects: Vec<ImportedComposeProject>,
     imported_selection: bool,
@@ -843,6 +898,7 @@ impl ComposeView {
         self.status = ComposeStatusState::Idle;
         self.containers.clear();
         self.invalidate_logs();
+        self.invalidate_follow();
     }
     fn can_request_service_logs(&self, service: &str) -> bool {
         validate_service_selector(service).is_some()
@@ -853,6 +909,19 @@ impl ComposeView {
                 .containers
                 .iter()
                 .any(|container| container.service == service)
+            && !matches!(&self.logs, ComposeLogsState::Loading { .. })
+            && !matches!(&self.follow, ComposeFollowState::Following { .. })
+    }
+    fn can_request_service_follow(&self, service: &str) -> bool {
+        validate_service_selector(service).is_some()
+            && self.current_imported_selection_validated()
+            && matches!(&self.status, ComposeStatusState::Succeeded { .. })
+            && matches!(&self.validation, ComposeValidationState::Succeeded { .. })
+            && self
+                .containers
+                .iter()
+                .any(|container| container.service == service)
+            && !matches!(&self.follow, ComposeFollowState::Following { .. })
             && !matches!(&self.logs, ComposeLogsState::Loading { .. })
     }
     pub(super) fn begin_service_logs(
@@ -868,6 +937,7 @@ impl ComposeView {
                 .iter()
                 .any(|container| container.service == service)
             || matches!(&self.logs, ComposeLogsState::Loading { .. })
+            || matches!(&self.follow, ComposeFollowState::Following { .. })
         {
             return None;
         }
@@ -915,6 +985,79 @@ impl ComposeView {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn begin_service_follow(&mut self, service: &str) -> Option<ComposeFollowLaunch> {
+        let profiles = self.selected_profiles().ok()?;
+        let service = validate_service_selector(service)?;
+        if !matches!(&self.status, ComposeStatusState::Succeeded { .. })
+            || !self.current_imported_selection_validated()
+            || !matches!(&self.validation, ComposeValidationState::Succeeded { .. })
+            || !self
+                .containers
+                .iter()
+                .any(|container| container.service == service)
+            || matches!(&self.follow, ComposeFollowState::Following { .. })
+            || matches!(&self.logs, ComposeLogsState::Loading { .. })
+        {
+            return None;
+        }
+        self.follow_generation = self.follow_generation.wrapping_add(1);
+        self.follow_output.clear();
+        self.follow = ComposeFollowState::Following {
+            service: service.to_owned(),
+        };
+        Some(ComposeFollowLaunch {
+            generation: self.follow_generation,
+            files: self.selected_files.clone(),
+            profiles,
+            service: service.to_owned(),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn apply_service_follow_event(
+        &mut self,
+        generation: u64,
+        event: ComposeFollowEvent,
+    ) -> bool {
+        if generation != self.follow_generation
+            || !matches!(&self.follow, ComposeFollowState::Following { .. })
+        {
+            return false;
+        }
+        match event {
+            ComposeFollowEvent::Line(line) => self.follow_output.push_line(line),
+            ComposeFollowEvent::Ended => {
+                let ComposeFollowState::Following { service } = std::mem::take(&mut self.follow)
+                else {
+                    return false;
+                };
+                self.follow = ComposeFollowState::Ended { service };
+            }
+            ComposeFollowEvent::Failed(error) => {
+                let ComposeFollowState::Following { service } = std::mem::take(&mut self.follow)
+                else {
+                    return false;
+                };
+                self.follow = ComposeFollowState::Failed { service, error };
+            }
+        }
+        true
+    }
+
+    pub(super) fn cancel_service_follow(&mut self) {
+        if let ComposeFollowState::Following { service } = std::mem::take(&mut self.follow) {
+            self.follow_generation = self.follow_generation.wrapping_add(1);
+            self.follow_output.clear();
+            self.follow = ComposeFollowState::Cancelled { service };
+        }
+    }
+
+    fn invalidate_follow(&mut self) {
+        self.follow_generation = self.follow_generation.wrapping_add(1);
+        self.follow_output.clear();
+        self.follow = ComposeFollowState::Idle;
+    }
     fn invalidate_logs(&mut self) {
         self.logs_generation = self.logs_generation.wrapping_add(1);
         self.logs_output.clear();
@@ -1407,6 +1550,7 @@ impl ComposeView {
                 self.is_file_selection_running() || self.is_validation_running();
             actions.cancel_status |= matches!(&self.status, ComposeStatusState::Loading { .. });
             actions.cancel_logs |= matches!(&self.logs, ComposeLogsState::Loading { .. });
+            actions.cancel_follow |= matches!(&self.follow, ComposeFollowState::Following { .. });
             self.select_imported_project(index);
         }
         ui.separator();
@@ -1518,14 +1662,15 @@ impl ComposeView {
                 ui.label("No existing containers for the selected Compose files.");
             }
             ComposeStatusState::Succeeded { .. } => {
-                ui.columns(7, |columns| {
+                ui.columns(8, |columns| {
                     columns[0].strong("Container");
                     columns[1].strong("Service");
                     columns[2].strong("Project");
                     columns[3].strong("State");
                     columns[4].strong("Health");
                     columns[5].strong("Recent logs");
-                    columns[6].strong("Restart");
+                    columns[6].strong("Follow logs");
+                    columns[7].strong("Restart");
                 });
                 ui.separator();
                 egui::ScrollArea::vertical()
@@ -1538,7 +1683,7 @@ impl ComposeView {
                         |ui, rows| {
                             for row in rows {
                                 let container = &self.containers[row];
-                                ui.columns(7, |columns| {
+                                ui.columns(8, |columns| {
                                     columns[0]
                                         .add(egui::Label::new(container.name.as_str()).truncate());
                                     columns[1].add(
@@ -1570,7 +1715,20 @@ impl ComposeView {
                                     {
                                         actions.logs_service = Some(container.service.clone());
                                     }
+                                    #[cfg(target_os = "linux")]
                                     if columns[6]
+                                        .add_enabled(
+                                            self.can_request_service_follow(&container.service),
+                                            egui::Button::new(format!(
+                                                "Follow logs for {}",
+                                                container.service
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        actions.follow_service = Some(container.service.clone());
+                                    }
+                                    if columns[7]
                                         .add_enabled(
                                             status_enabled
                                                 && self.can_request_service_restart(
@@ -1627,6 +1785,28 @@ impl ComposeView {
             }
             ComposeLogsState::Cancelled { .. } => {
                 ui.label("Log snapshot cancelled.");
+            }
+        }
+        #[cfg(target_os = "linux")]
+        match &self.follow {
+            ComposeFollowState::Idle => {}
+            ComposeFollowState::Following { service } => {
+                ui.heading(format!("Following logs: {service}"));
+                ui.label("Read-only Compose follow. Press Stop to cancel.");
+                actions.cancel_follow = ui.button("Stop log follow").clicked();
+                show_compose_follow_output(ui, &self.follow_output);
+            }
+            ComposeFollowState::Ended { service } => {
+                ui.label(format!("Log follow ended for {service}."));
+                show_compose_follow_output(ui, &self.follow_output);
+            }
+            ComposeFollowState::Failed { service, error } => {
+                ui.label(format!("Log follow failed for {service}."));
+                ui.colored_label(egui::Color32::from_rgb(224, 174, 109), error.message());
+                show_compose_follow_output(ui, &self.follow_output);
+            }
+            ComposeFollowState::Cancelled { .. } => {
+                ui.label("Log follow cancelled.");
             }
         }
         ui.heading("Imported configuration lifecycle");
@@ -2243,23 +2423,9 @@ impl Drop for ProcessGroupGuard {
 }
 
 #[cfg(target_os = "linux")]
-async fn run_command_with_timeout(
-    command: &mut tokio::process::Command,
-    deadline: Duration,
-) -> Result<Vec<u8>, CommandFailure> {
+fn apply_compose_child_resource_limits(command: &mut tokio::process::Command) {
     use std::os::unix::process::CommandExt;
-    use std::process::Stdio;
-    use tokio::io::AsyncReadExt;
 
-    #[cfg(test)]
-    let _test_subprocess_guard = crate::TEST_SUBPROCESS_LOCK.lock().await;
-
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .process_group(0);
     // SAFETY: The pre-exec closure uses only stack locals and AS-Safe
     // getrlimit/setrlimit calls. It performs no allocation, locking, logging,
     // or environment access after fork.
@@ -2292,6 +2458,25 @@ async fn run_command_with_timeout(
             Ok(())
         });
     }
+}
+#[cfg(target_os = "linux")]
+async fn run_command_with_timeout(
+    command: &mut tokio::process::Command,
+    deadline: Duration,
+) -> Result<Vec<u8>, CommandFailure> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+
+    #[cfg(test)]
+    let _test_subprocess_guard = crate::TEST_SUBPROCESS_LOCK.lock().await;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .process_group(0);
+    apply_compose_child_resource_limits(command);
     let mut child = command.spawn().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             CommandFailure::Launch
@@ -2778,7 +2963,128 @@ fn sanitize_compose_logs(output: &[u8]) -> Option<String> {
     }
     Some(sanitized)
 }
+#[derive(Default)]
+struct ComposeFollowBuffer {
+    lines: std::collections::VecDeque<String>,
+    bytes: usize,
+}
 
+impl ComposeFollowBuffer {
+    fn clear(&mut self) {
+        self.lines.clear();
+        self.bytes = 0;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn push_line(&mut self, line: String) {
+        let escaped = escape_untrusted_display_text_with_limit(line, 64 * 1024)
+            .unwrap_or_else(|| COMPOSE_FOLLOW_OMISSION.to_owned());
+        while self.lines.len() >= COMPOSE_FOLLOW_MAX_LINES
+            || self
+                .bytes
+                .saturating_add(escaped.len())
+                .saturating_add(usize::from(!self.lines.is_empty()))
+                > MAX_COMPOSE_LOG_DISPLAY_BYTES
+        {
+            let Some(oldest) = self.lines.pop_front() else {
+                break;
+            };
+            self.bytes = self
+                .bytes
+                .saturating_sub(oldest.len() + usize::from(!self.lines.is_empty()));
+        }
+        self.bytes += escaped.len() + usize::from(!self.lines.is_empty());
+        self.lines.push_back(escaped);
+    }
+}
+#[cfg(target_os = "linux")]
+const COMPOSE_FOLLOW_MAX_LINES: usize = 200;
+#[cfg(target_os = "linux")]
+const COMPOSE_FOLLOW_MAX_LINE_BYTES: usize = 4096;
+#[cfg(target_os = "linux")]
+const COMPOSE_FOLLOW_OMISSION: &str = "[line omitted: exceeds 4096 bytes]";
+
+#[cfg(target_os = "linux")]
+fn show_compose_follow_output(ui: &mut egui::Ui, output: &ComposeFollowBuffer) {
+    if !output.is_empty() {
+        egui::ScrollArea::vertical().max_height(220.0).show_rows(
+            ui,
+            18.0,
+            output.lines.len(),
+            |ui, rows| {
+                for row in rows {
+                    ui.label(egui::RichText::new(&output.lines[row]).monospace());
+                }
+            },
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn fresh_service_status_check(
+    binary: &std::path::Path,
+    socket_path: &std::path::Path,
+    files: &[std::path::PathBuf],
+    profiles: &[String],
+    service: &str,
+    search_path: &std::ffi::OsStr,
+    plugin: Option<&std::path::Path>,
+) -> Result<(), ComposeLogsError> {
+    let containers =
+        containers_with_binary(binary, socket_path, files, profiles, search_path, plugin)
+            .await
+            .map_err(|error| match error {
+                ComposeStatusError::DockerCliMissing => ComposeLogsError::DockerCliMissing,
+                ComposeStatusError::PrivateConfigSetupFailed => {
+                    ComposeLogsError::PrivateConfigSetupFailed
+                }
+                ComposeStatusError::QueryFailed | ComposeStatusError::InvalidOutput => {
+                    ComposeLogsError::QueryFailed
+                }
+            })?;
+    if containers
+        .iter()
+        .any(|container| container.service == service)
+    {
+        Ok(())
+    } else {
+        Err(ComposeLogsError::ServiceUnavailable)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn configure_compose_service_command(
+    command: &mut tokio::process::Command,
+    isolated: &PrivateDockerConfig,
+    socket_path: &std::path::Path,
+    files: &[std::path::PathBuf],
+    profiles: &[String],
+    search_path: &std::ffi::OsStr,
+) -> Result<(), ComposeLogsError> {
+    let socket_path = socket_path.to_str().ok_or(ComposeLogsError::QueryFailed)?;
+    let project_directory = files
+        .first()
+        .and_then(|file| file.parent())
+        .ok_or(ComposeLogsError::QueryFailed)?;
+    isolated.configure(command, search_path);
+    command
+        .env("COMPOSE_DISABLE_ENV_FILE", "1")
+        .arg("--host")
+        .arg(format!("unix://{socket_path}"))
+        .args(["compose", "--project-directory"])
+        .arg(project_directory);
+    for file in files {
+        command.arg("--file").arg(file);
+    }
+    for profile in profiles {
+        command.arg("--profile").arg(profile);
+    }
+    Ok(())
+}
 #[cfg(target_os = "linux")]
 async fn service_logs_with_binary(
     binary: &std::path::Path,
@@ -2794,51 +3100,31 @@ async fn service_logs_with_binary(
         return Err(ComposeLogsError::QueryFailed);
     }
     let service = validate_service_selector(service).ok_or(ComposeLogsError::QueryFailed)?;
-    let current_containers = containers_with_binary(
+    fresh_service_status_check(
         binary,
         socket_path,
         files,
         profiles,
+        service,
         search_path,
         user_compose_plugin,
     )
-    .await
-    .map_err(|error| match error {
-        ComposeStatusError::DockerCliMissing => ComposeLogsError::DockerCliMissing,
-        ComposeStatusError::PrivateConfigSetupFailed => ComposeLogsError::PrivateConfigSetupFailed,
-        ComposeStatusError::QueryFailed | ComposeStatusError::InvalidOutput => {
-            ComposeLogsError::QueryFailed
-        }
-    })?;
-    if !current_containers
-        .iter()
-        .any(|container| container.service == service)
-    {
-        return Err(ComposeLogsError::ServiceUnavailable);
-    }
+    .await?;
     if !selected_compose_files_are_valid(files) || selected_compose_files_size_exceeds_limit(files)
     {
         return Err(ComposeLogsError::QueryFailed);
     }
     let isolated = PrivateDockerConfig::new(user_compose_plugin)
         .map_err(|_| ComposeLogsError::PrivateConfigSetupFailed)?;
-    let socket_path = socket_path.to_str().ok_or(ComposeLogsError::QueryFailed)?;
-    let host = format!("unix://{socket_path}");
-    let parent = files[0].parent().ok_or(ComposeLogsError::QueryFailed)?;
     let mut command = Command::new(binary);
-    isolated.configure(&mut command, search_path);
-    command
-        .env("COMPOSE_DISABLE_ENV_FILE", "1")
-        .arg("--host")
-        .arg(host)
-        .args(["compose", "--project-directory"])
-        .arg(parent);
-    for file in files {
-        command.arg("--file").arg(file);
-    }
-    for profile in profiles {
-        command.arg("--profile").arg(profile);
-    }
+    configure_compose_service_command(
+        &mut command,
+        &isolated,
+        socket_path,
+        files,
+        profiles,
+        search_path,
+    )?;
     command
         .args(["logs", "--tail", "200", "--no-color"])
         .arg(service);
@@ -2885,6 +3171,214 @@ pub(super) async fn compose_service_logs(
             outcome: Err(error),
         },
     }
+}
+#[cfg(target_os = "linux")]
+async fn send_compose_follow_event(
+    sender: &tokio::sync::mpsc::Sender<(u64, ComposeFollowEvent)>,
+    context: &egui::Context,
+    generation: u64,
+    event: ComposeFollowEvent,
+) -> bool {
+    if sender.send((generation, event)).await.is_err() {
+        return false;
+    }
+    context.request_repaint();
+    true
+}
+
+#[cfg(target_os = "linux")]
+struct ComposeServiceFollowRequest<'a> {
+    binary: &'a std::path::Path,
+    socket_path: &'a std::path::Path,
+    files: &'a [std::path::PathBuf],
+    profiles: &'a [String],
+    service: &'a str,
+    search_path: &'a std::ffi::OsStr,
+    plugin: Option<&'a std::path::Path>,
+}
+
+#[cfg(target_os = "linux")]
+async fn service_log_follow_with_binary(
+    request: ComposeServiceFollowRequest<'_>,
+    generation: u64,
+    context: &egui::Context,
+    sender: &tokio::sync::mpsc::Sender<(u64, ComposeFollowEvent)>,
+) -> Result<(), ComposeLogsError> {
+    let ComposeServiceFollowRequest {
+        binary,
+        socket_path,
+        files,
+        profiles,
+        service,
+        search_path,
+        plugin,
+    } = request;
+    use std::process::Stdio;
+    use tokio::{io::AsyncReadExt, process::Command};
+
+    if !valid_profile_list(profiles)
+        || !selected_compose_files_are_valid(files)
+        || selected_compose_files_size_exceeds_limit(files)
+    {
+        return Err(ComposeLogsError::QueryFailed);
+    }
+    let service = validate_service_selector(service).ok_or(ComposeLogsError::QueryFailed)?;
+    fresh_service_status_check(
+        binary,
+        socket_path,
+        files,
+        profiles,
+        service,
+        search_path,
+        plugin,
+    )
+    .await?;
+    if !selected_compose_files_are_valid(files) || selected_compose_files_size_exceeds_limit(files)
+    {
+        return Err(ComposeLogsError::QueryFailed);
+    }
+    let isolated =
+        PrivateDockerConfig::new(plugin).map_err(|_| ComposeLogsError::PrivateConfigSetupFailed)?;
+    #[cfg(test)]
+    let _test_subprocess_guard = crate::TEST_SUBPROCESS_LOCK.lock().await;
+    let mut command = Command::new(binary);
+    configure_compose_service_command(
+        &mut command,
+        &isolated,
+        socket_path,
+        files,
+        profiles,
+        search_path,
+    )?;
+    command
+        .args(["logs", "--follow", "--tail", "200", "--no-color"])
+        .arg(service)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .process_group(0);
+    apply_compose_child_resource_limits(&mut command);
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ComposeLogsError::DockerCliMissing
+        } else {
+            ComposeLogsError::QueryFailed
+        }
+    })?;
+    let Some(process_id) = child.id().and_then(|id| libc::pid_t::try_from(id).ok()) else {
+        let _ = child.kill().await;
+        return Err(ComposeLogsError::QueryFailed);
+    };
+    let mut guard = ProcessGroupGuard {
+        id: process_id,
+        active: true,
+    };
+    let mut stdout = child.stdout.take().ok_or(ComposeLogsError::QueryFailed)?;
+    let mut chunk = [0u8; 4096];
+    let mut line = Vec::with_capacity(COMPOSE_FOLLOW_MAX_LINE_BYTES);
+    let mut dropping_line = false;
+    loop {
+        let count = stdout
+            .read(&mut chunk)
+            .await
+            .map_err(|_| ComposeLogsError::QueryFailed)?;
+        if count == 0 {
+            break;
+        }
+        for byte in &chunk[..count] {
+            if *byte == b'\n' {
+                let text = if dropping_line {
+                    COMPOSE_FOLLOW_OMISSION.to_owned()
+                } else {
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    String::from_utf8_lossy(&line).into_owned()
+                };
+                if !send_compose_follow_event(
+                    sender,
+                    context,
+                    generation,
+                    ComposeFollowEvent::Line(text),
+                )
+                .await
+                {
+                    return Ok(());
+                }
+                line.clear();
+                dropping_line = false;
+            } else if !dropping_line {
+                if line.len() == COMPOSE_FOLLOW_MAX_LINE_BYTES {
+                    line.clear();
+                    dropping_line = true;
+                } else {
+                    line.push(*byte);
+                }
+            }
+        }
+    }
+    if dropping_line {
+        if !send_compose_follow_event(
+            sender,
+            context,
+            generation,
+            ComposeFollowEvent::Line(COMPOSE_FOLLOW_OMISSION.to_owned()),
+        )
+        .await
+        {
+            return Ok(());
+        }
+    } else if !line.is_empty() {
+        let text = String::from_utf8_lossy(&line).into_owned();
+        if !send_compose_follow_event(sender, context, generation, ComposeFollowEvent::Line(text))
+            .await
+        {
+            return Ok(());
+        }
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|_| ComposeLogsError::QueryFailed)?;
+    guard.disarm();
+    if status.success() {
+        let _ =
+            send_compose_follow_event(sender, context, generation, ComposeFollowEvent::Ended).await;
+        Ok(())
+    } else {
+        Err(ComposeLogsError::QueryFailed)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) async fn compose_service_log_follow(
+    socket_path: &std::path::Path,
+    files: &[std::path::PathBuf],
+    profiles: &[String],
+    service: &str,
+    generation: u64,
+    context: &egui::Context,
+    sender: &tokio::sync::mpsc::Sender<(u64, ComposeFollowEvent)>,
+) -> Result<(), ComposeLogsError> {
+    let search_path = std::env::var_os("PATH").ok_or(ComposeLogsError::DockerCliMissing)?;
+    let binary = docker_binary(&search_path).ok_or(ComposeLogsError::DockerCliMissing)?;
+    let plugin = user_compose_plugin();
+    service_log_follow_with_binary(
+        ComposeServiceFollowRequest {
+            binary: &binary,
+            socket_path,
+            files,
+            profiles,
+            service,
+            search_path: &search_path,
+            plugin: plugin.as_deref(),
+        },
+        generation,
+        context,
+        sender,
+    )
+    .await
 }
 
 #[cfg(target_os = "linux")]
@@ -4539,6 +5033,292 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn compose_follow_uses_fresh_status_and_exact_ordered_read_only_arguments() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("project with spaces");
+            fs::create_dir(&project).unwrap();
+            let base = project.join("compose.yaml");
+            let overlay = project.join("override.yaml");
+            fs::write(&base, "services: {}\n").unwrap();
+            fs::write(&overlay, "services: {}\n").unwrap();
+            let socket = directory.path().join("selected socket.sock");
+            let trace_status = directory.path().join("status-argv");
+            let trace_logs = directory.path().join("follow-argv");
+            let binary = directory.path().join("docker-follow");
+            let status_output = "{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"running\"}\n";
+            let script = format!(
+                "#!/bin/sh\n\
+                 [ -n \"$PATH\" ] && [ -n \"$HOME\" ] && [ -n \"$DOCKER_CONFIG\" ] || exit 91\n\
+                 [ \"$COMPOSE_DISABLE_ENV_FILE\" = 1 ] && [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = false ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = false ] || exit 92\n\
+                 [ -z \"${{DOCKER_HOST+x}}${{DOCKER_CONTEXT+x}}${{HTTP_PROXY+x}}${{COMPOSE_FILE+x}}${{COMPOSE_PROFILES+x}}\" ] || exit 93\n\
+                 for argument do\n\
+                   if [ \"$argument\" = ps ]; then printf '%s\\n' \"$@\" > {}; printf '%s' {}; exit 0; fi\n\
+                   if [ \"$argument\" = logs ]; then printf '%s\\n' \"$@\" > {}; printf '%4097s' ''; printf 'discard\\n'; printf 'split'; sleep 0.02; printf ' line\\n'; printf 'unsafe\\033\\342\\200\\256\\n'; exit 0; fi\n\
+                 done\n\
+                 exit 94\n",
+                shell_quote(trace_status.to_str().unwrap()),
+                shell_quote(status_output),
+                shell_quote(trace_logs.to_str().unwrap()),
+            );
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let files = [base.clone(), overlay.clone()];
+            let profiles = ["frontend".to_owned(), "qa".to_owned()];
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+            let context = egui::Context::default();
+            let result = service_log_follow_with_binary(
+                ComposeServiceFollowRequest {
+                    binary: &binary,
+                    socket_path: &socket,
+                    files: &files,
+                    profiles: &profiles,
+                    service: "web",
+                    search_path: OsStr::new("/usr/bin"),
+                    plugin: None,
+                },
+                7,
+                &context,
+                &sender,
+            )
+            .await;
+            assert_eq!(result, Ok(()));
+            drop(sender);
+            let mut received = Vec::new();
+            while let Some((generation, event)) = receiver.recv().await {
+                assert_eq!(generation, 7);
+                received.push(event);
+            }
+            assert!(matches!(
+                received.first(),
+                Some(ComposeFollowEvent::Line(text)) if text == COMPOSE_FOLLOW_OMISSION
+            ));
+            assert!(received.iter().any(
+                |event| matches!(event, ComposeFollowEvent::Line(text) if text == "split line")
+            ));
+            assert!(matches!(received.last(), Some(ComposeFollowEvent::Ended)));
+            let common = [
+                "--host".to_owned(),
+                format!("unix://{}", socket.display()),
+                "compose".to_owned(),
+                "--project-directory".to_owned(),
+                project.display().to_string(),
+                "--file".to_owned(),
+                base.display().to_string(),
+                "--file".to_owned(),
+                overlay.display().to_string(),
+                "--profile".to_owned(),
+                "frontend".to_owned(),
+                "--profile".to_owned(),
+                "qa".to_owned(),
+            ];
+            let expected_status = [
+                common.clone().to_vec(),
+                vec![
+                    "ps".to_owned(),
+                    "--all".to_owned(),
+                    "--format".to_owned(),
+                    "json".to_owned(),
+                ],
+            ]
+            .concat()
+            .join("\n")
+                + "\n";
+            let expected_follow = [
+                common.to_vec(),
+                vec![
+                    "logs".to_owned(),
+                    "--follow".to_owned(),
+                    "--tail".to_owned(),
+                    "200".to_owned(),
+                    "--no-color".to_owned(),
+                    "web".to_owned(),
+                ],
+            ]
+            .concat()
+            .join("\n")
+                + "\n";
+            assert_eq!(fs::read_to_string(trace_status).unwrap(), expected_status);
+            assert_eq!(fs::read_to_string(trace_logs).unwrap(), expected_follow);
+        }
+        #[tokio::test]
+        async fn compose_follow_task_abort_kills_cli_process_group() {
+            let directory = FixtureDirectory::new();
+            let file = directory.path().join("compose.yaml");
+            fs::write(&file, "services: {}\n").unwrap();
+            let child_pid_file = directory.path().join("child-pid");
+            let binary = directory.path().join("docker-follow");
+            let script = format!(
+                "#!/bin/sh\n\
+                 for argument do\n\
+                   if [ \"$argument\" = ps ]; then printf '%s' '{{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"running\"}}'; exit 0; fi\n\
+                   if [ \"$argument\" = logs ]; then sleep 60 & echo $! > {}; while :; do printf 'follow line\\n'; done; fi\n\
+                 done\n\
+                 exit 94\n",
+                shell_quote(child_pid_file.to_str().unwrap()),
+            );
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+            let socket = directory.path().join("socket.sock");
+            let context = egui::Context::default();
+            let task = tokio::spawn(async move {
+                service_log_follow_with_binary(
+                    ComposeServiceFollowRequest {
+                        binary: &binary,
+                        socket_path: &socket,
+                        files: std::slice::from_ref(&file),
+                        profiles: &[],
+                        service: "web",
+                        search_path: OsStr::new("/usr/bin"),
+                        plugin: None,
+                    },
+                    1,
+                    &context,
+                    &sender,
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while !child_pid_file.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("fake CLI should spawn the controlled child");
+            let child_pid: i32 = fs::read_to_string(&child_pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            task.abort();
+            assert!(
+                task.await
+                    .expect_err("follow should be cancelled")
+                    .is_cancelled()
+            );
+            for _ in 0..100 {
+                let running = fs::read_to_string(format!("/proc/{child_pid}/stat"))
+                    .ok()
+                    .and_then(|stat| stat.split_whitespace().nth(2).map(str::to_owned))
+                    .is_some_and(|state| state != "Z");
+                if !running {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the child process in the Compose CLI group survived follow cancellation");
+        }
+        #[tokio::test]
+        async fn compose_follow_refuses_failed_or_absent_fresh_service_membership() {
+            for (mode, expected) in [
+                ("absent", ComposeLogsError::ServiceUnavailable),
+                ("failed", ComposeLogsError::QueryFailed),
+            ] {
+                let directory = FixtureDirectory::new();
+                let file = directory.path().join("compose.yaml");
+                fs::write(&file, "services: {}\n").unwrap();
+                let logs_marker = directory.path().join("logs-started");
+                let binary = directory.path().join("docker-follow");
+                let status = if mode == "absent" {
+                    "{\"Name\":\"worker-1\",\"Service\":\"worker\",\"State\":\"running\"}"
+                } else {
+                    ""
+                };
+                let status_exit = if mode == "absent" { 0 } else { 7 };
+                let script = format!(
+                    "#!/bin/sh\n\
+                     for argument do\n\
+                       if [ \"$argument\" = ps ]; then printf '%s\\n' {}; exit {}; fi\n\
+                       if [ \"$argument\" = logs ]; then : > {}; exit 0; fi\n\
+                     done\n\
+                     exit 94\n",
+                    shell_quote(status),
+                    status_exit,
+                    shell_quote(logs_marker.to_str().unwrap()),
+                );
+                fs::write(&binary, script).unwrap();
+                fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+                let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+                let context = egui::Context::default();
+                let socket = directory.path().join("socket.sock");
+                let files = [file];
+                let profiles: [String; 0] = [];
+                let result = service_log_follow_with_binary(
+                    ComposeServiceFollowRequest {
+                        binary: &binary,
+                        socket_path: &socket,
+                        files: &files,
+                        profiles: &profiles,
+                        service: "web",
+                        search_path: OsStr::new("/usr/bin"),
+                        plugin: None,
+                    },
+                    3,
+                    &context,
+                    &sender,
+                )
+                .await;
+                assert_eq!(result, Err(expected));
+                assert!(
+                    !logs_marker.exists(),
+                    "fresh status failure must prevent logs spawn"
+                );
+            }
+        }
+        #[tokio::test]
+        async fn compose_follow_rechecks_selected_file_size_after_fresh_status() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("project with spaces");
+            fs::create_dir(&project).unwrap();
+            let file = project.join("compose.yaml");
+            let selected = fs::File::create(&file).unwrap();
+            selected.set_len(MAX_COMPOSE_INPUT_BYTES).unwrap();
+            drop(selected);
+            let status = "{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"running\"}\n";
+            let logs_marker = directory.path().join("logs-started");
+            let binary = directory.path().join("docker-follow-size-guard");
+            let script = format!(
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                   *' ps '* ) printf 'x' >> {}; printf '%s' {}; exit 0 ;;\n\
+                   *' logs '* ) : > {}; exit 0 ;;\n\
+                 esac\n\
+                 exit 94\n",
+                shell_quote(file.to_str().unwrap()),
+                shell_quote(status),
+                shell_quote(logs_marker.to_str().unwrap()),
+            );
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+            let context = egui::Context::default();
+
+            let socket = directory.path().join("socket.sock");
+            let files = [file];
+            let profiles: [String; 0] = [];
+            let result = service_log_follow_with_binary(
+                ComposeServiceFollowRequest {
+                    binary: &binary,
+                    socket_path: &socket,
+                    files: &files,
+                    profiles: &profiles,
+                    service: "web",
+                    search_path: OsStr::new("/usr/bin"),
+                    plugin: None,
+                },
+                4,
+                &context,
+                &sender,
+            )
+            .await;
+
+            assert_eq!(result, Err(ComposeLogsError::QueryFailed));
+            assert!(
+                !logs_marker.exists(),
+                "changed oversized input must not reach logs"
+            );
+        }
+        #[tokio::test]
         async fn unsafe_service_is_rejected_before_launch() {
             let error = service_logs_with_binary(
                 std::path::Path::new("/definitely/not/a/docker-cli"),
@@ -5983,6 +6763,77 @@ mod tests {
             harness.run();
             let _cancelled = harness.get_by_role_and_label(Role::Label, "Log snapshot cancelled.");
         }
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn service_log_follow_action_escapes_bounds_and_rejects_stale_events() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("current"));
+            let (status_generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: vec![ComposeContainer {
+                        name: "api-1".to_owned(),
+                        service: "api".to_owned(),
+                        state: "running".to_owned(),
+                        project: None,
+                        health: None,
+                    }],
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(view.begin_service_follow("--help").is_none());
+            let mut harness = harness_for(view);
+            harness.run();
+            harness
+                .get_by_role_and_label(Role::Button, "Follow logs for api")
+                .click_accesskit();
+            harness.step();
+            assert_eq!(
+                harness.state().actions.follow_service.as_deref(),
+                Some("api")
+            );
+            let ComposeFollowLaunch {
+                generation,
+                service,
+                ..
+            } = harness
+                .state_mut()
+                .view
+                .begin_service_follow("api")
+                .expect("current service row should allow explicit follow");
+            assert_eq!(service, "api");
+            assert!(harness.state_mut().view.apply_service_follow_event(
+                generation,
+                ComposeFollowEvent::Line("hello\u{202e}\u{001b}".to_owned()),
+            ));
+            assert!(
+                harness
+                    .state()
+                    .view
+                    .follow_output
+                    .lines
+                    .iter()
+                    .any(|line| line == r"hello\u{202e}\x1b")
+            );
+            for _ in 0..300 {
+                assert!(harness.state_mut().view.apply_service_follow_event(
+                    generation,
+                    ComposeFollowEvent::Line("x".repeat(2048)),
+                ));
+            }
+            let output = &harness.state().view.follow_output;
+            assert!(output.bytes <= MAX_COMPOSE_LOG_DISPLAY_BYTES);
+            assert!(output.lines.len() <= COMPOSE_FOLLOW_MAX_LINES);
+            harness.state_mut().view.cancel_service_follow();
+            assert!(
+                !harness
+                    .state_mut()
+                    .view
+                    .apply_service_follow_event(generation, ComposeFollowEvent::Ended,)
+            );
+            assert!(harness.state().view.follow_output.is_empty());
+        }
         #[test]
         fn service_log_results_render_content_empty_and_static_error_states() {
             fn view_with_service_status() -> ComposeView {
@@ -6610,6 +7461,69 @@ mod tests {
             harness.step();
             assert!(!harness.state().actions.cancel_status);
             assert!(harness.state().actions.cancel_logs);
+        }
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn selecting_import_cancels_live_compose_follow() {
+            let mut follow = validated_compose_view();
+            assert!(follow.import_current_project("Saved follow"));
+            let (status_generation, _, _) =
+                follow.begin_status_refresh().expect("status can start");
+            assert!(follow.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: vec![ComposeContainer {
+                        name: "api-1".to_owned(),
+                        service: "api".to_owned(),
+                        state: "running".to_owned(),
+                        project: None,
+                        health: None,
+                    }],
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(follow.begin_service_follow("api").is_some());
+
+            let mut harness = harness_for(follow);
+            harness.step();
+            harness
+                .get_by_role_and_label(Role::Button, "Use imported configuration")
+                .click_accesskit();
+            harness.step();
+
+            assert!(harness.state().actions.cancel_follow);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn live_follow_output_remains_visible_after_clean_eof() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("Saved follow"));
+            let (status_generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: vec![ComposeContainer {
+                        name: "api-1".to_owned(),
+                        service: "api".to_owned(),
+                        state: "running".to_owned(),
+                        project: None,
+                        health: None,
+                    }],
+                    outcome: Ok(()),
+                },
+            ));
+            let ComposeFollowLaunch { generation, .. } = view.begin_service_follow("api").unwrap();
+            assert!(view.apply_service_follow_event(
+                generation,
+                ComposeFollowEvent::Line("captured log line".to_owned()),
+            ));
+            assert!(view.apply_service_follow_event(generation, ComposeFollowEvent::Ended));
+
+            let mut harness = harness_for(view);
+            harness.run();
+            let _line = harness.get_by_role_and_label(Role::Label, "captured log line");
+            let _ended = harness.get_by_role_and_label(Role::Label, "Log follow ended for api.");
         }
     }
 
