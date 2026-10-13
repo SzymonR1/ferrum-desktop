@@ -2012,7 +2012,7 @@ impl ComposeView {
                     let cancel_label = match confirmation.action {
                         ComposeOperationAction::Pull => "Cancel pull",
                         ComposeOperationAction::Build => "Cancel build",
-                        _ => "Cancel operation",
+                        ComposeOperationAction::Start | ComposeOperationAction::Stop | ComposeOperationAction::Restart => "Cancel lifecycle action",
                     };
                     actions.cancel_operation_confirmation = ui.button(cancel_label).clicked();
                 });
@@ -2046,7 +2046,7 @@ impl ComposeView {
                         ));
                     } else {
                         ui.label(format!(
-                            "Waiting for Compose {operation_label} progress; revalidation or the operation may still be running."
+                            "Waiting for Compose {operation_label} progress; revalidation or the {operation_label} may still be running."
                         ));
                     }
                     actions.cancel_operation = ui
