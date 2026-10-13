@@ -294,9 +294,10 @@ env -u DOCKER_HOST DOCKER_CONTEXT=default cargo test -p ferrum-engine --test liv
 env -u DOCKER_HOST DOCKER_CONTEXT=default cargo test -p ferrum-engine --test live_engine local_engine_loopback_registry_synthetic_basic_auth_pull_reports_progress -- --exact --ignored
 ```
 
-On 2026-10-13, both smokes passed on Fedora Linux 44 x86_64 against Docker
-Engine 29.9.0/API 1.56 through the local `default` context. Both assert at
-least one non-empty Engine status; numeric byte counters are not claimed. The
+The anonymous smoke passed on 2026-10-13. The synthetic-auth smoke passed on
+the same Fedora Linux 44 x86_64 host against Docker Engine 29.9.0/API 1.56
+through the local `default` context. Both assert at least one non-empty Engine
+status; numeric byte counters are not claimed. The
 authenticated smoke sends nonce-generated credentials directly as
 `RegistryAuth` and verifies that the loopback fixture accepts the expected
 Basic header; it does not exercise the configured helper or per-pull UI opt-in.
