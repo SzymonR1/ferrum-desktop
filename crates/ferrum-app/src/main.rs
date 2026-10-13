@@ -867,6 +867,25 @@ struct PendingComposeAuditRecord {
     completed: tokio::sync::oneshot::Sender<()>,
 }
 
+#[cfg(target_os = "linux")]
+async fn enqueue_compose_audit_record_and_wait(
+    sender: &mpsc::Sender<PendingComposeAuditRecord>,
+    record: audit::AuditRecord,
+) {
+    let (completed, completion_receiver) = tokio::sync::oneshot::channel();
+    if sender
+        .send(PendingComposeAuditRecord { record, completed })
+        .await
+        .is_err()
+        || completion_receiver.await.is_err()
+    {
+        tracing::warn!(
+            target: "ferrum::audit",
+            "Could not complete local Compose audit write"
+        );
+    }
+}
+
 struct FerrumApp {
     runtime: Runtime,
     sender: mpsc::Sender<EngineEvent>,
@@ -1567,7 +1586,10 @@ impl FerrumApp {
     fn queue_compose_operation_audit_record(
         &mut self,
         record: audit::AuditRecord,
-    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    ) -> Option<(
+        mpsc::Sender<PendingComposeAuditRecord>,
+        tokio::sync::oneshot::Receiver<()>,
+    )> {
         if self.compose_operation_audit_sender.is_none() {
             let (sender, mut receiver) =
                 mpsc::channel::<PendingComposeAuditRecord>(COMPOSE_OPERATION_AUDIT_QUEUE_CAPACITY);
@@ -1593,7 +1615,7 @@ impl FerrumApp {
             );
             return None;
         }
-        Some(receiver)
+        Some((sender.clone(), receiver))
     }
 
     #[cfg(target_os = "linux")]
@@ -1610,6 +1632,7 @@ impl FerrumApp {
             audit::ComposeMutationOutcome::NotSubmitted,
         );
         self.queue_compose_operation_audit_record(record)
+            .map(|(_, completed)| completed)
     }
 
     #[cfg(target_os = "linux")]
@@ -1634,7 +1657,6 @@ impl FerrumApp {
         let precondition_error = (precondition_failed || socket_path.is_none())
             .then_some(compose::ComposeOperationError::EngineUnavailable);
         let sender = self.sender.clone();
-        let audit_store = self.audit_store.clone();
         let selection = task.selection.clone();
         let service = task.service.clone();
         let scale = task.scale;
@@ -1660,7 +1682,7 @@ impl FerrumApp {
             }
             None => audit::record_compose_pull_result(audit::ComposePullOutcome::Started),
         };
-        let Some(audit_started_receiver) =
+        let Some((operation_audit_sender, audit_started_receiver)) =
             self.queue_compose_operation_audit_record(started_record)
         else {
             self.compose_operation_cancellation = None;
@@ -1833,7 +1855,7 @@ impl FerrumApp {
                 };
                 audit::record_compose_pull_result(outcome)
             };
-            persist_audit_record(&audit_store, record).await;
+            enqueue_compose_audit_record_and_wait(&operation_audit_sender, record).await;
             if sender
                 .send(EngineEvent::ComposeOperationFinished {
                     generation: task.generation,
