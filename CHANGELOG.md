@@ -37,6 +37,13 @@ All notable project changes are documented here. The project has not published a
   before submission when a start marker cannot be queued. Cancellation audit
   remains best-effort if the queue or durable store is unavailable, and shutdown
   attempts a bounded drain of accepted records.
+- Added an opt-in Linux local-Docker image-pull progress smoke using an
+  in-process loopback OCI registry and a generated image reference. It
+  preflights the generated reference and verifies daemon reachability with an
+  intentionally missing manifest before the real pull. It uses no registry
+  credentials or daemon configuration changes and removes only the generated
+  tag without force or prune. This does not validate helper-authenticated pulls,
+  external registry access, or broader platform support.
 - Added confirmed service-scoped Compose pause/unpause for the current imported,
   successfully revalidated ordered files/profiles on the selected Linux local
   Docker Unix socket. Pause is offered only for a declared service with a

@@ -254,6 +254,42 @@ The 2026-10-11 read-only history smoke passed against Docker Engine 29.9.0/API
 1.56 using the preinstalled `ghcr.io/catthehacker/ubuntu:rust-latest` image
 and current local Unix context; it read history without mutating the image.
 
+## Opt-in local Docker image-pull progress smoke
+
+`local_engine_loopback_registry_pull_reports_progress_and_cleans_only_test_tag`
+is an ignored Linux integration test for the Engine pull stream, not the Images
+page or credential-helper path. It requires the current Docker context to use a
+local Unix socket and the daemon's existing loopback-insecure-registry policy.
+The test starts an in-process OCI registry bound only to `127.0.0.1` on an
+ephemeral port and changes no daemon configuration. It preflights both generated
+references as absent. The missing-manifest probe must reach the fixture, be
+rejected, and leave both references absent. Each Engine progress stream has a
+30-second total deadline and a 1,024-record cap; the smoke retains only whether
+a non-empty status was observed. On a completed pull, cleanup is armed only
+after inventory confirms a full SHA-256 image ID and exactly the generated tag.
+It removes only that tag using `docker image rm --no-prune` without force. If
+inventory cannot confirm ownership, the test does not attempt removal. The
+explicit cleanup and Drop fallback use a CLI child with a five-second deadline;
+the helper attempts to kill and reap it on timeout. A failed explicit cleanup
+fails the test; no force or prune is attempted. No container, external registry,
+credentials, user image, or daemon setting is used. A failed pull stream is
+dropped and the loopback fixture is stopped, but Engine-side cancellation is
+not guaranteed; interrupted pulls may leave untagged blob data or an unknown
+outcome.
+Run only against a disposable local Docker Engine:
+
+```sh
+env -u DOCKER_HOST DOCKER_CONTEXT=default cargo test -p ferrum-engine --test live_engine local_engine_loopback_registry_pull_reports_progress_and_cleans_only_test_tag -- --exact --ignored
+```
+
+This smoke is one local anonymous pull path, not registry-helper auth, external
+registry, push, Ferrum image removal, Podman/rootless, or broader platform
+validation.
+
+On 2026-10-13, this smoke passed on Fedora Linux 44 x86_64 against Docker
+Engine 29.9.0/API 1.56 through the local `default` context. The Engine returned
+non-empty status/progress records; this response did not include byte counters.
+
 Image-build regressions exercise only temporary files and controlled helper
 processes. They do not invoke Docker or Buildx against an engine, build an image,
 or mutate image resources. Tests cover local-context and target validation,
@@ -821,11 +857,12 @@ tests use fixed image data and local state/events only; they never contact an
 engine or registry or mutate images.
 
 Pull presentation tests use fixed progress values. Tag, push, and removal tests
-use fake completion events and do not mutate image resources. No live pull,
-tag, removal, or registry-push operation is claimed. Push tests use fake
-sockets and headless UI state only; they do not mutate images or contact a
-registry. Tests must not pull, tag, push, delete, or otherwise mutate user
-images or engines.
+use fake completion events and do not mutate image resources. The separate
+live smoke is an Engine-level anonymous pull with exact-tag cleanup; it does
+not exercise Ferrum's UI. No live Ferrum UI pull, tag/removal, or registry-push
+operation is claimed. Push tests use fake sockets and headless UI state only;
+they do not mutate images or contact a registry. Tests must not pull, tag, push,
+delete, or otherwise mutate user images or engines.
 
 Engine image pull, push, tag, removal, and history contract tests use fake Unix
 sockets, not a Docker engine or registry. Tag cases cover encoded request

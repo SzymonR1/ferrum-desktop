@@ -1,6 +1,6 @@
 # Images
 
-**Status:** Linux local Docker Unix-socket image listing/inspection and bounded read-only layer history, anonymous-by-default pulls and pushes with explicit per-operation Secret Service/pass helper authentication, local tagging/removal, and confirmed local Buildx builds. An opt-in read-only history smoke passed on Docker Engine 29.9.0/API 1.56. No live helper-authenticated pull/push, registry push, tag, removal, or build integration was performed or validated; no image mutation is claimed. Native Images-page visual validation remains unverified.
+**Status:** Linux local Docker Unix-socket image listing/inspection and bounded read-only layer history, anonymous-by-default pulls and pushes with explicit per-operation Secret Service/pass helper authentication, local tagging/removal, and confirmed local Buildx builds are implemented. One opt-in live smoke verified an anonymous Engine pull from an in-process loopback registry and exact cleanup of its generated tag on Docker Engine 29.9.0/API 1.56. No live helper-authenticated pull/push, external registry push, Ferrum UI tag/removal/build, or native Images-page visual validation is claimed.
 
 Open **Images** in the sidebar to view images returned by the connected local
 Docker engine. Search is case-insensitive across repository tags and image IDs.
@@ -180,10 +180,13 @@ Podman/rootless behavior and broader endpoint or platform compatibility remain
 unvalidated under open, blocked
 [#10](https://github.com/SzymonR1/ferrum-desktop/issues/10). Issue
 [#16](https://github.com/SzymonR1/ferrum-desktop/issues/16) remains partial/open.
-No release or broader support claim is made. No live pull, authenticated or
-anonymous push, tag, removal, or build was performed during validation. Native
-Images-page visual validation remains unverified. Fake-socket and headless
-tests do not contact a real engine or mutate image resources. See the
+One opt-in anonymous pull smoke used a generated OCI image from an in-process
+loopback registry on Docker Engine 29.9.0/API 1.56. It returned Engine status
+progress and removed only the preflighted generated image tag without force or
+prune; it does not validate external registry access or helper authentication.
+No live push, Ferrum tag/removal, or build was performed. Native Images-page
+visual validation remains unverified. Default fake-socket/headless tests do not
+contact a real engine or mutate images. See the
 [platform support matrix](../platform-support.md).
 
 ## Building a local image
