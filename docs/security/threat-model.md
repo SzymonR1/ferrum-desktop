@@ -83,9 +83,10 @@ membership submits no restart. The import label and engine-reported `Project`
 metadata do not establish identity or authorization. Compose `start` starts
 existing containers; `stop` does not remove them. Service restart invokes only
 `restart --no-deps <SERVICE>`; Docker Compose restart does not apply Compose
-configuration changes. No build, pull, `up`, `down`, remove, or persistent
-project storage is added. Navigation does not cancel submitted lifecycle work;
-its redacted result is retained for the session. A static `started` audit entry
+configuration changes. These lifecycle operations do not build, `up`, `down`,
+remove resources, or persist project storage. Confirmed pulls are described
+separately below. Navigation does not cancel submitted lifecycle work; its
+redacted result is retained for the session. A static `started` audit entry
 precedes preflight; without a later terminal outcome, the final state is unknown
 and must be reconciled by refreshing the current project status. Issues #18 and
 #19 remain partial/open; issue #10 remains blocked/open.
@@ -261,8 +262,8 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   are not read during save.
   The label is not project identity or authorization. Only the currently
   selected imported registration after successful explicit revalidation can
-  start/stop/restart. Revalidate before each operation; failure must prevent
-  lifecycle mutation.
+  start/stop/restart or pull images. Revalidate before each operation; failure
+  must prevent the requested operation.
   Restart additionally requires current
   successful status membership and a fresh status query with the same selected
   local Docker Unix socket before mutation. The current socket, ordered files,
@@ -270,8 +271,18 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   engine-reported `Project` metadata. Docker `start` starts existing containers;
   `stop` does not remove them. Restart uses only
   `restart --no-deps <SERVICE>`; Compose restart does not apply configuration
-  changes. No persistent storage, build/pull/up/down, remove, or project-file
+  changes. No persistent storage, build/up/down, remove, or project-file
   mutation is added by these lifecycle operations.
+  Confirmed pull is limited to selected imported, explicitly revalidated files and
+  profiles on the current local Docker Unix socket. It uses a private config/HOME
+  and cleared environment; saved Docker credentials/helpers are not read and
+  private registries may reject anonymous pulls. The operation downloads images
+  only and does not build or change project containers, networks or volumes.
+  Progress retains only allowlisted phases/counts; combined stdout/stderr is
+  capped at 1 MiB, and raw CLI output is not shown or persisted. Preflight
+  cancellation submits no pull. After submission, cancellation, timeout, or
+  output-limit termination kills only the local CLI process group; Engine-side
+  image downloads may continue and the result is uncertain.
   Controlled fake-CLI/headless tests cover
   argv and states; no live lifecycle mutation was performed. See Docker's
   [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
@@ -522,8 +533,10 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   loaders are disabled during validation) remain trust risks. Session imports
   retain path/profile metadata and a local label in memory only; explicit saved
   registrations persist only validated labels, ordered absolute paths, and
-  profiles as described above. Project-content import, build/pull/up/down/
-  removal, and project-file mutations remain deferred. Scoped start/stop and a
+  profiles as described above. Project-content import, Compose build/up/down,
+  removal, and project-file mutation remain deferred. Pulls are limited to the
+  confirmed anonymous local-Docker operation described above; authenticated
+  Compose pulls and remote engines remain unsupported. Scoped start/stop and a
   confirmed service-scoped restart are available only for a selected imported
   and revalidated configuration; restart also requires current and freshly
   rechecked status membership. The bounded one-shot service log snapshot is

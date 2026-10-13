@@ -91,9 +91,10 @@ tags, endpoints, error text, and daemon response bodies are not included in
 those traces.
 
 Ferrum also maintains a Linux-local, bounded JSONL copy of mutation outcomes
-for container lifecycle, confirmed imported Compose start/stop/service restart, image
-pull/push/tag/removal and Buildx image builds, volume create/removal, and
-network create/removal/connect/disconnect requests. `audit.jsonl` is created
+for container lifecycle, confirmed imported Compose start/stop/service restart
+and Compose pulls, image pull/push/tag/removal and Buildx image builds, volume
+create/removal, and network create/removal/connect/disconnect requests.
+`audit.jsonl` is created
 lazily in Ferrum's descriptor-anchored config directory with directory mode
 `0700` and file mode `0600`. Schema version 1 records a timestamp, static
 event/action/outcome, and validated full resource IDs only where existing
@@ -344,8 +345,8 @@ entry and leaves the current session entry available. Neither selection nor
 persistence reads project contents or confines paths.
 Project lifecycle commands still use the selected files/profiles and local
 socket; the local label does not establish project identity or authorization.
-Build/pull/up/down, remove, and project-file mutations remain unavailable.
-One-shot and live service logs are read-only.
+Build/up/down, remove, and project-file mutations remain unavailable. Compose
+pull is a separate anonymous-only operation described below.
 
 Start/stop are available only for the currently selected imported entry
 (session-only or explicitly saved) after explicit successful revalidation.
@@ -379,6 +380,41 @@ selection/context after terminal completion. On shutdown Ferrum flushes the
 started audit marker before issuing the command; a submitted child may still be
 terminated, leaving Engine state uncertain. Selected/include files remain
 trusted local inputs under the logged-in user's permissions.
+
+Confirmed imported-configuration image pulls use the current imported and
+successfully revalidated ordered files/profiles and the selected Linux local
+Docker Unix socket:
+
+```text
+docker --host unix://<selected-socket> compose --progress plain --parallel 4 --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... pull --ignore-buildable
+```
+
+Compose pulls are anonymous only. Ferrum uses private Docker config/HOME and a
+cleared environment; it does not read saved Docker credentials or invoke a
+credential helper for Compose pulls. Private registries requiring credentials
+may reject them. Compose `--parallel 4` limits the operation to four
+concurrent service pulls. Once pulling starts, the CLI has a two-hour deadline
+and a combined 1 MiB stdout/stderr cap; exceeding either stops the local process
+and leaves image-store state uncertain. The UI shows only a bounded, rate-limited
+summary of recognized progress phases/counts, never raw output.
+`--ignore-buildable` excludes services that require a build. The command does
+not build images, start/create services, or run `up`. It changes only the
+selected Engine's image store; it does not create, start, stop, or remove project
+containers, networks, or volumes. Pulled images may consume network bandwidth
+and disk space.
+
+Cancellation kills only Ferrum's local Compose CLI process group; it does not
+guarantee submitted daemon-side work stops. A pull may continue after Ferrum
+stops waiting, leaving image state uncertain; inspect current Engine state
+rather than assuming the pull was undone. The best-effort audit event contains
+only static `compose_pull`/`pull` and `started`, `success`, `not_submitted`,
+`request_error`, or `uncertain` values. It excludes labels, paths/files,
+services, image references, credentials, output, diagnostics, and socket values.
+A `started` marker is recorded before process spawn; without a later terminal
+outcome, Ferrum exited or final audit persistence failed and the final Engine
+result is unknown.
+This slice applies only to Linux local Docker Unix sockets; it does not claim
+Podman, remote Docker, Windows, or macOS support.
 
 On successful validation the same bounded CLI invocation returns every
 declared service name via `config --services`, including services gated by

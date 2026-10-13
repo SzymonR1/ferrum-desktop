@@ -281,6 +281,71 @@ pub(super) fn record_compose_mutation_result(
         None,
     )
 }
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+pub(super) enum ComposePullOutcome {
+    Started,
+    Success,
+    NotSubmitted,
+    RequestError,
+    Uncertain,
+}
+
+#[cfg(target_os = "linux")]
+impl ComposePullOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Success => "success",
+            Self::NotSubmitted => "not_submitted",
+            Self::RequestError => "request_error",
+            Self::Uncertain => "uncertain",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn record_compose_pull_result(outcome: ComposePullOutcome) -> AuditRecord {
+    let outcome_label = outcome.label();
+    match outcome {
+        ComposePullOutcome::Started => tracing::info!(
+            target: "ferrum::audit",
+            audit_event = "compose_pull",
+            action = "pull",
+            outcome = outcome_label,
+            "Compose pull attempt started"
+        ),
+        ComposePullOutcome::Success => tracing::info!(
+            target: "ferrum::audit",
+            audit_event = "compose_pull",
+            action = "pull",
+            outcome = outcome_label,
+            "Compose pull completed"
+        ),
+        ComposePullOutcome::NotSubmitted => tracing::warn!(
+            target: "ferrum::audit",
+            audit_event = "compose_pull",
+            action = "pull",
+            outcome = outcome_label,
+            "Compose pull was not submitted"
+        ),
+        ComposePullOutcome::RequestError => tracing::warn!(
+            target: "ferrum::audit",
+            audit_event = "compose_pull",
+            action = "pull",
+            outcome = outcome_label,
+            "Compose pull returned an error"
+        ),
+        ComposePullOutcome::Uncertain => tracing::warn!(
+            target: "ferrum::audit",
+            audit_event = "compose_pull",
+            action = "pull",
+            outcome = outcome_label,
+            "Compose pull outcome is uncertain"
+        ),
+    }
+    AuditRecord::new("compose_pull", "pull", outcome_label, None, None)
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum NetworkMutation {
@@ -780,6 +845,73 @@ mod tests {
             assert!(!line.contains("label="));
             assert!(!line.contains("path="));
             assert!(!line.contains("project="));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compose_pull_audit_is_static_and_records_uncertain_outcome() {
+        use super::{ComposePullOutcome, record_compose_pull_result};
+
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(writer.clone())
+            .finish();
+        let dispatcher = tracing::Dispatch::new(subscriber);
+        let attempts = [
+            (ComposePullOutcome::Started, "started"),
+            (ComposePullOutcome::Success, "success"),
+            (ComposePullOutcome::NotSubmitted, "not_submitted"),
+            (ComposePullOutcome::RequestError, "request_error"),
+            (ComposePullOutcome::Uncertain, "uncertain"),
+        ];
+        let records = tracing::dispatcher::with_default(&dispatcher, || {
+            attempts.map(|(outcome, _)| {
+                serde_json::to_string(&record_compose_pull_result(outcome))
+                    .expect("the static Compose pull audit record should serialize")
+            })
+        });
+
+        for ((_, outcome), record) in attempts.iter().zip(&records) {
+            assert!(record.contains("\"event\":\"compose_pull\""));
+            assert!(record.contains("\"action\":\"pull\""));
+            assert!(record.contains(&format!("\"outcome\":\"{outcome}\"")));
+            for private_field in [
+                "label",
+                "path",
+                "file",
+                "service",
+                "image",
+                "credential",
+                "output",
+            ] {
+                assert!(!record.contains(private_field));
+            }
+        }
+
+        let captured = match writer.0.lock() {
+            Ok(output) => output.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let events = String::from_utf8(captured).expect("audit events should be UTF-8");
+        let events = events.lines().collect::<Vec<_>>();
+        assert_eq!(events.len(), attempts.len());
+        for (line, (_, outcome)) in events.iter().zip(attempts) {
+            assert!(line.contains("audit_event=\"compose_pull\""));
+            assert!(line.contains("action=\"pull\""));
+            assert!(line.contains(&format!("outcome=\"{outcome}\"")));
+            for private_field in [
+                "label=",
+                "path=",
+                "file=",
+                "service=",
+                "image=",
+                "credential=",
+                "output=",
+            ] {
+                assert!(!line.contains(private_field));
+            }
         }
     }
     #[cfg(target_os = "linux")]

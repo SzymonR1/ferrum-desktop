@@ -200,6 +200,10 @@ enum EngineEvent {
         generation: u64,
         result: compose::ComposeLogsResult,
     },
+    ComposePullProgress {
+        generation: u64,
+        progress: compose::ComposePullProgress,
+    },
     ComposeLifecycleFinished {
         generation: u64,
         selection: compose::ComposeLifecycleSelection,
@@ -889,6 +893,7 @@ struct FerrumApp {
     #[cfg(target_os = "linux")]
     compose_follow_receiver: Option<mpsc::Receiver<(u64, compose::ComposeFollowEvent)>>,
     compose_lifecycle_task: Option<JoinHandle<()>>,
+    compose_pull_cancellation: Option<tokio::sync::oneshot::Sender<()>>,
     compose_lifecycle_audit_task: Option<JoinHandle<()>>,
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
@@ -1103,6 +1108,7 @@ impl FerrumApp {
             #[cfg(target_os = "linux")]
             compose_follow_receiver: None,
             compose_lifecycle_task: None,
+            compose_pull_cancellation: None,
             compose_lifecycle_audit_task: None,
             image_list_task: None,
             image_inspection_task: None,
@@ -1567,13 +1573,21 @@ impl FerrumApp {
         let audit_store = self.audit_store.clone();
         let selection = task.selection.clone();
         let service = task.service.clone();
-        let action = match task.action {
-            compose::ComposeLifecycleAction::Start => audit::ComposeMutationAction::Start,
-            compose::ComposeLifecycleAction::Stop => audit::ComposeMutationAction::Stop,
-            compose::ComposeLifecycleAction::Restart => audit::ComposeMutationAction::Restart,
+        let pull_cancellation_receiver = task.pull_cancellation;
+        self.compose_pull_cancellation = task.pull_cancellation_sender;
+        let audit_action = match task.action {
+            compose::ComposeLifecycleAction::Start => Some(audit::ComposeMutationAction::Start),
+            compose::ComposeLifecycleAction::Stop => Some(audit::ComposeMutationAction::Stop),
+            compose::ComposeLifecycleAction::Restart => Some(audit::ComposeMutationAction::Restart),
+            compose::ComposeLifecycleAction::Pull => None,
         };
-        let started_record =
-            audit::record_compose_mutation_result(action, audit::ComposeMutationOutcome::Started);
+        let started_record = match audit_action {
+            Some(action) => audit::record_compose_mutation_result(
+                action,
+                audit::ComposeMutationOutcome::Started,
+            ),
+            None => audit::record_compose_pull_result(audit::ComposePullOutcome::Started),
+        };
         let started_audit_store = audit_store.clone();
         let (audit_started_sender, audit_started_receiver) = tokio::sync::oneshot::channel();
         self.compose_lifecycle_audit_task = Some(self.runtime.spawn(async move {
@@ -1582,6 +1596,24 @@ impl FerrumApp {
         }));
         context.request_repaint();
         self.compose_lifecycle_task = Some(self.runtime.spawn(async move {
+            let (pull_progress_sender, mut pull_progress_receiver) =
+                mpsc::channel(compose::COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+            let progress_event_sender = sender.clone();
+            let progress_generation = task.generation;
+            let progress_forwarder = tokio::spawn(async move {
+                while let Some(progress) = pull_progress_receiver.recv().await {
+                    if progress_event_sender
+                        .send(EngineEvent::ComposePullProgress {
+                            generation: progress_generation,
+                            progress,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
             if audit_started_receiver.await.is_err() {
                 return;
             }
@@ -1606,6 +1638,23 @@ impl FerrumApp {
                                 submitted: false,
                             }
                         }
+                    } else if task.action == compose::ComposeLifecycleAction::Pull {
+                        match pull_cancellation_receiver {
+                            Some(cancellation) => {
+                                compose::compose_pull(
+                                    &socket_path,
+                                    &task.selection.files,
+                                    &task.selection.profiles,
+                                    cancellation,
+                                    &pull_progress_sender,
+                                )
+                                .await
+                            }
+                            None => compose::ComposeLifecycleResult {
+                                outcome: Err(compose::ComposeLifecycleError::CommandStartFailed),
+                                submitted: false,
+                            },
+                        }
                     } else {
                         compose::compose_lifecycle(
                             &socket_path,
@@ -1621,14 +1670,31 @@ impl FerrumApp {
                     submitted: false,
                 },
             };
-            let outcome = if result.outcome.is_ok() {
-                audit::ComposeMutationOutcome::Success
-            } else if result.submitted {
-                audit::ComposeMutationOutcome::RequestError
+            drop(pull_progress_sender);
+            let _ = progress_forwarder.await;
+            let record = if let Some(action) = audit_action {
+                let outcome = if result.outcome.is_ok() {
+                    audit::ComposeMutationOutcome::Success
+                } else if result.submitted {
+                    audit::ComposeMutationOutcome::RequestError
+                } else {
+                    audit::ComposeMutationOutcome::NotSubmitted
+                };
+                audit::record_compose_mutation_result(action, outcome)
             } else {
-                audit::ComposeMutationOutcome::NotSubmitted
+                let outcome = if result.outcome.is_ok() {
+                    audit::ComposePullOutcome::Success
+                } else if !result.submitted {
+                    audit::ComposePullOutcome::NotSubmitted
+                } else if result.outcome
+                    == Err(compose::ComposeLifecycleError::PullOutcomeUncertain)
+                {
+                    audit::ComposePullOutcome::Uncertain
+                } else {
+                    audit::ComposePullOutcome::RequestError
+                };
+                audit::record_compose_pull_result(outcome)
             };
-            let record = audit::record_compose_mutation_result(action, outcome);
             persist_audit_record(&audit_store, record).await;
             if sender
                 .send(EngineEvent::ComposeLifecycleFinished {
@@ -3045,6 +3111,14 @@ impl FerrumApp {
                         self.compose_logs_task = None;
                     }
                 }
+                EngineEvent::ComposePullProgress {
+                    generation,
+                    progress,
+                } => {
+                    if self.compose.note_pull_progress(generation, progress) {
+                        context.request_repaint();
+                    }
+                }
                 EngineEvent::ComposeLifecycleFinished {
                     generation,
                     selection,
@@ -3053,15 +3127,16 @@ impl FerrumApp {
                     if self.compose.current_lifecycle_selection_matches(&selection)
                         && self.page == images::AppPage::Compose
                     {
-                        // Refresh is started after the terminal event is accepted below.
                         if self.compose.finish_lifecycle(generation, result) {
                             self.compose_lifecycle_task = None;
                             self.compose_lifecycle_audit_task = None;
+                            self.compose_pull_cancellation = None;
                             self.start_compose_status_refresh(context.clone());
                         }
                     } else if self.compose.finish_lifecycle(generation, result) {
                         self.compose_lifecycle_task = None;
                         self.compose_lifecycle_audit_task = None;
+                        self.compose_pull_cancellation = None;
                     }
                 }
                 EngineEvent::VolumeInspected {
@@ -5126,6 +5201,15 @@ impl eframe::App for FerrumApp {
         } else if compose_actions.stop_imported {
             self.compose
                 .request_lifecycle_confirmation(compose::ComposeLifecycleAction::Stop);
+        } else if compose_actions.pull_imported {
+            self.compose
+                .request_lifecycle_confirmation(compose::ComposeLifecycleAction::Pull);
+        }
+        if compose_actions.cancel_pull
+            && self.compose.request_pull_cancellation()
+            && let Some(cancellation) = self.compose_pull_cancellation.take()
+        {
+            let _ = cancellation.send(());
         }
         if compose_actions.cancel_lifecycle {
             self.compose.cancel_lifecycle_confirmation();
@@ -5697,6 +5781,7 @@ mod event_reconciliation_tests {
             #[cfg(target_os = "linux")]
             compose_follow_receiver: None,
             compose_lifecycle_task: None,
+            compose_pull_cancellation: None,
             compose_lifecycle_audit_task: None,
             pending_resource_read: None,
             image_list_task: None,

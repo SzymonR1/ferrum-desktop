@@ -585,14 +585,18 @@ selected project's default `.env`; `--no-interpolate` and
 loaders are explicitly disabled, so remote include/extends references fail
 without fetching. The CLI/plugin remains unsandboxed; validate only trusted
 files. Bounded profile selection applies to structural validation, read-only
-status, one-shot service logs and live follow, imported-project start/stop, and
-single-service restart; the declared-service inventory is not profile-filtered
+status, one-shot service logs and live follow, imported-project start/stop/pull,
+and single-service restart; the declared-service inventory is not profile-filtered
 and lists all declarations from selected files. Profiles are passed as explicit
 `--profile` arguments and are not inherited from the environment. Imports remain
 session-only unless explicitly saved. Saved registrations use bounded
 SettingsStore metadata, restore unselected/unvalidated, and require explicit
 revalidation; persistence adds no CLI/Engine request or project-file access.
-Build/pull/up/down, removal, and project-file mutation remain unsupported.
+Compose pull has fake-CLI/temp-file coverage for exact argv, isolated
+environment, preflight cancellation, bounded progress, and uncertain post-spawn
+outcomes; it uses anonymous auth only. No live pull, registry request, or image
+mutation is claimed. Build/up/down, removal, and project-file mutation remain
+unsupported.
 Service restart is covered by controlled fake-CLI/headless regressions only; no live restart runs.
 
 Controlled live-follow fixtures cover exact selected-file/profile/socket argv
