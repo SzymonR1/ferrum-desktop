@@ -4726,6 +4726,20 @@ mod connection_handshake_tests {
         requests
     }
 
+    async fn connected_client(socket_path: &std::path::Path) -> EngineClient {
+        let docker_host = format!("unix://{}", socket_path.display());
+        let client = EngineClient::connect_with_startup_environment(None, Some(docker_host))
+            .await
+            .expect("valid fake engine should connect");
+        assert_eq!(client.api_version, "1.45");
+        client
+    }
+
+    fn assert_inventory_requests(requests: &[String]) {
+        assert_eq!(requests[0], "GET /version HTTP/1.1");
+        assert_eq!(requests[1], "GET /v1.45/containers/json?all=true HTTP/1.1");
+    }
+
     #[tokio::test]
     async fn negotiates_api_version_before_returning_an_empty_container_inventory() {
         let (socket_path, server, directory) = fixture(
@@ -4733,17 +4747,12 @@ mod connection_handshake_tests {
             vec![version_response(), http_response("200 OK", b"[]")],
         )
         .await;
-        let docker_host = format!("unix://{}", socket_path.display());
-        let client = EngineClient::connect_with_startup_environment(None, Some(docker_host))
-            .await
-            .expect("valid fake engine should connect");
-        assert_eq!(client.api_version, "1.45");
+        let client = connected_client(&socket_path).await;
 
         let containers = client.list_containers().await;
         let requests = cleanup(&socket_path, server, &directory).await;
 
-        assert_eq!(requests[0], "GET /version HTTP/1.1");
-        assert_eq!(requests[1], "GET /v1.45/containers/json?all=true HTTP/1.1");
+        assert_inventory_requests(&requests);
         assert!(
             containers
                 .expect("successful empty inventory should not be a connection error")
@@ -4764,17 +4773,12 @@ mod connection_handshake_tests {
             ],
         )
         .await;
-        let docker_host = format!("unix://{}", socket_path.display());
-        let client = EngineClient::connect_with_startup_environment(None, Some(docker_host))
-            .await
-            .expect("valid fake engine should connect");
-        assert_eq!(client.api_version, "1.45");
+        let client = connected_client(&socket_path).await;
 
         let containers = client.list_containers().await;
         let requests = cleanup(&socket_path, server, &directory).await;
 
-        assert_eq!(requests[0], "GET /version HTTP/1.1");
-        assert_eq!(requests[1], "GET /v1.45/containers/json?all=true HTTP/1.1");
+        assert_inventory_requests(&requests);
         let error = containers.expect_err("failed inventory request should return an error");
         assert!(matches!(error, EngineError::InventoryRequest { .. }));
         assert!(!error.to_string().contains("private engine response"));
