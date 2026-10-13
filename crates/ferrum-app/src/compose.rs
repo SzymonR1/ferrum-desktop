@@ -208,6 +208,11 @@ pub(super) struct ComposeOperationSelection {
     pub(super) files: Vec<std::path::PathBuf>,
     pub(super) profiles: Vec<String>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ComposeScalePlan {
+    pub(super) target_replicas: u32,
+    pub(super) observed_replicas: usize,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 struct ComposeOperationConfirmation {
@@ -215,7 +220,7 @@ struct ComposeOperationConfirmation {
     selection: ComposeOperationSelection,
     ordered_files: Vec<String>,
     service: Option<String>,
-    scale: Option<(u32, usize)>,
+    scale: Option<ComposeScalePlan>,
 }
 
 #[derive(Default)]
@@ -227,7 +232,7 @@ enum ComposeOperationState {
         action: ComposeOperationAction,
         file_name: String,
         service: Option<String>,
-        scale: Option<(u32, usize)>,
+        scale: Option<ComposeScalePlan>,
         operation_progress: Option<ComposeOperationProgress>,
         cancel_requested: bool,
     },
@@ -235,13 +240,13 @@ enum ComposeOperationState {
         action: ComposeOperationAction,
         file_name: String,
         service: Option<String>,
-        scale: Option<(u32, usize)>,
+        scale: Option<ComposeScalePlan>,
     },
     Failed {
         action: ComposeOperationAction,
         file_name: String,
         service: Option<String>,
-        scale: Option<(u32, usize)>,
+        scale: Option<ComposeScalePlan>,
         error: ComposeOperationError,
     },
 }
@@ -287,7 +292,7 @@ pub(super) struct ComposeOperationTask {
     pub(super) action: ComposeOperationAction,
     pub(super) selection: ComposeOperationSelection,
     pub(super) service: Option<String>,
-    pub(super) scale: Option<(u32, usize)>,
+    pub(super) scale: Option<ComposeScalePlan>,
     pub(super) cancellation: Option<tokio::sync::oneshot::Receiver<()>>,
     pub(super) cancellation_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -728,14 +733,17 @@ impl ComposeView {
         self.set_operation_confirmation(
             ComposeOperationAction::Scale,
             Some(service.to_owned()),
-            Some((target, current)),
+            Some(ComposeScalePlan {
+                target_replicas: target,
+                observed_replicas: current,
+            }),
         )
     }
     fn set_operation_confirmation(
         &mut self,
         action: ComposeOperationAction,
         service: Option<String>,
-        scale: Option<(u32, usize)>,
+        scale: Option<ComposeScalePlan>,
     ) -> bool {
         let can_start = if matches!(
             action,
@@ -799,8 +807,8 @@ impl ComposeView {
                             .iter()
                             .any(|candidate| candidate == service))
                     || (action == ComposeOperationAction::Scale
-                        && scale.is_none_or(|(_, count)| {
-                            self.service_instance_count(service) != Some(count)
+                        && scale.is_none_or(|plan| {
+                            self.service_instance_count(service) != Some(plan.observed_replicas)
                         }))
                     || (action != ComposeOperationAction::Scale
                         && !self.containers.iter().any(|container| {
@@ -1917,13 +1925,14 @@ impl ComposeView {
             ui.heading("Scale a declared service");
             ui.horizontal(|ui| {
                 let label = ui.label("Target instances (1–32):");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.scale_target)
-                        .desired_width(48.0)
-                        .char_limit(2)
-                        .hint_text("1–32")
-                        .labelled_by(label.id),
-                );
+                let _target_input = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.scale_target)
+                            .desired_width(48.0)
+                            .char_limit(2)
+                            .hint_text("1–32"),
+                    )
+                    .labelled_by(label.id);
             });
             let valid_scale_target = self
                 .scale_target
@@ -2213,8 +2222,12 @@ impl ComposeView {
                         }
                     ));
                     if confirmation.action == ComposeOperationAction::Scale {
-                        let (target, count) = confirmation.scale.unwrap_or_default();
-                        ui.label(format!("Observed current instances: {count}; requested target: {target}."));
+                        if let Some(scale) = confirmation.scale {
+                            ui.label(format!(
+                                "Observed current instances: {}; requested target: {}.",
+                                scale.observed_replicas, scale.target_replicas
+                            ));
+                        }
                         ui.label("Scale-down can stop/remove excess containers; scale-up can create containers. Compose may recreate changed containers; volumes follow Compose semantics.");
                         ui.label("Dependencies will not auto-start. This requests no build, pull, volume removal, orphan removal, or force-recreate.");
                         ui.label("Explicitly targeting a profile-gated service activates that service's profile for this command; other services in the profile are not targeted.");
@@ -2321,12 +2334,12 @@ impl ComposeView {
                 service,
                 scale,
             } => {
-                if let Some((target, current)) = scale {
+                if let Some(scale) = scale {
                     ui.label(format!(
                         "Compose scale for {} completed ({} → {}).",
                         service.as_deref().unwrap_or("service"),
-                        current,
-                        target
+                        scale.observed_replicas,
+                        scale.target_replicas
                     ));
                 }
                 ui.label(format!(
@@ -2342,7 +2355,7 @@ impl ComposeView {
                 action,
                 file_name,
                 service,
-                scale: _,
+                scale,
                 error,
             } => {
                 ui.label(format!(
@@ -2353,6 +2366,12 @@ impl ComposeView {
                         .map(|service| format!(" service {service}"))
                         .unwrap_or_default()
                 ));
+                if let Some(scale) = scale {
+                    ui.label(format!(
+                        "At confirmation: {} instances; requested target: {}. Refresh status before retrying.",
+                        scale.observed_replicas, scale.target_replicas
+                    ));
+                }
                 ui.colored_label(egui::Color32::from_rgb(224, 174, 109), error.message());
             }
         }
@@ -4650,7 +4669,7 @@ async fn service_action_with_binary_and_scale(
     request: ComposeOperationRequest<'_>,
     service: &str,
     action: ComposeOperationAction,
-    scale: Option<(u32, usize)>,
+    scale: Option<ComposeScalePlan>,
 ) -> ComposeOperationResult {
     let failure = |error| ComposeOperationResult {
         outcome: Err(error),
@@ -4668,6 +4687,13 @@ async fn service_action_with_binary_and_scale(
     ) {
         return failure(ComposeOperationError::ServiceUnavailable);
     }
+
+    if action == ComposeOperationAction::Scale
+        && !scale.is_some_and(|plan| (1..=32).contains(&plan.target_replicas))
+    {
+        return failure(ComposeOperationError::InvalidScaleTarget);
+    }
+
     let prepared = match prepare_compose_operation(
         request.binary,
         request.files,
@@ -4707,32 +4733,31 @@ async fn service_action_with_binary_and_scale(
         .iter()
         .filter(|container| container.service == service)
         .count();
-    if (action == ComposeOperationAction::Scale
-        && (!prepared
+    if action == ComposeOperationAction::Scale {
+        if !prepared
             .services
             .iter()
             .any(|candidate| candidate == service)
-            || scale.is_none_or(|(_, expected)| expected != actual_count)))
-        || (expected_state.is_some()
-            && !prepared
-                .services
-                .iter()
-                .any(|candidate| candidate == service))
-        || (action != ComposeOperationAction::Scale
-            && !containers.iter().any(|container| {
-                container.service == service
-                    && expected_state.is_none_or(|state| container.state == state)
-            }))
+        {
+            return failure(ComposeOperationError::ServiceUnavailable);
+        }
+        let Some(scale) = scale else {
+            return failure(ComposeOperationError::InvalidScaleTarget);
+        };
+        if scale.observed_replicas != actual_count {
+            return failure(ComposeOperationError::StaleServiceCount);
+        }
+    } else if (expected_state.is_some()
+        && !prepared
+            .services
+            .iter()
+            .any(|candidate| candidate == service))
+        || !containers.iter().any(|container| {
+            container.service == service
+                && expected_state.is_none_or(|state| container.state == state)
+        })
     {
-        return failure(
-            if action == ComposeOperationAction::Scale
-                && scale.is_some_and(|(_, expected)| expected != actual_count)
-            {
-                ComposeOperationError::StaleServiceCount
-            } else {
-                ComposeOperationError::ServiceUnavailable
-            },
-        );
+        return failure(ComposeOperationError::ServiceUnavailable);
     }
     let Some(socket_path) = request.socket_path.to_str() else {
         return failure(ComposeOperationError::OperationFailed);
@@ -4756,12 +4781,9 @@ async fn service_action_with_binary_and_scale(
     if action == ComposeOperationAction::Restart {
         command.args(["restart", "--no-deps"]).arg(service);
     } else if action == ComposeOperationAction::Scale {
-        let Some((target, _)) = scale else {
+        let Some(scale) = scale else {
             return failure(ComposeOperationError::InvalidScaleTarget);
         };
-        if !(1..=32).contains(&target) {
-            return failure(ComposeOperationError::InvalidScaleTarget);
-        }
         command
             .args([
                 "up",
@@ -4772,7 +4794,7 @@ async fn service_action_with_binary_and_scale(
                 "--no-deps",
                 "--scale",
             ])
-            .arg(format!("{service}={target}"))
+            .arg(format!("{service}={}", scale.target_replicas))
             .arg(service);
     } else {
         command.arg(action.label()).arg(service);
@@ -4905,8 +4927,7 @@ pub(super) async fn compose_service_scale(
     files: &[std::path::PathBuf],
     profiles: &[String],
     service: &str,
-    target: u32,
-    expected_count: usize,
+    scale: ComposeScalePlan,
 ) -> ComposeOperationResult {
     let Some(search_path) = std::env::var_os("PATH") else {
         return ComposeOperationResult {
@@ -4932,7 +4953,7 @@ pub(super) async fn compose_service_scale(
         },
         service,
         ComposeOperationAction::Scale,
-        Some((target, expected_count)),
+        Some(scale),
     )
     .await
 }
@@ -7581,23 +7602,31 @@ exit 85
 
         #[tokio::test]
         async fn service_scale_revalidates_count_and_uses_bounded_up_arguments() {
-            for (status_response, expected_count, expected_error) in [
+            for (declared_service, service, status_response, expected_count, expected_error) in [
                 (
+                    "web",
+                    "web",
                     "{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"stopped\"}\n{\"Name\":\"web-2\",\"Service\":\"web\",\"State\":\"exited\"}\n",
                     2,
                     None,
                 ),
                 (
+                    "web",
+                    "web",
                     "{\"Name\":\"web-1\",\"Service\":\"web\",\"State\":\"stopped\"}\n",
                     2,
                     Some(ComposeOperationError::StaleServiceCount),
                 ),
                 (
+                    "worker",
+                    "web",
                     "{\"Name\":\"worker-1\",\"Service\":\"worker\",\"State\":\"running\"}\n",
-                    1,
+                    0,
                     Some(ComposeOperationError::ServiceUnavailable),
                 ),
                 (
+                    "web",
+                    "web",
                     "not-json",
                     0,
                     Some(ComposeOperationError::StatusUnavailable),
@@ -7607,18 +7636,23 @@ exit 85
                 let project = directory.path().join("project");
                 fs::create_dir(&project).unwrap();
                 let file = project.join("compose.yaml");
-                fs::write(&file, "services:\n  web:\n    image: busybox\n").unwrap();
+                fs::write(
+                    &file,
+                    format!("services:\n  {declared_service}:\n    image: busybox\n"),
+                )
+                .unwrap();
                 let operation = directory.path().join("scale-argv");
                 let binary = directory.path().join("docker-scale-fixture");
                 let script = format!(
                     "#!/bin/sh\n\
                      case \"$*\" in\n\
                        *' version --short'* ) printf 'v5.6.0\\n'; exit 0 ;;\n\
-                       *' config '* ) printf 'web\\n'; exit 0 ;;\n\
+                       *' config '* ) printf '%s\\n' {}; exit 0 ;;\n\
                        *' ps '* ) printf '%s' {}; exit 0 ;;\n\
                        *' up '* ) printf '%s\\n' \"$@\" > {}; exit 0 ;;\n\
                      esac\n\
                      exit 94\n",
+                    shell_quote(declared_service),
                     shell_quote(status_response),
                     shell_quote(operation.to_str().unwrap()),
                 );
@@ -7634,9 +7668,12 @@ exit 85
                         search_path: OsStr::new("/usr/bin"),
                         plugin: None,
                     },
-                    "web",
+                    service,
                     ComposeOperationAction::Scale,
-                    Some((3, expected_count)),
+                    Some(ComposeScalePlan {
+                        target_replicas: 3,
+                        observed_replicas: expected_count,
+                    }),
                 )
                 .await;
                 if let Some(expected_error) = expected_error {
@@ -8212,8 +8249,17 @@ exit 85
 
             // From this point, every result is recorded before any assertion, and the
             // generated-file/project-scoped down command is always attempted afterward.
-            let scale_up =
-                compose_service_scale(socket, &files, &profiles, "scale-probe", 2, 0).await;
+            let scale_up = compose_service_scale(
+                socket,
+                &files,
+                &profiles,
+                "scale-probe",
+                ComposeScalePlan {
+                    target_replicas: 2,
+                    observed_replicas: 0,
+                },
+            )
+            .await;
             let after_up = existing_compose_containers(socket, &files, &profiles).await;
             let scale_container_names = [
                 format!("{project_name}-scale-probe-1"),
@@ -8227,7 +8273,19 @@ exit 85
                         && scale_container_names.contains(&container.name)
                 });
             let downscale = if up_ownership {
-                Some(compose_service_scale(socket, &files, &profiles, "scale-probe", 1, 2).await)
+                Some(
+                    compose_service_scale(
+                        socket,
+                        &files,
+                        &profiles,
+                        "scale-probe",
+                        ComposeScalePlan {
+                            target_replicas: 1,
+                            observed_replicas: 2,
+                        },
+                    )
+                    .await,
+                )
             } else {
                 None
             };
@@ -9838,7 +9896,10 @@ exit 85
             assert_eq!(
                 view.operation_confirmation()
                     .and_then(|confirmation| confirmation.scale),
-                Some((3, 2))
+                Some(ComposeScalePlan {
+                    target_replicas: 3,
+                    observed_replicas: 2,
+                })
             );
             assert_eq!(
                 view.cancel_operation_confirmation(),
@@ -9920,14 +9981,9 @@ exit 85
             ));
             let mut harness = harness_for(view);
             harness.run();
-            assert!(
-                harness
-                    .get_by_role_and_label(
-                        Role::Label,
-                        "Enter a whole number from 1 to 32 to enable scaling."
-                    )
-                    .accesskit_node()
-                    .is_visible()
+            let _guidance = harness.get_by_role_and_label(
+                Role::Label,
+                "Enter a whole number from 1 to 32 to enable scaling.",
             );
             assert!(
                 harness
@@ -9971,6 +10027,10 @@ exit 85
                 Role::Label,
                 "Scale-down can stop/remove excess containers; scale-up can create containers. Compose may recreate changed containers; volumes follow Compose semantics.",
             );
+            let _profile_warning = harness.get_by_role_and_label(
+                Role::Label,
+                "Explicitly targeting a profile-gated service activates that service's profile for this command; other services in the profile are not targeted.",
+            );
             let _confirm = harness.get_by_role_and_label(Role::Button, "Confirm scale");
             harness
                 .get_by_role_and_label(Role::Button, "Cancel lifecycle action")
@@ -9982,6 +10042,50 @@ exit 85
                 Some(ComposeOperationAction::Scale)
             );
             assert!(!harness.state().view.operation_confirmation_open());
+        }
+        #[test]
+        fn uncertain_scale_failure_shows_snapshot_and_retry_guidance() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("Local label"));
+            view.validated_services = vec!["web".to_owned()];
+            let (generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                generation,
+                ComposeStatusResult {
+                    containers: vec![
+                        ComposeContainer {
+                            name: "web-1".to_owned(),
+                            service: "web".to_owned(),
+                            project: None,
+                            state: "running".to_owned(),
+                            health: None,
+                        },
+                        ComposeContainer {
+                            name: "web-2".to_owned(),
+                            service: "web".to_owned(),
+                            project: None,
+                            state: "stopped".to_owned(),
+                            health: None,
+                        },
+                    ],
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(view.request_service_scale_confirmation("web", "3"));
+            let task = view.confirm_operation().unwrap();
+            assert!(view.finish_operation(
+                task.generation,
+                ComposeOperationResult {
+                    outcome: Err(ComposeOperationError::OperationOutcomeUncertain),
+                    submitted: true,
+                },
+            ));
+            let mut harness = harness_for(view);
+            harness.run();
+            let _retry_guidance = harness.get_by_role_and_label(
+                Role::Label,
+                "At confirmation: 2 instances; requested target: 3. Refresh status before retrying.",
+            );
         }
         #[test]
         fn service_pause_and_unpause_require_exact_current_state_at_confirmation() {

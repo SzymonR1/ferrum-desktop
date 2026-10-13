@@ -1633,14 +1633,13 @@ impl FerrumApp {
                 (None, Some(socket_path)) => {
                     if task.action == compose::ComposeOperationAction::Scale {
                         match (service.as_deref(), scale) {
-                            (Some(service), Some((target, count))) => {
+                            (Some(service), Some(scale)) => {
                                 compose::compose_service_scale(
                                     &socket_path,
                                     &task.selection.files,
                                     &task.selection.profiles,
                                     service,
-                                    target,
-                                    count,
+                                    scale,
                                 )
                                 .await
                             }
