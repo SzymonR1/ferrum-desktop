@@ -1301,13 +1301,15 @@ Adapt commands for platform-specific targets and justified feature flags.
 7. Update PR.
 8. Record persistent blockers.
 
-## 16.3 Temporary CI Unavailability and Autonomous GitHub Management
+## 16.3 CI Availability, Infrastructure Fallback, and Autonomous GitHub Management
 
-**Temporary status (2026-10-11): GitHub Actions are currently unavailable for this repository because of an account billing/spending-limit restriction.** The annotation for Actions run `38154563168` says the job was not started because recent account payments failed or the spending limit needs to be increased. Recent jobs failed before any workflow step ran (`runner_id: 0`, no runner name, empty steps, and no logs). If the underlying cause or status changes, confirm it from GitHub's current run annotations and billing/runner information where accessible, then update this temporary status. Do not change billing or repository security settings to work around the restriction.
+**Historical outage (2026-10-11):** GitHub Actions run `38154563168` did not start because of an account billing/spending-limit restriction. Its annotation reported `runner_id: 0`, no runner name, empty steps, and no logs. This records a prior infrastructure failure, not a current test result. No billing or repository security settings were changed to work around it.
+
+**Current status (verified 2026-10-13):** Hosted Actions completed successfully on main commit `bd8fe9ab3606825f78760b73590393a1dfb98c8d` (run `38404935357`) and PR #95 head `3590673717070e8587d3f40b0cc5a8358d855b59` (run `38404158159`); all five CI jobs passed in both runs. This confirms Actions was functioning for this repository and these commits; it does not establish that the account-level billing state is permanently resolved. Use hosted CI normally and recheck current run annotations/runner allocation before choosing a fallback. Do not change billing or repository security settings.
 
 An Actions job that was not started, or failed before any step because of billing, runner allocation, or other GitHub infrastructure restrictions, is not evidence that Rust tests failed or passed. Read its annotations and execution state. Failures from commands that actually ran—including Rust tests—remain real blockers and must be fixed; never reclassify a code or test failure as infrastructure trouble.
 
-While hosted Actions are unavailable, validate the relevant checks locally against the exact PR head commit. Use a clean checkout pinned to its full SHA, confirm `git rev-parse HEAD` matches that SHA, and repeat validation after any source change or base synchronization that creates a new commit. Run the workflow-equivalent checks required by the change, including:
+If hosted Actions are unavailable for a future PR, validate the relevant checks locally against the exact PR head commit. Use a clean checkout pinned to its full SHA, confirm `git rev-parse HEAD` matches that SHA, and repeat validation after any source change or base synchronization that creates a new commit. Run the workflow-equivalent checks required by the change, including:
 
 ```bash
 cargo fmt --all -- --check
@@ -1320,7 +1322,7 @@ mdbook build docs
 
 Also run applicable MSRV, dependency security/license, packaging, platform, integration, and focused checks from the preserved workflows when the required tools and environment are available. Record unavailable platform-specific checks rather than claiming they passed. In the PR description or a comment, record the exact commit SHA, environment (OS, architecture, Rust/Cargo versions, and relevant targets), every command executed, and its observed result. Local checks do not override a required GitHub status check or authorize bypassing branch protection.
 
-Preserve all GitHub Actions workflows and their normal triggers and checks. Once Actions are available again, restore the normal hosted-CI requirements, rerun checks on current PR commits, and do not treat an outage-era local result as a permanent replacement for required hosted CI.
+Preserve all GitHub Actions workflows and their normal triggers and checks. Continue using hosted CI while current runs succeed. If an outage recurs, use the exact-head local fallback above, then restore normal hosted-CI requirements after new hosted runs execute successfully; outage-era local results never replace required hosted CI.
 
 Routine GitHub administration is explicitly authorized: create, update, and prioritize Issues, and close an Issue when its acceptance criteria are actually satisfied. Never close a parent Issue for a partially implemented feature; leave it open and accurately record the completed slice and outstanding acceptance criteria. Routine PR merges are explicitly authorized after successful validation and appropriate review, provided GitHub permits the merge. Do not bypass enforced branch protection, required approvals, security restrictions, or permissions, and do not repeatedly ask for permission for these already-authorized routine actions. If a merge is genuinely blocked, record the exact blocker, leave the PR and Issue state accurate, and continue independent authorized work.
 
