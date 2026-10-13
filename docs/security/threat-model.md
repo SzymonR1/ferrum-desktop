@@ -384,8 +384,10 @@ store but does not build or change project containers, networks, or volumes.
   target and same-profile sibling, preflights project/network absence, and
   verifies only the target starts/scales. It uses a preinstalled image, no
   mounts/ports/pull/build, then attempts generated-project-scoped `down` without
-  force, prune, or volume removal. It has not been run; live Engine validation
-  remains pending with the integration owner. Issue #18 remains partial/open.
+  force, prune, or volume removal. This smoke passed on 2026-10-13 against
+  Docker Engine 29.9.0/API 1.56 and Compose v5.6.0; it validates only one
+  generated-project scenario and not broad Engine/platform support. Issue #18
+  remains partial/open.
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
 - Escape selected control, bidi, zero-width, invisible-format, Hangul-filler,
   and Unicode-tag characters in engine-provided container inventory/inspection

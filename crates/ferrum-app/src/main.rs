@@ -1317,7 +1317,7 @@ impl FerrumApp {
         #[cfg(target_os = "linux")]
         self.abort_compose_service_follow();
         #[cfg(target_os = "linux")]
-        self.cancel_compose_operation_confirmation();
+        let _ = self.cancel_compose_operation_confirmation();
         self.compose.invalidate();
     }
 
@@ -1551,20 +1551,36 @@ impl FerrumApp {
         self.compose.cancel_service_follow();
     }
     #[cfg(target_os = "linux")]
-    fn cancel_compose_operation_confirmation(&mut self) {
+    fn queue_compose_operation_audit_record(
+        &mut self,
+        record: audit::AuditRecord,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let previous = self.compose_operation_audit_task.take();
+        let store = self.audit_store.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.compose_operation_audit_task = Some(self.runtime.spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            persist_audit_record(&store, record).await;
+            let _ = sender.send(());
+        }));
+        receiver
+    }
+    #[cfg(target_os = "linux")]
+    fn cancel_compose_operation_confirmation(
+        &mut self,
+    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
         if self.compose.cancel_operation_confirmation()
             != Some(compose::ComposeOperationAction::Scale)
         {
-            return;
+            return None;
         }
         let record = audit::record_compose_mutation_result(
             audit::ComposeMutationAction::Scale,
             audit::ComposeMutationOutcome::NotSubmitted,
         );
-        let store = self.audit_store.clone();
-        self.compose_operation_audit_task = Some(self.runtime.spawn(async move {
-            persist_audit_record(&store, record).await;
-        }));
+        Some(self.queue_compose_operation_audit_record(record))
     }
 
     #[cfg(target_os = "linux")]
@@ -1615,12 +1631,7 @@ impl FerrumApp {
             }
             None => audit::record_compose_pull_result(audit::ComposePullOutcome::Started),
         };
-        let started_audit_store = audit_store.clone();
-        let (audit_started_sender, audit_started_receiver) = tokio::sync::oneshot::channel();
-        self.compose_operation_audit_task = Some(self.runtime.spawn(async move {
-            persist_audit_record(&started_audit_store, started_record).await;
-            let _ = audit_started_sender.send(());
-        }));
+        let audit_started_receiver = self.queue_compose_operation_audit_record(started_record);
         context.request_repaint();
         self.compose_operation_task = Some(self.runtime.spawn(async move {
             let (operation_progress_sender, mut operation_progress_receiver) =
@@ -5320,7 +5331,7 @@ impl eframe::App for FerrumApp {
         }
         if compose_actions.cancel_operation_confirmation {
             #[cfg(target_os = "linux")]
-            self.cancel_compose_operation_confirmation();
+            let _ = self.cancel_compose_operation_confirmation();
             #[cfg(not(target_os = "linux"))]
             self.compose.cancel_operation_confirmation();
         }
@@ -7459,14 +7470,9 @@ mod event_reconciliation_tests {
                 .request_service_scale_confirmation("qa-worker", "3")
         );
 
-        app.cancel_compose_operation_confirmation();
-        app.runtime
-            .block_on(
-                app.compose_operation_audit_task
-                    .take()
-                    .expect("scale cancellation should persist an audit result"),
-            )
-            .expect("audit persistence task should complete");
+        let mut explicit_cancel_audit = app
+            .cancel_compose_operation_confirmation()
+            .expect("explicit cancellation should enqueue its audit record");
 
         assert!(
             app.compose
@@ -7480,6 +7486,7 @@ mod event_reconciliation_tests {
                     .expect("Compose invalidation should persist a scale cancellation"),
             )
             .expect("invalidation audit persistence task should complete");
+        assert!(explicit_cancel_audit.try_recv().is_ok());
 
         let contents = std::fs::read_to_string(root.join("audit.jsonl")).unwrap();
         let records = contents

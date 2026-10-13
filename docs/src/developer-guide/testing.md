@@ -135,14 +135,17 @@ directory, and known Compose file; it does not force-remove, prune, or remove
 volumes:
 
 ```sh
-FERRUM_TEST_IMAGE=ghcr.io/catthehacker/ubuntu:rust-latest cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_service_scale_scales_and_cleans_only_verified_project -- --exact --ignored
+env -u DOCKER_HOST DOCKER_CONTEXT=default FERRUM_TEST_IMAGE=ghcr.io/catthehacker/ubuntu:rust-latest cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_service_scale_scales_and_cleans_only_verified_project -- --exact --ignored
 ```
 
-Do not run this test against an engine containing valuable resources. The test
-is opt-in and was not executed as part of this change; live Engine validation is
-pending the integration owner's safe smoke. Neither its presence nor the
-fake-CLI/headless tests claim Podman, remote, Windows, macOS, or complete Issue
-#18 support.
+The test passed on 2026-10-13 against Fedora Linux 44 x86_64, Docker Engine
+29.9.0/API 1.56, and Compose v5.6.0 via the local `default` Unix-socket
+context: one test passed, the target reached two replicas and downscaled to one,
+the same-profile sibling remained absent, and scoped cleanup succeeded with no
+generated-project containers left. This is one Linux local Docker smoke, not
+general engine/platform support. Do not run it against an Engine containing
+valuable resources; it remains opt-in and touches only its preflighted,
+uniquely named generated project.
 
 ## Compose up with local images
 

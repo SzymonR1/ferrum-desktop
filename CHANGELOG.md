@@ -29,9 +29,10 @@ All notable project changes are documented here. The project has not published a
   live smoke now uses a unique project with a profile-gated target and
   same-profile sibling, preflights project/network absence, uses a preinstalled
   image without mounts/ports/pull/build, and attempts scoped non-force,
-  non-prune, non-volume cleanup. It was not run; live Engine validation is
-  pending the integration owner's safe smoke. No broader platform support or
-  full Issue #18 completion is claimed.
+  non-prune, non-volume cleanup. The smoke passed on 2026-10-13 against Docker
+  Engine 29.9.0/API 1.56 and Compose v5.6.0; the same-profile sibling remained
+  absent and the generated project containers were cleaned. No broader
+  platform support or full Issue #18 completion is claimed.
 - Added confirmed service-scoped Compose pause/unpause for the current imported,
   successfully revalidated ordered files/profiles on the selected Linux local
   Docker Unix socket. Pause is offered only for a declared service with a
