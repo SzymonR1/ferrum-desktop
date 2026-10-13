@@ -4507,14 +4507,9 @@ pub(super) async fn compose_pull(
 }
 #[cfg(target_os = "linux")]
 async fn service_action_with_binary(
-    binary: &std::path::Path,
-    socket_path: &std::path::Path,
-    files: &[std::path::PathBuf],
-    profiles: &[String],
+    request: ComposeOperationRequest<'_>,
     service: &str,
     action: ComposeOperationAction,
-    search_path: &std::ffi::OsStr,
-    user_compose_plugin: Option<&std::path::Path>,
 ) -> ComposeOperationResult {
     let failure = |error| ComposeOperationResult {
         outcome: Err(error),
@@ -4531,20 +4526,25 @@ async fn service_action_with_binary(
     ) {
         return failure(ComposeOperationError::ServiceUnavailable);
     }
-    let prepared =
-        match prepare_compose_operation(binary, files, profiles, search_path, user_compose_plugin)
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => return failure(error),
-        };
+    let prepared = match prepare_compose_operation(
+        request.binary,
+        request.files,
+        request.profiles,
+        request.search_path,
+        request.plugin,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => return failure(error),
+    };
     let containers = match containers_with_isolated_config(
-        binary,
-        socket_path,
+        request.binary,
+        request.socket_path,
         &prepared.files,
         &prepared.project_directory,
-        profiles,
-        search_path,
+        request.profiles,
+        request.search_path,
         &prepared.isolated,
     )
     .await
@@ -4577,11 +4577,13 @@ async fn service_action_with_binary(
     {
         return failure(ComposeOperationError::ServiceUnavailable);
     }
-    let Some(socket_path) = socket_path.to_str() else {
+    let Some(socket_path) = request.socket_path.to_str() else {
         return failure(ComposeOperationError::OperationFailed);
     };
-    let mut command = tokio::process::Command::new(binary);
-    prepared.isolated.configure(&mut command, search_path);
+    let mut command = tokio::process::Command::new(request.binary);
+    prepared
+        .isolated
+        .configure(&mut command, request.search_path);
     command
         .env("COMPOSE_DISABLE_ENV_FILE", "1")
         .arg("--host")
@@ -4591,7 +4593,7 @@ async fn service_action_with_binary(
     for file in &prepared.files {
         command.arg("--file").arg(file);
     }
-    for profile in profiles {
+    for profile in request.profiles {
         command.arg("--profile").arg(profile);
     }
     if action == ComposeOperationAction::Restart {
@@ -4705,14 +4707,16 @@ pub(super) async fn compose_service_action(
     };
     let plugin = user_compose_plugin();
     service_action_with_binary(
-        &binary,
-        socket_path,
-        files,
-        profiles,
+        ComposeOperationRequest {
+            binary: &binary,
+            socket_path,
+            files,
+            profiles,
+            search_path: &search_path,
+            plugin: plugin.as_deref(),
+        },
         service,
         action,
-        &search_path,
-        plugin.as_deref(),
     )
     .await
 }
@@ -7248,14 +7252,16 @@ exit 85
             let files = [base.clone(), overlay.clone()];
             let profiles = ["frontend".to_owned(), "qa".to_owned()];
             let result = service_action_with_binary(
-                &binary,
-                &socket,
-                &files,
-                &profiles,
+                ComposeOperationRequest {
+                    binary: &binary,
+                    socket_path: &socket,
+                    files: &files,
+                    profiles: &profiles,
+                    search_path: OsStr::new("/usr/bin"),
+                    plugin: None,
+                },
                 "web",
                 ComposeOperationAction::Restart,
-                OsStr::new("/usr/bin"),
-                None,
             )
             .await;
 
@@ -7390,15 +7396,19 @@ exit 85
                 fs::write(&binary, script).unwrap();
                 fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
 
+                let files = [file];
+                let socket_path = directory.path().join("socket.sock");
                 let result = service_action_with_binary(
-                    &binary,
-                    &directory.path().join("socket.sock"),
-                    &[file],
-                    &[],
+                    ComposeOperationRequest {
+                        binary: &binary,
+                        socket_path: &socket_path,
+                        files: &files,
+                        profiles: &[],
+                        search_path: OsStr::new("/usr/bin"),
+                        plugin: None,
+                    },
                     "web",
                     ComposeOperationAction::Restart,
-                    OsStr::new("/usr/bin"),
-                    None,
                 )
                 .await;
 
@@ -7444,15 +7454,19 @@ exit 85
                 );
                 fs::write(&binary, script).unwrap();
                 fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+                let files = [file, overlay];
+                let profiles = ["frontend".to_owned(), "qa".to_owned()];
                 let result = service_action_with_binary(
-                    &binary,
-                    &socket,
-                    &[file, overlay],
-                    &["frontend".to_owned(), "qa".to_owned()],
+                    ComposeOperationRequest {
+                        binary: &binary,
+                        socket_path: &socket,
+                        files: &files,
+                        profiles: &profiles,
+                        search_path: OsStr::new("/usr/bin"),
+                        plugin: None,
+                    },
                     "web",
                     action,
-                    OsStr::new("/usr/bin"),
-                    None,
                 )
                 .await;
                 assert_eq!(result.outcome, Ok(()));
@@ -7536,15 +7550,19 @@ exit 85
                 );
                 fs::write(&binary, script).unwrap();
                 fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+                let files = [file];
+                let socket_path = directory.path().join("socket.sock");
                 let result = service_action_with_binary(
-                    &binary,
-                    &directory.path().join("socket.sock"),
-                    &[file],
-                    &[],
+                    ComposeOperationRequest {
+                        binary: &binary,
+                        socket_path: &socket_path,
+                        files: &files,
+                        profiles: &[],
+                        search_path: OsStr::new("/usr/bin"),
+                        plugin: None,
+                    },
                     "web",
                     ComposeOperationAction::Pause,
-                    OsStr::new("/usr/bin"),
-                    None,
                 )
                 .await;
                 assert_eq!(
@@ -7575,15 +7593,19 @@ exit 85
             );
             fs::write(&binary, script).unwrap();
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let files = [file];
+            let socket_path = directory.path().join("selected.sock");
             let result = service_action_with_binary(
-                &binary,
-                &directory.path().join("selected.sock"),
-                &[file],
-                &[],
+                ComposeOperationRequest {
+                    binary: &binary,
+                    socket_path: &socket_path,
+                    files: &files,
+                    profiles: &[],
+                    search_path: OsStr::new("/usr/bin"),
+                    plugin: None,
+                },
                 "web",
                 ComposeOperationAction::Pause,
-                OsStr::new("/usr/bin"),
-                None,
             )
             .await;
             assert_eq!(
