@@ -164,15 +164,15 @@ After the selected base and overrides pass structural validation, click
 socket. Ferrum invokes Compose with the files in their selected order:
 
 ```text
-docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <selected-profile> ... ps --all --format json
 docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile '*' ps --all --format json
 ```
 
-The selected-profile query remains the status source for regular service
-actions. The additional all-profile query is read-only and provides accurate
-scale counts for profile-gated services, including stopped containers. Both
-queries use `--all`, which includes stopped containers; Compose's default
-orphan inclusion is preserved. Ferrum displays bounded, escaped container
+The refreshed page status uses one read-only all-profile query on the selected
+socket, so inactive-profile services and stopped containers are visible. Regular
+service actions remain gated by the selected-profile service list and recheck
+selected-profile status before mutation; scaling uses the all-profile snapshot.
+`--all` includes stopped containers and Compose's default orphan inclusion is
+preserved.
 name, service, optional per-container `Project` metadata, state, and reported
 health. When Compose omits `Project`, the row shows `Not reported`; rows may
 report different values. This engine-reported label is untrusted metadata: it
@@ -341,9 +341,9 @@ command and records only static `scale/not_submitted` audit data.
 Before submission Ferrum rejects changed imports, files, profiles, validation,
 status, busy work, invalid targets, undeclared services, and a stale observed
 count. The worker snapshots selected files into write-sealed descriptors,
-revalidates those exact snapshots using selected profiles, and obtains fresh
-selected-profile and all-profile `ps --all` status on the same selected local
-Docker Unix socket immediately before mutation. The command uses argument
+revalidates those exact snapshots using selected profiles, and obtains one fresh
+all-profile `ps --all` result on the same selected local Docker Unix socket as
+the authoritative replica count immediately before mutation. The command uses
 arrays and deliberately has no global `--profile` option:
 
 ```text

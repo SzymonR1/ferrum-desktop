@@ -112,8 +112,8 @@ The controlled fake-CLI and headless regressions cover one accessible control
 per all-declared service rather than per replica row; inactive-profile services
 are included, and all-profile `ps --all` counts include stopped containers.
 Regular lifecycle eligibility remains selected-profile-only. Tests cover target
-bounds, undeclared services, selected-profile preflight/status argv versus
-profile-free scale `up` argv, exact
+bounds, undeclared services, selected-profile validation and all-profile status
+argv versus profile-free scale `up` argv, exact
 `up --detach --no-build --pull never --no-deps --scale SERVICE=N SERVICE`
 arguments, sibling safety, stale confirmation counts, sealed-file validation,
 fresh same-socket status, and uncertain submitted results requiring a successful

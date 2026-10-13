@@ -121,13 +121,14 @@ make no Engine requests.
 No release or broader support claim is made.
 
 Status is available only after selected files pass structural validation and a
-local Docker Unix socket is connected. Ferrum merges two read-only
-`compose ps --all --format json` queries on that socket: one with the selected
-profiles and a second with `--profile '*'`. The selected-profile result remains
-the source for regular service-action eligibility; the all-profile result
-provides accurate counts for scaling inactive-profile services. `--all`
-includes stopped containers and Compose's default orphan inclusion is
-preserved. Ferrum retains bounded, escaped container name, service, optional
+local Docker Unix socket is connected. Ferrum runs one read-only `compose`
+status query with global `--profile '*'` and `ps --all --format json` on that
+socket. It includes inactive-profile services; `--all` includes stopped
+containers and Compose's default orphan inclusion is preserved. This result is
+authoritative for the page and scale counts. Regular service actions remain
+selected-profile-gated, and their workers recheck selected-profile status.
+The query does not create, start, stop, remove, or change containers or project
+files. Ferrum retains bounded, escaped container name, service, optional
 per-container `Project` metadata, state, and optional health; when `Project` is
 omitted, the UI shows `Not reported`. Values may vary row by row. The Project
 value is untrusted engine-reported display metadata only; it does not establish

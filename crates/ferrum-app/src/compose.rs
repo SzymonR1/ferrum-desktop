@@ -3624,6 +3624,9 @@ async fn containers_with_all_profiles(
     search_path: &std::ffi::OsStr,
     isolated: &PrivateDockerConfig,
 ) -> Result<Vec<ComposeContainer>, ComposeStatusError> {
+    if !valid_profile_list(profiles) {
+        return Err(ComposeStatusError::QueryFailed);
+    }
     let request = ComposeStatusRequest {
         binary,
         socket_path,
@@ -3633,16 +3636,7 @@ async fn containers_with_all_profiles(
         search_path,
         isolated,
     };
-    let mut selected = containers_with_profile_query(&request, false).await?;
-    let all = containers_with_profile_query(&request, true).await?;
-    for container in all {
-        if !selected.iter().any(|existing| {
-            existing.name == container.name && existing.service == container.service
-        }) {
-            selected.push(container);
-        }
-    }
-    Ok(selected)
+    containers_with_profile_query(&request, true).await
 }
 
 #[cfg(target_os = "linux")]
@@ -7951,12 +7945,17 @@ exit 85
                     assert!(calls.lines().any(|call| {
                         call.contains("--profile selected") && call.contains(" config ")
                     }));
-                    assert!(calls.lines().any(|call| {
-                        call.contains("--profile selected") && call.contains(" ps --all ")
-                    }));
-                    assert!(calls.lines().any(|call| {
-                        call.contains("--profile *") && call.contains(" ps --all ")
-                    }));
+                    assert!(
+                        calls.lines().any(|call| {
+                            call.contains("--profile *") && call.contains(" config ")
+                        })
+                    );
+                    let status_calls = calls
+                        .lines()
+                        .filter(|call| call.contains(" ps --all "))
+                        .collect::<Vec<_>>();
+                    assert_eq!(status_calls.len(), 1);
+                    assert!(status_calls[0].contains("--profile *"));
                     assert!(
                         !args.iter().any(|argument| argument == "--profile"),
                         "the mutating up command must not enable any global profile"
