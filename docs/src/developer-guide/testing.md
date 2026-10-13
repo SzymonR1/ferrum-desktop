@@ -635,14 +635,18 @@ escaping, bounded queue and rolling output, cancellation, stale-event rejection,
 and process-group cleanup. Headless controls test Stop, imported-selection
 cancellation, and output retained after EOF. Neither one-shot snapshots nor live
 follow read real service logs; no project or Engine resource is mutated.
-A temporary-project profile-validation smoke
-verifies that `config --services` lists all declarations, including one in
-inactive profile `other`, with Compose v5.6.0 and no Engine access. An ignored
-profile status smoke uses a unique temporary project and the selected local
-socket to run `ps` with a selected profile on Docker Engine 29.9.0/default
-context; it reads only that project, asserts an empty container list, and
-creates or changes no resources. Run it with
-`cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_profile_status_reads_temporary_project_without_mutation -- --exact --ignored --nocapture`.
+The engine-free Compose CLI smoke uses owned temporary base/override/include
+files and verifies that `config --services` resolves the selected project from
+sealed snapshot descriptors while preserving the original project directory.
+The ignored snapshot-backed status smoke then uses `prepare_compose_operation`
+and the same descriptors for a read-only `compose ps --all --format json`
+request on a uniquely named temporary project and the selected local Docker
+Unix socket. It creates or changes no Engine resources; on 2026-10-13 it
+passed with Docker Engine 29.9.0, Compose 5.6.0, and the `default` context:
+
+```sh
+cargo test -p ferrum-app compose::tests::subprocess::local_compose_profile_status_reads_temporary_project_without_mutation -- --exact --ignored --nocapture
+```
 
 Compose validation and service listing use no Engine; the opt-in status smoke
 is local Docker-only. The native Compose page visual check is unavailable, and
