@@ -864,7 +864,7 @@ const COMPOSE_OPERATION_AUDIT_QUEUE_CAPACITY: usize = 32;
 #[cfg(target_os = "linux")]
 struct PendingComposeAuditRecord {
     record: audit::AuditRecord,
-    persisted: tokio::sync::oneshot::Sender<()>,
+    completed: tokio::sync::oneshot::Sender<()>,
 }
 
 struct FerrumApp {
@@ -1575,16 +1575,16 @@ impl FerrumApp {
             self.compose_operation_audit_task = Some(self.runtime.spawn(async move {
                 while let Some(pending) = receiver.recv().await {
                     persist_audit_record(&store, pending.record).await;
-                    let _ = pending.persisted.send(());
+                    let _ = pending.completed.send(());
                 }
             }));
             self.compose_operation_audit_sender = Some(sender);
         }
 
-        let (persisted, receiver) = tokio::sync::oneshot::channel();
+        let (completed, receiver) = tokio::sync::oneshot::channel();
         let sender = self.compose_operation_audit_sender.as_ref()?;
         if sender
-            .try_send(PendingComposeAuditRecord { record, persisted })
+            .try_send(PendingComposeAuditRecord { record, completed })
             .is_err()
         {
             tracing::warn!(
@@ -7600,7 +7600,7 @@ mod event_reconciliation_tests {
         );
 
         let (audit_sender, audit_receiver) = mpsc::channel(1);
-        let (persisted, persisted_receiver) = tokio::sync::oneshot::channel();
+        let (completed, completion_receiver) = tokio::sync::oneshot::channel();
         assert!(
             audit_sender
                 .try_send(PendingComposeAuditRecord {
@@ -7608,7 +7608,7 @@ mod event_reconciliation_tests {
                         audit::ComposeMutationAction::Scale,
                         audit::ComposeMutationOutcome::Started,
                     ),
-                    persisted,
+                    completed,
                 })
                 .is_ok()
         );
@@ -7623,7 +7623,7 @@ mod event_reconciliation_tests {
         assert!(app.compose_operation_task.is_none());
         assert!(app.compose_operation_cancellation.is_none());
 
-        drop(persisted_receiver);
+        drop(completion_receiver);
         drop(audit_receiver);
     }
 
