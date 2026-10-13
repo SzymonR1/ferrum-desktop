@@ -1403,8 +1403,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("ferrum-audit-{}-{nonce}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-audit-redacted-{}-{nonce}",
+            std::process::id()
+        ));
         fs::create_dir(&root).unwrap();
         let store = AuditStore::new(Arc::new(SettingsStore::at(root.join("settings.toml"))));
         let container_id = "a".repeat(64);
