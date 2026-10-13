@@ -46,6 +46,26 @@ or user project:
 cargo test -p ferrum-app compose::tests::subprocess::local_compose_validation_reads_the_sealed_operation_snapshot -- --exact --ignored
 ```
 
+## Compose service pause/unpause
+
+Controlled fake-CLI and headless tests cover service-scoped `pause SERVICE`
+and `unpause SERVICE` on the selected Linux local Docker Unix socket. Pause is
+eligible only for a declared service whose current status row is exactly
+`running`; unpause requires exactly `paused`. Stopped, unknown, absent, or
+undeclared services are ineligible. Tests cover imported/revalidated selection,
+status gating before confirmation and the worker's fresh status recheck after
+sealed-snapshot validation, exact service-targeted argv, confirmation and
+cancellation, static action/outcome audit records without service/path/project
+metadata, and retry blocking after a post-spawn failure until status refresh
+succeeds. The operation uses the existing private, cleared Compose environment,
+argv, 30-second bound, and child-process cleanup. Pause suspends processes and
+unpause resumes them; neither operation creates or removes containers,
+networks, or volumes.
+
+No live mutation was run because no disposable Engine is designated. There is
+no native visual validation, and these tests do not establish Podman, remote,
+Windows, or macOS support or full completion of Issues #18/#19.
+
 ## Compose up with local images
 
 The confirmed Compose `up` path has controlled fake-CLI and headless UI

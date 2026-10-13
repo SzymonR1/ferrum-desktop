@@ -197,27 +197,33 @@ environment sources under the logged-in user's permissions; validate only
 trusted files. The command uses the same subprocess timeout, output cap, and
 per-process resource limits described above.
 
-## Start/stop an imported configuration or restart a service
+## Start/stop an imported configuration or restart, pause, or unpause a service
 
 The Linux local Docker-socket page exposes **Start imported project** and
 **Stop imported project** only when the current selection was imported for this
 session and then explicitly validated successfully. **Restart service SERVICE**
 is shown beside each service present in the current successful container-status
-snapshot, and is enabled only for the current imported, explicitly revalidated
-selection. Selecting an import clears old validation/status/log data; revalidate
-before requesting an operation or refresh status before choosing a service to
-restart. The local import label is display-only and is never passed as
+snapshot. **Pause service SERVICE** is enabled only for a declared service with
+a current status row exactly `running`; **Unpause service SERVICE** is enabled
+only for a declared service with a current status row exactly `paused`.
+Stopped, unknown, or missing statuses are ineligible for pause/unpause. All
+actions require the current imported, explicitly revalidated selection.
+Selecting an import clears old validation/status/log data; revalidate before
+requesting an operation and refresh status before choosing a service action.
+The local import label is display-only and is never passed as
 `--project-name`. Untrusted per-container `Project` metadata is not used to
 choose or authorize the target. Scope comes from the selected ordered
-files/profiles, current local socket, and—for restart—the service name in the
-current status snapshot.
+files/profiles, current local socket, and the validated service in current
+status; pause/unpause additionally require that service to be declared and in
+the eligible state.
 
 Before each confirmed mutation, Ferrum opens each selected file without
 following a final symlink and copies the ordered bytes into write-sealed Linux
 memory-backed file descriptors (memfds). The aggregate copy is capped at
 16 MiB; failure to capture a valid snapshot fails closed. Preflight validates
-those snapshots, then submits the mutation with the same descriptors. Restart's
-fresh read-only status query also uses the same snapshots before the restart.
+those snapshots, then submits the mutation with the same descriptors. Each
+service action's fresh read-only status query also uses the same snapshots
+before mutation.
 Compose receives `/proc/self/fd/N` file references while `--project-directory`
 remains the original base file's parent, preserving normal relative-path
 resolution. No named on-disk copies of the selected Compose files are created;
@@ -234,47 +240,64 @@ They may be read or change under the logged-in user's permissions. This is not
 a sandbox or a path-containment guarantee; use only trusted project trees.
 
 The confirmation names the imported local label, ordered safe file basenames,
-selected profiles, action, and (for restart) service; cancelling it sends no
-command. Confirmation is rejected if the imported label, ordered files,
-profiles, successful validation, or restart service's current status
-membership no longer match its snapshot. Validation or status failure submits
-no mutation. Ferrum invokes the installed Docker Compose CLI through argument
-arrays:
+selected profiles, action, and target service where applicable; it explains
+that pause suspends a running service's processes and unpause resumes them,
+and that neither action creates or removes project resources (including
+containers, networks, or volumes). Cancelling it sends no command.
+Confirmation is rejected if the imported label, ordered files, profiles,
+successful validation, or target service's current status/eligibility no longer
+match. Before a service action is submitted, Ferrum rechecks fresh read-only
+status after validating sealed snapshots on the same selected Linux local
+Docker Unix socket; if the service is no longer eligible, no mutation is sent.
+Validation or status failure submits no mutation. Ferrum invokes the installed
+Docker Compose CLI through argument arrays:
 
 ```text
 docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <snapshot-fd-1> --file <snapshot-fd-2> ... --profile <profile> ... start
 docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <snapshot-fd-1> --file <snapshot-fd-2> ... --profile <profile> ... stop
 docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <snapshot-fd-1> --file <snapshot-fd-2> ... --profile <profile> ... restart --no-deps <SERVICE>
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <snapshot-fd-1> --file <snapshot-fd-2> ... --profile <profile> ... pause <SERVICE>
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <snapshot-fd-1> --file <snapshot-fd-2> ... --profile <profile> ... unpause <SERVICE>
 ```
 
 `start` starts existing containers; it does not create, build, or pull.
 `stop` stops running containers without removing them. Restart targets only the
 selected service; `--no-deps` prevents restarting dependent services. Docker
 Compose restart does **not** apply changes made to the Compose configuration:
-it restarts containers using their existing configuration. These mutations
-are Linux local Docker Unix-socket only and preserve selected file ordering,
-active profile arguments, and the base-parent project directory; Ferrum does
-not add an import-label project name. Commands use Ferrum's private Docker CLI
-config/HOME, cleared environment, disabled selected project `.env`, disabled
-remote Git/OCI loaders, an eight-second per-command validation/status bound,
-and a 30-second lifecycle-command deadline, 1 MiB output cap, and Linux process
-resource limits.
+it restarts containers using their existing configuration. Pause suspends
+processes in the selected running service; unpause resumes processes in that
+service. They target only the validated service (never a project-wide
+all-service command) and do not create or remove containers, networks, or
+volumes. See Docker's [`pause`](https://docs.docker.com/reference/cli/docker/compose/pause/)
+and [`unpause`](https://docs.docker.com/reference/cli/docker/compose/unpause/)
+references.
+
+These mutations are Linux local Docker Unix-socket only and preserve selected
+file ordering, active profile arguments, and the base-parent project directory;
+Ferrum does not add an import-label project name. Commands use Ferrum's private
+Docker CLI config/HOME, cleared environment, disabled selected project `.env`,
+disabled remote Git/OCI loaders, an eight-second per-command validation/status
+bound, and a 30-second lifecycle-command deadline with child-process cleanup,
+1 MiB output cap, and Linux process resource limits.
 
 Lifecycle tasks remain owned by the app when navigating away; leaving Compose
 does not cancel a command that may already have been accepted by the Engine.
 Context switching is blocked while a lifecycle command is pending. After
 completion Ferrum refreshes read-only status only if the same imported files,
 profiles, validation, and selected context remain current; otherwise refresh
-manually after returning to that configuration. For these `start`, `stop`, and
-`restart` actions, Ferrum records only the static action and `started`,
+manually after returning to that configuration. For `start`, `stop`, `restart`,
+`pause`, and `unpause`, Ferrum records only the static action and `started`,
 `success`, `not_submitted`, or `request_error` outcomes in its best-effort local
-audit history. A `started` record is written before preflight; with no later
+audit history.
+A `started` record is written before preflight; with no later
 terminal outcome, Ferrum exited or final audit persistence failed, and the
 Engine result is unknown. `not_submitted` means preflight/validation,
 service-membership query, or process-spawn failure before the mutation starts;
-a returned failure or timeout after process start is `request_error`. `up`
-instead records post-spawn failures as `uncertain`, as described below. Audit
-persistence failure does not change the operation result.
+a returned failure or timeout after process start is `request_error`. For
+pause/unpause, a post-spawn failure or timeout is uncertain; successful status
+refresh is required before retry. `up` instead records post-spawn failures as
+`uncertain`, as described below. Audit persistence failure does not change the
+operation result.
 During shutdown Ferrum makes a best-effort,
 up-to-one-second flush of the initial audit marker before aborting the lifecycle
 worker. A submitted child may still be terminated, leaving Engine state

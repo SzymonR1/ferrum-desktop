@@ -1580,6 +1580,8 @@ impl FerrumApp {
             compose::ComposeOperationAction::Start => Some(audit::ComposeMutationAction::Start),
             compose::ComposeOperationAction::Stop => Some(audit::ComposeMutationAction::Stop),
             compose::ComposeOperationAction::Restart => Some(audit::ComposeMutationAction::Restart),
+            compose::ComposeOperationAction::Pause => Some(audit::ComposeMutationAction::Pause),
+            compose::ComposeOperationAction::Unpause => Some(audit::ComposeMutationAction::Unpause),
             compose::ComposeOperationAction::Pull | compose::ComposeOperationAction::Build => None,
         };
         let started_record = match audit_action {
@@ -1627,13 +1629,19 @@ impl FerrumApp {
                     submitted: false,
                 },
                 (None, Some(socket_path)) => {
-                    if task.action == compose::ComposeOperationAction::Restart {
+                    if matches!(
+                        task.action,
+                        compose::ComposeOperationAction::Restart
+                            | compose::ComposeOperationAction::Pause
+                            | compose::ComposeOperationAction::Unpause
+                    ) {
                         if let Some(service) = service.as_deref() {
-                            compose::compose_service_restart(
+                            compose::compose_service_action(
                                 &socket_path,
                                 &task.selection.files,
                                 &task.selection.profiles,
                                 service,
+                                task.action,
                             )
                             .await
                         } else {
@@ -5233,6 +5241,18 @@ impl eframe::App for FerrumApp {
         }
         if let Some(service) = compose_actions.restart_service.as_deref() {
             self.compose.request_service_restart_confirmation(service);
+        }
+        if let Some(service) = compose_actions.pause_service.as_deref() {
+            self.compose.request_service_action_confirmation(
+                service,
+                compose::ComposeOperationAction::Pause,
+            );
+        }
+        if let Some(service) = compose_actions.unpause_service.as_deref() {
+            self.compose.request_service_action_confirmation(
+                service,
+                compose::ComposeOperationAction::Unpause,
+            );
         }
         if compose_actions.up_imported {
             self.compose

@@ -209,6 +209,8 @@ pub(super) enum ComposeMutationAction {
     Start,
     Stop,
     Restart,
+    Pause,
+    Unpause,
 }
 
 #[cfg(target_os = "linux")]
@@ -219,6 +221,8 @@ impl ComposeMutationAction {
             Self::Start => "start",
             Self::Stop => "stop",
             Self::Restart => "restart",
+            Self::Pause => "pause",
+            Self::Unpause => "unpause",
         }
     }
 }
@@ -906,6 +910,24 @@ mod tests {
                 "up",
                 "uncertain",
             ),
+            (
+                ComposeMutationAction::Pause,
+                ComposeMutationOutcome::Started,
+                "pause",
+                "started",
+            ),
+            (
+                ComposeMutationAction::Pause,
+                ComposeMutationOutcome::Uncertain,
+                "pause",
+                "uncertain",
+            ),
+            (
+                ComposeMutationAction::Unpause,
+                ComposeMutationOutcome::Success,
+                "unpause",
+                "success",
+            ),
         ];
         let records = tracing::dispatcher::with_default(&dispatcher, || {
             attempts.map(|(action, outcome, _, _)| {
@@ -1381,8 +1403,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("ferrum-audit-{}-{nonce}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-audit-redacted-{}-{nonce}",
+            std::process::id()
+        ));
         fs::create_dir(&root).unwrap();
         let store = AuditStore::new(Arc::new(SettingsStore::at(root.join("settings.toml"))));
         let container_id = "a".repeat(64);
