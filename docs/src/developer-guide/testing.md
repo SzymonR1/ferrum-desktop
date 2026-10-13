@@ -46,6 +46,16 @@ or user project:
 cargo test -p ferrum-app compose::tests::subprocess::local_compose_validation_reads_the_sealed_operation_snapshot -- --exact --ignored
 ```
 
+## Compose up with local images
+
+The confirmed Compose `up` path has controlled fake-CLI and headless UI
+coverage. These regressions exercise the selected ordered file/profile and
+socket arguments, sealed-snapshot submission, confirmation gating, static
+audit outcomes, and failure classification without changing Engine resources.
+The command is not live-validated: no mutating integration test ran because no
+disposable Engine is designated. Fake fixtures do not establish live Docker
+Engine behavior or broader platform support.
+
 Settings tests cover missing/corrupt settings, file-symlink rejection without
 changing target permissions, non-regular and hard-linked file rejection, and
 refusal to chmod or write through symlinked settings directories. The hard-link

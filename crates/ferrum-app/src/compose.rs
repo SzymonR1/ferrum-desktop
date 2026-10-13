@@ -238,6 +238,7 @@ enum ComposeOperationState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ComposeOperationAction {
+    Up,
     Start,
     Stop,
     Restart,
@@ -248,6 +249,7 @@ pub(super) enum ComposeOperationAction {
 impl ComposeOperationAction {
     fn label(self) -> &'static str {
         match self {
+            Self::Up => "up",
             Self::Start => "start",
             Self::Stop => "stop",
             Self::Restart => "restart",
@@ -513,6 +515,7 @@ pub(super) struct ComposeActions {
     pub(super) cancel_follow: bool,
     pub(super) restart_service: Option<String>,
     pub(super) cancel_status: bool,
+    pub(super) up_imported: bool,
     pub(super) start_imported: bool,
     pub(super) stop_imported: bool,
     pub(super) build_imported: bool,
@@ -1938,7 +1941,7 @@ impl ComposeView {
             }
         }
         ui.heading("Imported configuration operations");
-        ui.label("Start or stop affects only the currently selected, imported, and explicitly revalidated local files. Start requires existing containers; it does not create or build. Stop does not remove containers. Restart is offered only for a service in the current successful status snapshot.");
+        ui.label("Create and start uses only existing local images and may create or recreate containers and networks. Start requires existing containers; it does not create. Stop does not remove containers. Restart targets a service in the current status snapshot.");
         let operation_enabled = status_enabled && self.can_start_operation();
         ui.horizontal(|ui| {
             actions.start_imported = ui
@@ -1951,6 +1954,14 @@ impl ComposeView {
                 .add_enabled(
                     operation_enabled,
                     egui::Button::new("Stop imported project"),
+                )
+                .clicked();
+        });
+        ui.horizontal(|ui| {
+            actions.up_imported = ui
+                .add_enabled(
+                    operation_enabled,
+                    egui::Button::new("Create and start (local images)"),
                 )
                 .clicked();
         });
@@ -1994,6 +2005,10 @@ impl ComposeView {
                         ui.label("Compose-file build arguments remain active and may expose secrets; do not store credentials there.");
                         ui.label("Build credential warning");
                         ui.label("Compose-file build.ssh may grant SSH-agent access, while build.secrets may expose configured secret contents to build instructions. Inspect both before building, and never build untrusted project files.");
+                    } else if confirmation.action == ComposeOperationAction::Up {
+                        ui.label("Create/start safety warning");
+                        ui.label("Compose up creates containers and networks and may recreate existing containers when configuration or images change. It runs project configuration and service code on the selected Engine; use only trusted project files.");
+                        ui.label("Only images already present locally are used: --no-build and --pull never prevent builds and registry access. Prepare missing images separately. This command does not remove orphans or volumes.");
                     }
                     if !status_enabled {
                         ui.label(
@@ -2012,7 +2027,10 @@ impl ComposeView {
                     let cancel_label = match confirmation.action {
                         ComposeOperationAction::Pull => "Cancel pull",
                         ComposeOperationAction::Build => "Cancel build",
-                        ComposeOperationAction::Start | ComposeOperationAction::Stop | ComposeOperationAction::Restart => "Cancel lifecycle action",
+                        ComposeOperationAction::Up => "Cancel up confirmation",
+                        ComposeOperationAction::Start
+                        | ComposeOperationAction::Stop
+                        | ComposeOperationAction::Restart => "Cancel lifecycle action",
                     };
                     actions.cancel_operation_confirmation = ui.button(cancel_label).clicked();
                 });
@@ -3802,11 +3820,21 @@ async fn lifecycle_with_binary(
     for profile in profiles {
         command.arg("--profile").arg(profile);
     }
-    command.arg(action.label());
+    if action == ComposeOperationAction::Up {
+        command.args(["up", "--detach", "--no-build", "--pull", "never"]);
+    } else {
+        command.arg(action.label());
+    }
     prepared
         .isolated
         .configure_compose_file_descriptors(&mut command);
-    run_lifecycle_command_with_timeout(&mut command, LIFECYCLE_COMMAND_TIMEOUT).await
+    let submitted_failure = if action == ComposeOperationAction::Up {
+        ComposeOperationError::OperationOutcomeUncertain
+    } else {
+        ComposeOperationError::OperationFailed
+    };
+    run_lifecycle_command_with_timeout(&mut command, LIFECYCLE_COMMAND_TIMEOUT, submitted_failure)
+        .await
 }
 #[cfg(target_os = "linux")]
 fn classify_compose_operation_progress_line(line: &[u8]) -> Option<ComposeOperationProgressPhase> {
@@ -4430,19 +4458,25 @@ async fn service_restart_with_binary(
     prepared
         .isolated
         .configure_compose_file_descriptors(&mut command);
-    run_lifecycle_command_with_timeout(&mut command, LIFECYCLE_COMMAND_TIMEOUT).await
+    run_lifecycle_command_with_timeout(
+        &mut command,
+        LIFECYCLE_COMMAND_TIMEOUT,
+        ComposeOperationError::OperationFailed,
+    )
+    .await
 }
 
 #[cfg(target_os = "linux")]
 async fn run_lifecycle_command_with_timeout(
     command: &mut tokio::process::Command,
     deadline: Duration,
+    submitted_failure: ComposeOperationError,
 ) -> ComposeOperationResult {
     let (outcome, submitted) = match run_command_with_timeout(command, deadline).await {
         Ok(_) => (Ok(()), true),
         Err(CommandFailure::Launch) => (Err(ComposeOperationError::DockerCliMissing), false),
         Err(CommandFailure::Spawn) => (Err(ComposeOperationError::CommandStartFailed), false),
-        Err(_) => (Err(ComposeOperationError::OperationFailed), true),
+        Err(_) => (Err(submitted_failure), true),
     };
     ComposeOperationResult { outcome, submitted }
 }
@@ -6295,7 +6329,8 @@ mod tests {
             assert!(!format!("{result:?}").contains("secret-diagnostic"));
         }
         #[tokio::test]
-        async fn lifecycle_and_pull_use_explicit_ordered_files_profiles_and_isolated_environment() {
+        async fn lifecycle_up_and_pull_use_explicit_ordered_files_profiles_and_isolated_environment()
+         {
             let directory = FixtureDirectory::new();
             let project_directory = directory.path().join("project with spaces");
             fs::create_dir(&project_directory).expect("the project directory should exist");
@@ -6348,6 +6383,18 @@ mod tests {
                    printf '%s\\n' pull >> {}\n\
                    exit 0\n\
                  fi\n\
+                 if [ \"$1\" = --host ] && [ \"${{14}}\" = up ]; then\n\
+                   [ \"$#\" -eq 18 ] || exit 97\n\
+                   case \"$2\" in unix://*) ;; *) exit 98 ;; esac\n\
+                   [ \"$3\" = compose ] || exit 99\n\
+                   [ \"$4\" = --project-directory ] && [ -n \"$5\" ] && [ \"$6\" = --file ] && [ \"$8\" = --file ] || exit 100\n\
+                   case \"$7\" in /proc/self/fd/*) ;; *) exit 101 ;; esac\n\
+                   case \"$9\" in /proc/self/fd/*) ;; *) exit 102 ;; esac\n\
+                   [ \"${{10}}\" = --profile ] && [ \"${{11}}\" = web ] && [ \"${{12}}\" = --profile ] && [ \"${{13}}\" = qa ] || exit 103\n\
+                   [ \"${{14}}\" = up ] && [ \"${{15}}\" = --detach ] && [ \"${{16}}\" = --no-build ] && [ \"${{17}}\" = --pull ] && [ \"${{18}}\" = never ] || exit 104\n\
+                   check_environment\n\
+                   exit 0\n\
+                 fi\n\
                  [ \"$#\" -eq 14 ] || exit 77\n\
                  [ \"$1\" = --host ] && [ \"$2\" = {} ] && [ \"$3\" = compose ] || exit 78\n\
                  [ \"$4\" = --project-directory ] && [ \"$5\" = {} ] && [ \"$6\" = --file ] && [ \"$8\" = --file ] || exit 79\n\
@@ -6372,6 +6419,7 @@ mod tests {
             for (action, expected) in [
                 (ComposeOperationAction::Start, "start"),
                 (ComposeOperationAction::Stop, "stop"),
+                (ComposeOperationAction::Up, "up"),
                 (ComposeOperationAction::Pull, "pull"),
             ] {
                 let result = if action == ComposeOperationAction::Pull {
@@ -6418,15 +6466,61 @@ mod tests {
                 };
                 assert_eq!(result.outcome, Ok(()));
                 assert!(result.submitted, "the lifecycle process started");
-                assert_eq!(
-                    fs::read_to_string(&lifecycle_marker)
-                        .expect("the fixture should record only accepted lifecycle commands")
-                        .lines()
-                        .last(),
-                    Some(expected)
-                );
+                if action != ComposeOperationAction::Up {
+                    assert_eq!(
+                        fs::read_to_string(&lifecycle_marker)
+                            .expect("the fixture should record only accepted lifecycle commands")
+                            .lines()
+                            .last(),
+                        Some(expected)
+                    );
+                }
             }
         }
+        #[tokio::test]
+        async fn compose_up_failure_after_spawn_is_uncertain() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("project");
+            fs::create_dir(&project).unwrap();
+            let file = project.join("compose.yaml");
+            fs::write(&file, "services:\n  web:\n    image: busybox\n").unwrap();
+            let socket = directory.path().join("selected.sock");
+            let binary = directory.path().join("docker-up-failure");
+            let script = r#"#!/bin/sh
+if [ "$1" = compose ]; then
+  if [ "$2" = version ]; then printf 'v5.6.0\n'; else printf 'web\n'; fi
+  exit 0
+fi
+if [ "$1" = --host ]; then
+  for argument do
+    if [ "$argument" = config ]; then printf 'web\n'; exit 0; fi
+  done
+  [ "${14}" = up ] || exit 83
+  exit 7
+fi
+exit 84
+"#;
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+            let result = lifecycle_with_binary(
+                &binary,
+                &socket,
+                &[file],
+                &[],
+                ComposeOperationAction::Up,
+                OsStr::new("/usr/bin"),
+                None,
+            )
+            .await;
+
+            assert_eq!(
+                result.outcome,
+                Err(ComposeOperationError::OperationOutcomeUncertain)
+            );
+            assert!(result.submitted);
+        }
+
         #[tokio::test]
         async fn compose_build_uses_fixed_argv_isolation_and_redacted_progress() {
             let directory = FixtureDirectory::new();
@@ -7204,23 +7298,41 @@ exit 85
             assert!(!format!("{result:?}").contains(&file.display().to_string()));
         }
         #[tokio::test]
-        async fn lifecycle_failure_and_timeout_are_classified_after_submission() {
+        async fn lifecycle_post_spawn_failures_use_operation_specific_outcomes() {
             let directory = FixtureDirectory::new();
 
-            for (mode, deadline) in [
-                ("failure", COMMAND_TIMEOUT),
-                ("timeout", Duration::from_millis(50)),
+            for (mode, deadline, submitted_failure) in [
+                (
+                    "failure",
+                    COMMAND_TIMEOUT,
+                    ComposeOperationError::OperationFailed,
+                ),
+                (
+                    "timeout",
+                    Duration::from_millis(50),
+                    ComposeOperationError::OperationFailed,
+                ),
+                (
+                    "uncertain",
+                    COMMAND_TIMEOUT,
+                    ComposeOperationError::OperationOutcomeUncertain,
+                ),
             ] {
                 let binary = directory.path().join(format!("docker-lifecycle-{mode}"));
                 let script = "#!/bin/sh\n\
-                     case \"$0\" in *failure) exit 7 ;; *timeout) sleep 1 ;; esac\n\
+                     case \"$0\" in *failure|*uncertain) exit 7 ;; *timeout) sleep 1 ;; esac\n\
                      exit 0\n";
                 fs::write(&binary, script).expect("the fake Docker CLI should be written");
                 fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
                     .expect("the fake Docker CLI should be executable");
                 let mut command = tokio::process::Command::new(&binary);
-                let result = run_lifecycle_command_with_timeout(&mut command, deadline).await;
-                assert_eq!(result.outcome, Err(ComposeOperationError::OperationFailed));
+                let result = run_lifecycle_command_with_timeout(
+                    &mut command,
+                    deadline,
+                    submitted_failure.clone(),
+                )
+                .await;
+                assert_eq!(result.outcome, Err(submitted_failure));
                 assert!(
                     result.submitted,
                     "the lifecycle process started before {mode}"
@@ -7230,7 +7342,12 @@ exit 85
             let unlaunchable = directory.path().join("docker-lifecycle-unlaunchable");
             fs::create_dir(&unlaunchable).expect("the non-executable test path should exist");
             let mut command = tokio::process::Command::new(&unlaunchable);
-            let result = run_lifecycle_command_with_timeout(&mut command, COMMAND_TIMEOUT).await;
+            let result = run_lifecycle_command_with_timeout(
+                &mut command,
+                COMMAND_TIMEOUT,
+                ComposeOperationError::OperationFailed,
+            )
+            .await;
             assert_eq!(
                 result.outcome,
                 Err(ComposeOperationError::CommandStartFailed)
@@ -7255,7 +7372,12 @@ exit 85
 
             let missing = directory.path().join("missing-docker-command");
             let mut command = tokio::process::Command::new(missing);
-            let result = run_lifecycle_command_with_timeout(&mut command, COMMAND_TIMEOUT).await;
+            let result = run_lifecycle_command_with_timeout(
+                &mut command,
+                COMMAND_TIMEOUT,
+                ComposeOperationError::OperationFailed,
+            )
+            .await;
             assert_eq!(result.outcome, Err(ComposeOperationError::DockerCliMissing));
             assert!(!result.submitted, "a missing CLI did not submit a process");
         }
@@ -9004,6 +9126,60 @@ exit 85
             );
             assert!(harness.state_mut().view.confirm_operation().is_none());
         }
+        #[test]
+        fn up_confirmation_warns_and_cancel_does_not_create_a_task() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("Local label"));
+            let mut harness = harness_for(view);
+            harness.run();
+            harness
+                .get_by_role_and_label(Role::Button, "Create and start (local images)")
+                .click_accesskit();
+            harness.step();
+            assert!(harness.state().actions.up_imported);
+            assert!(
+                harness
+                    .state_mut()
+                    .view
+                    .request_operation_confirmation(ComposeOperationAction::Up)
+            );
+            harness.step();
+            let _warning =
+                harness.get_by_role_and_label(Role::Label, "Create/start safety warning");
+            let _local_images = harness.get_by_role_and_label(
+                Role::Label,
+                "Only images already present locally are used: --no-build and --pull never prevent builds and registry access. Prepare missing images separately. This command does not remove orphans or volumes.",
+            );
+            let _confirmation = harness.get_by_role_and_label(Role::Button, "Confirm up");
+            harness
+                .get_by_role_and_label(Role::Button, "Cancel up confirmation")
+                .click_accesskit();
+            harness.step();
+            assert!(harness.state().actions.cancel_operation_confirmation);
+            assert!(
+                harness
+                    .state_mut()
+                    .view
+                    .cancel_operation_confirmation()
+                    .is_some()
+            );
+            assert!(harness.state_mut().view.confirm_operation().is_none());
+
+            assert!(
+                harness
+                    .state_mut()
+                    .view
+                    .request_operation_confirmation(ComposeOperationAction::Up)
+            );
+            let task = harness
+                .state_mut()
+                .view
+                .confirm_operation()
+                .expect("the confirmed imported selection should create an up task");
+            assert_eq!(task.action, ComposeOperationAction::Up);
+            assert!(task.cancellation.is_none());
+            assert!(task.cancellation_sender.is_none());
+        }
 
         #[test]
         fn confirmed_pull_shows_live_progress_and_cancel_keeps_operation_running() {
@@ -9139,7 +9315,11 @@ exit 85
         }
         #[test]
         fn lifecycle_confirmation_rejects_changed_files_profiles_or_validation() {
-            for action in [ComposeOperationAction::Pull, ComposeOperationAction::Build] {
+            for action in [
+                ComposeOperationAction::Up,
+                ComposeOperationAction::Pull,
+                ComposeOperationAction::Build,
+            ] {
                 for change in 0..4 {
                     let mut view = validated_compose_view();
                     assert!(view.import_current_project("Local label"));

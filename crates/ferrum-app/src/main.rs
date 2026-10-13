@@ -1576,6 +1576,7 @@ impl FerrumApp {
         let cancellation_receiver = task.cancellation;
         self.compose_operation_cancellation = task.cancellation_sender;
         let audit_action = match task.action {
+            compose::ComposeOperationAction::Up => Some(audit::ComposeMutationAction::Up),
             compose::ComposeOperationAction::Start => Some(audit::ComposeMutationAction::Start),
             compose::ComposeOperationAction::Stop => Some(audit::ComposeMutationAction::Stop),
             compose::ComposeOperationAction::Restart => Some(audit::ComposeMutationAction::Restart),
@@ -1695,6 +1696,11 @@ impl FerrumApp {
             let record = if let Some(action) = audit_action {
                 let outcome = if result.outcome.is_ok() {
                     audit::ComposeMutationOutcome::Success
+                } else if result.submitted
+                    && result.outcome
+                        == Err(compose::ComposeOperationError::OperationOutcomeUncertain)
+                {
+                    audit::ComposeMutationOutcome::Uncertain
                 } else if result.submitted {
                     audit::ComposeMutationOutcome::RequestError
                 } else {
@@ -5228,7 +5234,10 @@ impl eframe::App for FerrumApp {
         if let Some(service) = compose_actions.restart_service.as_deref() {
             self.compose.request_service_restart_confirmation(service);
         }
-        if compose_actions.start_imported {
+        if compose_actions.up_imported {
+            self.compose
+                .request_operation_confirmation(compose::ComposeOperationAction::Up);
+        } else if compose_actions.start_imported {
             self.compose
                 .request_operation_confirmation(compose::ComposeOperationAction::Start);
         } else if compose_actions.stop_imported {

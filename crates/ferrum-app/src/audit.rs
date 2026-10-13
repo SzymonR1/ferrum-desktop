@@ -205,6 +205,7 @@ pub(super) fn record_container_action_result(
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 pub(super) enum ComposeMutationAction {
+    Up,
     Start,
     Stop,
     Restart,
@@ -214,6 +215,7 @@ pub(super) enum ComposeMutationAction {
 impl ComposeMutationAction {
     fn label(self) -> &'static str {
         match self {
+            Self::Up => "up",
             Self::Start => "start",
             Self::Stop => "stop",
             Self::Restart => "restart",
@@ -226,6 +228,7 @@ impl ComposeMutationAction {
 pub(super) enum ComposeMutationOutcome {
     Started,
     Success,
+    Uncertain,
     NotSubmitted,
     RequestError,
 }
@@ -237,6 +240,7 @@ impl ComposeMutationOutcome {
             Self::Started => "started",
             Self::Success => "success",
             Self::NotSubmitted => "not_submitted",
+            Self::Uncertain => "uncertain",
             Self::RequestError => "request_error",
         }
     }
@@ -270,8 +274,15 @@ pub(super) fn record_compose_mutation_result(
                 action = action.label(),
                 outcome = outcome_label,
                 "Compose lifecycle command did not complete successfully"
-            )
+            );
         }
+        ComposeMutationOutcome::Uncertain => tracing::warn!(
+            target: "ferrum::audit",
+            audit_event = "compose_mutation",
+            action = action.label(),
+            outcome = outcome_label,
+            "Compose lifecycle command outcome is uncertain"
+        ),
     }
     AuditRecord::new(
         "compose_mutation",
@@ -876,6 +887,24 @@ mod tests {
                 ComposeMutationOutcome::RequestError,
                 "start",
                 "request_error",
+            ),
+            (
+                ComposeMutationAction::Up,
+                ComposeMutationOutcome::Started,
+                "up",
+                "started",
+            ),
+            (
+                ComposeMutationAction::Up,
+                ComposeMutationOutcome::Success,
+                "up",
+                "success",
+            ),
+            (
+                ComposeMutationAction::Up,
+                ComposeMutationOutcome::Uncertain,
+                "up",
+                "uncertain",
             ),
         ];
         let records = tracing::dispatcher::with_default(&dispatcher, || {
