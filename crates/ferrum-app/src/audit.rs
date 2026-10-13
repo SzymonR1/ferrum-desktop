@@ -205,6 +205,7 @@ pub(super) fn record_container_action_result(
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 pub(super) enum ComposeMutationAction {
+    Scale,
     Up,
     Start,
     Stop,
@@ -218,6 +219,7 @@ impl ComposeMutationAction {
     fn label(self) -> &'static str {
         match self {
             Self::Up => "up",
+            Self::Scale => "scale",
             Self::Start => "start",
             Self::Stop => "stop",
             Self::Restart => "restart",
@@ -262,7 +264,7 @@ pub(super) fn record_compose_mutation_result(
             audit_event = "compose_mutation",
             action = action.label(),
             outcome = outcome_label,
-            "Compose lifecycle attempt started"
+            "Compose mutation attempt started"
         ),
         ComposeMutationOutcome::Success => tracing::info!(
             target: "ferrum::audit",
@@ -857,6 +859,36 @@ mod tests {
         let dispatcher = tracing::Dispatch::new(subscriber);
         let attempts = [
             (
+                ComposeMutationAction::Scale,
+                ComposeMutationOutcome::Started,
+                "scale",
+                "started",
+            ),
+            (
+                ComposeMutationAction::Scale,
+                ComposeMutationOutcome::Success,
+                "scale",
+                "success",
+            ),
+            (
+                ComposeMutationAction::Scale,
+                ComposeMutationOutcome::NotSubmitted,
+                "scale",
+                "not_submitted",
+            ),
+            (
+                ComposeMutationAction::Scale,
+                ComposeMutationOutcome::Uncertain,
+                "scale",
+                "uncertain",
+            ),
+            (
+                ComposeMutationAction::Scale,
+                ComposeMutationOutcome::RequestError,
+                "scale",
+                "request_error",
+            ),
+            (
                 ComposeMutationAction::Start,
                 ComposeMutationOutcome::Started,
                 "start",
@@ -945,6 +977,8 @@ mod tests {
             assert!(!record.contains("project"));
             assert!(!record.contains("path"));
             assert!(!record.contains("service"));
+            assert!(!record.contains("count"));
+            assert!(!record.contains("target"));
             assert!(!record.contains("diagnostic"));
         }
         let captured = match writer.0.lock() {
@@ -961,6 +995,8 @@ mod tests {
             assert!(!line.contains("label="));
             assert!(!line.contains("path="));
             assert!(!line.contains("project="));
+            assert!(!line.contains("count="));
+            assert!(!line.contains("target="));
         }
     }
     #[cfg(target_os = "linux")]

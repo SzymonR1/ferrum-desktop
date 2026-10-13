@@ -3,6 +3,40 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Added confirmed one-service Compose scaling for the current imported,
+  explicitly revalidated ordered files/profiles on the selected Linux local
+  Docker Unix socket. Validation keeps the selected-profile service list for
+  existing lifecycle eligibility and obtains a separate `--profile '*'
+  config --services` inventory for all declared services. One all-profile
+  `ps --all` snapshot supplies page status and accurate scale counts, including
+  stopped containers; revalidation clears prior status/counts and requires a
+  fresh refresh after validation before status-gated actions. The UI offers
+  one initially blank control per declared service, including inactive-profile
+  services, with integer targets 1–32; scale-to-zero and project-wide scaling
+  are unavailable. The worker revalidates sealed files with the
+  selected profiles, checks all-profile service membership/count, then submits
+  exact `up --detach --no-build --pull never --no-deps --scale SERVICE=N
+  SERVICE` argv without any global `--profile` flag. Explicit target activation
+  does not start same-profile siblings. Confirmation warns that `up` can start
+  stopped containers and run configured service code on the selected Engine;
+  removal or configuration/image-driven recreation discards writable-layer changes, and
+  mounted volumes follow Compose semantics. No build, pull, volume/orphan
+  removal, or force recreation is requested. Submitted failures/timeouts remain
+  uncertain and require successful status refresh before retry; explicit
+  cancellation or page/context invalidation records static
+  `scale/not_submitted`. Audit excludes
+  service, project, count, path, profile, socket, and output data. The ignored
+  live smoke now uses a unique project with a profile-gated target and
+  same-profile sibling, preflights project/network absence, uses a preinstalled
+  image without mounts/ports/pull/build, and attempts scoped non-force,
+  non-prune, non-volume cleanup. The smoke passed on 2026-10-13 against Docker
+  Engine 29.9.0/API 1.56 and Compose v5.6.0; the same-profile sibling remained
+  absent and the generated project containers were cleaned. No broader
+  platform support or full Issue #18 completion is claimed.
+  Compose audit writes use one 32-entry bounded FIFO; operations fail closed
+  before submission when a start marker cannot be queued. Cancellation audit
+  remains best-effort if the queue or durable store is unavailable, and shutdown
+  attempts a bounded drain of accepted records.
 - Added confirmed service-scoped Compose pause/unpause for the current imported,
   successfully revalidated ordered files/profiles on the selected Linux local
   Docker Unix socket. Pause is offered only for a declared service with a

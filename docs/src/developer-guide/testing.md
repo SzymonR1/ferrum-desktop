@@ -68,10 +68,11 @@ cargo test -p ferrum-engine connection_handshake_tests
 ## Compose mutation input snapshots
 
 Confirmed Compose mutations use the same write-sealed memfd descriptors for
-preflight validation and the submitted command; service restart also reuses
-them for its fresh read-only status query. A controlled fake-CLI regression
-replaces selected source files after preflight and verifies the operation still
-receives the bytes that were validated. Run it with:
+preflight validation and the submitted command; service restart and scale also
+reuse them for the fresh read-only status query.
+A controlled fake-CLI regression replaces selected source files after preflight
+and verifies the operation still receives the bytes that were validated. Run
+it with:
 
 ```sh
 cargo test -p ferrum-app compose::tests::subprocess::compose_mutation_uses_the_validated_file_snapshot -- --exact
@@ -106,6 +107,45 @@ networks, or volumes.
 No live mutation was run because no disposable Engine is designated. There is
 no native visual validation, and these tests do not establish Podman, remote,
 Windows, or macOS support or full completion of Issues #18/#19.
+
+The controlled fake-CLI and headless regressions cover one accessible control
+per all-declared service rather than per replica row; inactive-profile services
+are included, and all-profile `ps --all` counts include stopped containers.
+Regular lifecycle eligibility remains selected-profile-only. Tests cover target
+bounds, undeclared services, selected-profile validation and all-profile status
+argv versus profile-free scale `up` argv, exact
+`up --detach --no-build --pull never --no-deps --scale SERVICE=N SERVICE`
+arguments, sibling safety, stale confirmation counts, sealed-file validation,
+fresh same-socket status, uncertain retries, and revalidation invalidating
+status/counts until a fresh refresh. Headless confirmation regressions cover
+stopped-container starts, configured service code execution, writable-layer loss
+on configuration/image-driven recreation, and mounted-volume semantics.
+Explicit cancel and page/context invalidation tests assert static
+`scale/not_submitted` audit data without dynamic operation metadata.
+
+The optional ignored live test preflights that a unique generated project and
+its default network are unused, then scales the profile-gated `scale-probe`
+service up to exactly two replicas and down to one. A same-profile sibling
+service verifies that explicit target activation does not start siblings. It
+uses an already-installed `FERRUM_TEST_IMAGE` with `/bin/sleep`, no host mounts
+or published ports, and requests no pull or build. Read-only inventory/status
+and generated-project cleanup may use `--profile '*'`; scale mutations never
+do. A scoped cleanup runs `compose down` only with the generated project name,
+directory, and known Compose file; it does not force-remove, prune, or remove
+volumes:
+
+```sh
+env -u DOCKER_HOST DOCKER_CONTEXT=default FERRUM_TEST_IMAGE=ghcr.io/catthehacker/ubuntu:rust-latest cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_service_scale_scales_and_cleans_only_verified_project -- --exact --ignored
+```
+
+The test passed on 2026-10-13 against Fedora Linux 44 x86_64, Docker Engine
+29.9.0/API 1.56, and Compose v5.6.0 via the local `default` Unix-socket
+context: one test passed, the target reached two replicas and downscaled to one,
+the same-profile sibling remained absent, and scoped cleanup succeeded with no
+generated-project containers left. This is one Linux local Docker smoke, not
+general engine/platform support. Do not run it against an Engine containing
+valuable resources; it remains opt-in and touches only its preflighted,
+uniquely named generated project.
 
 ## Compose up with local images
 

@@ -30,14 +30,16 @@ never persisted.
 
 Compose support includes read-only Docker CLI version/project discovery,
 explicit structural validation of a user-selected local base file followed by
-ordered local overrides, and a bounded declared-service inventory from the
-successful validation command on Linux. `config --services` includes every
-service declared in the selected files, including inactive profile-gated
-services; it is not filtered by selected profiles. It also supports read-only
-status for containers already associated with selected files. Files are limited
-to 16 total. Docker merges `-f` files in supplied order; relative paths resolve
-from the first/base config or `--project-directory`, which Ferrum sets to the
-base file's parent. See Docker's [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
+ordered local overrides, and two bounded read-only declared-service inventories
+from successful validation on Linux. The selected-profile `config --services`
+list preserves existing lifecycle eligibility; a separate
+`config --profile '*' --services` query supplies all declared services for
+inventory/scale, including inactive-profile services. Status reports existing
+containers for selected files; it does not establish that the configuration has
+no other services. Files are limited to 16 total. Docker merges `-f` files in
+supplied order; relative paths resolve from the first/base config or
+`--project-directory`, which Ferrum sets to the base file's parent. See Docker's
+[Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose)
 for ordered merge/path semantics and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
 for `config --no-interpolate --no-env-resolution --services`.
 On Linux, explicitly selected base and override files have a combined 16 MiB
@@ -49,8 +51,9 @@ the original selected paths for validation, so the contents read may differ
 from those measured by the check. The check does not include local files read
 through `include` or service `extends.file`.
 Linux Compose subprocesses for version, discovery, validation, status, one-shot
-and live service-log queries, and start/stop/restart have per-process `RLIMIT_AS`
-of 4 GiB and `RLIMIT_DATA` of 512 MiB, preserving lower inherited limits.
+and live service-log queries, start/stop/restart/scale/up have per-process
+`RLIMIT_AS` of 4 GiB and `RLIMIT_DATA` of 512 MiB, preserving lower inherited
+limits.
 These limits apply
 while Compose reads selected and included files. They are inherited by child
 processes and bound each process, not aggregate process-tree RSS; they are not a
@@ -72,25 +75,35 @@ permissions, potentially outside the base directory. Remote Git/OCI loaders
 are disabled. The selected files and private CLI environment do not sandbox
 those reads; validate only trusted files. Explicit profiles affect validation,
 read-only status, one-shot service logs and live service-log follow, and imported
-configuration start/stop/restart/pull/up. The declared-service inventory
-includes every service regardless of active profiles. Lifecycle is available
-only for the currently selected, session-imported, explicitly revalidated
-files/profiles and the selected local Docker Unix socket. Before service
-restart Ferrum additionally requires the service to appear in the successful
-current status snapshot, revalidates the files/profiles, and makes a fresh
-read-only `compose ps --all --format json` query on the same socket before
-mutation. Failure or absent membership submits no restart. The import label and
-engine-reported `Project` metadata do not establish identity or authorization.
+configuration start/stop/restart/scale/pull/up. Lifecycle is available only for
+the currently selected, session-imported, explicitly revalidated files/profiles
+and the selected local Docker Unix socket. Existing service actions retain
+selected-profile service eligibility. Status and scale counts use read-only
+selected-profile and `--profile '*'` `ps --all --format json` queries so
+inactive-profile and stopped containers are counted without changing service
+action eligibility. Before service restart Ferrum requires current status
+membership, revalidates the files/profiles, and makes a fresh selected-profile
+status query on the same socket before mutation. Failure or absent membership
+submits no restart. The import label and engine-reported `Project` metadata do
+not establish identity or authorization.
 Compose `start` starts existing containers; `stop` does not remove them.
 Service restart invokes only `restart --no-deps <SERVICE>`; Docker Compose
-restart does not apply Compose configuration changes. These lifecycle
-operations do not build, pull, remove resources, or persist project storage.
-Confirmed pulls and `up` are separate operations described below. Navigation
+restart does not apply configuration changes. These lifecycle operations do
+not build, pull, remove resources, or persist project storage. Confirmed scale,
+pull, and `up` are separate operations described below. Navigation
 does not cancel submitted lifecycle work; its redacted result is retained for
 the session. A static `started` audit entry precedes preflight; without a later
 terminal outcome, the final state is unknown and must be reconciled by
 refreshing the current project status. Issues #18 and #19 remain partial/open;
 issue #10 remains blocked/open.
+
+Compose audit entries, including terminal outcomes, pass through one 32-entry
+bounded FIFO. Saturation prevents an operation from being submitted when its
+`started` marker cannot be queued; cancellation records remain best-effort if
+the queue is full. Durable store failures are logged without operation data.
+Shutdown closes the queue and gives the writer a bounded drain interval, so a
+write in progress or a terminal enqueue waiting for capacity may be lost; this
+local log is not a complete or tamper-proof ledger.
 
 Saved Compose registrations are an explicit local opt-in in the existing
 descriptor-pinned settings store, not a second persistence layer. Each stores a
@@ -106,32 +119,32 @@ not files or resources. Persisting paths neither reads project contents nor
 confines paths. Compose may read referenced files under the user's permissions,
 so validate only trusted projects.
 
-The service inventory comes from that same validation command, so no additional
-CLI process or Engine request is made. It accepts at most 128 KiB of service
-output, 1024 rows, and 128 bytes per name; malformed or duplicate output fails
+The service inventory uses separate selected-profile and all-profile Compose
+CLI queries. The latter uses `--profile '*' config --services` to include every
+declared service, including inactive profiles. Each response is capped at 128
+KiB, 1024 rows, and 128 bytes per name; malformed or duplicate output fails
 with a static error. Escaped service names are shown in a bounded virtualized
-list. This is a local CLI/file-derived list of every service declared in the
-selected files, including profile-gated services regardless of the active
-profile set; it is not container status. An empty list means no service names
-were returned for these selected files. It never triggers status/log queries or
-Engine requests.
+list. This is local CLI/file-derived data, not container status; these queries
+make no Engine requests.
 No release or broader support claim is made.
 
 Status is available only after selected files pass structural validation and a
-local Docker Unix socket is connected. Ferrum runs
-`docker --host unix://<selected-socket> compose --project-directory <base-parent> --file ... ps --all --format json`.
-The query is read-only; it does not create, start, stop, remove, or change
-containers or project files. `--all` includes stopped containers and Compose's
-default orphan inclusion is preserved. Ferrum retains bounded, escaped
-container name, service, optional per-container `Project` metadata, state, and
-optional health; when `Project` is omitted, the UI shows `Not reported`. Values
-may vary row by row. The Project value is untrusted engine-reported display
-metadata only; it does not establish file ownership, canonical identity,
-authentication, or authorization and is never used for lifecycle operations.
-Ferrum discards IDs, commands, published ports, exit codes, and unknown fields.
-Empty output means no existing containers matched the isolated project
-selection, not that the file declares no services. Status is a manually
-refreshed point-in-time snapshot.
+local Docker Unix socket is connected. Ferrum runs one read-only `compose`
+status query with global `--profile '*'` and `ps --all --format json` on that
+socket. It includes inactive-profile services; `--all` includes stopped
+containers and Compose's default orphan inclusion is preserved. This result is
+authoritative for the page and scale counts. Regular service actions remain
+selected-profile-gated, and their workers recheck selected-profile status.
+The query does not create, start, stop, remove, or change containers or project
+files. Ferrum retains bounded, escaped container name, service, optional
+per-container `Project` metadata, state, and optional health; when `Project` is
+omitted, the UI shows `Not reported`. Values may vary row by row. The Project
+value is untrusted engine-reported display metadata only; it does not establish
+file ownership, canonical identity, authentication, or authorization and is
+never used for lifecycle operations. Ferrum discards IDs, commands, published
+ports, exit codes, and unknown fields. Empty output means no existing
+containers matched the isolated project selection, not that the file declares
+no services. Status is a manually refreshed point-in-time snapshot.
 
 Status uses a private CLI configuration, clears inherited shell variables, and
 sets `COMPOSE_DISABLE_ENV_FILE=1`. Environment-dependent projects may fail or
@@ -238,17 +251,23 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   diagnostics private; display only a bounded escaped basename and static result.
 - Accept optional comma-separated Compose profiles for validation, read-only
   status, one-shot service logs and live follow, and imported-configuration
-  start/stop/restart/pull/up.
-  Limit input to 1024 UTF-8 bytes, 16 profiles, and 64 UTF-8 bytes per name.
-  Trim outer whitespace per token; blank means no explicit profiles. Reject
-  empty entries and duplicate names. Accept `[A-Za-z0-9][A-Za-z0-9_.-]+` names
-  and standalone `*`; pass each as its own `--profile <name>` argv before
-  `config`, `ps`, `logs`, `start`, `stop`, `restart`, `pull`, or `up`, never
-  through an environment variable. Use the same selected profiles for the
-  immediate status rechecks before one-shot logs and live follow. Invalid or
-  changed selection clears validation/status/log output, cancels read-only/
-  follow tasks, and requires revalidation; already-submitted mutations are not
-  cancelled.
+  start/stop/restart/pull/up/scale. Validation retains selected-profile
+  services for existing lifecycle eligibility and separately queries all
+  declared services with `--profile '*' config --services`. Status/counts use
+  read-only selected-profile and all-profile `ps --all` queries. Limit input to
+  1024 UTF-8 bytes, 16 profiles, and 64 UTF-8 bytes per name. Trim outer
+  whitespace per token; blank means no explicit profiles. Reject empty entries
+  and duplicate names. Accept `[A-Za-z0-9][A-Za-z0-9_.-]+` names and standalone
+  `*`; pass each selected profile as its own `--profile <name>` argv before
+  validation/status/log/lifecycle commands, never through an environment
+  variable. Scale `up` is the exception: omit all global `--profile` flags so
+  explicitly targeting one profile-gated service activates that service alone,
+  not its profile siblings. Use selected profiles for regular service-action
+  status rechecks. Invalid or changed selection clears validation/status/log
+  output and cancels read-only/follow tasks. Starting file revalidation also
+  invalidates old status/counts and aborts in-flight status/log/follow tasks;
+  after validation succeeds, require a fresh status query before status-gated
+  actions. Already-submitted mutations are not cancelled.
 - Keep private Docker config/HOME, cleared allowlisted environment, disabled
   selected-project `.env`, and disabled remote Git/OCI loaders. An explicitly
   opted-in persistent registration stores only a unique bounded label, ordered
@@ -261,25 +280,25 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   revalidation. Forget removes only the registration and leaves the current
   entry session-only. Persisted paths are not confined and project contents
   are not read during save.
-  The label is not project identity or authorization. Only the currently
-  selected imported registration after successful explicit revalidation can
-  start/stop/restart/pull/up. Revalidate before each operation; failure must
-  prevent the requested operation.
-  Restart additionally requires current
-  successful status membership and a fresh status query with the same selected
-  local Docker Unix socket before mutation. The current socket, ordered files,
-  profiles, and base-parent directory scope operations, not the local label or
-  engine-reported `Project` metadata. Docker `start` starts existing containers;
-  `stop` does not remove them. Restart uses only
-  `restart --no-deps <SERVICE>`; Compose restart does not apply configuration
-  changes. These start/stop/restart operations do not build, bring the project
-  up or down, remove resources, or persist project storage. Confirmed pull and
-  `up` are separate operations. Pull is limited to selected imported, explicitly
-  revalidated files and profiles on the current local Docker Unix socket. It
-  uses a private config/HOME and cleared environment; saved Docker credentials/
-  helpers are not read, and private registries may reject anonymous pulls. The
-  operation downloads images only and does not build or change project
-  containers, networks, or volumes.
+Only the currently selected imported registration after successful explicit
+revalidation can start/stop/restart/scale/pull/up. Revalidate before each
+operation; failure must prevent the requested operation. Restart additionally
+requires current successful status membership and a fresh selected-profile
+status query with the same local Docker Unix socket before mutation. Scale
+requires all-declared-service membership and an observed count matching a fresh
+all-profile `ps --all` query, in addition to selected-profile snapshot
+validation/status; the mutating `up` has no `--profile` flags. The current
+socket, ordered files, profiles, and base-parent directory scope operations,
+not the local label or engine-reported `Project` metadata. Docker `start` starts
+existing containers; `stop` does not remove them. Restart uses only
+`restart --no-deps <SERVICE>`; Compose restart does not apply configuration
+changes. Start/stop/restart do not build, pull, remove resources, or persist
+project storage. Confirmed pull, scale, and `up` are separate operations.
+Pull is limited to selected imported, explicitly revalidated files and profiles
+on the current local Docker Unix socket. It uses a private config/HOME and
+cleared environment; saved Docker credentials/helpers are not read, and private
+registries may reject anonymous pulls. Pull changes the selected Engine's image
+store but does not build or change project containers, networks, or volumes.
   Progress retains only allowlisted phases/counts; combined stdout/stderr is
   capped at 1 MiB, and raw CLI output is not shown or persisted. Preflight
   cancellation submits no pull. After submission, cancellation, timeout, or
@@ -340,6 +359,43 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   Remote references remain disabled and are not fetched. Existing temporary-
   file/status smokes do not validate arbitrary projects. Native page visual
   check is unavailable.
+- Allow confirmed service-scoped Compose scaling only for the current imported
+  selection after ordered files/profiles are explicitly revalidated and a
+  successful all-profile `ps --all` snapshot is available. Beginning
+  revalidation clears prior status/container/count caches; refresh status again
+  after validation before showing scale controls. Provide one control per
+  all-declared service, including inactive profile services, use the
+  all-profile observed count including stopped containers, and leave the target
+  blank until the user enters an integer 1–32; disable every Scale button while
+  the target is empty or invalid.
+  Confirm the imported local label (not project identity), service, current
+  count, and target. Warn about excess-container removal, creation, and that
+  selected configuration/image differences may recreate containers. State that
+  removal/recreation loses container writable-layer data while mounted volumes
+  follow Compose semantics; `up` can start stopped containers and run configured
+  service code on the selected Engine. State that dependencies are not started
+  and a profile-gated target is activated without enabling sibling services.
+  Snapshot selected files into write-sealed descriptors, revalidate them with
+  the selected profiles, and recheck membership/all-profile `ps --all` count
+  immediately before fixed `up --detach --no-build --pull never --no-deps
+  --scale SERVICE=N SERVICE` argv. The mutating `up` must not receive global
+  `--profile` flags; explicit service targeting activates only its required
+  profile. Do not request build, pull, volume/orphan removal, or force
+  recreation. The operation is Linux local Docker Compose CLI only, bounded to
+  30 seconds, using the isolated CLI environment and child limits. Any submitted
+  error, timeout, or cancellation is uncertain; require successful status
+  refresh before retry. Explicit cancellation or invalidation while leaving
+  Compose/switching context records only static `scale/not_submitted`; audit
+  excludes target/count, service, project label, file/profile/socket data, and
+  output.
+  The ignored live smoke uses a unique generated project with a profile-gated
+  target and same-profile sibling, preflights project/network absence, and
+  verifies only the target starts/scales. It uses a preinstalled image, no
+  mounts/ports/pull/build, then attempts generated-project-scoped `down` without
+  force, prune, or volume removal. This smoke passed on 2026-10-13 against
+  Docker Engine 29.9.0/API 1.56 and Compose v5.6.0; it validates only one
+  generated-project scenario and not broad Engine/platform support. Issue #18
+  remains partial/open.
 - Render engine-provided strings and inspection details as plain text; do not interpret metadata as markup or commands. Inspection details omit environment variables, labels, and command arguments.
 - Escape selected control, bidi, zero-width, invisible-format, Hangul-filler,
   and Unicode-tag characters in engine-provided container inventory/inspection
@@ -579,25 +635,26 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
 - Podman API compatibility and rootless endpoint discovery; issue #10 remains open for these and the broader engine matrix.
 - Confirmed Compose mutations copy the explicitly selected base and ordered
   overrides into write-sealed Linux memfds before validation. Validation,
-  submitted action, and restart status share those descriptors and the original
-  project directory. No named on-disk copy is created, but host swap or core
-  dumps may retain memory pages. This binds only explicitly selected files;
-  transitive local inputs remain live, uncontained, and unsandboxed.
+  submitted action, and service-action/scale status share those descriptors and
+  the original project directory. No named on-disk copy is created, but host
+  swap or core dumps may retain memory pages. This binds only explicitly
+  selected files; transitive local inputs remain live, uncontained, and
+  unsandboxed.
 - Compose `.env`/service `env_file` and recursive local `include`/`extends.file`
   sources remain trust risks. Remote OCI/Git loaders are disabled for every
   Compose CLI invocation. Session imports retain path/profile metadata and a
   local label in memory only; explicit saved
   registrations persist only validated labels, ordered absolute paths, and
-  profiles as described above. Compose `up`/`down`, removal, and project-file
+  profiles as described above. Compose `down`, resource removal, and project-file
   mutation remain deferred. Pulls are limited to the confirmed anonymous
   local-Docker operation described above; authenticated Compose pulls and remote
   engines remain unsupported. Confirmed Compose build is supported only for
   selected imported, revalidated files/profiles on the selected local Docker
   socket as described above; arbitrary credentials and remote engines remain
-  unsupported. Scoped start/stop and a confirmed service-scoped restart are
-  available only for a selected imported and revalidated configuration;
-  restart also requires current and freshly rechecked status membership. The
-  bounded one-shot service log snapshot is implemented as described above.
+  unsupported. Scoped start/stop, service restart, and one-service scale are
+  available only for a selected imported and revalidated configuration. Restart
+  and scale also require current and freshly rechecked status membership/count.
+  The bounded one-shot service log snapshot is implemented as described above.
 - The explicit local Docker CLI Buildx invocation is an added external build process. Other external process integrations, archive extraction, and file-path surfaces remain deferred.
 - Ferrum-managed credential persistence and helper integrations beyond the
   Linux Secret Service/`pass` choices; authenticated Podman/remote-engine
