@@ -4,12 +4,12 @@ The Compose page provides read-only project discovery, structural validation of
 a local base file with ordered overrides, a list of every service declared in
 the selected files (including profile-gated services regardless of active
 profiles), and read-only status for existing containers. It also supports
-explicit imported-configuration `start`/`stop` and single-service `restart`
-operations for the current imported, revalidated selection. The declared-
-service list is local Compose CLI/file-derived and does not query an Engine;
-it is separate from running-container status. Import labels are local display
-labels, never Engine-discovered project identities; imports are session-only
-unless explicitly saved below.
+explicit imported-configuration start/stop, single-service
+restart/pause/unpause, and bounded one-service scaling for the current imported,
+revalidated selection. The declared-service list is local Compose CLI/file-
+derived and does not query an Engine; it is separate from running-container
+status. Import labels are local display labels, never Engine-discovered project
+identities; imports are session-only unless explicitly saved below.
 Project discovery uses Docker's Compose CLI:
 
 - `docker compose version --short`
@@ -144,8 +144,9 @@ and sets `COMPOSE_EXPERIMENTAL_GIT_REMOTE=false` and
 by Ferrum itself; included projects may still read their default `.env` and
 explicit `include.env_file` under the logged-in user's permissions. Discovery,
 validation, status, and one-shot log subprocesses have an eight-second deadline
-per command; imported start/stop/restart/up mutations have a 30-second command
-bound after validation (restart also has a separate eight-second status check).
+per command; imported start/stop/restart/pause/unpause/up/scale mutations use
+the 30-second lifecycle deadline (restart also has a separate eight-second
+status check).
 Each call has a 1 MiB stdout cap; raw stderr and diagnostics are discarded.
 
 CLI processes use a private isolated Docker config and `HOME` with a cleared
@@ -307,6 +308,49 @@ endpoint values, raw diagnostics, and project metadata are never audited.
 slice. Compose pull is separately constrained as documented above. Explicitly
 saved local registrations are the only persistent Compose-project metadata and
 are described above.
+
+## Scale one declared service
+
+For the current imported selection, after explicit successful validation and a
+successful current status refresh, the page shows one Scale control per declared
+service—not one per replica row. Each control shows the observed instance count
+from `compose ps --all --format json`, including stopped containers. The target
+starts empty: enter an integer from 1 through 32 to enable the Scale controls;
+no target is chosen automatically. Scaling to zero
+and project-wide scaling are not offered. Only declared services are eligible,
+including a declared service with zero observed containers.
+
+The explicit confirmation identifies the imported local label (not project
+identity), service, observed count, and target. It warns that scaling down can
+stop/remove excess containers, scaling up can create containers, and Compose
+`up` may recreate changed containers; volume behavior follows Compose semantics.
+Dependencies do not auto-start (`--no-deps`). If a target service is profile-
+gated, explicitly naming it activates that service's profile for this command;
+other services in that profile are not targeted. Ferrum requests no build,
+pull, volume removal, orphan removal, or force recreation. Cancelling submits
+no command.
+
+Before submission Ferrum rejects changed imports, files, profiles, validation,
+status, busy work, invalid targets, undeclared services, and a stale observed
+count. The worker snapshots selected files into write-sealed descriptors,
+revalidates those exact snapshots, and obtains a fresh `ps --all` status on the
+same selected local Docker Unix socket immediately before mutation. The command
+uses argument arrays:
+
+```text
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <snapshot-fd> ... --profile <profile> ... up --detach --no-build --pull never --no-deps --scale SERVICE=N SERVICE
+```
+
+The operation uses Ferrum's private isolated CLI environment, 30-second
+deadline, bounded output, and process cleanup. A failure before process spawn
+is `not_submitted`; every submitted error, timeout, or cancellation is
+`uncertain`. Ferrum requires a successful status refresh before another scale
+attempt after an uncertain result. Best-effort audit stores only static
+`scale` action and `started`, `success`, `not_submitted`, `request_error`, or
+`uncertain` outcomes; it excludes project labels, service names, counts, paths,
+profiles, socket values, and command output. This remains Linux local Docker
+Compose CLI support only; it does not complete Issue #18 or claim Podman,
+remote, Windows, or macOS support.
 
 ## Pull images for an imported configuration
 

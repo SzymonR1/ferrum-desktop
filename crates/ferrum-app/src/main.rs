@@ -1573,6 +1573,7 @@ impl FerrumApp {
         let audit_store = self.audit_store.clone();
         let selection = task.selection.clone();
         let service = task.service.clone();
+        let scale = task.scale;
         let cancellation_receiver = task.cancellation;
         self.compose_operation_cancellation = task.cancellation_sender;
         let audit_action = match task.action {
@@ -1582,6 +1583,7 @@ impl FerrumApp {
             compose::ComposeOperationAction::Restart => Some(audit::ComposeMutationAction::Restart),
             compose::ComposeOperationAction::Pause => Some(audit::ComposeMutationAction::Pause),
             compose::ComposeOperationAction::Unpause => Some(audit::ComposeMutationAction::Unpause),
+            compose::ComposeOperationAction::Scale => Some(audit::ComposeMutationAction::Scale),
             compose::ComposeOperationAction::Pull | compose::ComposeOperationAction::Build => None,
         };
         let started_record = match audit_action {
@@ -1629,7 +1631,25 @@ impl FerrumApp {
                     submitted: false,
                 },
                 (None, Some(socket_path)) => {
-                    if matches!(
+                    if task.action == compose::ComposeOperationAction::Scale {
+                        match (service.as_deref(), scale) {
+                            (Some(service), Some((target, count))) => {
+                                compose::compose_service_scale(
+                                    &socket_path,
+                                    &task.selection.files,
+                                    &task.selection.profiles,
+                                    service,
+                                    target,
+                                    count,
+                                )
+                                .await
+                            }
+                            _ => compose::ComposeOperationResult {
+                                outcome: Err(compose::ComposeOperationError::InvalidScaleTarget),
+                                submitted: false,
+                            },
+                        }
+                    } else if matches!(
                         task.action,
                         compose::ComposeOperationAction::Restart
                             | compose::ComposeOperationAction::Pause
@@ -5241,6 +5261,10 @@ impl eframe::App for FerrumApp {
         }
         if let Some(service) = compose_actions.restart_service.as_deref() {
             self.compose.request_service_restart_confirmation(service);
+        }
+        if let Some((service, target)) = compose_actions.scale_service.as_ref() {
+            self.compose
+                .request_service_scale_confirmation(service, target);
         }
         if let Some(service) = compose_actions.pause_service.as_deref() {
             self.compose.request_service_action_confirmation(

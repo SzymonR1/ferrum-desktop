@@ -68,10 +68,11 @@ cargo test -p ferrum-engine connection_handshake_tests
 ## Compose mutation input snapshots
 
 Confirmed Compose mutations use the same write-sealed memfd descriptors for
-preflight validation and the submitted command; service restart also reuses
-them for its fresh read-only status query. A controlled fake-CLI regression
-replaces selected source files after preflight and verifies the operation still
-receives the bytes that were validated. Run it with:
+preflight validation and the submitted command; service restart and scale also
+reuse them for the fresh read-only status query.
+A controlled fake-CLI regression replaces selected source files after preflight
+and verifies the operation still receives the bytes that were validated. Run
+it with:
 
 ```sh
 cargo test -p ferrum-app compose::tests::subprocess::compose_mutation_uses_the_validated_file_snapshot -- --exact
@@ -106,6 +107,34 @@ networks, or volumes.
 No live mutation was run because no disposable Engine is designated. There is
 no native visual validation, and these tests do not establish Podman, remote,
 Windows, or macOS support or full completion of Issues #18/#19.
+
+## Compose service scaling
+
+The controlled fake-CLI and headless regressions cover one accessible control
+per declared service rather than per replica row; observed counts include
+stopped containers. They check target bounds, undeclared services, cancellation,
+stale confirmation counts, sealed-file validation, fresh same-socket status,
+fixed `up --detach --no-build --pull never --no-deps --scale SERVICE=N SERVICE`
+argv, and uncertain submitted results requiring a successful status refresh
+before retry. Audit assertions must remain static and exclude project, service,
+count, path, profile, socket, and output data.
+
+The optional ignored live test preflights that a unique generated project and its
+default network are unused, then scales the `scale-probe` service up to exactly
+two replicas and down to one. It uses an already-installed `FERRUM_TEST_IMAGE`
+with `/bin/sleep`, no host mounts or published ports, and requests no pull or
+build. A scoped cleanup runs `compose down` only with the generated project
+name, directory, and known Compose file, regardless of intermediate operation
+results; it does not force-remove, prune, or remove volumes:
+
+```sh
+FERRUM_TEST_IMAGE=ghcr.io/catthehacker/ubuntu:rust-latest cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_service_scale_scales_and_cleans_only_verified_project -- --exact --ignored
+```
+
+Do not run this test against an engine containing valuable resources. The test
+is opt-in and was not executed as part of this change. Neither its presence nor
+the fake-CLI/headless tests claim Podman, remote, Windows, macOS, or complete
+Issue #18 support.
 
 ## Compose up with local images
 
