@@ -522,20 +522,15 @@ async fn local_engine_loopback_registry_pull_reports_progress_and_cleans_only_te
         .await
     {
         Err(_) => true,
-        Ok(mut stream) => {
-            let mut rejected = false;
-            loop {
-                match stream.next_progress().await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(_) => {
-                        rejected = true;
-                        break;
-                    }
-                }
+        Ok(mut stream) => match drain_pull_progress(&mut stream).await {
+            Ok((_, Some(_))) => true,
+            Ok((_, None)) => false,
+            Err(error) => {
+                drop(stream);
+                drop(registry);
+                panic!("the missing-manifest probe exceeded its bounds: {error}");
             }
-            rejected
-        }
+        },
     };
     assert!(
         registry.missing_manifest_was_requested(),
@@ -558,6 +553,7 @@ async fn local_engine_loopback_registry_pull_reports_progress_and_cleans_only_te
     let mut stream = match engine.open_image_pull(&image_reference, None).await {
         Ok(stream) => stream,
         Err(error) => {
+            drop(registry);
             let images = engine
                 .list_images()
                 .await
@@ -569,18 +565,13 @@ async fn local_engine_loopback_registry_pull_reports_progress_and_cleans_only_te
             panic!("the local registry pull stream should open: {error}");
         }
     };
-    let mut progress = Vec::new();
-    let mut stream_error = None;
-    loop {
-        match stream.next_progress().await {
-            Ok(Some(update)) => progress.push(update),
-            Ok(None) => break,
-            Err(error) => {
-                stream_error = Some(error);
-                break;
-            }
-        }
-    }
+    let progress_result = drain_pull_progress(&mut stream).await;
+    drop(stream);
+    drop(registry);
+    let (saw_status_progress, stream_error) = match progress_result {
+        Ok(result) => result,
+        Err(error) => (false, Some(error)),
+    };
 
     let images_after_pull = engine
         .list_images()
@@ -592,10 +583,7 @@ async fn local_engine_loopback_registry_pull_reports_progress_and_cleans_only_te
     else {
         panic!(
             "the loopback pull should create the unique generated image tag; stream error: {}",
-            stream_error
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "none".to_owned())
+            stream_error.as_deref().unwrap_or("none")
         );
     };
     assert!(
@@ -627,9 +615,7 @@ async fn local_engine_loopback_registry_pull_reports_progress_and_cleans_only_te
         panic!("the Engine pull progress stream should complete: {error}");
     }
     assert!(
-        progress
-            .iter()
-            .any(|update| !update.status.trim().is_empty()),
+        saw_status_progress,
         "the Engine should report at least one non-empty pull status"
     );
 }
@@ -1809,6 +1795,41 @@ fn image_tag_is_present(images: &[ImageSummary], reference: &str) -> bool {
         .iter()
         .any(|image| image.repo_tags.iter().any(|tag| tag == reference))
 }
+#[cfg(target_os = "linux")]
+async fn drain_pull_progress(
+    stream: &mut ferrum_engine::ImagePullStream,
+) -> Result<(bool, Option<String>), String> {
+    const MAX_PROGRESS_RECORDS: usize = 1_024;
+
+    let drain = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut progress_records = 0;
+        let mut saw_non_empty_status = false;
+        loop {
+            match stream.next_progress().await {
+                Ok(Some(update)) => {
+                    progress_records += 1;
+                    if progress_records > MAX_PROGRESS_RECORDS {
+                        return Err(format!(
+                            "Engine pull exceeded {MAX_PROGRESS_RECORDS} progress records"
+                        ));
+                    }
+                    saw_non_empty_status |= !update.status.trim().is_empty();
+                }
+                Ok(None) => return Ok((saw_non_empty_status, None)),
+                Err(error) => {
+                    return Ok((saw_non_empty_status, Some(error.to_string())));
+                }
+            }
+        }
+    })
+    .await;
+
+    match drain {
+        Ok(result) => result,
+        Err(_) => Err("Engine pull progress exceeded the 30-second deadline".to_owned()),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn docker_remove_disposable_image_tag(
     context_name: &str,

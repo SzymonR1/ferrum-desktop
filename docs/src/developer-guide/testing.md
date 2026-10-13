@@ -262,16 +262,17 @@ page or credential-helper path. It requires the current Docker context to use a
 local Unix socket and the daemon's existing loopback-insecure-registry policy.
 The test starts an in-process OCI registry bound only to `127.0.0.1` on an
 ephemeral port and changes no daemon configuration. It preflights both generated
-references as absent, then asks the Engine to pull a separate intentionally
-missing manifest tag. The fixture confirms that request reached its missing-
-manifest handler, the Engine rejects it, and the image inventory remains
-unchanged. Only then does it pull a generated, content-addressed OCI image and
-check for non-empty Engine status progress. It removes only the generated tag
-using `docker image rm --no-prune` without force. Cleanup is armed only after
-inventory confirms a full SHA-256 image ID and the sole generated tag; ownership
-uncertainty causes no removal. No container, external registry, credentials,
-user image, daemon setting, or prune operation is used. A failed transfer can
-leave untagged blob data; the test never runs image prune.
+references as absent. The missing-manifest probe must reach the fixture, be
+rejected, and leave both references absent. Each Engine progress stream has a
+30-second total deadline and a 1,024-record cap; the smoke retains only whether
+a non-empty status was observed. On a completed pull, cleanup is armed only
+after inventory confirms a full SHA-256 image ID and exactly the generated tag.
+It removes only that tag using `docker image rm --no-prune` without force. If
+inventory cannot confirm ownership, the test does not remove the tag. No
+container, external registry, credentials, user image, daemon setting, or prune
+operation is used. A failed pull stream is dropped and the loopback fixture is
+stopped, but Engine-side cancellation is not guaranteed; interrupted pulls may
+leave untagged blob data or an unknown outcome.
 
 Run only against a disposable local Docker Engine:
 
