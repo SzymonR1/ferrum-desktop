@@ -19,11 +19,12 @@ All notable project changes are documented here. The project has not published a
   SERVICE` argv without any global `--profile` flag. Explicit target activation
   does not start same-profile siblings. Confirmation warns that `up` can start
   stopped containers and run configured service code on the selected Engine;
-  removal or configuration recreation discards writable-layer changes, and
+  removal or configuration/image-driven recreation discards writable-layer changes, and
   mounted volumes follow Compose semantics. No build, pull, volume/orphan
   removal, or force recreation is requested. Submitted failures/timeouts remain
-  uncertain and require successful status refresh before retry; canceling the
-  Scale confirmation records static `scale/not_submitted`. Audit excludes
+  uncertain and require successful status refresh before retry; explicit
+  cancellation or page/context invalidation records static
+  `scale/not_submitted`. Audit excludes
   service, project, count, path, profile, socket, and output data. The ignored
   live smoke now uses a unique project with a profile-gated target and
   same-profile sibling, preflights project/network absence, uses a preinstalled

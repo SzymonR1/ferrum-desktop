@@ -361,12 +361,12 @@ store but does not build or change project containers, networks, or volumes.
   blank until the user enters an integer 1–32; disable every Scale button while
   the target is empty or invalid.
   Confirm the imported local label (not project identity), service, current
-  count, and target. Warn about excess-container removal, creation,
-  configuration recreation, writable-layer data loss on removal/recreation,
-  mounted-volume Compose semantics, and that `up` can start stopped containers
-  and run configured service code on the selected Engine. State that
-  dependencies are not started and a profile-gated target is activated without
-  enabling its sibling services.
+  count, and target. Warn about excess-container removal, creation, and that
+  selected configuration/image differences may recreate containers. State that
+  removal/recreation loses container writable-layer data while mounted volumes
+  follow Compose semantics; `up` can start stopped containers and run configured
+  service code on the selected Engine. State that dependencies are not started
+  and a profile-gated target is activated without enabling sibling services.
   Snapshot selected files into write-sealed descriptors, revalidate them with
   the selected profiles, and recheck membership/all-profile `ps --all` count
   immediately before fixed `up --detach --no-build --pull never --no-deps
@@ -376,9 +376,10 @@ store but does not build or change project containers, networks, or volumes.
   recreation. The operation is Linux local Docker Compose CLI only, bounded to
   30 seconds, using the isolated CLI environment and child limits. Any submitted
   error, timeout, or cancellation is uncertain; require successful status
-  refresh before retry. A cancelled confirmation records only static
-  `scale/not_submitted`; audit excludes target/count, service, project label,
-  file/profile/socket data, and output.
+  refresh before retry. Explicit cancellation or invalidation while leaving
+  Compose/switching context records only static `scale/not_submitted`; audit
+  excludes target/count, service, project label, file/profile/socket data, and
+  output.
   The ignored live smoke uses a unique generated project with a profile-gated
   target and same-profile sibling, preflights project/network absence, and
   verifies only the target starts/scales. It uses a preinstalled image, no

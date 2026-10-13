@@ -118,8 +118,10 @@ argv versus profile-free scale `up` argv, exact
 arguments, sibling safety, stale confirmation counts, sealed-file validation,
 fresh same-socket status, uncertain retries, and revalidation invalidating
 status/counts until a fresh refresh. Headless confirmation regressions cover
-stopped-container starts, configured service code execution, writable-layer loss,
-mounted-volume semantics, and redacted `scale/not_submitted` audit on cancel.
+stopped-container starts, configured service code execution, writable-layer loss
+on configuration/image-driven recreation, and mounted-volume semantics.
+Explicit cancel and page/context invalidation tests assert static
+`scale/not_submitted` audit data without dynamic operation metadata.
 
 The optional ignored live test preflights that a unique generated project and
 its default network are unused, then scales the profile-gated `scale-probe`

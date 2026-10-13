@@ -329,16 +329,17 @@ after validation succeeds before scaling or other status-gated actions.
 
 The explicit confirmation identifies the imported local label (not project
 identity), service, observed count, and target. It warns that scaling down can
-stop/remove excess containers, scaling up can create containers, and Compose
-`up` may recreate changed containers. It can also start stopped containers and
-run the configured service code on the selected Engine. Scaling down/removing
-containers or configuration-driven recreation discards container writable-
-layer changes; mounted volumes follow Compose semantics. Dependencies do not
-auto-start (`--no-deps`). If a target service is profile-gated, explicitly
-naming it activates that service's profile for this command; sibling services
-in that profile are not targeted or started. Ferrum requests no build, pull,
-volume removal, orphan removal, or force recreation. Cancelling submits no
-command and records only static `scale/not_submitted` audit data.
+stop/remove excess containers and scaling up can create containers. Compose
+`up` may recreate containers when the selected configuration or image differs;
+it can also start stopped containers and run configured service code on the
+selected Engine. Removing or recreating containers discards container
+writable-layer changes; mounted volumes follow Compose semantics. Dependencies
+do not auto-start (`--no-deps`). Explicitly targeting a profile-gated service
+activates that service's profile for this command without starting sibling
+services. Ferrum requests no build, pull, volume removal, orphan removal, or
+force recreation. Explicit cancellation, leaving Compose, or switching context
+before confirmation submits no command and records only static
+`scale/not_submitted` audit data.
 
 Before submission Ferrum rejects changed imports, files, profiles, validation,
 status, busy work, invalid targets, undeclared services, and a stale observed

@@ -1316,6 +1316,8 @@ impl FerrumApp {
         }
         #[cfg(target_os = "linux")]
         self.abort_compose_service_follow();
+        #[cfg(target_os = "linux")]
+        self.cancel_compose_operation_confirmation();
         self.compose.invalidate();
     }
 
@@ -7415,7 +7417,7 @@ mod event_reconciliation_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cancelling_scale_confirmation_persists_only_redacted_not_submitted_audit() {
+    fn cancelling_or_invalidating_scale_confirmation_persists_only_redacted_not_submitted_audit() {
         let (mut app, _) = app_with_open_inspection();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7466,28 +7468,47 @@ mod event_reconciliation_tests {
             )
             .expect("audit persistence task should complete");
 
-        let contents = std::fs::read_to_string(root.join("audit.jsonl")).unwrap();
-        let record = serde_json::from_str::<serde_json::Value>(&contents).unwrap();
-        assert_eq!(record["event"], "compose_mutation");
-        assert_eq!(record["action"], "scale");
-        assert_eq!(record["outcome"], "not_submitted");
-        assert_eq!(
-            record
-                .as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect::<std::collections::BTreeSet<_>>(),
-            [
-                "action",
-                "event",
-                "outcome",
-                "schema_version",
-                "timestamp_unix_ms"
-            ]
-            .into_iter()
-            .collect()
+        assert!(
+            app.compose
+                .request_service_scale_confirmation("qa-worker", "4")
         );
+        app.invalidate_compose();
+        app.runtime
+            .block_on(
+                app.compose_operation_audit_task
+                    .take()
+                    .expect("Compose invalidation should persist a scale cancellation"),
+            )
+            .expect("invalidation audit persistence task should complete");
+
+        let contents = std::fs::read_to_string(root.join("audit.jsonl")).unwrap();
+        let records = contents
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        for record in records {
+            assert_eq!(record["event"], "compose_mutation");
+            assert_eq!(record["action"], "scale");
+            assert_eq!(record["outcome"], "not_submitted");
+            assert_eq!(
+                record
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                [
+                    "action",
+                    "event",
+                    "outcome",
+                    "schema_version",
+                    "timestamp_unix_ms"
+                ]
+                .into_iter()
+                .collect()
+            );
+        }
         assert!(!contents.contains("qa-worker"));
         assert!(!contents.contains("private-label"));
         assert!(!contents.contains("/private/scale-project"));

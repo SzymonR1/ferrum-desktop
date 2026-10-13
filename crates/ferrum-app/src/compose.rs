@@ -2318,9 +2318,9 @@ impl ComposeView {
                                 scale.observed_replicas, scale.target_replicas
                             ));
                         }
-                        ui.label("Scale-down can stop/remove excess containers; scale-up can create containers. Compose may recreate changed containers; volumes follow Compose semantics.");
+                        ui.label("Scale-down can stop/remove excess containers; scale-up can create containers. Compose `up` may recreate containers when the selected configuration or image differs; volumes follow Compose semantics.");
                         ui.label("This command can start stopped containers and run the configured service code on the selected Engine.");
-                        ui.label("Scaling down/removing containers or configuration-driven recreation discards container writable-layer changes; mounted volumes follow Compose semantics.");
+                        ui.label("Scaling down/removing containers or configuration/image-driven recreation discards container writable-layer changes; mounted volumes follow Compose semantics.");
                         ui.label("Dependencies will not auto-start. This requests no build, pull, volume removal, orphan removal, or force-recreate.");
                         ui.label("Explicitly targeting a profile-gated service activates only that service's profile for this command; sibling services in that profile are not started.");
                     }
@@ -10455,7 +10455,7 @@ exit 85
             );
             let _warning = harness.get_by_role_and_label(
                 Role::Label,
-                "Scale-down can stop/remove excess containers; scale-up can create containers. Compose may recreate changed containers; volumes follow Compose semantics.",
+                "Scale-down can stop/remove excess containers; scale-up can create containers. Compose `up` may recreate containers when the selected configuration or image differs; volumes follow Compose semantics.",
             );
             let _stopped_warning = harness.get_by_role_and_label(
                 Role::Label,
@@ -10463,7 +10463,7 @@ exit 85
             );
             let _writable_layer_warning = harness.get_by_role_and_label(
                 Role::Label,
-                "Scaling down/removing containers or configuration-driven recreation discards container writable-layer changes; mounted volumes follow Compose semantics.",
+                "Scaling down/removing containers or configuration/image-driven recreation discards container writable-layer changes; mounted volumes follow Compose semantics.",
             );
             let _profile_warning = harness.get_by_role_and_label(
                 Role::Label,
