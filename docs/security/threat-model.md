@@ -256,8 +256,10 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   explicitly targeting one profile-gated service activates that service alone,
   not its profile siblings. Use selected profiles for regular service-action
   status rechecks. Invalid or changed selection clears validation/status/log
-  output, cancels read-only/follow tasks, and requires revalidation; already-
-  submitted mutations are not cancelled.
+  output and cancels read-only/follow tasks. Starting file revalidation also
+  invalidates old status/counts and aborts in-flight status/log/follow tasks;
+  after validation succeeds, require a fresh status query before status-gated
+  actions. Already-submitted mutations are not cancelled.
 - Keep private Docker config/HOME, cleared allowlisted environment, disabled
   selected-project `.env`, and disabled remote Git/OCI loaders. An explicitly
   opted-in persistent registration stores only a unique bounded label, ordered
@@ -350,12 +352,14 @@ store but does not build or change project containers, networks, or volumes.
   file/status smokes do not validate arbitrary projects. Native page visual
   check is unavailable.
 - Allow confirmed service-scoped Compose scaling only for the current imported
-  selection after ordered files/profiles are explicitly revalidated and
-  successful selected-profile and all-profile `ps --all` snapshots are
-  available. Provide one control per all-declared service, including inactive
-  profile services, use the all-profile observed count including stopped
-  containers, and leave the target blank until the user enters an integer
-  1–32; disable every Scale button while the target is empty or invalid.
+  selection after ordered files/profiles are explicitly revalidated and a
+  successful all-profile `ps --all` snapshot is available. Beginning
+  revalidation clears prior status/container/count caches; refresh status again
+  after validation before showing scale controls. Provide one control per
+  all-declared service, including inactive profile services, use the
+  all-profile observed count including stopped containers, and leave the target
+  blank until the user enters an integer 1–32; disable every Scale button while
+  the target is empty or invalid.
   Confirm the imported local label (not project identity), service, current
   count, and target. Warn about excess-container removal, creation,
   configuration recreation, writable-layer data loss on removal/recreation,

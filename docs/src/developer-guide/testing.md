@@ -116,13 +116,10 @@ bounds, undeclared services, selected-profile validation and all-profile status
 argv versus profile-free scale `up` argv, exact
 `up --detach --no-build --pull never --no-deps --scale SERVICE=N SERVICE`
 arguments, sibling safety, stale confirmation counts, sealed-file validation,
-fresh same-socket status, and uncertain submitted results requiring a successful
-status refresh before retry. Headless confirmation regressions cover stopped
-container starts, configured service code execution on the selected Engine,
-writable-layer loss on removal/recreation, and mounted-volume Compose
-semantics. Cancellation coverage verifies the app records static
-`scale/not_submitted` audit data without service, project, count, path, profile,
-socket, or output metadata.
+fresh same-socket status, uncertain retries, and revalidation invalidating
+status/counts until a fresh refresh. Headless confirmation regressions cover
+stopped-container starts, configured service code execution, writable-layer loss,
+mounted-volume semantics, and redacted `scale/not_submitted` audit on cancel.
 
 The optional ignored live test preflights that a unique generated project and
 its default network are unused, then scales the profile-gated `scale-probe`

@@ -1643,6 +1643,7 @@ impl ComposeView {
                 return None;
             }
         };
+        self.invalidate_status();
         self.clear_operation_result();
         let generation = self.validation_generation;
         let file_name = display_compose_file_list(&self.selected_files);
@@ -2005,32 +2006,52 @@ impl ComposeView {
             }
             let scale_actions_enabled =
                 status_enabled && valid_scale_target && self.can_request_service_operation();
-            for service in &self.all_declared_services {
-                let count = self
-                    .service_instance_counts
-                    .get(service)
-                    .copied()
-                    .unwrap_or_default();
-                ui.horizontal(|ui| {
-                    ui.label(format!("{service}: {count} observed instance(s)"));
-                    if ui
-                        .add_enabled(
-                            scale_actions_enabled && validate_service_selector(service).is_some(),
-                            egui::Button::new(if self.scale_target.is_empty() {
-                                format!("Scale service {service}")
-                            } else {
-                                format!("Scale service {service} to {}", self.scale_target)
-                            }),
-                        )
-                        .clicked()
-                    {
-                        actions.scale_service = Some(ComposeScaleRequest {
-                            service: service.clone(),
-                            target: self.scale_target.clone(),
-                        });
-                    }
-                });
-            }
+            egui::ScrollArea::vertical()
+                .id_salt("compose-scale-services")
+                .max_height(280.0)
+                .show_rows(
+                    ui,
+                    COMPOSE_CONTAINER_ROW_HEIGHT,
+                    self.all_declared_services.len(),
+                    |ui, rows| {
+                        for row in rows {
+                            let service = &self.all_declared_services[row];
+                            let count = self
+                                .service_instance_counts
+                                .get(service)
+                                .copied()
+                                .unwrap_or_default();
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Label::new(format!(
+                                        "{service}: {count} observed instance(s)"
+                                    ))
+                                    .truncate(),
+                                );
+                                if ui
+                                    .add_enabled(
+                                        scale_actions_enabled
+                                            && validate_service_selector(service).is_some(),
+                                        egui::Button::new(if self.scale_target.is_empty() {
+                                            format!("Scale service {service}")
+                                        } else {
+                                            format!(
+                                                "Scale service {service} to {}",
+                                                self.scale_target
+                                            )
+                                        }),
+                                    )
+                                    .clicked()
+                                {
+                                    actions.scale_service = Some(ComposeScaleRequest {
+                                        service: service.clone(),
+                                        target: self.scale_target.clone(),
+                                    });
+                                }
+                            });
+                        }
+                    },
+                );
         }
         match &self.status {
             ComposeStatusState::Idle => {}
@@ -10150,6 +10171,81 @@ exit 85
             assert!(view.request_service_restart_confirmation("worker"));
             view.profile_input = "qa".to_owned();
             assert!(view.confirm_operation().is_none());
+        }
+        #[test]
+        fn revalidation_invalidates_status_and_requires_a_fresh_scale_count() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("Local label"));
+            view.validated_services = vec!["web".to_owned()];
+            view.all_declared_services = vec!["web".to_owned()];
+            let (status_generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: vec![
+                        ComposeContainer {
+                            name: "web-1".to_owned(),
+                            service: "web".to_owned(),
+                            project: None,
+                            state: "running".to_owned(),
+                            health: None,
+                        },
+                        ComposeContainer {
+                            name: "web-2".to_owned(),
+                            service: "web".to_owned(),
+                            project: None,
+                            state: "stopped".to_owned(),
+                            health: None,
+                        },
+                    ],
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(view.request_service_scale_confirmation("web", "3"));
+            assert_eq!(
+                view.cancel_operation_confirmation(),
+                Some(ComposeOperationAction::Scale)
+            );
+
+            let (validation_generation, _, _) = view.begin_validation().unwrap();
+            assert!(matches!(&view.status, ComposeStatusState::Idle));
+            assert!(view.containers.is_empty());
+            assert!(view.service_instance_counts.is_empty());
+            assert!(!view.request_service_scale_confirmation("web", "3"));
+            assert!(view.finish_validation(
+                validation_generation,
+                ComposeValidationResult {
+                    version: None,
+                    services: vec!["web".to_owned()],
+                    all_services: vec!["web".to_owned()],
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(!view.request_service_scale_confirmation("web", "3"));
+
+            let (status_generation, _, _) = view.begin_status_refresh().unwrap();
+            assert!(view.finish_status_refresh(
+                status_generation,
+                ComposeStatusResult {
+                    containers: vec![ComposeContainer {
+                        name: "web-1".to_owned(),
+                        service: "web".to_owned(),
+                        project: None,
+                        state: "running".to_owned(),
+                        health: None,
+                    }],
+                    outcome: Ok(()),
+                },
+            ));
+            assert!(view.request_service_scale_confirmation("web", "3"));
+            assert_eq!(
+                view.operation_confirmation()
+                    .and_then(|confirmation| confirmation.scale),
+                Some(ComposeScalePlan {
+                    target_replicas: 3,
+                    observed_replicas: 1,
+                })
+            );
         }
 
         #[test]

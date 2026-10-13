@@ -324,6 +324,8 @@ containers. The target starts empty: enter an integer from 1 through 32 to
 enable the Scale controls; no target is chosen automatically. Scaling to zero
 and project-wide scaling are not offered. Every declared service is eligible,
 including one with zero observed containers.
+Starting revalidation clears the previous status/count snapshot; refresh again
+after validation succeeds before scaling or other status-gated actions.
 
 The explicit confirmation identifies the imported local label (not project
 identity), service, observed count, and target. It warns that scaling down can

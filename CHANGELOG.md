@@ -7,12 +7,13 @@ All notable project changes are documented here. The project has not published a
   explicitly revalidated ordered files/profiles on the selected Linux local
   Docker Unix socket. Validation keeps the selected-profile service list for
   existing lifecycle eligibility and obtains a separate `--profile '*'
-  config --services` inventory for all declared services. Read-only selected-
-  profile and all-profile `ps --all` snapshots provide lifecycle status and
-  accurate scale counts including stopped containers. The UI offers one control
-  per declared service, including inactive-profile services, with an initially
-  blank target restricted to integers 1–32; scale-to-zero and project-wide
-  scaling are unavailable. The worker revalidates sealed files with the
+  config --services` inventory for all declared services. One all-profile
+  `ps --all` snapshot supplies page status and accurate scale counts, including
+  stopped containers; revalidation clears prior status/counts and requires a
+  fresh refresh after validation before status-gated actions. The UI offers
+  one initially blank control per declared service, including inactive-profile
+  services, with integer targets 1–32; scale-to-zero and project-wide scaling
+  are unavailable. The worker revalidates sealed files with the
   selected profiles, checks all-profile service membership/count, then submits
   exact `up --detach --no-build --pull never --no-deps --scale SERVICE=N
   SERVICE` argv without any global `--profile` flag. Explicit target activation

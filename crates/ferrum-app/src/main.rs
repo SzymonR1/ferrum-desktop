@@ -5261,6 +5261,14 @@ impl eframe::App for FerrumApp {
         } else if compose_actions.validate_files
             && let Some((generation, files, profiles)) = self.compose.begin_validation()
         {
+            if let Some(task) = self.compose_status_task.take() {
+                task.abort();
+            }
+            if let Some(task) = self.compose_logs_task.take() {
+                task.abort();
+            }
+            #[cfg(target_os = "linux")]
+            self.abort_compose_service_follow();
             self.start_compose_validation(files, profiles, generation, context.clone());
         }
         if compose_actions.refresh_containers {
