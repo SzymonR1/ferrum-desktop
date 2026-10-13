@@ -125,6 +125,7 @@ pub(super) enum ComposeOperationError {
     PrivateConfigSetupFailed,
     ValidationFailed,
     EngineUnavailable,
+    AuditUnavailable,
     InvalidScaleTarget,
     StaleServiceCount,
     ServiceUnavailable,
@@ -147,6 +148,9 @@ impl ComposeOperationError {
             }
             Self::EngineUnavailable => {
                 "The engine or Compose configuration is not ready; no Compose operation was run."
+            }
+            Self::AuditUnavailable => {
+                "Local Compose audit logging is unavailable; no Compose operation was run."
             }
             Self::InvalidScaleTarget => "Target scale must be an integer from 1 to 32.",
             Self::StaleServiceCount => {

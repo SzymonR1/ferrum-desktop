@@ -97,6 +97,13 @@ terminal outcome, the final state is unknown and must be reconciled by
 refreshing the current project status. Issues #18 and #19 remain partial/open;
 issue #10 remains blocked/open.
 
+Compose audit entries pass through one 32-entry bounded FIFO. Saturation
+prevents an operation from being submitted when its `started` marker cannot be
+queued; cancellation records remain best-effort if the queue is full. Durable
+store failures are logged without operation data. Shutdown closes the queue and
+gives the writer a bounded drain interval, so an append still in progress may
+be lost; this local log is not a complete or tamper-proof ledger.
+
 Saved Compose registrations are an explicit local opt-in in the existing
 descriptor-pinned settings store, not a second persistence layer. Each stores a
 unique bounded label, 1–16 ordered absolute UTF-8 file paths, and validated

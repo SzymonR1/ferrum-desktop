@@ -858,6 +858,15 @@ async fn persist_audit_record(store: &audit::AuditStore, record: audit::AuditRec
 #[cfg(not(target_os = "linux"))]
 async fn persist_audit_record(_store: &audit::AuditStore, _record: audit::AuditRecord) {}
 
+#[cfg(target_os = "linux")]
+const COMPOSE_OPERATION_AUDIT_QUEUE_CAPACITY: usize = 32;
+
+#[cfg(target_os = "linux")]
+struct PendingComposeAuditRecord {
+    record: audit::AuditRecord,
+    persisted: tokio::sync::oneshot::Sender<()>,
+}
+
 struct FerrumApp {
     runtime: Runtime,
     sender: mpsc::Sender<EngineEvent>,
@@ -895,6 +904,8 @@ struct FerrumApp {
     compose_operation_task: Option<JoinHandle<()>>,
     compose_operation_cancellation: Option<tokio::sync::oneshot::Sender<()>>,
     compose_operation_audit_task: Option<JoinHandle<()>>,
+    #[cfg(target_os = "linux")]
+    compose_operation_audit_sender: Option<mpsc::Sender<PendingComposeAuditRecord>>,
     image_list_task: Option<JoinHandle<()>>,
     image_inspection_task: Option<JoinHandle<()>>,
     // Hold the reader until the terminal response event releases the mutation gate.
@@ -1110,6 +1121,8 @@ impl FerrumApp {
             compose_operation_task: None,
             compose_operation_cancellation: None,
             compose_operation_audit_task: None,
+            #[cfg(target_os = "linux")]
+            compose_operation_audit_sender: None,
             image_list_task: None,
             image_inspection_task: None,
             image_pull_task: None,
@@ -1554,19 +1567,37 @@ impl FerrumApp {
     fn queue_compose_operation_audit_record(
         &mut self,
         record: audit::AuditRecord,
-    ) -> tokio::sync::oneshot::Receiver<()> {
-        let previous = self.compose_operation_audit_task.take();
-        let store = self.audit_store.clone();
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.compose_operation_audit_task = Some(self.runtime.spawn(async move {
-            if let Some(previous) = previous {
-                let _ = previous.await;
-            }
-            persist_audit_record(&store, record).await;
-            let _ = sender.send(());
-        }));
-        receiver
+    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        if self.compose_operation_audit_sender.is_none() {
+            let (sender, mut receiver) =
+                mpsc::channel::<PendingComposeAuditRecord>(COMPOSE_OPERATION_AUDIT_QUEUE_CAPACITY);
+            let store = self.audit_store.clone();
+            self.compose_operation_audit_task = Some(self.runtime.spawn(async move {
+                while let Some(pending) = receiver.recv().await {
+                    persist_audit_record(&store, pending.record).await;
+                    let _ = pending.persisted.send(());
+                }
+            }));
+            self.compose_operation_audit_sender = Some(sender);
+        }
+
+        let (persisted, receiver) = tokio::sync::oneshot::channel();
+        let Some(sender) = self.compose_operation_audit_sender.as_ref() else {
+            return None;
+        };
+        if sender
+            .try_send(PendingComposeAuditRecord { record, persisted })
+            .is_err()
+        {
+            tracing::warn!(
+                target: "ferrum::audit",
+                "Could not queue local Compose audit record"
+            );
+            return None;
+        }
+        Some(receiver)
     }
+
     #[cfg(target_os = "linux")]
     fn cancel_compose_operation_confirmation(
         &mut self,
@@ -1580,7 +1611,7 @@ impl FerrumApp {
             audit::ComposeMutationAction::Scale,
             audit::ComposeMutationOutcome::NotSubmitted,
         );
-        Some(self.queue_compose_operation_audit_record(record))
+        self.queue_compose_operation_audit_record(record)
     }
 
     #[cfg(target_os = "linux")]
@@ -1631,7 +1662,20 @@ impl FerrumApp {
             }
             None => audit::record_compose_pull_result(audit::ComposePullOutcome::Started),
         };
-        let audit_started_receiver = self.queue_compose_operation_audit_record(started_record);
+        let Some(audit_started_receiver) =
+            self.queue_compose_operation_audit_record(started_record)
+        else {
+            self.compose_operation_cancellation = None;
+            let _ = self.compose.finish_operation(
+                task.generation,
+                compose::ComposeOperationResult {
+                    outcome: Err(compose::ComposeOperationError::AuditUnavailable),
+                    submitted: false,
+                },
+            );
+            context.request_repaint();
+            return;
+        };
         context.request_repaint();
         self.compose_operation_task = Some(self.runtime.spawn(async move {
             let (operation_progress_sender, mut operation_progress_receiver) =
@@ -3225,13 +3269,11 @@ impl FerrumApp {
                     {
                         if self.compose.finish_operation(generation, result) {
                             self.compose_operation_task = None;
-                            self.compose_operation_audit_task = None;
                             self.compose_operation_cancellation = None;
                             self.start_compose_status_refresh(context.clone());
                         }
                     } else if self.compose.finish_operation(generation, result) {
                         self.compose_operation_task = None;
-                        self.compose_operation_audit_task = None;
                         self.compose_operation_cancellation = None;
                     }
                 }
@@ -5138,18 +5180,20 @@ impl Drop for FerrumApp {
         self.cancel_image_build();
         self.cancel_image_read_tasks();
         self.invalidate_compose();
+        // Do not let a queued start marker release a mutation while shutdown drains audit.
+        if let Some(task) = self.compose_operation_task.take() {
+            task.abort();
+        }
+        #[cfg(target_os = "linux")]
+        drop(self.compose_operation_audit_sender.take());
         if let Some(audit_task) = self.compose_operation_audit_task.take()
             && !audit_task.is_finished()
             && tokio::runtime::Handle::try_current().is_err()
         {
-            // The lifecycle task waits for this marker before it can start Compose.
-            // Drain the bounded audit stage before aborting it on app shutdown.
+            // The bounded queue is closed above so the writer drains accepted records.
             let _ = self.runtime.block_on(async {
                 tokio::time::timeout(std::time::Duration::from_secs(1), audit_task).await
             });
-        }
-        if let Some(task) = self.compose_operation_task.take() {
-            task.abort();
         }
         self.pending_resource_read = None;
         if let Some(task) = self.resource_read_task.take() {
@@ -5904,6 +5948,8 @@ mod event_reconciliation_tests {
             compose_operation_task: None,
             compose_operation_cancellation: None,
             compose_operation_audit_task: None,
+            #[cfg(target_os = "linux")]
+            compose_operation_audit_sender: None,
             pending_resource_read: None,
             image_list_task: None,
             image_inspection_task: None,
@@ -7479,6 +7525,7 @@ mod event_reconciliation_tests {
                 .request_service_scale_confirmation("qa-worker", "4")
         );
         app.invalidate_compose();
+        drop(app.compose_operation_audit_sender.take());
         app.runtime
             .block_on(
                 app.compose_operation_audit_task
@@ -7520,6 +7567,66 @@ mod event_reconciliation_tests {
         assert!(!contents.contains("private-label"));
         assert!(!contents.contains("/private/scale-project"));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_compose_audit_queue_prevents_operation_submission() {
+        let (mut app, _) = app_with_open_inspection();
+        let generation = app.compose.begin_file_selection();
+        assert!(app.compose.finish_file_selection(
+            generation,
+            Some(std::path::Path::new("/private/scale-project/compose.yaml")),
+        ));
+        assert!(app.compose.finish_validation(
+            generation,
+            compose::ComposeValidationResult {
+                version: None,
+                services: vec!["web".to_owned()],
+                all_services: vec!["web".to_owned(), "qa-worker".to_owned()],
+                outcome: Ok(()),
+            },
+        ));
+        assert!(app.compose.import_current_project("private-label"));
+        let (status_generation, _, _) = app.compose.begin_status_refresh().unwrap();
+        assert!(app.compose.finish_status_refresh(
+            status_generation,
+            compose::ComposeStatusResult {
+                containers: Vec::new(),
+                outcome: Ok(()),
+            },
+        ));
+        assert!(
+            app.compose
+                .request_service_scale_confirmation("qa-worker", "3")
+        );
+
+        let (audit_sender, audit_receiver) = mpsc::channel(1);
+        let (persisted, persisted_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            audit_sender
+                .try_send(PendingComposeAuditRecord {
+                    record: audit::record_compose_mutation_result(
+                        audit::ComposeMutationAction::Scale,
+                        audit::ComposeMutationOutcome::Started,
+                    ),
+                    persisted,
+                })
+                .is_ok()
+        );
+        app.compose_operation_audit_sender = Some(audit_sender);
+
+        let task = app
+            .compose
+            .confirm_operation()
+            .expect("the validated scale confirmation should be ready");
+        app.start_compose_operation(task, egui::Context::default());
+
+        assert!(app.compose_operation_task.is_none());
+        assert!(app.compose_operation_cancellation.is_none());
+
+        drop(persisted_receiver);
+        drop(audit_receiver);
     }
 
     #[cfg(target_os = "linux")]

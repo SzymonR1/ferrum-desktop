@@ -33,6 +33,10 @@ All notable project changes are documented here. The project has not published a
   Engine 29.9.0/API 1.56 and Compose v5.6.0; the same-profile sibling remained
   absent and the generated project containers were cleaned. No broader
   platform support or full Issue #18 completion is claimed.
+  Compose audit writes use one 32-entry bounded FIFO; operations fail closed
+  before submission when a start marker cannot be queued. Cancellation audit
+  remains best-effort if the queue or durable store is unavailable, and shutdown
+  attempts a bounded drain of accepted records.
 - Added confirmed service-scoped Compose pause/unpause for the current imported,
   successfully revalidated ordered files/profiles on the selected Linux local
   Docker Unix socket. Pause is offered only for a declared service with a
