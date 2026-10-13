@@ -3,6 +3,16 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Hardened confirmed local Compose mutations against selected-file path races.
+  Each operation snapshots the explicitly selected ordered YAML files into
+  write-sealed Linux memfds, validates and submits using the same descriptors,
+  and reuses them for restart status checks while retaining the original base
+  project directory. Snapshot failures fail closed and create no named on-disk
+  copy; host swap/core dumps remain outside Ferrum's control.
+  Recursive include/extends and environment sources, plus Dockerfiles/build
+  contexts, remain live trusted inputs and are not sandboxed. Added fake-CLI
+  source-replacement coverage and an opt-in Compose CLI smoke using temporary
+  files without an Engine.
 - Added confirmed image pulls for the current imported, successfully revalidated
   Compose file/profile selection on Linux local Docker Unix sockets using
   `docker --host unix://<selected-socket> compose --progress plain

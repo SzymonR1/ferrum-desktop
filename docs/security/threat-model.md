@@ -554,9 +554,16 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
 
 - Remote TCP/HTTP/TLS/SSH transport trust, credentials, and identity validation.
 - Podman API compatibility and rootless endpoint discovery; issue #10 remains open for these and the broader engine matrix.
-- Compose `.env`/service `env_file` resolution and remote OCI/Git inputs (remote
-  loaders are disabled during validation) remain trust risks. Session imports
-  retain path/profile metadata and a local label in memory only; explicit saved
+- Confirmed Compose mutations copy the explicitly selected base and ordered
+  overrides into write-sealed Linux memfds before validation. Validation,
+  submitted action, and restart status share those descriptors and the original
+  project directory. No named on-disk copy is created, but host swap or core
+  dumps may retain memory pages. This binds only explicitly selected files;
+  transitive local inputs remain live, uncontained, and unsandboxed.
+- Compose `.env`/service `env_file` and recursive local `include`/`extends.file`
+  sources remain trust risks. Remote OCI/Git loaders are disabled for every
+  Compose CLI invocation. Session imports retain path/profile metadata and a
+  local label in memory only; explicit saved
   registrations persist only validated labels, ordered absolute paths, and
   profiles as described above. Compose `up`/`down`, removal, and project-file
   mutation remain deferred. Pulls are limited to the confirmed anonymous

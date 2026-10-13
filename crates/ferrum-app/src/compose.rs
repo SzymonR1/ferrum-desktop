@@ -2719,10 +2719,25 @@ async fn run_command_with_timeout(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComposeInputSnapshotError {
+    InvalidSelectedFile,
+    InputTooLarge,
+    PrivateConfigSetupFailed,
+}
+
+#[cfg(target_os = "linux")]
+struct ComposeFileSnapshot {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
 struct PrivateDockerConfig {
     root: std::path::PathBuf,
     home: std::path::PathBuf,
     docker_config: std::path::PathBuf,
+    compose_files: Vec<ComposeFileSnapshot>,
 }
 
 #[cfg(target_os = "linux")]
@@ -2775,12 +2790,117 @@ impl PrivateDockerConfig {
                 root: root.clone(),
                 home,
                 docker_config,
+                compose_files: Vec::new(),
             })
         })();
         if setup.is_err() {
             let _ = fs::remove_dir_all(&root);
         }
         setup
+    }
+
+    fn snapshot_compose_files(
+        &mut self,
+        files: &[std::path::PathBuf],
+    ) -> Result<(), ComposeInputSnapshotError> {
+        use std::{
+            fs::OpenOptions,
+            io::Read,
+            os::{
+                fd::{AsRawFd, FromRawFd},
+                unix::fs::OpenOptionsExt,
+            },
+        };
+
+        if files.is_empty() || files.len() > MAX_COMPOSE_FILES {
+            return Err(ComposeInputSnapshotError::InvalidSelectedFile);
+        }
+        self.compose_files.clear();
+        let mut total = 0_u64;
+        for path in files {
+            let source = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+                .map_err(|_| ComposeInputSnapshotError::InvalidSelectedFile)?;
+            if !source
+                .metadata()
+                .map_err(|_| ComposeInputSnapshotError::InvalidSelectedFile)?
+                .file_type()
+                .is_file()
+            {
+                return Err(ComposeInputSnapshotError::InvalidSelectedFile);
+            }
+
+            let remaining = MAX_COMPOSE_INPUT_BYTES.saturating_sub(total);
+            // SAFETY: The memfd name is a static NUL-terminated string and
+            // both flags are supported Linux memfd creation flags.
+            let descriptor = unsafe {
+                libc::memfd_create(
+                    c"ferrum-compose-input".as_ptr(),
+                    libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+                )
+            };
+            if descriptor < 0 {
+                return Err(ComposeInputSnapshotError::PrivateConfigSetupFailed);
+            }
+            // SAFETY: `memfd_create` returned a newly owned descriptor.
+            let mut snapshot = unsafe { std::fs::File::from_raw_fd(descriptor) };
+            let copied =
+                std::io::copy(&mut source.take(remaining.saturating_add(1)), &mut snapshot)
+                    .map_err(|_| ComposeInputSnapshotError::PrivateConfigSetupFailed)?;
+            if copied > remaining {
+                return Err(ComposeInputSnapshotError::InputTooLarge);
+            }
+            total = total.saturating_add(copied);
+
+            let seals =
+                libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+            // SAFETY: The owned memfd contains the completed snapshot and has
+            // no writable mappings; adding these seals makes its contents fixed.
+            if unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_ADD_SEALS, seals) } == -1 {
+                return Err(ComposeInputSnapshotError::PrivateConfigSetupFailed);
+            }
+            let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", snapshot.as_raw_fd()));
+            self.compose_files.push(ComposeFileSnapshot {
+                file: snapshot,
+                path,
+            });
+        }
+        Ok(())
+    }
+
+    fn configure_compose_file_descriptors(&self, command: &mut tokio::process::Command) {
+        use std::os::{fd::AsRawFd, unix::process::CommandExt};
+
+        if self.compose_files.is_empty() {
+            return;
+        }
+        let mut descriptors = [0; MAX_COMPOSE_FILES];
+        for (descriptor, snapshot) in descriptors.iter_mut().zip(&self.compose_files) {
+            *descriptor = snapshot.file.as_raw_fd();
+        }
+        let count = self.compose_files.len();
+        // SAFETY: The pre-exec closure uses only stack locals and async-signal-
+        // safe fcntl/lseek calls. It performs no allocation, locking, logging,
+        // or environment access after fork.
+        unsafe {
+            command.as_std_mut().pre_exec(move || {
+                for descriptor in descriptors.iter().take(count) {
+                    let flags = libc::fcntl(*descriptor, libc::F_GETFD);
+                    if flags == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(*descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::lseek(*descriptor, 0, libc::SEEK_SET) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
     }
 
     fn configure(&self, command: &mut tokio::process::Command, search_path: &std::ffi::OsStr) {
@@ -2974,8 +3094,6 @@ async fn validate_with_profiles_report(
     user_compose_plugin: Option<&std::path::Path>,
     deadline: Duration,
 ) -> ComposeValidationResult {
-    use tokio::process::Command;
-
     if !valid_profile_list(profiles) {
         return ComposeValidationResult::failed(ComposeValidationError::InvalidProfiles);
     }
@@ -2985,7 +3103,9 @@ async fn validate_with_profiles_report(
     if selected_compose_files_size_exceeds_limit(files) {
         return ComposeValidationResult::failed(ComposeValidationError::InputTooLarge);
     }
-    let parent = files[0].parent().expect("absolute file has a parent");
+    let Some(project_directory) = files.first().and_then(|file| file.parent()) else {
+        return ComposeValidationResult::failed(ComposeValidationError::InvalidSelectedFile);
+    };
     let isolated = match PrivateDockerConfig::new(user_compose_plugin) {
         Ok(isolated) => isolated,
         Err(_) => {
@@ -2994,7 +3114,34 @@ async fn validate_with_profiles_report(
             );
         }
     };
-    let version_output = match probe_compose_version(binary, &isolated, search_path, deadline).await
+    validate_with_profiles_report_in_config(
+        binary,
+        files,
+        project_directory,
+        profiles,
+        search_path,
+        &isolated,
+        deadline,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn validate_with_profiles_report_in_config(
+    binary: &std::path::Path,
+    files: &[std::path::PathBuf],
+    project_directory: &std::path::Path,
+    profiles: &[String],
+    search_path: &std::ffi::OsStr,
+    isolated: &PrivateDockerConfig,
+    deadline: Duration,
+) -> ComposeValidationResult {
+    use tokio::process::Command;
+
+    if !valid_profile_list(profiles) {
+        return ComposeValidationResult::failed(ComposeValidationError::InvalidProfiles);
+    }
+    let version_output = match probe_compose_version(binary, isolated, search_path, deadline).await
     {
         Ok(output) => output,
         Err(failure) => {
@@ -3018,7 +3165,7 @@ async fn validate_with_profiles_report(
         .env("COMPOSE_DISABLE_ENV_FILE", "1")
         .args(["compose"])
         .arg("--project-directory")
-        .arg(parent);
+        .arg(project_directory);
     for file in files {
         command.arg("--file").arg(file);
     }
@@ -3031,6 +3178,7 @@ async fn validate_with_profiles_report(
         "--no-env-resolution",
         "--services",
     ]);
+    isolated.configure_compose_file_descriptors(&mut command);
     let (services, outcome) = match run_command_with_timeout(&mut command, deadline).await {
         Ok(output) => match parse_declared_services(&output) {
             Some(services) => (services, Ok(())),
@@ -3078,15 +3226,44 @@ async fn containers_with_binary(
     search_path: &std::ffi::OsStr,
     user_compose_plugin: Option<&std::path::Path>,
 ) -> Result<Vec<ComposeContainer>, ComposeStatusError> {
-    use tokio::process::Command;
     if !valid_profile_list(profiles)
         || !selected_compose_files_are_valid(files)
         || selected_compose_files_size_exceeds_limit(files)
     {
         return Err(ComposeStatusError::QueryFailed);
     }
+    let project_directory = files
+        .first()
+        .and_then(|file| file.parent())
+        .ok_or(ComposeStatusError::QueryFailed)?;
     let isolated = PrivateDockerConfig::new(user_compose_plugin)
         .map_err(|_| ComposeStatusError::PrivateConfigSetupFailed)?;
+    containers_with_isolated_config(
+        binary,
+        socket_path,
+        files,
+        project_directory,
+        profiles,
+        search_path,
+        &isolated,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn containers_with_isolated_config(
+    binary: &std::path::Path,
+    socket_path: &std::path::Path,
+    files: &[std::path::PathBuf],
+    project_directory: &std::path::Path,
+    profiles: &[String],
+    search_path: &std::ffi::OsStr,
+    isolated: &PrivateDockerConfig,
+) -> Result<Vec<ComposeContainer>, ComposeStatusError> {
+    use tokio::process::Command;
+    if !valid_profile_list(profiles) || files.is_empty() {
+        return Err(ComposeStatusError::QueryFailed);
+    }
     let socket_path = socket_path
         .to_str()
         .ok_or(ComposeStatusError::QueryFailed)?;
@@ -3098,7 +3275,7 @@ async fn containers_with_binary(
         .arg("--host")
         .arg(host)
         .args(["compose", "--project-directory"])
-        .arg(files[0].parent().ok_or(ComposeStatusError::QueryFailed)?);
+        .arg(project_directory);
     for file in files {
         command.arg("--file").arg(file);
     }
@@ -3106,6 +3283,7 @@ async fn containers_with_binary(
         command.arg("--profile").arg(profile);
     }
     command.args(["ps", "--all", "--format", "json"]);
+    isolated.configure_compose_file_descriptors(&mut command);
     let output = run_command_with_timeout(&mut command, COMMAND_TIMEOUT)
         .await
         .map_err(|failure| match failure {
@@ -3592,69 +3770,42 @@ async fn lifecycle_with_binary(
             submitted: false,
         };
     }
-    use tokio::process::Command;
-    let validation = validate_with_profiles_report(
-        binary,
-        files,
-        profiles,
-        search_path,
-        user_compose_plugin,
-        COMMAND_TIMEOUT,
-    )
-    .await;
-    if let Err(error) = validation.outcome {
-        let error = match error {
-            ComposeValidationError::DockerCliMissing
-            | ComposeValidationError::ComposePluginUnavailable => {
-                ComposeOperationError::DockerCliMissing
+    let prepared =
+        match prepare_compose_operation(binary, files, profiles, search_path, user_compose_plugin)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return ComposeOperationResult {
+                    outcome: Err(error),
+                    submitted: false,
+                };
             }
-            ComposeValidationError::CommandStartFailed => ComposeOperationError::CommandStartFailed,
-            ComposeValidationError::PrivateConfigSetupFailed => {
-                ComposeOperationError::PrivateConfigSetupFailed
-            }
-            _ => ComposeOperationError::ValidationFailed,
         };
-        return ComposeOperationResult {
-            outcome: Err(error),
-            submitted: false,
-        };
-    }
-    let isolated = match PrivateDockerConfig::new(user_compose_plugin) {
-        Ok(isolated) => isolated,
-        Err(_) => {
-            return ComposeOperationResult {
-                outcome: Err(ComposeOperationError::PrivateConfigSetupFailed),
-                submitted: false,
-            };
-        }
-    };
     let Some(socket_path) = socket_path.to_str() else {
         return ComposeOperationResult {
             outcome: Err(ComposeOperationError::OperationFailed),
             submitted: false,
         };
     };
-    let Some(parent) = files.first().and_then(|file| file.parent()) else {
-        return ComposeOperationResult {
-            outcome: Err(ComposeOperationError::ValidationFailed),
-            submitted: false,
-        };
-    };
-    let mut command = Command::new(binary);
-    isolated.configure(&mut command, search_path);
+    let mut command = tokio::process::Command::new(binary);
+    prepared.isolated.configure(&mut command, search_path);
     command
         .env("COMPOSE_DISABLE_ENV_FILE", "1")
         .arg("--host")
         .arg(format!("unix://{socket_path}"))
         .args(["compose", "--project-directory"])
-        .arg(parent);
-    for file in files {
+        .arg(&prepared.project_directory);
+    for file in &prepared.files {
         command.arg("--file").arg(file);
     }
     for profile in profiles {
         command.arg("--profile").arg(profile);
     }
     command.arg(action.label());
+    prepared
+        .isolated
+        .configure_compose_file_descriptors(&mut command);
     run_lifecycle_command_with_timeout(&mut command, LIFECYCLE_COMMAND_TIMEOUT).await
 }
 #[cfg(target_os = "linux")]
@@ -3945,6 +4096,12 @@ struct ComposeOperationRequest<'a> {
     plugin: Option<&'a std::path::Path>,
 }
 #[cfg(target_os = "linux")]
+struct PreparedComposeOperation {
+    isolated: PrivateDockerConfig,
+    files: Vec<std::path::PathBuf>,
+    project_directory: std::path::PathBuf,
+}
+#[cfg(target_os = "linux")]
 fn compose_validation_operation_error(error: ComposeValidationError) -> ComposeOperationError {
     match error {
         ComposeValidationError::DockerCliMissing
@@ -3960,64 +4117,95 @@ fn compose_validation_operation_error(error: ComposeValidationError) -> ComposeO
 }
 
 #[cfg(target_os = "linux")]
-async fn compose_operation_preflight(
-    request: &ComposeOperationRequest<'_>,
-    cancellation: &mut tokio::sync::oneshot::Receiver<()>,
-) -> Result<PrivateDockerConfig, ComposeOperationError> {
-    if !valid_profile_list(request.profiles)
-        || !selected_compose_files_are_valid(request.files)
-        || selected_compose_files_size_exceeds_limit(request.files)
+async fn prepare_compose_operation(
+    binary: &std::path::Path,
+    files: &[std::path::PathBuf],
+    profiles: &[String],
+    search_path: &std::ffi::OsStr,
+    plugin: Option<&std::path::Path>,
+) -> Result<PreparedComposeOperation, ComposeOperationError> {
+    if !valid_profile_list(profiles)
+        || !selected_compose_files_are_valid(files)
+        || selected_compose_files_size_exceeds_limit(files)
     {
         return Err(ComposeOperationError::ValidationFailed);
     }
-    let validation = tokio::select! {
-        validation = validate_with_profiles_report(
+    let project_directory = files
+        .first()
+        .and_then(|file| file.parent())
+        .ok_or(ComposeOperationError::ValidationFailed)?;
+    let mut isolated = PrivateDockerConfig::new(plugin)
+        .map_err(|_| ComposeOperationError::PrivateConfigSetupFailed)?;
+    isolated
+        .snapshot_compose_files(files)
+        .map_err(|error| match error {
+            ComposeInputSnapshotError::InvalidSelectedFile
+            | ComposeInputSnapshotError::InputTooLarge => ComposeOperationError::ValidationFailed,
+            ComposeInputSnapshotError::PrivateConfigSetupFailed => {
+                ComposeOperationError::PrivateConfigSetupFailed
+            }
+        })?;
+    let snapshot_files = isolated
+        .compose_files
+        .iter()
+        .map(|snapshot| snapshot.path.clone())
+        .collect::<Vec<_>>();
+    let validation = validate_with_profiles_report_in_config(
+        binary,
+        &snapshot_files,
+        project_directory,
+        profiles,
+        search_path,
+        &isolated,
+        COMMAND_TIMEOUT,
+    )
+    .await;
+    validation
+        .outcome
+        .map_err(compose_validation_operation_error)?;
+    Ok(PreparedComposeOperation {
+        isolated,
+        files: snapshot_files,
+        project_directory: project_directory.to_path_buf(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn compose_operation_preflight(
+    request: &ComposeOperationRequest<'_>,
+    cancellation: &mut tokio::sync::oneshot::Receiver<()>,
+) -> Result<PreparedComposeOperation, ComposeOperationError> {
+    if request.socket_path.to_str().is_none() {
+        return Err(ComposeOperationError::OperationFailed);
+    }
+    tokio::select! {
+        prepared = prepare_compose_operation(
             request.binary,
             request.files,
             request.profiles,
             request.search_path,
             request.plugin,
-            COMMAND_TIMEOUT,
-        ) => validation,
+        ) => prepared,
         _ = &mut *cancellation => {
-            return Err(ComposeOperationError::OperationCancelledBeforeSpawn);
+            Err(ComposeOperationError::OperationCancelledBeforeSpawn)
         }
-    };
-    validation
-        .outcome
-        .map_err(compose_validation_operation_error)?;
-    if request.socket_path.to_str().is_none() {
-        return Err(ComposeOperationError::OperationFailed);
     }
-    if request
-        .files
-        .first()
-        .and_then(|file| file.parent())
-        .is_none()
-    {
-        return Err(ComposeOperationError::ValidationFailed);
-    }
-    PrivateDockerConfig::new(request.plugin)
-        .map_err(|_| ComposeOperationError::PrivateConfigSetupFailed)
 }
 
 #[cfg(target_os = "linux")]
 fn configured_compose_command(
     request: &ComposeOperationRequest<'_>,
-    isolated: &PrivateDockerConfig,
+    prepared: &PreparedComposeOperation,
     parallelism: &'static str,
 ) -> Result<tokio::process::Command, ComposeOperationError> {
     let socket_path = request
         .socket_path
         .to_str()
         .ok_or(ComposeOperationError::OperationFailed)?;
-    let project_directory = request
-        .files
-        .first()
-        .and_then(|file| file.parent())
-        .ok_or(ComposeOperationError::ValidationFailed)?;
     let mut command = tokio::process::Command::new(request.binary);
-    isolated.configure(&mut command, request.search_path);
+    prepared
+        .isolated
+        .configure(&mut command, request.search_path);
     command
         .env("COMPOSE_DISABLE_ENV_FILE", "1")
         .arg("--host")
@@ -4030,13 +4218,16 @@ fn configured_compose_command(
             parallelism,
             "--project-directory",
         ])
-        .arg(project_directory);
-    for file in request.files {
+        .arg(&prepared.project_directory);
+    for file in &prepared.files {
         command.arg("--file").arg(file);
     }
     for profile in request.profiles {
         command.arg("--profile").arg(profile);
     }
+    prepared
+        .isolated
+        .configure_compose_file_descriptors(&mut command);
     Ok(command)
 }
 
@@ -4050,11 +4241,11 @@ async fn compose_pull_with_binary(
         outcome: Err(error),
         submitted: false,
     };
-    let isolated = match compose_operation_preflight(&request, &mut cancellation).await {
-        Ok(isolated) => isolated,
+    let prepared = match compose_operation_preflight(&request, &mut cancellation).await {
+        Ok(prepared) => prepared,
         Err(error) => return failure(error),
     };
-    let mut command = match configured_compose_command(&request, &isolated, "4") {
+    let mut command = match configured_compose_command(&request, &prepared, "4") {
         Ok(command) => command,
         Err(error) => return failure(error),
     };
@@ -4077,11 +4268,11 @@ async fn compose_build_with_binary(
         outcome: Err(error),
         submitted: false,
     };
-    let isolated = match compose_operation_preflight(&request, &mut cancellation).await {
-        Ok(isolated) => isolated,
+    let prepared = match compose_operation_preflight(&request, &mut cancellation).await {
+        Ok(prepared) => prepared,
         Err(error) => return failure(error),
     };
-    let mut command = match configured_compose_command(&request, &isolated, "2") {
+    let mut command = match configured_compose_command(&request, &prepared, "2") {
         Ok(command) => command,
         Err(error) => return failure(error),
     };
@@ -4176,7 +4367,6 @@ async fn service_restart_with_binary(
     search_path: &std::ffi::OsStr,
     user_compose_plugin: Option<&std::path::Path>,
 ) -> ComposeOperationResult {
-    use tokio::process::Command;
     let failure = |error| ComposeOperationResult {
         outcome: Err(error),
         submitted: false,
@@ -4184,35 +4374,21 @@ async fn service_restart_with_binary(
     let Some(service) = validate_service_selector(service) else {
         return failure(ComposeOperationError::ServiceUnavailable);
     };
-    let validation = validate_with_profiles_report(
-        binary,
-        files,
-        profiles,
-        search_path,
-        user_compose_plugin,
-        COMMAND_TIMEOUT,
-    )
-    .await;
-    if let Err(error) = validation.outcome {
-        return failure(match error {
-            ComposeValidationError::DockerCliMissing
-            | ComposeValidationError::ComposePluginUnavailable => {
-                ComposeOperationError::DockerCliMissing
-            }
-            ComposeValidationError::CommandStartFailed => ComposeOperationError::CommandStartFailed,
-            ComposeValidationError::PrivateConfigSetupFailed => {
-                ComposeOperationError::PrivateConfigSetupFailed
-            }
-            _ => ComposeOperationError::ValidationFailed,
-        });
-    }
-    let containers = match containers_with_binary(
+    let prepared =
+        match prepare_compose_operation(binary, files, profiles, search_path, user_compose_plugin)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => return failure(error),
+        };
+    let containers = match containers_with_isolated_config(
         binary,
         socket_path,
-        files,
+        &prepared.files,
+        &prepared.project_directory,
         profiles,
         search_path,
-        user_compose_plugin,
+        &prepared.isolated,
     )
     .await
     {
@@ -4233,37 +4409,27 @@ async fn service_restart_with_binary(
     {
         return failure(ComposeOperationError::ServiceUnavailable);
     }
-    if !valid_profile_list(profiles)
-        || !selected_compose_files_are_valid(files)
-        || selected_compose_files_size_exceeds_limit(files)
-    {
-        return failure(ComposeOperationError::ValidationFailed);
-    }
-    let isolated = match PrivateDockerConfig::new(user_compose_plugin) {
-        Ok(isolated) => isolated,
-        Err(_) => return failure(ComposeOperationError::PrivateConfigSetupFailed),
-    };
     let Some(socket_path) = socket_path.to_str() else {
         return failure(ComposeOperationError::OperationFailed);
     };
-    let Some(parent) = files.first().and_then(|file| file.parent()) else {
-        return failure(ComposeOperationError::ValidationFailed);
-    };
-    let mut command = Command::new(binary);
-    isolated.configure(&mut command, search_path);
+    let mut command = tokio::process::Command::new(binary);
+    prepared.isolated.configure(&mut command, search_path);
     command
         .env("COMPOSE_DISABLE_ENV_FILE", "1")
         .arg("--host")
         .arg(format!("unix://{socket_path}"))
         .args(["compose", "--project-directory"])
-        .arg(parent);
-    for file in files {
+        .arg(&prepared.project_directory);
+    for file in &prepared.files {
         command.arg("--file").arg(file);
     }
     for profile in profiles {
         command.arg("--profile").arg(profile);
     }
     command.args(["restart", "--no-deps"]).arg(service);
+    prepared
+        .isolated
+        .configure_compose_file_descriptors(&mut command);
     run_lifecycle_command_with_timeout(&mut command, LIFECYCLE_COMMAND_TIMEOUT).await
 }
 
@@ -5158,6 +5324,52 @@ mod tests {
             result.outcome.expect(
                 "the local Compose CLI should validate and list all declared services without contacting an engine",
             );
+        }
+        #[tokio::test]
+        #[ignore = "requires Docker CLI and Compose; validates sealed selected files and relative includes without an Engine"]
+        async fn local_compose_validation_reads_the_sealed_operation_snapshot() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("snapshot project");
+            let included = project.join("included");
+            fs::create_dir_all(included.join("data")).unwrap();
+            fs::create_dir_all(project.join("data")).unwrap();
+            let base = project.join("compose.yaml");
+            let override_file = project.join("override.yaml");
+            let included_file = included.join("compose.yaml");
+            fs::write(
+                &base,
+                "include:\n  - ./included/compose.yaml\nservices:\n  web:\n    image: busybox\n    volumes:\n      - ./data:/data\n",
+            )
+            .unwrap();
+            fs::write(
+                &included_file,
+                "services:\n  included:\n    image: busybox\n    volumes:\n      - ./data:/data\n",
+            )
+            .unwrap();
+            fs::write(&override_file, "services:\n  worker:\n    image: busybox\n").unwrap();
+
+            let files = [base, override_file];
+            let search_path = search_path();
+            let binary = docker_binary(&search_path).expect("Docker CLI should be installed");
+            let plugin = user_compose_plugin();
+            let prepared =
+                prepare_compose_operation(&binary, &files, &[], &search_path, plugin.as_deref())
+                    .await
+                    .expect("the sealed operation snapshot should validate");
+            let result = validate_with_profiles_report_in_config(
+                &binary,
+                &prepared.files,
+                &prepared.project_directory,
+                &[],
+                &search_path,
+                &prepared.isolated,
+                COMMAND_TIMEOUT,
+            )
+            .await;
+            assert_eq!(result.outcome, Ok(()));
+            let mut services = result.services;
+            services.sort();
+            assert_eq!(services, ["included", "web", "worker"]);
         }
 
         #[tokio::test]
@@ -6113,7 +6325,10 @@ mod tests {
                    if [ \"$#\" -eq 3 ]; then [ \"$2\" = version ] && [ \"$3\" = --short ] || exit 71; printf 'v5.6.0\\n'; exit 0; fi\n\
                    [ \"$#\" -eq 15 ] || exit 72\n\
                    [ \"$1\" = compose ] && [ \"$2\" = --project-directory ] && [ \"$3\" = {} ] || exit 73\n\
-                   [ \"$4\" = --file ] && [ \"$5\" = {} ] && [ \"$6\" = --file ] && [ \"$7\" = {} ] || exit 74\n\
+                   [ \"$4\" = --file ] || exit 82\n\
+                   case \"$5\" in /proc/self/fd/*) ;; *) exit 82 ;; esac\n\
+                   [ \"$6\" = --file ] || exit 82\n\
+                   case \"$7\" in /proc/self/fd/*) ;; *) exit 82 ;; esac\n\
                    [ \"$8\" = --profile ] && [ \"$9\" = web ] && [ \"${{10}}\" = --profile ] && [ \"${{11}}\" = qa ] || exit 75\n\
                    [ \"${{12}}\" = config ] && [ \"${{13}}\" = --no-interpolate ] && [ \"${{14}}\" = --no-env-resolution ] && [ \"${{15}}\" = --services ] || exit 76\n\
                    check_environment\n\
@@ -6123,7 +6338,9 @@ mod tests {
                    [ \"$#\" -eq 19 ] || exit 83\n\
                    [ \"$1\" = --host ] && [ \"$2\" = {} ] && [ \"$3\" = compose ] && [ \"$4\" = --progress ] && [ \"$5\" = plain ] || exit 84\n\
                    [ \"$6\" = --parallel ] && [ \"$7\" = 4 ] && [ \"$8\" = --project-directory ] && [ \"$9\" = {} ] || exit 85\n\
-                   [ \"${{10}}\" = --file ] && [ \"${{11}}\" = {} ] && [ \"${{12}}\" = --file ] && [ \"${{13}}\" = {} ] || exit 86\n\
+                   [ \"${{10}}\" = --file ] && [ \"${{12}}\" = --file ] || exit 86\n\
+                   case \"${{11}}\" in /proc/self/fd/*) ;; *) exit 86 ;; esac\n\
+                   case \"${{13}}\" in /proc/self/fd/*) ;; *) exit 86 ;; esac\n\
                    [ \"${{14}}\" = --profile ] && [ \"${{15}}\" = web ] && [ \"${{16}}\" = --profile ] && [ \"${{17}}\" = qa ] || exit 87\n\
                    [ \"${{18}}\" = pull ] && [ \"${{19}}\" = --ignore-buildable ] || exit 88\n\
                    check_environment\n\
@@ -6133,23 +6350,19 @@ mod tests {
                  fi\n\
                  [ \"$#\" -eq 14 ] || exit 77\n\
                  [ \"$1\" = --host ] && [ \"$2\" = {} ] && [ \"$3\" = compose ] || exit 78\n\
-                 [ \"$4\" = --project-directory ] && [ \"$5\" = {} ] && [ \"$6\" = --file ] && [ \"$7\" = {} ] && [ \"$8\" = --file ] && [ \"$9\" = {} ] || exit 79\n\
+                 [ \"$4\" = --project-directory ] && [ \"$5\" = {} ] && [ \"$6\" = --file ] && [ \"$8\" = --file ] || exit 79\n\
+                 case \"$7\" in /proc/self/fd/*) ;; *) exit 79 ;; esac\n\
+                 case \"$9\" in /proc/self/fd/*) ;; *) exit 79 ;; esac\n\
                  [ \"${{10}}\" = --profile ] && [ \"${{11}}\" = web ] && [ \"${{12}}\" = --profile ] && [ \"${{13}}\" = qa ] || exit 80\n\
                  [ \"${{14}}\" = start ] || [ \"${{14}}\" = stop ] || exit 81\n\
                  check_environment\n\
                  printf '%s\\n' \"${{14}}\" >> {}\n",
                 shell_quote(&project_directory.to_string_lossy()),
-                shell_quote(&file.to_string_lossy()),
-                shell_quote(&override_file.to_string_lossy()),
                 shell_quote(&format!("unix://{}", socket.to_string_lossy())),
                 shell_quote(&project_directory.to_string_lossy()),
-                shell_quote(&file.to_string_lossy()),
-                shell_quote(&override_file.to_string_lossy()),
                 shell_quote(&lifecycle_marker.to_string_lossy()),
                 shell_quote(&format!("unix://{}", socket.to_string_lossy())),
                 shell_quote(&project_directory.to_string_lossy()),
-                shell_quote(&file.to_string_lossy()),
-                shell_quote(&override_file.to_string_lossy()),
                 shell_quote(&lifecycle_marker.to_string_lossy()),
             );
             fs::write(&binary, script).expect("the fake Docker CLI should be written");
@@ -6260,25 +6473,24 @@ mod tests {
             assert_eq!(result.outcome, Ok(()));
             assert!(result.submitted);
             let argv = fs::read_to_string(marker).unwrap();
-            assert_eq!(
-                argv.lines().collect::<Vec<_>>(),
-                [
-                    "--host",
-                    &format!("unix://{}", socket.display()),
-                    "compose",
-                    "--progress",
-                    "plain",
-                    "--parallel",
-                    "2",
-                    "--project-directory",
-                    &project.display().to_string(),
-                    "--file",
-                    &file.display().to_string(),
-                    "--profile",
-                    "qa",
-                    "build",
-                ]
-            );
+            let args = argv.lines().collect::<Vec<_>>();
+            let socket_argument = format!("unix://{}", socket.display());
+            let project_argument = project.display().to_string();
+            let expected_prefix = [
+                "--host",
+                socket_argument.as_str(),
+                "compose",
+                "--progress",
+                "plain",
+                "--parallel",
+                "2",
+                "--project-directory",
+                project_argument.as_str(),
+                "--file",
+            ];
+            assert_eq!(&args[..10], &expected_prefix);
+            assert!(args[10].starts_with("/proc/self/fd/"));
+            assert_eq!(&args[11..], &["--profile", "qa", "build"]);
             assert!(!argv.contains("--push"));
             assert!(!argv.contains("--ssh"));
             let progress =
@@ -6290,6 +6502,118 @@ mod tests {
             assert_eq!(progress.last().unwrap().recognized_records, 3);
             assert!(!format!("{progress:?}").contains("private"));
             assert!(progress.len() <= COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
+        }
+        #[tokio::test]
+        async fn compose_mutation_uses_the_validated_file_snapshot() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("snapshot project");
+            fs::create_dir(&project).expect("the project directory should exist");
+            let base = project.join("compose.yaml");
+            let override_file = project.join("override.yaml");
+            let original_base = "services:\n  safe:\n    image: busybox\n";
+            let original_override = "services:\n  safe:\n    environment:\n      MODE: original\n";
+            let changed_base = "services:\n  changed:\n    image: attacker\n";
+            let changed_override = "services:\n  changed:\n    environment:\n      MODE: changed\n";
+            fs::write(&base, original_base).expect("the base Compose file should be written");
+            fs::write(&override_file, original_override)
+                .expect("the override Compose file should be written");
+
+            let submitted = directory.path().join("submitted-compose-inputs");
+            let binary = directory.path().join("docker-snapshot-fixture");
+            let script = format!(
+                r#"#!/bin/sh
+if [ "$1" = compose ] && [ "$2" = version ]; then
+  printf 'v5.6.0\n'
+  exit 0
+fi
+if [ "$1" = compose ]; then
+  is_config=0
+  for argument do
+    [ "$argument" = config ] && is_config=1
+  done
+  if [ "$is_config" -eq 1 ]; then
+    found=0
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --file ]; then
+        shift
+        found=$((found + 1))
+        cat "$1" >/dev/null || exit 80
+        if printf '%s' 'corrupt' > "$1" 2>/dev/null; then exit 80; fi
+      fi
+      shift
+    done
+    [ "$found" -eq 2 ] || exit 81
+    printf '%s' {} > {}
+    printf '%s' {} > {}
+    printf 'safe\n'
+    exit 0
+  fi
+fi
+if [ "$1" = --host ]; then
+  last_argument=
+  for argument do last_argument="$argument"; done
+  [ "$last_argument" = build ] || exit 82
+  found=0
+  : > {}
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --file ]; then
+      shift
+      found=$((found + 1))
+      if [ "$found" -gt 1 ]; then printf '%s\n' '---' >> {}; fi
+      cat "$1" >> {} || exit 83
+    fi
+    shift
+  done
+  [ "$found" -eq 2 ] || exit 84
+  exit 0
+fi
+exit 85
+"#,
+                shell_quote(changed_base),
+                shell_quote(&base.to_string_lossy()),
+                shell_quote(changed_override),
+                shell_quote(&override_file.to_string_lossy()),
+                shell_quote(&submitted.to_string_lossy()),
+                shell_quote(&submitted.to_string_lossy()),
+                shell_quote(&submitted.to_string_lossy()),
+            );
+            fs::write(&binary, script).expect("the fake Docker CLI should be written");
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+                .expect("the fake Docker CLI should be executable");
+
+            let (_cancel_sender, cancellation) = tokio::sync::oneshot::channel();
+            let (progress_sender, _progress_receiver) =
+                tokio::sync::mpsc::channel(COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
+            let result = compose_build_with_binary(
+                ComposeOperationRequest {
+                    binary: &binary,
+                    socket_path: &directory.path().join("selected.sock"),
+                    files: &[base.clone(), override_file.clone()],
+                    profiles: &[],
+                    search_path: OsStr::new("/usr/bin"),
+                    plugin: None,
+                },
+                cancellation,
+                &progress_sender,
+            )
+            .await;
+
+            assert_eq!(result.outcome, Ok(()));
+            assert!(result.submitted);
+            assert_eq!(
+                fs::read_to_string(&base).expect("the fixture should replace the base file"),
+                changed_base
+            );
+            assert_eq!(
+                fs::read_to_string(&override_file)
+                    .expect("the fixture should replace the override file"),
+                changed_override
+            );
+            assert_eq!(
+                fs::read_to_string(&submitted)
+                    .expect("the operation should record its Compose inputs"),
+                format!("{original_base}---\n{original_override}")
+            );
         }
         #[test]
         fn compose_build_progress_recognizes_buildkit_load_records_without_retaining_text() {
@@ -6690,72 +7014,96 @@ mod tests {
 
             assert_eq!(result.outcome, Ok(()));
             assert!(result.submitted);
-            let expected_validation = [
-                "compose".to_owned(),
-                "--project-directory".to_owned(),
-                project.display().to_string(),
-                "--file".to_owned(),
-                base.display().to_string(),
-                "--file".to_owned(),
-                overlay.display().to_string(),
-                "--profile".to_owned(),
-                "frontend".to_owned(),
-                "--profile".to_owned(),
-                "qa".to_owned(),
-                "config".to_owned(),
-                "--no-interpolate".to_owned(),
-                "--no-env-resolution".to_owned(),
-                "--services".to_owned(),
-            ]
-            .join("\n")
-                + "\n";
-            assert_eq!(
-                fs::read_to_string(validation_trace).unwrap(),
-                expected_validation
+            let socket_argument = format!("unix://{}", socket.display());
+            let project_argument = project.display().to_string();
+            let validation_trace = fs::read_to_string(validation_trace).unwrap();
+            let validation_arguments = validation_trace.lines().collect::<Vec<_>>();
+            assert_eq!(validation_arguments[0], "compose");
+            assert_eq!(validation_arguments[1], "--project-directory");
+            assert_eq!(validation_arguments[2], project_argument.as_str());
+            assert_eq!(validation_arguments[3], "--file");
+            assert_eq!(validation_arguments[5], "--file");
+            let snapshot_files = [
+                validation_arguments[4].to_owned(),
+                validation_arguments[6].to_owned(),
+            ];
+            assert!(
+                snapshot_files
+                    .iter()
+                    .all(|path| path.starts_with("/proc/self/fd/"))
             );
-            let expected_status = [
-                "--host".to_owned(),
-                format!("unix://{}", socket.display()),
-                "compose".to_owned(),
-                "--project-directory".to_owned(),
-                project.display().to_string(),
-                "--file".to_owned(),
-                base.display().to_string(),
-                "--file".to_owned(),
-                overlay.display().to_string(),
-                "--profile".to_owned(),
-                "frontend".to_owned(),
-                "--profile".to_owned(),
-                "qa".to_owned(),
-                "ps".to_owned(),
-                "--all".to_owned(),
-                "--format".to_owned(),
-                "json".to_owned(),
-            ]
-            .join("\n")
-                + "\n";
-            assert_eq!(fs::read_to_string(status_trace).unwrap(), expected_status);
-            let expected_restart = [
-                "--host".to_owned(),
-                format!("unix://{}", socket.display()),
-                "compose".to_owned(),
-                "--project-directory".to_owned(),
-                project.display().to_string(),
-                "--file".to_owned(),
-                base.display().to_string(),
-                "--file".to_owned(),
-                overlay.display().to_string(),
-                "--profile".to_owned(),
-                "frontend".to_owned(),
-                "--profile".to_owned(),
-                "qa".to_owned(),
-                "restart".to_owned(),
-                "--no-deps".to_owned(),
-                "web".to_owned(),
-            ]
-            .join("\n")
-                + "\n";
-            assert_eq!(fs::read_to_string(restart_trace).unwrap(), expected_restart);
+            assert_eq!(
+                &validation_arguments[7..],
+                [
+                    "--profile",
+                    "frontend",
+                    "--profile",
+                    "qa",
+                    "config",
+                    "--no-interpolate",
+                    "--no-env-resolution",
+                    "--services",
+                ]
+            );
+
+            let status_trace = fs::read_to_string(status_trace).unwrap();
+            let status_arguments = status_trace.lines().collect::<Vec<_>>();
+            assert_eq!(
+                &status_arguments[..6],
+                [
+                    "--host",
+                    socket_argument.as_str(),
+                    "compose",
+                    "--project-directory",
+                    project_argument.as_str(),
+                    "--file",
+                ]
+            );
+            assert_eq!(status_arguments[6], snapshot_files[0]);
+            assert_eq!(status_arguments[7], "--file");
+            assert_eq!(status_arguments[8], snapshot_files[1]);
+            assert_eq!(
+                &status_arguments[9..],
+                [
+                    "--profile",
+                    "frontend",
+                    "--profile",
+                    "qa",
+                    "ps",
+                    "--all",
+                    "--format",
+                    "json",
+                ]
+            );
+
+            let restart_trace = fs::read_to_string(restart_trace).unwrap();
+            let restart_arguments = restart_trace.lines().collect::<Vec<_>>();
+            assert_eq!(
+                &restart_arguments[..6],
+                [
+                    "--host",
+                    socket_argument.as_str(),
+                    "compose",
+                    "--project-directory",
+                    project_argument.as_str(),
+                    "--file",
+                ]
+            );
+            assert_eq!(restart_arguments[6], snapshot_files[0]);
+            assert_eq!(restart_arguments[7], "--file");
+            assert_eq!(restart_arguments[8], snapshot_files[1]);
+            assert_eq!(
+                &restart_arguments[9..],
+                [
+                    "--profile",
+                    "frontend",
+                    "--profile",
+                    "qa",
+                    "restart",
+                    "--no-deps",
+                    "web",
+                ]
+            );
             assert_eq!(
                 fs::read_to_string(sequence).unwrap(),
                 "version\nvalidation\nstatus\nrestart\n"

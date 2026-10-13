@@ -56,19 +56,19 @@ for the validation flags.
 Validation is Linux local Docker Compose CLI only. Ferrum rejects a combined
 selected-file size greater than 16 MiB across the base and all overrides
 before launching any Docker/Compose process; exactly 16 MiB is accepted. This
-is a point-in-time check of the explicitly selected files, not an atomic
-security boundary: a same-UID process can change or replace a file after it is
-checked. After the Compose version preflight, Compose reopens the original
-selected paths for validation, so the files read need not be the same contents
-that were measured. The size check excludes local files Compose reads through
-`include` or service `extends.file`. It does not contact or require a Docker
-Engine socket, and Ferrum does not write, modify, delete, or extract project
-files. A successful result means structural validation only:
+size check is a point-in-time check: during standalone validation, a same-UID
+process can change or replace a selected file after it is checked, and Compose
+reopens the original paths after the version preflight. Included
+`include`/`extends.file` files are outside the selected-file size check and are
+read under the logged-in user's permissions. This does not contact or require
+a Docker Engine socket, and Ferrum does not write, modify, delete, or extract
+project files. A successful result means structural validation only:
 `--no-interpolate` skips interpolation and `--no-env-resolution` skips service
-`env_file` resolution. The selected paths are held only for the current
-validation session; Ferrum displays bounded, escaped basenames, a static
-validation result, and the bounded escaped service list, never full paths or
-raw CLI diagnostics.
+`env_file` resolution. A prior successful validation is not a content snapshot
+for a later operation; each confirmed mutation takes and revalidates its own
+bounded snapshot as described below. Ferrum displays bounded, escaped
+basenames, a static validation result, and the bounded escaped service list,
+never full paths or raw CLI diagnostics.
 
 ## Import a validated configuration for this session
 
@@ -212,21 +212,39 @@ choose or authorize the target. Scope comes from the selected ordered
 files/profiles, current local socket, and—for restart—the service name in the
 current status snapshot.
 
-Before each action, Ferrum revalidates the current files and profiles with the
-same structural validation command. Restart then queries a fresh read-only
-`compose ps --all --format json` using that same selection/socket and refuses
-the operation if the service is absent or the query fails. The confirmation
-names the imported local label, ordered safe file basenames, selected profiles,
-action, and (for restart) service; cancelling it sends no command. Confirmation
-is rejected if the imported label, ordered files, profiles, successful
-validation, or restart service's current status membership no longer match its
-snapshot. Validation or status failure submits no mutation. Ferrum invokes the
-installed Docker Compose CLI through argument arrays:
+Before each confirmed mutation, Ferrum opens each selected file without
+following a final symlink and copies the ordered bytes into write-sealed Linux
+memory-backed file descriptors (memfds). The aggregate copy is capped at
+16 MiB; failure to capture a valid snapshot fails closed. Preflight validates
+those snapshots, then submits the mutation with the same descriptors. Restart's
+fresh read-only status query also uses the same snapshots before the restart.
+Compose receives `/proc/self/fd/N` file references while `--project-directory`
+remains the original base file's parent, preserving normal relative-path
+resolution. No named on-disk copies of the selected Compose files are created;
+the host may still retain memory pages in swap or core dumps, so memfd does
+not provide secret erasure. Changes to a source file after its snapshot cannot
+change that operation; a change before snapshotting is the content that is
+validated and submitted.
+
+This protects only the explicitly selected base and ordered overrides. Local
+files reached through `include`, service `extends.file`, included-project
+`.env`/`include.env_file`, or service `env_file`, as well as Dockerfiles and
+build contexts, are not snapshotted and remain trusted, live local inputs.
+They may be read or change under the logged-in user's permissions. This is not
+a sandbox or a path-containment guarantee; use only trusted project trees.
+
+The confirmation names the imported local label, ordered safe file basenames,
+selected profiles, action, and (for restart) service; cancelling it sends no
+command. Confirmation is rejected if the imported label, ordered files,
+profiles, successful validation, or restart service's current status
+membership no longer match its snapshot. Validation or status failure submits
+no mutation. Ferrum invokes the installed Docker Compose CLI through argument
+arrays:
 
 ```text
-docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... start
-docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... stop
-docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... restart --no-deps <SERVICE>
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <snapshot-fd-1> --file <snapshot-fd-2> ... --profile <profile> ... start
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <snapshot-fd-1> --file <snapshot-fd-2> ... --profile <profile> ... stop
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <snapshot-fd-1> --file <snapshot-fd-2> ... --profile <profile> ... restart --no-deps <SERVICE>
 ```
 
 `start` starts existing containers; it does not create, build, or pull.
@@ -240,9 +258,7 @@ not add an import-label project name. Commands use Ferrum's private Docker CLI
 config/HOME, cleared environment, disabled selected project `.env`, disabled
 remote Git/OCI loaders, an eight-second per-command validation/status bound,
 and a 30-second lifecycle-command deadline, 1 MiB output cap, and Linux process
-resource limits. As with validation and status, trusted local Compose
-`include`/`extends.file` files and included-project environment files remain
-unsandboxed and may be read under the logged-in user's permissions.
+resource limits.
 
 Lifecycle tasks remain owned by the app when navigating away; leaving Compose
 does not cancel a command that may already have been accepted by the Engine.
@@ -273,7 +289,7 @@ After confirmation, **Pull images** is available for the current imported,
 successfully revalidated file/profile selection. Ferrum invokes:
 
 ```text
-docker --host unix://<selected-socket> compose --progress plain --parallel 4 --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... pull --ignore-buildable
+docker --host unix://<selected-socket> compose --progress plain --parallel 4 --project-directory <base-parent> --file <snapshot-fd-1> --file <snapshot-fd-2> ... --profile <profile> ... pull --ignore-buildable
 ```
 
 The pull is limited to Linux local Docker Unix sockets. Ferrum uses a private
@@ -318,7 +334,7 @@ The import label is display-only and does not select or authorize scope.
 Ferrum invokes only this fixed argv shape:
 
 ```text
-docker --host unix://<selected-socket> compose --progress plain --parallel 2 --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... build
+docker --host unix://<selected-socket> compose --progress plain --parallel 2 --project-directory <base-parent> --file <snapshot-fd-1> --file <snapshot-fd-2> ... --profile <profile> ... build
 ```
 
 Ferrum adds no `--push`, command-line `--ssh`, user-selected builder options, or
@@ -351,8 +367,11 @@ Timeout or output overflow has the same uncertain result. There is no automatic
 retry. Static best-effort audit records only `compose_build`/`build` and
 `started`, `success`, `not_submitted`, `request_error`, or `uncertain` values.
 No project/file/service/context/image/credential/output data is recorded.
-Tests use fake CLI and temporary Compose fixtures only; no Engine, registry,
-remote context, user project, or image mutation is performed.
+The red-before/fixed-after fake-CLI regression replaces selected source files
+during preflight and verifies that the mutation receives the original sealed
+snapshot. An opt-in smoke uses the installed Compose CLI and owned temporary
+base, override, and include files with `config --services` only; it does not
+contact an Engine, registry, or user project.
 
 
 
