@@ -41,6 +41,7 @@ fn build_engine_source_label<'a>(
 }
 mod audit;
 mod compose;
+mod compose_selection;
 mod display;
 #[cfg(target_os = "linux")]
 mod image_build;
@@ -1139,6 +1140,8 @@ impl FerrumApp {
             settings_open: false,
             settings_error,
         };
+        app.compose
+            .restore_saved_projects(&app.settings.saved_compose_projects);
         let context_sender = app.sender.clone();
         let context = creation_context.egui_ctx.clone();
         app.runtime.spawn(async move {
@@ -3884,6 +3887,61 @@ impl FerrumApp {
             &self.containers,
         )
     }
+    fn commit_saved_compose_projects(&mut self, projects: Vec<settings::SavedComposeProject>) {
+        self.settings.saved_compose_projects = projects.clone();
+        self.settings_draft.saved_compose_projects = projects;
+        self.settings_error = None;
+    }
+
+    fn save_compose_registration(&mut self, index: usize) {
+        let Some(project) = self.compose.registration_to_save(index) else {
+            self.compose
+                .set_registration_feedback("This Compose selection cannot be saved.");
+            return;
+        };
+        if self.settings.saved_compose_projects.len() >= settings::MAX_SAVED_COMPOSE_PROJECTS {
+            self.compose.set_registration_feedback(
+                "The saved Compose registration limit has been reached.",
+            );
+            return;
+        }
+        let mut candidate = self.settings.clone();
+        candidate.saved_compose_projects.push(project);
+        match self.settings_store.save(&candidate) {
+            Ok(()) => {
+                self.commit_saved_compose_projects(candidate.saved_compose_projects);
+                self.compose.mark_project_saved(index);
+                self.compose
+                    .set_registration_feedback("Saved for future sessions.");
+            }
+            Err(error) => self.compose.set_registration_feedback(error.message()),
+        }
+    }
+
+    fn forget_compose_registration(&mut self, index: usize) {
+        let Some(label) = self
+            .compose
+            .imported_project_label(index)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let mut candidate = self.settings.clone();
+        candidate
+            .saved_compose_projects
+            .retain(|project| project.label != label);
+        match self.settings_store.save(&candidate) {
+            Ok(()) => {
+                self.commit_saved_compose_projects(candidate.saved_compose_projects);
+                self.compose.forget_saved_project(index);
+                self.compose.set_registration_feedback(
+                    "Registration forgotten; this entry remains available for this session.",
+                );
+            }
+            Err(error) => self.compose.set_registration_feedback(error.message()),
+        }
+    }
+
     fn draw_compose(&mut self, ui: &mut egui::Ui) -> compose::ComposeActions {
         if self.loading {
             ui.spinner();
@@ -4993,6 +5051,12 @@ impl eframe::App for FerrumApp {
                 images::AppPage::Networks => network_action = self.draw_networks(ui),
                 images::AppPage::Compose => compose_actions = self.draw_compose(ui),
             });
+        if let Some(index) = compose_actions.save_imported {
+            self.save_compose_registration(index);
+        }
+        if let Some(index) = compose_actions.forget_saved {
+            self.forget_compose_registration(index);
+        }
         if compose_actions.profiles_changed {
             if let Some(task) = self.compose_validation_task.take() {
                 task.abort();
@@ -5733,6 +5797,128 @@ mod event_reconciliation_tests {
             settings_error: None,
         };
         (app, sender)
+    }
+    #[test]
+    fn failed_compose_registration_persistence_preserves_saved_state() {
+        let (mut app, _) = app_with_open_inspection();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-compose-persistence-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let blocker = root.join("not-a-directory");
+        std::fs::write(&blocker, b"block").unwrap();
+        app.settings_store = Arc::new(settings::SettingsStore::at(blocker.join("settings.toml")));
+
+        let generation = app.compose.begin_file_selection();
+        assert!(app.compose.finish_file_selection(
+            generation,
+            Some(std::path::Path::new("/private/compose.yaml")),
+        ));
+        assert!(app.compose.finish_validation(
+            generation,
+            compose::ComposeValidationResult {
+                version: None,
+                services: Vec::new(),
+                outcome: Ok(()),
+            },
+        ));
+        assert!(app.compose.import_current_project("session entry"));
+        app.save_compose_registration(0);
+        assert!(
+            app.compose.registration_to_save(0).is_some(),
+            "failed persistence must not mark the session entry saved"
+        );
+        assert!(app.settings.saved_compose_projects.is_empty());
+        assert!(app.settings_draft.saved_compose_projects.is_empty());
+
+        let saved = settings::SavedComposeProject {
+            label: "saved entry".into(),
+            files: vec!["/private/saved.yaml".into()],
+            profiles: vec!["dev".into()],
+        };
+        app.settings.saved_compose_projects = vec![saved.clone()];
+        app.settings_draft = app.settings.clone();
+        app.compose
+            .restore_saved_projects(&app.settings.saved_compose_projects);
+        app.forget_compose_registration(0);
+        assert!(
+            app.compose.registration_to_save(0).is_none(),
+            "failed persistence must not mark the saved entry session-only"
+        );
+        assert_eq!(
+            app.settings.saved_compose_projects.as_slice(),
+            std::slice::from_ref(&saved)
+        );
+        assert_eq!(app.settings_draft.saved_compose_projects, [saved]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn saved_compose_registration_persists_and_forgets_without_project_io() {
+        let (mut app, _) = app_with_open_inspection();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-compose-registration-round-trip-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let settings_path = root.join("settings.toml");
+        app.settings_store = Arc::new(settings::SettingsStore::at(settings_path.clone()));
+
+        let generation = app.compose.begin_file_selection();
+        assert!(app.compose.finish_file_selection(
+            generation,
+            Some(std::path::Path::new("/private/compose.yaml")),
+        ));
+        assert!(app.compose.finish_validation(
+            generation,
+            compose::ComposeValidationResult {
+                version: None,
+                services: Vec::new(),
+                outcome: Ok(()),
+            },
+        ));
+        assert!(app.compose.import_current_project("Persistent stack"));
+
+        app.save_compose_registration(0);
+
+        let (saved, warning) = settings::SettingsStore::at(settings_path.clone()).load();
+        assert_eq!(warning, None);
+        assert_eq!(saved.saved_compose_projects.len(), 1);
+        assert_eq!(saved.saved_compose_projects[0].label, "Persistent stack");
+        assert_eq!(
+            saved.saved_compose_projects[0].files,
+            ["/private/compose.yaml"]
+        );
+        assert_eq!(
+            saved.saved_compose_projects[0].profiles,
+            Vec::<String>::new()
+        );
+        assert!(app.compose.registration_to_save(0).is_none());
+        assert_eq!(
+            app.settings_draft.saved_compose_projects,
+            saved.saved_compose_projects
+        );
+
+        app.forget_compose_registration(0);
+
+        let (forgotten, warning) = settings::SettingsStore::at(settings_path).load();
+        assert_eq!(warning, None);
+        assert!(forgotten.saved_compose_projects.is_empty());
+        assert!(app.compose.registration_to_save(0).is_some());
+        assert!(app.settings.saved_compose_projects.is_empty());
+        assert!(app.settings_draft.saved_compose_projects.is_empty());
+
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[cfg(target_os = "linux")]
     fn app_with_zero_reference_volume() -> (FerrumApp, mpsc::Sender<EngineEvent>) {

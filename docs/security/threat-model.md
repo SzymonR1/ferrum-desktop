@@ -90,6 +90,20 @@ precedes preflight; without a later terminal outcome, the final state is unknown
 and must be reconciled by refreshing the current project status. Issues #18 and
 #19 remain partial/open; issue #10 remains blocked/open.
 
+Saved Compose registrations are an explicit local opt-in in the existing
+descriptor-pinned settings store, not a second persistence layer. Each stores a
+unique bounded label, 1–16 ordered absolute UTF-8 file paths, and validated
+profiles; project contents, environment values, credentials, Engine identity,
+and commands are excluded. Schema v2 migrates v1/versionless settings with an
+empty list. Invalid persisted entries are skipped and warned about without
+becoming selected or validated. The settings file has a 256 KiB cap, and saved
+entries are limited to 32. Loading, selecting, saving, and forgetting execute
+no Docker/Compose CLI and make no Engine request; selection only clears stale
+state and requires explicit revalidation. Forget only removes the registration,
+not files or resources. Persisting paths neither reads project contents nor
+confines paths. Compose may read referenced files under the user's permissions,
+so validate only trusted projects.
+
 The service inventory comes from that same validation command, so no additional
 CLI process or Engine request is made. It accepts at most 128 KiB of service
 output, 1024 rows, and 128 bytes per name; malformed or duplicate output fails
@@ -234,13 +248,22 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   selection clears validation/status/log output, cancels read-only/follow tasks,
   and requires revalidation; already-submitted lifecycle work is not cancelled.
 - Keep private Docker config/HOME, cleared allowlisted environment, disabled
-  selected-project `.env`, and disabled remote Git/OCI loaders. A transient
-  import retains validated ordered file paths, profiles, and a bounded local
-  label in memory only; import itself invokes no CLI/Engine operation and
-  copies/persists no files. The label is not project identity or authorization.
-  Only the currently selected session import after successful explicit
-  revalidation can start/stop/restart. Revalidate before each operation; failure
-  must prevent lifecycle mutation. Restart additionally requires current
+  selected-project `.env`, and disabled remote Git/OCI loaders. An explicitly
+  opted-in persistent registration stores only a unique bounded label, ordered
+  absolute UTF-8 paths, and validated profiles in SettingsStore. It stores no
+  project content, environment values, credentials, Engine identity, or
+  commands; entries cap at 32, and the settings file caps at 256 KiB.
+  Session imports remain transient unless saved. Loading, selecting, saving,
+  and forgetting execute no CLI or Engine request; restore is unselected and
+  unvalidated. Selection clears old results and requires explicit
+  revalidation. Forget removes only the registration and leaves the current
+  entry session-only. Persisted paths are not confined and project contents
+  are not read during save.
+  The label is not project identity or authorization. Only the currently
+  selected imported registration after successful explicit revalidation can
+  start/stop/restart. Revalidate before each operation; failure must prevent
+  lifecycle mutation.
+  Restart additionally requires current
   successful status membership and a fresh status query with the same selected
   local Docker Unix socket before mutation. The current socket, ordered files,
   profiles, and base-parent directory scope operations, not the local label or
@@ -440,7 +463,12 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   directory creation policy. Extended ACLs and other xattrs are not carried
   forward. Parent-path trust and crash durability are not expanded.
 - Keep the experimental embedded terminal restricted to the selected local Docker-compatible Unix socket on Linux and the negotiated API version. Terminal output is untrusted; cap each raw OSC string at 1024 bytes before feeding vt100. On overflow, stop feeding the parser and discard the string tail until BEL, CAN, SUB, or ESC; pass the actual terminator to the parser to reset its state before resuming. This keeps vte's default-std OSC buffer bounded while the string remains open. Ignore OSC 52 clipboard and title requests, expose clipboard actions only to explicit user controls, and never put terminal bytes or daemon bodies in logs or errors. Closing the exec session closes its connection only; it does not stop or remove the container.
-- Persist only the schema version and startup auto-connect boolean; reject unknown fields, bound input size, and keep config files/private temporary files owner-only.
+- Persist schema v2 settings with backward-compatible defaults, including the
+  startup auto-connect preference, registry-helper enum, and an empty-default
+  saved Compose registration list. Reject unknown fields, cap serialization and
+  input at 256 KiB, cap registrations at 32, and keep config and temporary files
+  owner-only. Save only a validated label, absolute ordered paths, and profiles;
+  never persist project contents or secrets.
 - Do not include configuration paths or contents in settings errors or logs. Corrupt settings fall back to defaults and are not overwritten until explicit user save.
 - The agreed Linux settings-path contract uses an absolute
   `XDG_CONFIG_HOME` path or falls back to absolute `HOME`. At initialization,
@@ -491,14 +519,15 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
 - Remote TCP/HTTP/TLS/SSH transport trust, credentials, and identity validation.
 - Podman API compatibility and rootless endpoint discovery; issue #10 remains open for these and the broader engine matrix.
 - Compose `.env`/service `env_file` resolution and remote OCI/Git inputs (remote
-  loaders are disabled during validation) remain trust risks. The transient
-  configuration import stores only session-local path/profile metadata and a
-  local label; file-content import, persistent project registration, build/
-  pull/up/down/removal, and project-file mutations remain
-  deferred. Scoped start/stop and a confirmed service-scoped restart are
-  available only for a selected imported and revalidated configuration; restart
-  also requires current and freshly rechecked status membership. The bounded
-  one-shot service log snapshot is implemented as described above.
+  loaders are disabled during validation) remain trust risks. Session imports
+  retain path/profile metadata and a local label in memory only; explicit saved
+  registrations persist only validated labels, ordered absolute paths, and
+  profiles as described above. Project-content import, build/pull/up/down/
+  removal, and project-file mutations remain deferred. Scoped start/stop and a
+  confirmed service-scoped restart are available only for a selected imported
+  and revalidated configuration; restart also requires current and freshly
+  rechecked status membership. The bounded one-shot service log snapshot is
+  implemented as described above.
 - The explicit local Docker CLI Buildx invocation is an added external build process. Other external process integrations, archive extraction, and file-path surfaces remain deferred.
 - Ferrum-managed credential persistence and helper integrations beyond the
   Linux Secret Service/`pass` choices; authenticated Podman/remote-engine

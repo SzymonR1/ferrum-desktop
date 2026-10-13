@@ -12,6 +12,7 @@ flowchart LR
     APP -->|selected files and profiles| COMPOSE[Docker Compose CLI]
     COMPOSE -->|pinned local Unix socket| SOCKET
     COMPOSE -->|bounded follow events| APP
+    APP -->|opt-in label, ordered paths, profiles| SETTINGS[Private SettingsStore]
     CLIENT -->|bounded version, inventory, inspect, lifecycle requests| SOCKET[Selected local Linux Unix socket]
     SOCKET --> ENGINE[Docker-compatible engine]
     ENGINE -->|container events| SOCKET
@@ -81,13 +82,18 @@ version; Start/Stop treat 304 as idempotent success, while other non-2xx statuse
 become safe typed errors. Remove uses DELETE without force or volume-removal
 parameters. Raw response bodies are never logged or exposed.
 
-The app owns a small Linux TOML settings store for the startup auto-connect
-preference. See [Settings](../settings.md) for path selection, migration,
-permissions, and persistence behavior. Docker context selection is session-only;
-the engine crate invokes the Docker CLI with an argument array and exposes only
-validated names, current status, and local-Unix versus unsupported transport.
-Raw endpoint values are private and excluded from debug/UI output. A failed
-context switch preserves the working connection and inventory.
+The app owns a Linux TOML SettingsStore for startup preferences and opt-in
+Compose registrations. Saved records contain only a local label, ordered
+absolute paths, and validated profiles; no project contents or credentials are
+stored. Loading restores them unselected and unvalidated without invoking
+Compose or contacting an Engine. Selecting a saved entry clears stale results
+and requires explicit revalidation before operations. See [Settings](../settings.md)
+for path selection, migrations, permissions, and persistence behavior.
+Docker context selection remains session-only; the engine crate invokes the
+Docker CLI with an argument array and exposes only validated names, current
+status, and local-Unix versus unsupported transport. Raw endpoint values are
+private and excluded from debug/UI output. A failed context switch preserves
+the working connection and inventory.
 
 ## Current limits
 

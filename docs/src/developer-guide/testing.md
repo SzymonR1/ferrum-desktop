@@ -29,8 +29,12 @@ changing target permissions, non-regular and hard-linked file rejection, and
 refusal to chmod or write through symlinked settings directories. The hard-link
 regression links a `0644` sibling sentinel as `settings.toml` and verifies that
 load rejects it without changing the sentinel's contents or mode; load also
-normalizes the opened final settings directory to `0700`. Single-link
-versionless legacy settings continue to migrate in memory.
+normalizes the opened final settings directory to `0700`. Versionless and v1
+settings migrate with an empty Compose registration list. Deterministic temp
+store tests round-trip valid saved records, validate count/path/profile/label
+bounds, enforce the 256 KiB serialized cap before atomic replacement, and
+verify oversize failure leaves an existing settings file unchanged. These
+tests use temporary directories only and contact no Engine or Compose CLI.
 
 Temporary-directory path regressions verify the anchored-path contract. Create
 a store, then replace the selected parent path and confirm that loads and saves
@@ -421,6 +425,15 @@ named pipes and macOS remain deferred to issue #21/M8.
 
 Default Compose discovery, validation, lifecycle, and headless UI tests use
 controlled CLI fixtures; they do not contact a live engine or mutate projects.
+
+Saved-registration regressions use the real `SettingsStore` in deterministic
+temporary directories, not a fake storage echo. They cover validated session
+selection save -> settings-file save -> reload -> visible saved row with exact
+ordered paths/profiles and no selected/validated/status state; selecting it
+requires explicit revalidation. Headless row tests return save/forget actions.
+An app-level failed atomic save test verifies both save and forget preserve the
+prior in-memory saved status and settings records. These tests invoke no
+Docker/Compose CLI and contact no Engine.
 Discovery fixtures check `docker compose version --short` and
 `docker compose ls --all --format json`, with only the listing pinned to the
 selected `EngineClient::local_socket_path()`. Validation preflights
@@ -575,10 +588,12 @@ files. Bounded profile selection applies to structural validation, read-only
 status, one-shot service logs and live follow, imported-project start/stop, and
 single-service restart; the declared-service inventory is not profile-filtered
 and lists all declarations from selected files. Profiles are passed as explicit
-`--profile` arguments and are not inherited from the environment. Transient
-import is session-only; persistent project registration, build/pull/up/down,
-removal, and project-file mutation remain unsupported. Service restart is
-covered by controlled fake-CLI/headless regressions only; no live restart runs.
+`--profile` arguments and are not inherited from the environment. Imports remain
+session-only unless explicitly saved. Saved registrations use bounded
+SettingsStore metadata, restore unselected/unvalidated, and require explicit
+revalidation; persistence adds no CLI/Engine request or project-file access.
+Build/pull/up/down, removal, and project-file mutation remain unsupported.
+Service restart is covered by controlled fake-CLI/headless regressions only; no live restart runs.
 
 Controlled live-follow fixtures cover exact selected-file/profile/socket argv
 and fresh status-before-stream ordering, absent/failed service-membership

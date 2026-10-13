@@ -1,6 +1,13 @@
+use crate::compose_selection::{
+    MAX_COMPOSE_FILES, MAX_COMPOSE_PROFILE_INPUT_BYTES, MAX_COMPOSE_REGISTRATION_LABEL_BYTES,
+    MAX_COMPOSE_REGISTRATIONS, parse_compose_profiles, valid_profile_list,
+};
+#[cfg(test)]
+use crate::compose_selection::{MAX_COMPOSE_PROFILE_NAME_BYTES, MAX_COMPOSE_PROFILES};
 #[cfg(target_os = "linux")]
 use crate::display::escape_untrusted_display_text;
 use crate::display::escape_untrusted_display_text_with_limit;
+use crate::settings::{SavedComposeProject, valid_saved_compose_project};
 use eframe::egui;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
@@ -35,72 +42,6 @@ const CHILD_DATA_LIMIT: libc::rlim_t = 512 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const CHILD_GO_MEMORY_LIMIT: &str = "402653184";
 
-const MAX_COMPOSE_PROFILES: usize = 16;
-const MAX_COMPOSE_PROFILE_NAME_BYTES: usize = 64;
-const MAX_COMPOSE_PROFILE_INPUT_BYTES: usize = 1024;
-
-fn parse_compose_profiles(input: &str) -> Result<Vec<String>, ()> {
-    if input.len() > MAX_COMPOSE_PROFILE_INPUT_BYTES {
-        return Err(());
-    }
-    if input.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut profiles = Vec::new();
-    for token in input.split(',') {
-        let name = token.trim();
-        if name.is_empty()
-            || name.len() > MAX_COMPOSE_PROFILE_NAME_BYTES
-            || (name != "*"
-                && (name.len() < 2
-                    || !name.as_bytes().iter().enumerate().all(|(index, byte)| {
-                        if index == 0 {
-                            byte.is_ascii_alphanumeric()
-                        } else {
-                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
-                        }
-                    })))
-        {
-            return Err(());
-        }
-        if name == "*" && (!profiles.is_empty() || input.split(',').count() != 1) {
-            return Err(());
-        }
-        if profiles.iter().any(|profile| profile == name) {
-            return Err(());
-        }
-        profiles.push(name.to_owned());
-        if profiles.len() > MAX_COMPOSE_PROFILES {
-            return Err(());
-        }
-    }
-    Ok(profiles)
-}
-fn valid_profile_list(profiles: &[String]) -> bool {
-    if profiles.len() > MAX_COMPOSE_PROFILES {
-        return false;
-    }
-    let input_bytes = profiles
-        .iter()
-        .fold(0_usize, |total, profile| {
-            total.saturating_add(profile.len())
-        })
-        .saturating_add(profiles.len().saturating_sub(1));
-    input_bytes <= MAX_COMPOSE_PROFILE_INPUT_BYTES
-        && profiles.iter().enumerate().all(|(index, name)| {
-            name.len() <= MAX_COMPOSE_PROFILE_NAME_BYTES
-                && (name == "*" && profiles.len() == 1
-                    || (name.len() >= 2
-                        && name.as_bytes().iter().enumerate().all(|(i, byte)| {
-                            if i == 0 {
-                                byte.is_ascii_alphanumeric()
-                            } else {
-                                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
-                            }
-                        })
-                        && !profiles[..index].iter().any(|previous| previous == name)))
-        })
-}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ComposeContainer {
     pub(super) name: String,
@@ -519,10 +460,11 @@ pub(super) struct ComposeActions {
     pub(super) confirm_lifecycle: bool,
     pub(super) cancel_lifecycle: bool,
     pub(super) profiles_changed: bool,
+    pub(super) save_imported: Option<usize>,
+    pub(super) forget_saved: Option<usize>,
 }
-const MAX_COMPOSE_FILES: usize = 16;
-const MAX_IMPORTED_COMPOSE_PROJECTS: usize = 32;
-const MAX_IMPORTED_COMPOSE_NAME_BYTES: usize = 256;
+const MAX_IMPORTED_COMPOSE_PROJECTS: usize = MAX_COMPOSE_REGISTRATIONS;
+const MAX_IMPORTED_COMPOSE_NAME_BYTES: usize = MAX_COMPOSE_REGISTRATION_LABEL_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ImportedComposeProject {
@@ -530,6 +472,7 @@ struct ImportedComposeProject {
     display_name: String,
     files: Vec<std::path::PathBuf>,
     profiles: Vec<String>,
+    saved: bool,
 }
 
 fn display_imported_project_name(name: &str) -> String {
@@ -1098,6 +1041,72 @@ impl ComposeView {
             && self.validated_generation == Some(self.validation_generation)
             && matches!(&self.validation, ComposeValidationState::Succeeded { .. })
     }
+    pub(super) fn restore_saved_projects(&mut self, projects: &[SavedComposeProject]) {
+        self.imported_projects.clear();
+        for project in projects.iter().take(MAX_IMPORTED_COMPOSE_PROJECTS) {
+            if !valid_saved_compose_project(project)
+                || self
+                    .imported_projects
+                    .iter()
+                    .any(|entry| entry.name == project.label)
+            {
+                continue;
+            }
+            let files = project.files.iter().map(std::path::PathBuf::from).collect();
+            self.imported_projects.push(ImportedComposeProject {
+                name: project.label.clone(),
+                display_name: display_imported_project_name(&project.label),
+                files,
+                profiles: project.profiles.clone(),
+                saved: true,
+            });
+        }
+    }
+
+    pub(super) fn registration_to_save(&self, index: usize) -> Option<SavedComposeProject> {
+        let project = self.imported_projects.get(index)?;
+        if project.saved {
+            return None;
+        }
+        let files = project
+            .files
+            .iter()
+            .map(|file| file.to_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()?;
+        Some(SavedComposeProject {
+            label: project.name.clone(),
+            files,
+            profiles: project.profiles.clone(),
+        })
+    }
+    pub(super) fn mark_project_saved(&mut self, index: usize) -> bool {
+        let Some(project) = self.imported_projects.get_mut(index) else {
+            return false;
+        };
+        project.saved = true;
+        true
+    }
+
+    pub(super) fn forget_saved_project(&mut self, index: usize) -> bool {
+        let Some(project) = self.imported_projects.get_mut(index) else {
+            return false;
+        };
+        if !project.saved {
+            return false;
+        }
+        project.saved = false;
+        true
+    }
+    pub(super) fn imported_project_label(&self, index: usize) -> Option<&str> {
+        self.imported_projects
+            .get(index)
+            .map(|project| project.name.as_str())
+    }
+
+    pub(super) fn set_registration_feedback(&mut self, message: &'static str) {
+        self.import_feedback = Some(message);
+    }
+
     pub(super) fn can_import_current_project(&self, profiles_valid: bool) -> bool {
         self.is_current_selection_validated()
             && profiles_valid
@@ -1133,6 +1142,7 @@ impl ComposeView {
             display_name: display_name.clone(),
             files: self.selected_files.clone(),
             profiles,
+            saved: false,
         });
         self.imported_selection = true;
         self.selected_import_label = Some(display_name);
@@ -1482,7 +1492,7 @@ impl ComposeView {
         let mut imported_selection = None;
         ui.separator();
         ui.heading("Import validated configuration");
-        ui.label("The local label is only for this session; it is not a Compose project identity.");
+        ui.label("Labels are local display names, not Compose project identities. Imports are session-only unless explicitly saved.");
         ui.horizontal(|ui| {
             let label = ui.label("Import name:");
             let input = ui
@@ -1524,11 +1534,22 @@ impl ComposeView {
         if let Some(feedback) = self.import_feedback {
             ui.label(feedback);
         }
-        ui.heading("Imported local projects (this session only)");
+        ui.heading("Imported local projects");
         ui.label("Selecting one restores its ordered files and profiles, clears old results, and requires explicit revalidation.");
         for (index, project) in self.imported_projects.iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(&project.display_name);
+                ui.label(if project.saved {
+                    "Saved"
+                } else {
+                    "Session only"
+                });
+                if !project.saved && ui.button("Save for future sessions").clicked() {
+                    actions.save_imported = Some(index);
+                }
+                if project.saved && ui.button("Forget saved registration").clicked() {
+                    actions.forget_saved = Some(index);
+                }
                 if ui
                     .add_enabled(
                         !matches!(
@@ -7083,6 +7104,144 @@ mod tests {
             );
             assert!(!harness.state().view.is_current_selection_validated());
         }
+        #[test]
+        fn saved_registration_round_trips_to_visible_unvalidated_row() {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "ferrum-compose-roundtrip-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = crate::settings::SettingsStore::at(root.join("settings.toml"));
+            let mut session = validated_compose_view();
+            let override_file = std::path::Path::new("/private/override.yaml");
+            let generation = session.begin_override_selection();
+            assert!(session.finish_file_selection(generation, Some(override_file)));
+            assert!(session.finish_validation(generation, validation_result(Ok(()))));
+            session.profile_input = "dev,qa".into();
+            session.profiles_changed();
+            let (generation, _, _) = session.begin_validation().unwrap();
+            assert!(session.finish_validation(generation, validation_result(Ok(()))));
+            assert!(session.import_current_project("persisted stack"));
+            let mut settings = crate::settings::Settings::default();
+            settings.saved_compose_projects = vec![
+                session
+                    .registration_to_save(0)
+                    .expect("session entry can be saved"),
+            ];
+            store.save(&settings).unwrap();
+            drop(session);
+
+            let (loaded, warning) = store.load();
+            assert_eq!(warning, None);
+            let mut restored = ComposeView::default();
+            restored.restore_saved_projects(&loaded.saved_compose_projects);
+            assert_eq!(restored.imported_projects.len(), 1);
+            assert!(restored.imported_projects[0].saved);
+            assert_eq!(
+                restored.imported_projects[0].files,
+                [
+                    std::path::PathBuf::from("/private/compose.yaml"),
+                    std::path::PathBuf::from("/private/override.yaml")
+                ]
+            );
+            assert_eq!(restored.imported_projects[0].profiles, ["dev", "qa"]);
+            assert!(restored.selected_files.is_empty());
+            assert!(!restored.is_current_selection_validated());
+            assert!(!restored.can_refresh_containers());
+            assert!(restored.containers.is_empty());
+
+            let mut harness = harness_for(restored);
+            harness.run();
+            let _visible_label = harness.get_by_role_and_label(Role::Label, "persisted stack");
+            harness
+                .get_by_role_and_label(Role::Button, "Use imported configuration")
+                .click_accesskit();
+            harness.step();
+            assert_eq!(
+                harness.state().view.selected_files,
+                [
+                    std::path::PathBuf::from("/private/compose.yaml"),
+                    std::path::PathBuf::from("/private/override.yaml")
+                ]
+            );
+            assert_eq!(harness.state().view.profile_input, "dev,qa");
+            assert!(!harness.state().view.is_current_selection_validated());
+            assert!(!harness.state().view.can_refresh_containers());
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn restored_saved_registration_is_inert_until_explicit_revalidation() {
+            let saved = SavedComposeProject {
+                label: "saved stack".into(),
+                files: vec![
+                    "/private/base.yaml".into(),
+                    "/private/overrides/dev.yml".into(),
+                ],
+                profiles: vec!["dev".into(), "qa".into()],
+            };
+            let mut view = ComposeView::default();
+            view.restore_saved_projects(&[saved]);
+            assert_eq!(view.imported_projects.len(), 1);
+            assert!(view.imported_projects[0].saved);
+            assert_eq!(
+                view.imported_projects[0].files,
+                [
+                    std::path::PathBuf::from("/private/base.yaml"),
+                    std::path::PathBuf::from("/private/overrides/dev.yml")
+                ]
+            );
+            assert_eq!(view.imported_projects[0].profiles, ["dev", "qa"]);
+            assert!(view.selected_files.is_empty());
+            assert!(!view.is_current_selection_validated());
+            assert!(!view.can_refresh_containers());
+
+            assert!(view.select_imported_project(0));
+            assert_eq!(
+                view.selected_files,
+                [
+                    std::path::PathBuf::from("/private/base.yaml"),
+                    std::path::PathBuf::from("/private/overrides/dev.yml")
+                ]
+            );
+            assert_eq!(view.profile_input, "dev,qa");
+            assert!(!view.is_current_selection_validated());
+            assert!(!view.can_refresh_containers());
+            assert!(view.begin_validation().is_some());
+        }
+
+        #[test]
+        fn registration_row_actions_return_save_and_forget_without_engine_work() {
+            let mut session = validated_compose_view();
+            assert!(session.import_current_project("local session"));
+            let mut harness = harness_for(session);
+            harness.run();
+            harness
+                .get_by_role_and_label(Role::Button, "Save for future sessions")
+                .click_accesskit();
+            harness.step();
+            assert_eq!(harness.state().actions.save_imported, Some(0));
+            assert!(!harness.state().view.imported_projects[0].saved);
+            drop(harness);
+
+            let mut restored = ComposeView::default();
+            restored.restore_saved_projects(&[SavedComposeProject {
+                label: "saved registration".into(),
+                files: vec!["/private/base.yml".into()],
+                profiles: vec![],
+            }]);
+            let mut harness = harness_for(restored);
+            harness.run();
+            harness
+                .get_by_role_and_label(Role::Button, "Forget saved registration")
+                .click_accesskit();
+            harness.step();
+            assert_eq!(harness.state().actions.forget_saved, Some(0));
+            assert!(harness.state().view.imported_projects[0].saved);
+        }
 
         #[test]
         fn imported_projects_render_separately_from_engine_discovery() {
@@ -7095,8 +7254,8 @@ mod tests {
             view.loaded = true;
             let mut harness = harness_for(view);
             harness.run();
-            let _import_heading = harness
-                .get_by_role_and_label(Role::Label, "Imported local projects (this session only)");
+            let _import_heading =
+                harness.get_by_role_and_label(Role::Label, "Imported local projects");
             let _local_name = harness.get_by_role_and_label(Role::Label, "Local label");
             let _discovery_name = harness.get_by_role_and_label(Role::Label, "engine-project");
         }

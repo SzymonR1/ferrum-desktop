@@ -19,7 +19,7 @@ exercised.
 | Linux local Docker Compose container status | Read-only CLI/UI slice; fake-CLI/headless tests; read-only temporary-project status smoke passed 2026-10-12 with Compose v5.6.0 and Docker Engine 29.9.0; native page visual check unavailable | After successful validation, status uses the selected profiles and pins `compose ps --all --format json` to the selected local Unix socket. It retains bounded escaped container name/service/state/health plus optional per-container `Project`; it mutates no resources. The isolated CLI environment omits the selected project's `.env`; environment-dependent status may differ from a normal shell. Include/extends reads remain under user permissions; validate only trusted files. Lifecycle/restart mutations are documented in the separate row above; this row covers read-only status only. |
 | Linux local Docker Compose one-shot service-log snapshots | Read-only CLI/UI; fake-CLI/headless tests; no real service logs were read; native page visual check unavailable | For a service in the current selected-file status snapshot, Ferrum rechecks `compose ps --all --format json` membership before running `compose logs --tail 200 --no-color SERVICE`, using the same selected profiles, Unix socket, ordered files, and base-parent project directory. The safe 1–128 byte ASCII selector and each selected profile are separate arguments. Each command has an eight-second/1 MiB bound; status plus logs may take up to 16 seconds. Compose's tail is per container; Ferrum retains at most the first 200 combined response lines/256 KiB, so replicated output can omit containers and is not globally time-sorted. Output is escaped and transient, excluded from Debug/tracing/audit/files; cancellation/process-group cleanup and stale-result checks apply. This is a one-shot snapshot only; live follow is documented in the next row. It does not mutate Engine/project resources. Validate only trusted files; #18 partial/open and #10 blocked/open. |
 | Linux local Docker Compose live service-log follow | Compiles; read-only CLI/UI; controlled fake-CLI/headless tests; no live logs or Engine/project mutation; native page visual check unavailable | A listed service requires the current imported/revalidated selection and fresh `compose ps --all --format json` membership on the pinned local Unix socket before `logs --follow --tail 200 --no-color SERVICE`. Selected ordered files/profiles are argv entries. A dedicated 16-event queue applies backpressure; raw lines cap at 4096 bytes and the escaped UI buffer rolls at 200 combined lines/256 KiB. Stop, page/context/selection/status invalidation, and shutdown abort the CLI process group. The stream has no total deadline/retry; tail is per container and output is not globally time-sorted. Trusted local Compose file caveats still apply. #18 remains partial/open. |
-| Linux local Docker Compose transient session imports | Read-only in-memory UI; headless/fake tests; no CLI/Engine access or file copying; native page visual check unavailable | Import is enabled only for the current successful validation/profile generation. At most 32 entries retain a bounded escaped local label, absolute base/ordered override paths, and selected profiles for the current app session; the list is lost at exit and no file contents are copied or persisted. Selecting an entry aborts in-flight validation/status/log work, restores exact ordered paths/profiles, clears derived services/status/logs, and requires explicit revalidation. Local labels remain distinct from Engine discovery and reported Project values; they are not ownership or authorization evidence. Selection itself invokes no CLI/Engine action or lifecycle mutation. Persistent project registry remains unsupported; the scoped imported lifecycle/restart slice is described above. #18 partial/open and #10 blocked/open. |
+| Linux local Docker Compose transient imports and saved registrations | Compiles; opt-in SettingsStore persistence with settings/headless Compose regressions passed; no Docker/Engine/Compose access or project-file copying; native page visual check unavailable | Session imports remain transient unless explicitly saved. Saved records retain only a unique bounded local label, 1–16 ordered absolute UTF-8 paths, and validated profiles; settings schema v2 migrates v1/versionless files with an empty list. Settings are capped at 256 KiB and 32 saved entries. Restored records remain unselected and unvalidated; selecting clears stale derived data and requires explicit successful revalidation. Forget removes only the record and leaves a session-only entry. Neither persistence action reads project content, confines paths, invokes CLI, or contacts an Engine. Issue #18 remains partial/open; no full acceptance claim. |
 | Linux local lifecycle and container-event synchronization | Engine integration-tested; lifecycle audit events unit-tested; UI action clicks not visually verified | On 2026-10-08, the opt-in ignored lifecycle test passed against Docker Engine 29.8.2/API 1.56. It exercised Start/Stop/Restart/Pause/Unpause/Remove, observed an external CLI Start event, and verified state, inventory, and removal for one owned disposable container. Ferrum gates actions on known state; Remove is confirmed and does not force-remove or delete volumes. Lifecycle request results emit structured process-tracing events with action, `success` or `request_error`, and a validated full container ID when available; raw errors, names, endpoints, and daemon bodies are excluded. A request error does not prove the engine state remained unchanged. These events are not a persistent audit store. Event processing is bounded, reconnect retries are limited, and manual refresh remains available. |
 | Linux local historical/live container logs | Engine integration-tested; headless Logs controls tested; native surface not visually/screen-reader validated | On 2026-10-08, the opt-in ignored live test passed against the selected local Unix-socket Docker engine using the preinstalled `ghcr.io/catthehacker/ubuntu:rust-latest` image. It decoded timestamped historical and followed stdout/stderr markers, verified TTY mode, dropped the stream, and removed the owned container. A headless egui/accessibility test interacts with the real Logs dialog, exercising Pause/Resume, auto-scroll, Copy output, and Export availability. Native click/screenshot/screen-reader validation remains unavailable because the desktop provider cannot enumerate Ferrum or capture/accessibility state. |
 | Linux local embedded terminal | Experimental; local Docker-compatible Unix sockets only; visual and screen-reader validation not established | On 2026-10-09, the opt-in live terminal test passed against Docker Engine 29.8.2/API 1.56 using the preinstalled `ghcr.io/catthehacker/ubuntu:rust-latest` image. It verified TTY input/output, ANSI and Unicode bytes, resize to 37x101, Ctrl+C, and that dropping the exec session leaves the container running; the test then stopped and removed its own container, and no `ferrum-live-exec-*` container remained. The engine path is live-tested; the native terminal surface remains untested visually and with a screen reader. Terminal output is untrusted; OSC 52 clipboard and title requests are ignored; clipboard controls require explicit user action. Podman/rootless and remote compatibility remain open in issue #10. |
@@ -212,22 +212,23 @@ or omits the service. Native Compose-page visual validation is unavailable.
 One-shot service-log snapshots use fake-CLI/headless tests only; no real project
 logs were read.
 
-Lifecycle is enabled only for the currently selected session import after
-successful explicit revalidation. Each operation revalidates before invoking
-the CLI with selected ordered files/profiles, the base-parent project directory,
-and the current local Docker Unix socket. Service restart is exposed only beside
-a service present in the current successful status snapshot; it repeats
-read-only `compose ps --all --format json` against that same socket after
-revalidation and submits no mutation if the service is absent or the query
-fails. Docker Compose `start` starts existing containers; `stop` stops without
-removing them. Restart invokes only `restart --no-deps SERVICE`, keeping
-dependent services out of scope. Docker Compose restart does not apply changes
-to Compose configuration. The session label and engine-reported `Project`
-metadata do not establish identity or operation scope. Commands use argument
+Lifecycle is enabled only for the currently selected imported entry, either
+session-only or explicitly saved, after successful explicit revalidation. Each
+operation revalidates before invoking the CLI with selected ordered
+files/profiles, the base-parent project directory, and the current local Docker Unix socket.
+Service restart is exposed only beside a service present in the current
+successful status snapshot; it repeats read-only `compose ps --all --format
+json` against that same socket after revalidation and submits no mutation if
+the service is absent or the query fails. Docker Compose `start` starts existing
+containers; `stop` stops without removing them. Restart invokes only
+`restart --no-deps SERVICE`, keeping dependent services out of scope. Docker
+Compose restart does not apply changes to Compose configuration. The session
+label and engine-reported `Project` metadata do not establish identity or operation scope.
+Commands use argument
 arrays and local Docker Unix sockets only. Navigation does not cancel a
 submitted operation; its redacted outcome is retained.
-No `up`, `down`, create, build, pull, removal, persistent project registration,
-or project-file mutation is added.
+No `up`, `down`, create, build, pull, removal, or project-file mutation is
+added. Explicit saved registrations are described above.
 
 Compose profile selection is supported for structural validation, read-only
 status, one-shot service logs and live follow, and imported-project start/stop/
@@ -243,9 +244,9 @@ Invalid or changed selection clears validation, declared services, status, and
 snapshot/follow output, and aborts in-flight read-only/follow queries. Revalidate
 before requesting again. Private Docker config/HOME, the cleared environment,
 disabled selected-project `.env`, and disabled remote loaders remain in effect.
-Session-
-only imports retain validated file/profile metadata and a local label, not a
-persistent project registry. See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
+Session imports retain validated file/profile metadata and a local label in
+memory unless explicitly saved. Saved registrations are the only persistent
+Compose-project metadata. See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
 and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
 Issue #18 remains partial/open; issue #10 remains blocked/open. No full issue
 completion, release, or broader support claim is made.
