@@ -108,33 +108,42 @@ No live mutation was run because no disposable Engine is designated. There is
 no native visual validation, and these tests do not establish Podman, remote,
 Windows, or macOS support or full completion of Issues #18/#19.
 
-## Compose service scaling
-
 The controlled fake-CLI and headless regressions cover one accessible control
-per declared service rather than per replica row; observed counts include
-stopped containers. They check target bounds, undeclared services, cancellation,
-stale confirmation counts, sealed-file validation, fresh same-socket status,
-fixed `up --detach --no-build --pull never --no-deps --scale SERVICE=N SERVICE`
-argv, and uncertain submitted results requiring a successful status refresh
-before retry. Audit assertions must remain static and exclude project, service,
-count, path, profile, socket, and output data.
+per all-declared service rather than per replica row; inactive-profile services
+are included, and all-profile `ps --all` counts include stopped containers.
+Regular lifecycle eligibility remains selected-profile-only. Tests cover target
+bounds, undeclared services, selected-profile preflight/status argv versus
+profile-free scale `up` argv, exact
+`up --detach --no-build --pull never --no-deps --scale SERVICE=N SERVICE`
+arguments, sibling safety, stale confirmation counts, sealed-file validation,
+fresh same-socket status, and uncertain submitted results requiring a successful
+status refresh before retry. Headless confirmation regressions cover stopped
+container starts, configured service code execution on the selected Engine,
+writable-layer loss on removal/recreation, and mounted-volume Compose
+semantics. Cancellation coverage verifies the app records static
+`scale/not_submitted` audit data without service, project, count, path, profile,
+socket, or output metadata.
 
-The optional ignored live test preflights that a unique generated project and its
-default network are unused, then scales the `scale-probe` service up to exactly
-two replicas and down to one. It uses an already-installed `FERRUM_TEST_IMAGE`
-with `/bin/sleep`, no host mounts or published ports, and requests no pull or
-build. A scoped cleanup runs `compose down` only with the generated project
-name, directory, and known Compose file, regardless of intermediate operation
-results; it does not force-remove, prune, or remove volumes:
+The optional ignored live test preflights that a unique generated project and
+its default network are unused, then scales the profile-gated `scale-probe`
+service up to exactly two replicas and down to one. A same-profile sibling
+service verifies that explicit target activation does not start siblings. It
+uses an already-installed `FERRUM_TEST_IMAGE` with `/bin/sleep`, no host mounts
+or published ports, and requests no pull or build. Read-only inventory/status
+and generated-project cleanup may use `--profile '*'`; scale mutations never
+do. A scoped cleanup runs `compose down` only with the generated project name,
+directory, and known Compose file; it does not force-remove, prune, or remove
+volumes:
 
 ```sh
 FERRUM_TEST_IMAGE=ghcr.io/catthehacker/ubuntu:rust-latest cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_service_scale_scales_and_cleans_only_verified_project -- --exact --ignored
 ```
 
 Do not run this test against an engine containing valuable resources. The test
-is opt-in and was not executed as part of this change. Neither its presence nor
-the fake-CLI/headless tests claim Podman, remote, Windows, macOS, or complete
-Issue #18 support.
+is opt-in and was not executed as part of this change; live Engine validation is
+pending the integration owner's safe smoke. Neither its presence nor the
+fake-CLI/headless tests claim Podman, remote, Windows, macOS, or complete Issue
+#18 support.
 
 ## Compose up with local images
 

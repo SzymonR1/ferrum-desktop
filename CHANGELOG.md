@@ -5,26 +5,31 @@ All notable project changes are documented here. The project has not published a
 ## Unreleased
 - Added confirmed one-service Compose scaling for the current imported,
   explicitly revalidated ordered files/profiles on the selected Linux local
-  Docker Unix socket. The UI offers one accessible target control per declared
-  service, initially blank until the user enters a valid target, and displays
-  observed instance counts from `ps --all`, including stopped containers.
-  Targets are integers 1–32; scale-to-zero and project-wide scaling are not
-  supported. Confirmation names the imported local label, service, current
-  count, and target; cancellation submits nothing. The worker validates write-sealed
-  snapshots and rechecks declared membership and the fresh instance count on
-  the selected socket before fixed `up --detach --no-build --pull never
-  --no-deps --scale SERVICE=N SERVICE` argv. Dependencies do not auto-start;
-  no build, pull, volume/orphan removal, or force recreation is requested.
-  Scaling can create containers or stop/remove excess containers, and Compose
-  may recreate changed containers according to its normal volume semantics.
-  Every submitted failure, timeout, or cancellation is uncertain and requires
-  successful status refresh before retry. Audit records only static `scale`
-  action/outcome values without service, project, count, path, profile, socket,
-  or output data. Added controlled fake-CLI/headless regressions and an ignored
-  live smoke which preflights a unique generated project and its default network,
-  verifies scale-up to two and downscale to one, and attempts project-scoped
-  cleanup; the live smoke was not run. No broader platform support or full Issue
-  #18 completion is claimed.
+  Docker Unix socket. Validation keeps the selected-profile service list for
+  existing lifecycle eligibility and obtains a separate `--profile '*'
+  config --services` inventory for all declared services. Read-only selected-
+  profile and all-profile `ps --all` snapshots provide lifecycle status and
+  accurate scale counts including stopped containers. The UI offers one control
+  per declared service, including inactive-profile services, with an initially
+  blank target restricted to integers 1–32; scale-to-zero and project-wide
+  scaling are unavailable. The worker revalidates sealed files with the
+  selected profiles, checks all-profile service membership/count, then submits
+  exact `up --detach --no-build --pull never --no-deps --scale SERVICE=N
+  SERVICE` argv without any global `--profile` flag. Explicit target activation
+  does not start same-profile siblings. Confirmation warns that `up` can start
+  stopped containers and run configured service code on the selected Engine;
+  removal or configuration recreation discards writable-layer changes, and
+  mounted volumes follow Compose semantics. No build, pull, volume/orphan
+  removal, or force recreation is requested. Submitted failures/timeouts remain
+  uncertain and require successful status refresh before retry; canceling the
+  Scale confirmation records static `scale/not_submitted`. Audit excludes
+  service, project, count, path, profile, socket, and output data. The ignored
+  live smoke now uses a unique project with a profile-gated target and
+  same-profile sibling, preflights project/network absence, uses a preinstalled
+  image without mounts/ports/pull/build, and attempts scoped non-force,
+  non-prune, non-volume cleanup. It was not run; live Engine validation is
+  pending the integration owner's safe smoke. No broader platform support or
+  full Issue #18 completion is claimed.
 - Added confirmed service-scoped Compose pause/unpause for the current imported,
   successfully revalidated ordered files/profiles on the selected Linux local
   Docker Unix socket. Pause is offered only for a declared service with a

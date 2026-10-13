@@ -52,6 +52,12 @@ pub(super) struct ComposeContainer {
     pub(super) state: String,
     pub(super) health: Option<String>,
 }
+fn service_instance_count(containers: &[ComposeContainer], service: &str) -> usize {
+    containers
+        .iter()
+        .filter(|container| container.service == service)
+        .count()
+}
 
 #[cfg(target_os = "linux")]
 const MAX_COMPOSE_CONTAINERS: usize = 4096;
@@ -492,7 +498,10 @@ impl ComposeValidationError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ComposeValidationResult {
     pub(super) version: Option<String>,
+    /// Services visible under the explicitly selected profiles.
     pub(super) services: Vec<String>,
+    /// Every service declared in the selected files, including inactive profiles.
+    pub(super) all_services: Vec<String>,
     pub(super) outcome: Result<(), ComposeValidationError>,
 }
 
@@ -501,6 +510,7 @@ impl ComposeValidationResult {
         Self {
             version: None,
             services: Vec::new(),
+            all_services: Vec::new(),
             outcome: Err(error),
         }
     }
@@ -529,6 +539,12 @@ enum ComposeValidationState {
     SelectionCancelled,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ComposeScaleRequest {
+    pub(super) service: String,
+    pub(super) target: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct ComposeActions {
     pub(super) refresh: bool,
@@ -543,7 +559,7 @@ pub(super) struct ComposeActions {
     pub(super) follow_service: Option<String>,
     pub(super) cancel_follow: bool,
     pub(super) restart_service: Option<String>,
-    pub(super) scale_service: Option<(String, String)>,
+    pub(super) scale_service: Option<ComposeScaleRequest>,
     pub(super) cancel_status: bool,
     pub(super) pause_service: Option<String>,
     pub(super) unpause_service: Option<String>,
@@ -608,6 +624,7 @@ pub(super) struct ComposeView {
     validation_generation: u64,
     validation: ComposeValidationState,
     validated_services: Vec<String>,
+    all_declared_services: Vec<String>,
     selected_files: Vec<std::path::PathBuf>,
     profile_input: String,
     status_generation: u64,
@@ -727,9 +744,7 @@ impl ComposeView {
         if !(1..=32).contains(&target) || !self.can_request_service_scale(service) {
             return false;
         }
-        let Some(current) = self.service_instance_count(service) else {
-            return false;
-        };
+        let current = self.service_instance_count(service);
         self.set_operation_confirmation(
             ComposeOperationAction::Scale,
             Some(service.to_owned()),
@@ -800,7 +815,12 @@ impl ComposeView {
                 != Some(confirmation.selection.profiles.as_slice())
             || service.as_ref().is_some_and(|service| {
                 !matches!(&self.status, ComposeStatusState::Succeeded { .. })
-                    || ((action == ComposeOperationAction::Scale
+                    || (action == ComposeOperationAction::Scale
+                        && !self
+                            .all_declared_services
+                            .iter()
+                            .any(|candidate| candidate == service))
+                    || ((action == ComposeOperationAction::Restart
                         || service_action_expected_state(action).is_some())
                         && !self
                             .validated_services
@@ -808,7 +828,7 @@ impl ComposeView {
                             .any(|candidate| candidate == service))
                     || (action == ComposeOperationAction::Scale
                         && scale.is_none_or(|plan| {
-                            self.service_instance_count(service) != Some(plan.observed_replicas)
+                            self.service_instance_count(service) != plan.observed_replicas
                         }))
                     || (action != ComposeOperationAction::Scale
                         && !self.containers.iter().any(|container| {
@@ -992,6 +1012,10 @@ impl ComposeView {
         validate_service_selector(service).is_some()
             && self.can_request_service_operation()
             && self
+                .validated_services
+                .iter()
+                .any(|candidate| candidate == service)
+            && self
                 .containers
                 .iter()
                 .any(|container| container.service == service)
@@ -1008,19 +1032,14 @@ impl ComposeView {
                 .iter()
                 .any(|container| container.service == service && container.state == expected_state)
     }
-    fn service_instance_count(&self, service: &str) -> Option<usize> {
-        Some(
-            self.containers
-                .iter()
-                .filter(|container| container.service == service)
-                .count(),
-        )
+    fn service_instance_count(&self, service: &str) -> usize {
+        service_instance_count(&self.containers, service)
     }
     fn can_request_service_scale(&self, service: &str) -> bool {
         validate_service_selector(service).is_some()
             && self.can_request_service_operation()
             && self
-                .validated_services
+                .all_declared_services
                 .iter()
                 .any(|candidate| candidate == service)
     }
@@ -1098,6 +1117,10 @@ impl ComposeView {
             && self.selected_profiles().is_ok()
             && matches!(&self.validation, ComposeValidationState::Succeeded { .. })
             && self
+                .validated_services
+                .iter()
+                .any(|candidate| candidate == service)
+            && self
                 .containers
                 .iter()
                 .any(|container| container.service == service)
@@ -1109,6 +1132,10 @@ impl ComposeView {
             && self.current_imported_selection_validated()
             && matches!(&self.status, ComposeStatusState::Succeeded { .. })
             && matches!(&self.validation, ComposeValidationState::Succeeded { .. })
+            && self
+                .validated_services
+                .iter()
+                .any(|candidate| candidate == service)
             && self
                 .containers
                 .iter()
@@ -1124,6 +1151,10 @@ impl ComposeView {
         let service = validate_service_selector(service)?;
         if !matches!(&self.status, ComposeStatusState::Succeeded { .. })
             || !matches!(&self.validation, ComposeValidationState::Succeeded { .. })
+            || !self
+                .validated_services
+                .iter()
+                .any(|candidate| candidate == service)
             || !self
                 .containers
                 .iter()
@@ -1184,6 +1215,10 @@ impl ComposeView {
         if !matches!(&self.status, ComposeStatusState::Succeeded { .. })
             || !self.current_imported_selection_validated()
             || !matches!(&self.validation, ComposeValidationState::Succeeded { .. })
+            || !self
+                .validated_services
+                .iter()
+                .any(|candidate| candidate == service)
             || !self
                 .containers
                 .iter()
@@ -1270,6 +1305,7 @@ impl ComposeView {
         self.selected_import_label = None;
         self.clear_operation_result();
         self.validated_services.clear();
+        self.all_declared_services.clear();
         self.validation_generation = self.validation_generation.wrapping_add(1);
         self.invalidate_status();
         self.validation = ComposeValidationState::SelectingFile { override_file };
@@ -1420,6 +1456,7 @@ impl ComposeView {
         self.validated_generation = None;
         self.invalidate_status();
         self.validated_services.clear();
+        self.all_declared_services.clear();
         self.validation = ComposeValidationState::Idle;
         self.selected_files = files;
         self.profile_input = profile_input;
@@ -1451,6 +1488,7 @@ impl ComposeView {
         self.imported_selection = false;
         self.validated_generation = None;
         self.validated_services.clear();
+        self.all_declared_services.clear();
         self.validation_generation = self.validation_generation.wrapping_add(1);
         self.invalidate_status();
         self.validation = ComposeValidationState::Idle;
@@ -1488,6 +1526,11 @@ impl ComposeView {
         self.validated_generation = result.outcome.is_ok().then_some(generation);
         self.validated_services = if result.outcome.is_ok() {
             result.services
+        } else {
+            Vec::new()
+        };
+        self.all_declared_services = if result.outcome.is_ok() {
+            result.all_services
         } else {
             Vec::new()
         };
@@ -1556,6 +1599,7 @@ impl ComposeView {
             self.validated_generation = None;
             self.invalidate_status();
             self.validated_services.clear();
+            self.all_declared_services.clear();
             self.validation_generation = self.validation_generation.wrapping_add(1);
             self.selected_files.remove(index);
             self.validation = ComposeValidationState::Idle;
@@ -1573,6 +1617,7 @@ impl ComposeView {
             return None;
         }
         self.validated_services.clear();
+        self.all_declared_services.clear();
         self.validated_generation = None;
         let profiles = match self.selected_profiles() {
             Ok(profiles) => profiles,
@@ -1594,6 +1639,7 @@ impl ComposeView {
     pub(super) fn cancel_validation(&mut self) {
         self.validated_generation = None;
         self.validated_services.clear();
+        self.all_declared_services.clear();
         if let ComposeValidationState::Validating { file_name } =
             std::mem::take(&mut self.validation)
         {
@@ -1608,6 +1654,7 @@ impl ComposeView {
         }
         self.validated_generation = None;
         self.validated_services.clear();
+        self.all_declared_services.clear();
         self.generation = self.generation.wrapping_add(1);
         self.loading = false;
         self.loaded = false;
@@ -1831,7 +1878,7 @@ impl ComposeView {
                 ui.spinner();
                 ui.label("Loading declared services…");
             }
-            ComposeValidationState::Succeeded { .. } if self.validated_services.is_empty() => {
+            ComposeValidationState::Succeeded { .. } if self.all_declared_services.is_empty() => {
                 ui.label("No declared services were returned for the selected files.");
             }
             ComposeValidationState::Succeeded { .. } => {
@@ -1841,10 +1888,10 @@ impl ComposeView {
                     .show_rows(
                         ui,
                         COMPOSE_SERVICE_ROW_HEIGHT,
-                        self.validated_services.len(),
+                        self.all_declared_services.len(),
                         |ui, rows| {
                             for row in rows {
-                                ui.label(self.validated_services[row].as_str());
+                                ui.label(self.all_declared_services[row].as_str());
                             }
                         },
                     );
@@ -1921,7 +1968,8 @@ impl ComposeView {
                 egui::Button::new("Refresh existing containers"),
             )
             .clicked();
-        if matches!(&self.status, ComposeStatusState::Succeeded { .. }) {
+        if cfg!(target_os = "linux") && matches!(&self.status, ComposeStatusState::Succeeded { .. })
+        {
             ui.heading("Scale a declared service");
             ui.horizontal(|ui| {
                 let label = ui.label("Target instances (1–32):");
@@ -1941,8 +1989,8 @@ impl ComposeView {
             if !valid_scale_target {
                 ui.label("Enter a whole number from 1 to 32 to enable scaling.");
             }
-            for service in &self.validated_services {
-                let count = self.service_instance_count(service).unwrap_or_default();
+            for service in &self.all_declared_services {
+                let count = self.service_instance_count(service);
                 ui.horizontal(|ui| {
                     ui.label(format!("{service}: {count} observed instance(s)"));
                     if ui
@@ -1958,7 +2006,10 @@ impl ComposeView {
                         )
                         .clicked()
                     {
-                        actions.scale_service = Some((service.clone(), self.scale_target.clone()));
+                        actions.scale_service = Some(ComposeScaleRequest {
+                            service: service.clone(),
+                            target: self.scale_target.clone(),
+                        });
                     }
                 });
             }
@@ -2229,8 +2280,10 @@ impl ComposeView {
                             ));
                         }
                         ui.label("Scale-down can stop/remove excess containers; scale-up can create containers. Compose may recreate changed containers; volumes follow Compose semantics.");
+                        ui.label("This command can start stopped containers and run the configured service code on the selected Engine.");
+                        ui.label("Scaling down/removing containers or configuration-driven recreation discards container writable-layer changes; mounted volumes follow Compose semantics.");
                         ui.label("Dependencies will not auto-start. This requests no build, pull, volume removal, orphan removal, or force-recreate.");
-                        ui.label("Explicitly targeting a profile-gated service activates that service's profile for this command; other services in the profile are not targeted.");
+                        ui.label("Explicitly targeting a profile-gated service activates only that service's profile for this command; sibling services in that profile are not started.");
                     }
                     if confirmation.action == ComposeOperationAction::Pull {
                         ui.label("Downloads eligible images to the selected local Docker Engine image store. This uses bandwidth and disk space; downloads may continue after cancellation. Only anonymous public pulls are supported; private-registry credentials are not imported.");
@@ -3463,7 +3516,7 @@ async fn validate_with_profiles_report_in_config(
         "--services",
     ]);
     isolated.configure_compose_file_descriptors(&mut command);
-    let (services, outcome) = match run_command_with_timeout(&mut command, deadline).await {
+    let (services, mut outcome) = match run_command_with_timeout(&mut command, deadline).await {
         Ok(output) => match parse_declared_services(&output) {
             Some(services) => (services, Ok(())),
             None => (Vec::new(), Err(ComposeValidationError::ValidationFailed)),
@@ -3477,11 +3530,119 @@ async fn validate_with_profiles_report_in_config(
             | CommandFailure::Io,
         ) => (Vec::new(), Err(ComposeValidationError::ValidationFailed)),
     };
+    let all_services = if outcome.is_ok() {
+        let mut all_command = Command::new(binary);
+        isolated.configure(&mut all_command, search_path);
+        all_command
+            .env("COMPOSE_DISABLE_ENV_FILE", "1")
+            .args(["compose", "--project-directory"])
+            .arg(project_directory);
+        for file in files {
+            all_command.arg("--file").arg(file);
+        }
+        all_command.args(["--profile", "*"]).args([
+            "config",
+            "--no-interpolate",
+            "--no-env-resolution",
+            "--services",
+        ]);
+        isolated.configure_compose_file_descriptors(&mut all_command);
+        match run_command_with_timeout(&mut all_command, deadline).await {
+            Ok(output) => match parse_declared_services(&output) {
+                Some(services) => services,
+                None => {
+                    outcome = Err(ComposeValidationError::ValidationFailed);
+                    Vec::new()
+                }
+            },
+            Err(CommandFailure::Launch) => {
+                outcome = Err(ComposeValidationError::DockerCliMissing);
+                Vec::new()
+            }
+            Err(CommandFailure::Spawn) => {
+                outcome = Err(ComposeValidationError::CommandStartFailed);
+                Vec::new()
+            }
+            Err(_) => {
+                outcome = Err(ComposeValidationError::ValidationFailed);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
     ComposeValidationResult {
         version: Some(version),
         services,
+        all_services,
         outcome,
     }
+}
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct ComposeStatusRequest<'a> {
+    binary: &'a std::path::Path,
+    socket_path: &'a std::path::Path,
+    files: &'a [std::path::PathBuf],
+    project_directory: &'a std::path::Path,
+    profiles: &'a [String],
+    search_path: &'a std::ffi::OsStr,
+    isolated: &'a PrivateDockerConfig,
+}
+#[cfg(target_os = "linux")]
+async fn containers_with_isolated_config(
+    binary: &std::path::Path,
+    socket_path: &std::path::Path,
+    files: &[std::path::PathBuf],
+    project_directory: &std::path::Path,
+    profiles: &[String],
+    search_path: &std::ffi::OsStr,
+    isolated: &PrivateDockerConfig,
+) -> Result<Vec<ComposeContainer>, ComposeStatusError> {
+    containers_with_profile_query(
+        &ComposeStatusRequest {
+            binary,
+            socket_path,
+            files,
+            project_directory,
+            profiles,
+            search_path,
+            isolated,
+        },
+        false,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn containers_with_all_profiles(
+    binary: &std::path::Path,
+    socket_path: &std::path::Path,
+    files: &[std::path::PathBuf],
+    project_directory: &std::path::Path,
+    profiles: &[String],
+    search_path: &std::ffi::OsStr,
+    isolated: &PrivateDockerConfig,
+) -> Result<Vec<ComposeContainer>, ComposeStatusError> {
+    let request = ComposeStatusRequest {
+        binary,
+        socket_path,
+        files,
+        project_directory,
+        profiles,
+        search_path,
+        isolated,
+    };
+    let mut selected = containers_with_profile_query(&request, false).await?;
+    let all = containers_with_profile_query(&request, true).await?;
+    for container in all {
+        if !selected.iter().any(|existing| {
+            existing.name == container.name && existing.service == container.service
+        }) {
+            selected.push(container);
+        }
+    }
+    Ok(selected)
 }
 
 #[cfg(target_os = "linux")]
@@ -3535,39 +3696,43 @@ async fn containers_with_binary(
 }
 
 #[cfg(target_os = "linux")]
-async fn containers_with_isolated_config(
-    binary: &std::path::Path,
-    socket_path: &std::path::Path,
-    files: &[std::path::PathBuf],
-    project_directory: &std::path::Path,
-    profiles: &[String],
-    search_path: &std::ffi::OsStr,
-    isolated: &PrivateDockerConfig,
+async fn containers_with_profile_query(
+    request: &ComposeStatusRequest<'_>,
+    all_profiles: bool,
 ) -> Result<Vec<ComposeContainer>, ComposeStatusError> {
     use tokio::process::Command;
-    if !valid_profile_list(profiles) || files.is_empty() {
+    if (!all_profiles && !valid_profile_list(request.profiles)) || request.files.is_empty() {
         return Err(ComposeStatusError::QueryFailed);
     }
-    let socket_path = socket_path
+    let socket_path = request
+        .socket_path
         .to_str()
         .ok_or(ComposeStatusError::QueryFailed)?;
     let host = format!("unix://{socket_path}");
-    let mut command = Command::new(binary);
-    isolated.configure(&mut command, search_path);
+    let mut command = Command::new(request.binary);
+    request
+        .isolated
+        .configure(&mut command, request.search_path);
     command
         .env("COMPOSE_DISABLE_ENV_FILE", "1")
         .arg("--host")
         .arg(host)
         .args(["compose", "--project-directory"])
-        .arg(project_directory);
-    for file in files {
+        .arg(request.project_directory);
+    for file in request.files {
         command.arg("--file").arg(file);
     }
-    for profile in profiles {
-        command.arg("--profile").arg(profile);
+    if all_profiles {
+        command.args(["--profile", "*"]);
+    } else {
+        for profile in request.profiles {
+            command.arg("--profile").arg(profile);
+        }
     }
     command.args(["ps", "--all", "--format", "json"]);
-    isolated.configure_compose_file_descriptors(&mut command);
+    request
+        .isolated
+        .configure_compose_file_descriptors(&mut command);
     let output = run_command_with_timeout(&mut command, COMMAND_TIMEOUT)
         .await
         .map_err(|failure| match failure {
@@ -4398,6 +4563,7 @@ struct PreparedComposeOperation {
     files: Vec<std::path::PathBuf>,
     project_directory: std::path::PathBuf,
     services: Vec<String>,
+    all_services: Vec<String>,
 }
 #[cfg(target_os = "linux")]
 fn compose_validation_operation_error(error: ComposeValidationError) -> ComposeOperationError {
@@ -4466,6 +4632,7 @@ async fn prepare_compose_operation(
         files: snapshot_files,
         project_directory: project_directory.to_path_buf(),
         services: validation.services,
+        all_services: validation.all_services,
     })
 }
 
@@ -4706,17 +4873,30 @@ async fn service_action_with_binary_and_scale(
         Ok(prepared) => prepared,
         Err(error) => return failure(error),
     };
-    let containers = match containers_with_isolated_config(
-        request.binary,
-        request.socket_path,
-        &prepared.files,
-        &prepared.project_directory,
-        request.profiles,
-        request.search_path,
-        &prepared.isolated,
-    )
-    .await
-    {
+    let status_query = if action == ComposeOperationAction::Scale {
+        containers_with_all_profiles(
+            request.binary,
+            request.socket_path,
+            &prepared.files,
+            &prepared.project_directory,
+            request.profiles,
+            request.search_path,
+            &prepared.isolated,
+        )
+        .await
+    } else {
+        containers_with_isolated_config(
+            request.binary,
+            request.socket_path,
+            &prepared.files,
+            &prepared.project_directory,
+            request.profiles,
+            request.search_path,
+            &prepared.isolated,
+        )
+        .await
+    };
+    let containers = match status_query {
         Ok(containers) => containers,
         Err(ComposeStatusError::DockerCliMissing) => {
             return failure(ComposeOperationError::DockerCliMissing);
@@ -4729,13 +4909,10 @@ async fn service_action_with_binary_and_scale(
         }
     };
     let expected_state = service_action_expected_state(action);
-    let actual_count = containers
-        .iter()
-        .filter(|container| container.service == service)
-        .count();
+    let actual_count = service_instance_count(&containers, service);
     if action == ComposeOperationAction::Scale {
         if !prepared
-            .services
+            .all_services
             .iter()
             .any(|candidate| candidate == service)
         {
@@ -4747,7 +4924,7 @@ async fn service_action_with_binary_and_scale(
         if scale.observed_replicas != actual_count {
             return failure(ComposeOperationError::StaleServiceCount);
         }
-    } else if (expected_state.is_some()
+    } else if ((expected_state.is_some() || action == ComposeOperationAction::Restart)
         && !prepared
             .services
             .iter()
@@ -4775,8 +4952,10 @@ async fn service_action_with_binary_and_scale(
     for file in &prepared.files {
         command.arg("--file").arg(file);
     }
-    for profile in request.profiles {
-        command.arg("--profile").arg(profile);
+    if action != ComposeOperationAction::Scale {
+        for profile in request.profiles {
+            command.arg("--profile").arg(profile);
+        }
     }
     if action == ComposeOperationAction::Restart {
         command.args(["restart", "--no-deps"]).arg(service);
@@ -4977,13 +5156,20 @@ pub(super) async fn existing_compose_containers(
         let search_path = std::env::var_os("PATH").ok_or(ComposeStatusError::DockerCliMissing)?;
         let binary = docker_binary(&search_path).ok_or(ComposeStatusError::DockerCliMissing)?;
         let plugin = user_compose_plugin();
-        containers_with_binary(
+        let project_directory = files
+            .first()
+            .and_then(|file| file.parent())
+            .ok_or(ComposeStatusError::QueryFailed)?;
+        let isolated = PrivateDockerConfig::new(plugin.as_deref())
+            .map_err(|_| ComposeStatusError::PrivateConfigSetupFailed)?;
+        containers_with_all_profiles(
             &binary,
             socket_path,
             files,
+            project_directory,
             profiles,
             &search_path,
-            plugin.as_deref(),
+            &isolated,
         )
         .await
     }
@@ -5240,10 +5426,10 @@ mod tests {
                    printf '%s' {}\n\
                    exit {}\n\
                  fi\n\
-                 [ \"$#\" -eq 9 ] || exit 80\n\
-                 [ \"$1\" = compose ] && [ \"$2\" = --project-directory ] || exit 81\n\
-                 [ \"$3\" = {} ] && [ \"$4\" = --file ] && [ \"$5\" = {} ] || exit 82\n\
-                 [ \"$6\" = config ] && [ \"$7\" = --no-interpolate ] && [ \"$8\" = --no-env-resolution ] && [ \"$9\" = --services ] || exit 83\n\
+                [ \"$#\" -eq 9 ] || [ \"$#\" -eq 11 ] || exit 80\n\
+                [ \"$1\" = compose ] && [ \"$2\" = --project-directory ] || exit 81\n\
+                [ \"$3\" = {} ] && [ \"$4\" = --file ] && [ \"$5\" = {} ] || exit 82\n\
+                if [ \"$#\" -eq 9 ]; then [ \"$6\" = config ] && [ \"$7\" = --no-interpolate ] && [ \"$8\" = --no-env-resolution ] && [ \"$9\" = --services ] || exit 83; else [ \"$6\" = --profile ] && [ \"$7\" = '*' ] && [ \"$8\" = config ] && [ \"$9\" = --no-interpolate ] && [ \"${{10}}\" = --no-env-resolution ] && [ \"${{11}}\" = --services ] || exit 83; fi\n\
                  [ \"$COMPOSE_DISABLE_ENV_FILE\" = 1 ] || exit 85\n\
                  [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = \"false\" ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = \"false\" ] || exit 91\n\
                  [ -n \"$PATH\" ] && [ -d \"$HOME\" ] && [ -d \"$DOCKER_CONFIG\" ] || exit 86\n\
@@ -5287,11 +5473,10 @@ mod tests {
             let script = format!(
                 "#!/bin/sh\n\
                  if [ \"$#\" -eq 3 ]; then [ \"$1\" = compose ] && [ \"$2\" = version ] && [ \"$3\" = --short ] || exit 70; printf '%s' started > {}; printf 'v5.6.0\\n'; exit 0; fi\n\
-                 [ \"$#\" -eq 17 ] || exit 71\n\
+                 [ \"$#\" -eq 17 ] || [ \"$#\" -eq 15 ] || exit 71\n\
                  [ \"$1\" = compose ] && [ \"$2\" = --project-directory ] && [ \"$3\" = {} ] || exit 72\n\
                  [ \"$4\" = --file ] && [ \"$5\" = {} ] && [ \"$6\" = --file ] && [ \"$7\" = {} ] && [ \"$8\" = --file ] && [ \"$9\" = {} ] || exit 73\n\
-                 [ \"${{10}}\" = --profile ] && [ \"${{11}}\" = frontend ] && [ \"${{12}}\" = --profile ] && [ \"${{13}}\" = qa ] || exit 74\n\
-                 [ \"${{14}}\" = config ] && [ \"${{15}}\" = --no-interpolate ] && [ \"${{16}}\" = --no-env-resolution ] && [ \"${{17}}\" = --services ] || exit 75\n\
+                 if [ \"$#\" -eq 17 ]; then [ \"${{10}}\" = --profile ] && [ \"${{11}}\" = frontend ] && [ \"${{12}}\" = --profile ] && [ \"${{13}}\" = qa ] && [ \"${{14}}\" = config ] && [ \"${{15}}\" = --no-interpolate ] && [ \"${{16}}\" = --no-env-resolution ] && [ \"${{17}}\" = --services ] || exit 74; else [ \"${{10}}\" = --profile ] && [ \"${{11}}\" = '*' ] && [ \"${{12}}\" = config ] && [ \"${{13}}\" = --no-interpolate ] && [ \"${{14}}\" = --no-env-resolution ] && [ \"${{15}}\" = --services ] || exit 74; fi\n\
                  [ \"$COMPOSE_DISABLE_ENV_FILE\" = 1 ] || exit 75\n\
                  [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = false ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = false ] || exit 76\n\
                  [ -n \"$PATH\" ] && [ -d \"$HOME\" ] && [ -d \"$DOCKER_CONFIG\" ] && [ \"$HOME\" != \"$DOCKER_CONFIG\" ] || exit 77\n\
@@ -5321,6 +5506,41 @@ mod tests {
         fn search_path() -> std::ffi::OsString {
             std::env::var_os("PATH").unwrap_or_else(|| OsStr::new("/usr/bin:/bin").to_owned())
         }
+        #[tokio::test]
+        async fn validation_separates_selected_profile_services_from_all_declared_services() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("profile project");
+            fs::create_dir(&project).unwrap();
+            let file = project.join("compose.yaml");
+            fs::write(&file, "services:\n  web:\n    image: busybox\n").unwrap();
+            let binary = directory.path().join("docker-profile-validation");
+            fs::write(
+                &binary,
+                "#!/bin/sh\n\
+                 if [ \"$#\" -eq 3 ]; then printf 'v5.6.0\\n'; exit 0; fi\n\
+                 [ \"$1\" = compose ] && [ \"$8\" = config ] || exit 91\n\
+                 if [ \"$7\" = qa ]; then printf 'web\\n'; exit 0; fi\n\
+                 if [ \"$7\" = '*' ]; then printf 'web\\nqa-worker\\n'; exit 0; fi\n\
+                 exit 92\n",
+            )
+            .unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+            let result = validate_with_profiles_report(
+                &binary,
+                std::slice::from_ref(&file),
+                &["qa".to_owned()],
+                &search_path(),
+                None,
+                COMMAND_TIMEOUT,
+            )
+            .await;
+
+            assert_eq!(result.outcome, Ok(()));
+            assert_eq!(result.services, ["web"]);
+            assert_eq!(result.all_services, ["web", "qa-worker"]);
+        }
+
         #[tokio::test]
         async fn subprocess_limits_bound_go_memory_and_shell_resource_limits() {
             let isolated = PrivateDockerConfig::new(None)
@@ -5745,9 +5965,12 @@ mod tests {
             let profiles = ["smoke".to_owned()];
             let result = validate_compose_files(&files, &profiles).await;
             assert_eq!(result.version.as_deref(), Some("5.6.0"));
-            let mut declared_services = result.services.clone();
-            declared_services.sort();
-            assert_eq!(declared_services, ["always", "app", "hidden"]);
+            let mut selected_services = result.services.clone();
+            selected_services.sort();
+            assert_eq!(selected_services, ["always", "app"]);
+            let mut all_declared_services = result.all_services.clone();
+            all_declared_services.sort();
+            assert_eq!(all_declared_services, ["always", "app", "hidden"]);
             result.outcome.expect(
                 "the local Compose CLI should validate and list all declared services without contacting an engine",
             );
@@ -6751,14 +6974,13 @@ mod tests {
                  }}\n\
                  if [ \"$1\" = compose ]; then\n\
                    if [ \"$#\" -eq 3 ]; then [ \"$2\" = version ] && [ \"$3\" = --short ] || exit 71; printf 'v5.6.0\\n'; exit 0; fi\n\
-                   [ \"$#\" -eq 15 ] || exit 72\n\
+                   [ \"$#\" -eq 15 ] || [ \"$#\" -eq 13 ] || exit 72\n\
                    [ \"$1\" = compose ] && [ \"$2\" = --project-directory ] && [ \"$3\" = {} ] || exit 73\n\
                    [ \"$4\" = --file ] || exit 82\n\
                    case \"$5\" in /proc/self/fd/*) ;; *) exit 82 ;; esac\n\
                    [ \"$6\" = --file ] || exit 82\n\
                    case \"$7\" in /proc/self/fd/*) ;; *) exit 82 ;; esac\n\
-                   [ \"$8\" = --profile ] && [ \"$9\" = web ] && [ \"${{10}}\" = --profile ] && [ \"${{11}}\" = qa ] || exit 75\n\
-                   [ \"${{12}}\" = config ] && [ \"${{13}}\" = --no-interpolate ] && [ \"${{14}}\" = --no-env-resolution ] && [ \"${{15}}\" = --services ] || exit 76\n\
+                   if [ \"$#\" -eq 15 ]; then [ \"$8\" = --profile ] && [ \"$9\" = web ] && [ \"${{10}}\" = --profile ] && [ \"${{11}}\" = qa ] && [ \"${{12}}\" = config ] && [ \"${{13}}\" = --no-interpolate ] && [ \"${{14}}\" = --no-env-resolution ] && [ \"${{15}}\" = --services ] || exit 75; else [ \"$8\" = --profile ] && [ \"$9\" = '*' ] && [ \"${{10}}\" = config ] && [ \"${{11}}\" = --no-interpolate ] && [ \"${{12}}\" = --no-env-resolution ] && [ \"${{13}}\" = --services ] || exit 75; fi\n\
                    check_environment\n\
                    printf 'web\\n'; exit 0\n\
                  fi\n\
@@ -7469,13 +7691,14 @@ exit 85
                 "#!/bin/sh\n\
                  case \"$*\" in\n\
                    *' version --short'* ) printf 'version\\n' >> {}; printf 'v5.6.0\\n'; exit 0 ;;\n\
-                   *' config '* ) printf 'validation\\n' >> {}; printf '%s\\n' \"$@\" > {}; printf 'web\\nworker\\n'; exit 0 ;;\n\
+                   *' config '* ) printf 'validation\\n' >> {}; printf '%s\\n' '---' >> {}; printf '%s\\n' \"$@\" >> {}; printf 'web\\nworker\\n'; exit 0 ;;\n\
                    *' ps '* ) printf 'status\\n' >> {}; printf '%s\\n' \"$@\" > {}; printf '%s' {}; exit 0 ;;\n\
                    *' restart '* ) printf 'restart\\n' >> {}; printf '%s\\n' \"$@\" > {}; exit 0 ;;\n\
                  esac\n\
                  exit 94\n",
                 shell_quote(sequence.to_str().unwrap()),
                 shell_quote(sequence.to_str().unwrap()),
+                shell_quote(validation_trace.to_str().unwrap()),
                 shell_quote(validation_trace.to_str().unwrap()),
                 shell_quote(sequence.to_str().unwrap()),
                 shell_quote(status_trace.to_str().unwrap()),
@@ -7507,15 +7730,22 @@ exit 85
             let socket_argument = format!("unix://{}", socket.display());
             let project_argument = project.display().to_string();
             let validation_trace = fs::read_to_string(validation_trace).unwrap();
-            let validation_arguments = validation_trace.lines().collect::<Vec<_>>();
-            assert_eq!(validation_arguments[0], "compose");
-            assert_eq!(validation_arguments[1], "--project-directory");
-            assert_eq!(validation_arguments[2], project_argument.as_str());
-            assert_eq!(validation_arguments[3], "--file");
-            assert_eq!(validation_arguments[5], "--file");
+            let mut validation_calls = validation_trace
+                .split("---\n")
+                .filter(|call| !call.is_empty());
+            let selected_validation_arguments =
+                validation_calls.next().unwrap().lines().collect::<Vec<_>>();
+            let all_validation_arguments =
+                validation_calls.next().unwrap().lines().collect::<Vec<_>>();
+            assert!(validation_calls.next().is_none());
+            assert_eq!(selected_validation_arguments[0], "compose");
+            assert_eq!(selected_validation_arguments[1], "--project-directory");
+            assert_eq!(selected_validation_arguments[2], project_argument.as_str());
+            assert_eq!(selected_validation_arguments[3], "--file");
+            assert_eq!(selected_validation_arguments[5], "--file");
             let snapshot_files = [
-                validation_arguments[4].to_owned(),
-                validation_arguments[6].to_owned(),
+                selected_validation_arguments[4].to_owned(),
+                selected_validation_arguments[6].to_owned(),
             ];
             assert!(
                 snapshot_files
@@ -7523,12 +7753,23 @@ exit 85
                     .all(|path| path.starts_with("/proc/self/fd/"))
             );
             assert_eq!(
-                &validation_arguments[7..],
+                &selected_validation_arguments[7..],
                 [
                     "--profile",
                     "frontend",
                     "--profile",
                     "qa",
+                    "config",
+                    "--no-interpolate",
+                    "--no-env-resolution",
+                    "--services",
+                ]
+            );
+            assert_eq!(
+                &all_validation_arguments[7..],
+                [
+                    "--profile",
+                    "*",
                     "config",
                     "--no-interpolate",
                     "--no-env-resolution",
@@ -7596,7 +7837,7 @@ exit 85
             );
             assert_eq!(
                 fs::read_to_string(sequence).unwrap(),
-                "version\nvalidation\nstatus\nrestart\n"
+                "version\nvalidation\nvalidation\nstatus\nrestart\n"
             );
         }
 
@@ -7643,8 +7884,10 @@ exit 85
                 .unwrap();
                 let operation = directory.path().join("scale-argv");
                 let binary = directory.path().join("docker-scale-fixture");
+                let trace = directory.path().join("scale-trace");
                 let script = format!(
                     "#!/bin/sh\n\
+                     printf '%s\\n' \"$*\" >> {}\n\
                      case \"$*\" in\n\
                        *' version --short'* ) printf 'v5.6.0\\n'; exit 0 ;;\n\
                        *' config '* ) printf '%s\\n' {}; exit 0 ;;\n\
@@ -7652,6 +7895,7 @@ exit 85
                        *' up '* ) printf '%s\\n' \"$@\" > {}; exit 0 ;;\n\
                      esac\n\
                      exit 94\n",
+                    shell_quote(trace.to_str().unwrap()),
                     shell_quote(declared_service),
                     shell_quote(status_response),
                     shell_quote(operation.to_str().unwrap()),
@@ -7659,12 +7903,13 @@ exit 85
                 fs::write(&binary, script).unwrap();
                 fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
                 let socket = directory.path().join("selected.sock");
+                let profiles = ["selected".to_owned()];
                 let result = service_action_with_binary_and_scale(
                     ComposeOperationRequest {
                         binary: &binary,
                         socket_path: &socket,
                         files: std::slice::from_ref(&file),
-                        profiles: &[],
+                        profiles: &profiles,
                         search_path: OsStr::new("/usr/bin"),
                         plugin: None,
                     },
@@ -7683,7 +7928,7 @@ exit 85
                 } else {
                     assert_eq!(result.outcome, Ok(()));
                     assert!(result.submitted);
-                    let args = fs::read_to_string(operation)
+                    let args = fs::read_to_string(&operation)
                         .unwrap()
                         .lines()
                         .map(str::to_owned)
@@ -7701,6 +7946,20 @@ exit 85
                             "web=3",
                             "web"
                         ]
+                    );
+                    let calls = fs::read_to_string(&trace).unwrap();
+                    assert!(calls.lines().any(|call| {
+                        call.contains("--profile selected") && call.contains(" config ")
+                    }));
+                    assert!(calls.lines().any(|call| {
+                        call.contains("--profile selected") && call.contains(" ps --all ")
+                    }));
+                    assert!(calls.lines().any(|call| {
+                        call.contains("--profile *") && call.contains(" ps --all ")
+                    }));
+                    assert!(
+                        !args.iter().any(|argument| argument == "--profile"),
+                        "the mutating up command must not enable any global profile"
                     );
                     assert!(
                         !args
@@ -8195,9 +8454,7 @@ exit 85
                 .expect("JSON encoding produces a valid YAML quoted scalar");
             fs::write(
                 &file,
-                format!(
-                    "name: {project_name}\nservices:\n  scale-probe:\n    image: {yaml_image}\n    command: [\"/bin/sleep\", \"45\"]\n"
-                ),
+                format!("name: {project_name}\nservices:\n  scale-probe:\n    image: {yaml_image}\n    command: [\"/bin/sleep\", \"45\"]\n    profiles: [scale-check]\n  sibling-probe:\n    image: {yaml_image}\n    command: [\"/bin/sleep\", \"45\"]\n    profiles: [scale-check]\n"),
             )
             .expect("write the controlled Compose file");
             let files = [file];
@@ -8238,6 +8495,8 @@ exit 85
                 .arg(format!("unix://{}", socket.display()))
                 .args([
                     "compose",
+                    "--profile",
+                    "*",
                     "--project-name",
                     &cleanup_scope.0,
                     "--project-directory",
@@ -8315,7 +8574,7 @@ exit 85
             assert!(scale_up.submitted, "scale-up should be submitted");
             assert!(
                 up_ownership,
-                "exactly two generated-project replicas should be observed"
+                "the target has exactly two replicas and its same-profile sibling did not start"
             );
             assert!(
                 downscale.is_some(),
@@ -8398,6 +8657,7 @@ exit 85
             ComposeValidationResult {
                 version: None,
                 services: Vec::new(),
+                all_services: Vec::new(),
                 outcome,
             }
         }
@@ -8532,6 +8792,7 @@ exit 85
                 ComposeValidationResult {
                     version: Some("v5.6.0".to_owned()),
                     services: vec!["web".to_owned()],
+                    all_services: vec!["web".to_owned()],
                     outcome: Ok(()),
                 },
             ));
@@ -8764,6 +9025,11 @@ exit 85
                 ComposeValidationResult {
                     version: None,
                     services: vec!["web".to_owned(), "api\\u{202e}".to_owned()],
+                    all_services: vec![
+                        "web".to_owned(),
+                        "api\\u{202e}".to_owned(),
+                        "qa-worker".to_owned(),
+                    ],
                     outcome: Ok(()),
                 },
             ));
@@ -8771,6 +9037,7 @@ exit 85
             harness.run();
             let _web = harness.get_by_role_and_label(Role::Label, "web");
             let _escaped = harness.get_by_role_and_label(Role::Label, "api\\u{202e}");
+            let _inactive_profile_service = harness.get_by_role_and_label(Role::Label, "qa-worker");
             let _declared_not_running = harness.get_by_role_and_label(
                 Role::Label,
                 "Local Compose CLI/file-derived inventory includes every declared service, including profile-gated services even when their profiles are inactive. These are not running containers. Listing does not query Engine status or logs.",
@@ -8820,6 +9087,7 @@ exit 85
                 ComposeValidationResult {
                     version: None,
                     services: vec!["current".to_owned()],
+                    all_services: vec!["current".to_owned()],
                     outcome: Ok(()),
                 },
             ));
@@ -8830,6 +9098,7 @@ exit 85
                 ComposeValidationResult {
                     version: None,
                     services: vec!["stale".to_owned()],
+                    all_services: vec!["stale".to_owned()],
                     outcome: Ok(()),
                 },
             ));
@@ -8970,6 +9239,7 @@ exit 85
         #[test]
         fn profile_changes_invalidate_status_and_logs_and_reject_stale_results() {
             let mut view = validated_compose_view();
+            view.validated_services = vec!["api".to_owned()];
             let (status_generation, _, _) = view.begin_status_refresh().unwrap();
             assert!(view.finish_status_refresh(
                 status_generation,
@@ -9288,6 +9558,7 @@ exit 85
         #[test]
         fn service_log_action_requires_current_status_and_cancel_rejects_stale_output() {
             let mut view = validated_compose_view();
+            view.validated_services = vec!["api".to_owned(), "worker".to_owned()];
             assert!(view.begin_service_logs("api").is_none());
             let (status_generation, _, _) = view.begin_status_refresh().unwrap();
             assert!(view.finish_status_refresh(
@@ -9348,6 +9619,7 @@ exit 85
         #[test]
         fn service_log_follow_action_escapes_bounds_and_rejects_stale_events() {
             let mut view = validated_compose_view();
+            view.validated_services = vec!["api".to_owned()];
             assert!(view.import_current_project("current"));
             let (status_generation, _, _) = view.begin_status_refresh().unwrap();
             assert!(view.finish_status_refresh(
@@ -9419,6 +9691,7 @@ exit 85
         fn service_log_results_render_content_empty_and_static_error_states() {
             fn view_with_service_status() -> ComposeView {
                 let mut view = validated_compose_view();
+                view.validated_services = vec!["api".to_owned()];
                 let (generation, _, _) = view.begin_status_refresh().unwrap();
                 assert!(view.finish_status_refresh(
                     generation,
@@ -9571,6 +9844,7 @@ exit 85
             view.profiles_changed();
             let (generation, _, _) = view.begin_validation().unwrap();
             assert!(view.finish_validation(generation, validation_result(Ok(()))));
+            view.validated_services = vec!["api".to_owned()];
             assert!(view.import_current_project("Imported"));
 
             let (status_generation, _, _) = view.begin_status_refresh().unwrap();
@@ -9832,6 +10106,7 @@ exit 85
         #[test]
         fn service_restart_confirmation_rejects_absent_status_service_or_changed_selection() {
             let mut view = validated_compose_view();
+            view.validated_services = vec!["worker".to_owned()];
             assert!(view.import_current_project("Local label"));
             assert!(
                 !view.request_service_restart_confirmation("web"),
@@ -9865,6 +10140,7 @@ exit 85
             let mut view = validated_compose_view();
             assert!(view.import_current_project("Local label"));
             view.validated_services = vec!["web".to_owned()];
+            view.all_declared_services = vec!["web".to_owned(), "worker".to_owned()];
             let (generation, _, _) = view.begin_status_refresh().unwrap();
             assert!(view.finish_status_refresh(
                 generation,
@@ -9884,6 +10160,13 @@ exit 85
                             state: "exited".to_owned(),
                             health: None,
                         },
+                        ComposeContainer {
+                            name: "worker-1".to_owned(),
+                            service: "worker".to_owned(),
+                            project: None,
+                            state: "running".to_owned(),
+                            health: None,
+                        },
                     ],
                     outcome: Ok(()),
                 },
@@ -9891,7 +10174,22 @@ exit 85
             assert!(!view.request_service_scale_confirmation("web", "0"));
             assert!(!view.request_service_scale_confirmation("web", "abc"));
             assert!(!view.request_service_scale_confirmation("web", "33"));
-            assert!(!view.request_service_scale_confirmation("worker", "2"));
+            assert!(!view.request_service_scale_confirmation("rogue", "2"));
+            assert!(!view.can_request_service_action("worker", "running"));
+            assert!(!view.can_request_service_restart("worker"));
+            assert!(view.request_service_scale_confirmation("worker", "2"));
+            assert_eq!(
+                view.operation_confirmation()
+                    .and_then(|confirmation| confirmation.scale),
+                Some(ComposeScalePlan {
+                    target_replicas: 2,
+                    observed_replicas: 1,
+                })
+            );
+            assert_eq!(
+                view.cancel_operation_confirmation(),
+                Some(ComposeOperationAction::Scale)
+            );
             assert!(view.request_service_scale_confirmation("web", "3"));
             assert_eq!(
                 view.operation_confirmation()
@@ -9906,7 +10204,8 @@ exit 85
                 Some(ComposeOperationAction::Scale)
             );
             assert!(view.request_service_scale_confirmation("web", "3"));
-            view.containers.pop();
+            view.containers
+                .retain(|container| container.name != "web-2");
             assert!(view.confirm_operation().is_none());
             view.containers.push(ComposeContainer {
                 name: "web-2".to_owned(),
@@ -9956,6 +10255,7 @@ exit 85
             let mut view = validated_compose_view();
             assert!(view.import_current_project("Local label"));
             view.validated_services = vec!["web".to_owned()];
+            view.all_declared_services = vec!["web".to_owned(), "worker".to_owned()];
             let (generation, _, _) = view.begin_status_refresh().unwrap();
             assert!(view.finish_status_refresh(
                 generation,
@@ -9981,6 +10281,14 @@ exit 85
             ));
             let mut harness = harness_for(view);
             harness.run();
+            let _inactive_count =
+                harness.get_by_role_and_label(Role::Label, "worker: 0 observed instance(s)");
+            assert!(
+                harness
+                    .get_by_role_and_label(Role::Button, "Scale service worker")
+                    .accesskit_node()
+                    .is_disabled()
+            );
             let _guidance = harness.get_by_role_and_label(
                 Role::Label,
                 "Enter a whole number from 1 to 32 to enable scaling.",
@@ -10001,13 +10309,22 @@ exit 85
                     .accesskit_node()
                     .is_disabled()
             );
+            assert!(
+                !harness
+                    .get_by_role_and_label(Role::Button, "Scale service worker to 3")
+                    .accesskit_node()
+                    .is_disabled()
+            );
             harness
                 .get_by_role_and_label(Role::Button, "Scale service web to 3")
                 .click_accesskit();
             harness.step();
             assert_eq!(
                 harness.state().actions.scale_service.as_ref(),
-                Some(&("web".to_owned(), "3".to_owned()))
+                Some(&ComposeScaleRequest {
+                    service: "web".to_owned(),
+                    target: "3".to_owned(),
+                })
             );
             assert!(
                 harness
@@ -10027,9 +10344,17 @@ exit 85
                 Role::Label,
                 "Scale-down can stop/remove excess containers; scale-up can create containers. Compose may recreate changed containers; volumes follow Compose semantics.",
             );
+            let _stopped_warning = harness.get_by_role_and_label(
+                Role::Label,
+                "This command can start stopped containers and run the configured service code on the selected Engine.",
+            );
+            let _writable_layer_warning = harness.get_by_role_and_label(
+                Role::Label,
+                "Scaling down/removing containers or configuration-driven recreation discards container writable-layer changes; mounted volumes follow Compose semantics.",
+            );
             let _profile_warning = harness.get_by_role_and_label(
                 Role::Label,
-                "Explicitly targeting a profile-gated service activates that service's profile for this command; other services in the profile are not targeted.",
+                "Explicitly targeting a profile-gated service activates only that service's profile for this command; sibling services in that profile are not started.",
             );
             let _confirm = harness.get_by_role_and_label(Role::Button, "Confirm scale");
             harness
@@ -10046,6 +10371,7 @@ exit 85
         #[test]
         fn uncertain_scale_failure_shows_snapshot_and_retry_guidance() {
             let mut view = validated_compose_view();
+            view.all_declared_services = vec!["web".to_owned()];
             assert!(view.import_current_project("Local label"));
             view.validated_services = vec!["web".to_owned()];
             let (generation, _, _) = view.begin_status_refresh().unwrap();
@@ -10238,6 +10564,7 @@ exit 85
         #[test]
         fn service_restart_confirmation_names_scope_and_cancel_submits_no_task() {
             let mut view = validated_compose_view();
+            view.validated_services = vec!["web".to_owned()];
             assert!(view.import_current_project("Local label"));
             let (generation, _, _) = view.begin_status_refresh().unwrap();
             assert!(view.finish_status_refresh(
@@ -10747,6 +11074,7 @@ exit 85
             assert!(!harness.state().actions.cancel_logs);
 
             let mut logs = validated_compose_view();
+            logs.validated_services = vec!["api".to_owned()];
             assert!(logs.import_current_project("Saved logs"));
             let (status_generation, _, _) = logs.begin_status_refresh().expect("status can start");
             assert!(logs.finish_status_refresh(
@@ -10776,6 +11104,7 @@ exit 85
         #[test]
         fn selecting_import_cancels_live_compose_follow() {
             let mut follow = validated_compose_view();
+            follow.validated_services = vec!["api".to_owned()];
             assert!(follow.import_current_project("Saved follow"));
             let (status_generation, _, _) =
                 follow.begin_status_refresh().expect("status can start");
@@ -10808,6 +11137,7 @@ exit 85
         #[test]
         fn live_follow_output_remains_visible_after_clean_eof() {
             let mut view = validated_compose_view();
+            view.validated_services = vec!["api".to_owned()];
             assert!(view.import_current_project("Saved follow"));
             let (status_generation, _, _) = view.begin_status_refresh().unwrap();
             assert!(view.finish_status_refresh(

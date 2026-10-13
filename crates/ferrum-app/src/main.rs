@@ -1549,6 +1549,23 @@ impl FerrumApp {
         self.compose.cancel_service_follow();
     }
     #[cfg(target_os = "linux")]
+    fn cancel_compose_operation_confirmation(&mut self) {
+        if self.compose.cancel_operation_confirmation()
+            != Some(compose::ComposeOperationAction::Scale)
+        {
+            return;
+        }
+        let record = audit::record_compose_mutation_result(
+            audit::ComposeMutationAction::Scale,
+            audit::ComposeMutationOutcome::NotSubmitted,
+        );
+        let store = self.audit_store.clone();
+        self.compose_operation_audit_task = Some(self.runtime.spawn(async move {
+            persist_audit_record(&store, record).await;
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
     fn start_compose_operation(
         &mut self,
         task: compose::ComposeOperationTask,
@@ -5261,9 +5278,9 @@ impl eframe::App for FerrumApp {
         if let Some(service) = compose_actions.restart_service.as_deref() {
             self.compose.request_service_restart_confirmation(service);
         }
-        if let Some((service, target)) = compose_actions.scale_service.as_ref() {
+        if let Some(request) = compose_actions.scale_service.as_ref() {
             self.compose
-                .request_service_scale_confirmation(service, target);
+                .request_service_scale_confirmation(&request.service, &request.target);
         }
         if let Some(service) = compose_actions.pause_service.as_deref() {
             self.compose.request_service_action_confirmation(
@@ -5300,6 +5317,9 @@ impl eframe::App for FerrumApp {
             let _ = cancellation.send(());
         }
         if compose_actions.cancel_operation_confirmation {
+            #[cfg(target_os = "linux")]
+            self.cancel_compose_operation_confirmation();
+            #[cfg(not(target_os = "linux"))]
             self.compose.cancel_operation_confirmation();
         }
         if compose_actions.confirm_operation {
@@ -5997,6 +6017,7 @@ mod event_reconciliation_tests {
             compose::ComposeValidationResult {
                 version: None,
                 services: Vec::new(),
+                all_services: Vec::new(),
                 outcome: Ok(()),
             },
         ));
@@ -6056,6 +6077,7 @@ mod event_reconciliation_tests {
             compose::ComposeValidationResult {
                 version: None,
                 services: Vec::new(),
+                all_services: Vec::new(),
                 outcome: Ok(()),
             },
         ));
@@ -7377,6 +7399,7 @@ mod event_reconciliation_tests {
             compose::ComposeValidationResult {
                 version: None,
                 services: Vec::new(),
+                all_services: Vec::new(),
                 outcome: Ok(()),
             },
         ));
@@ -7392,6 +7415,88 @@ mod event_reconciliation_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn cancelling_scale_confirmation_persists_only_redacted_not_submitted_audit() {
+        let (mut app, _) = app_with_open_inspection();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-compose-scale-cancel-audit-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        app.audit_store = audit::AuditStore::new(Arc::new(settings::SettingsStore::at(
+            root.join("settings.toml"),
+        )));
+        let generation = app.compose.begin_file_selection();
+        assert!(app.compose.finish_file_selection(
+            generation,
+            Some(std::path::Path::new("/private/scale-project/compose.yaml")),
+        ));
+        assert!(app.compose.finish_validation(
+            generation,
+            compose::ComposeValidationResult {
+                version: None,
+                services: vec!["web".to_owned()],
+                all_services: vec!["web".to_owned(), "qa-worker".to_owned()],
+                outcome: Ok(()),
+            },
+        ));
+        assert!(app.compose.import_current_project("private-label"));
+        let (status_generation, _, _) = app.compose.begin_status_refresh().unwrap();
+        assert!(app.compose.finish_status_refresh(
+            status_generation,
+            compose::ComposeStatusResult {
+                containers: Vec::new(),
+                outcome: Ok(()),
+            },
+        ));
+        assert!(
+            app.compose
+                .request_service_scale_confirmation("qa-worker", "3")
+        );
+
+        app.cancel_compose_operation_confirmation();
+        app.runtime
+            .block_on(
+                app.compose_operation_audit_task
+                    .take()
+                    .expect("scale cancellation should persist an audit result"),
+            )
+            .expect("audit persistence task should complete");
+
+        let contents = std::fs::read_to_string(root.join("audit.jsonl")).unwrap();
+        let record = serde_json::from_str::<serde_json::Value>(&contents).unwrap();
+        assert_eq!(record["event"], "compose_mutation");
+        assert_eq!(record["action"], "scale");
+        assert_eq!(record["outcome"], "not_submitted");
+        assert_eq!(
+            record
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "action",
+                "event",
+                "outcome",
+                "schema_version",
+                "timestamp_unix_ms"
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(!contents.contains("qa-worker"));
+        assert!(!contents.contains("private-label"));
+        assert!(!contents.contains("/private/scale-project"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+
     fn unavailable_compose_operation_finishes_and_persists_not_submitted_outcome() {
         let (mut app, _) = app_with_open_inspection();
         let nonce = std::time::SystemTime::now()
@@ -8413,6 +8518,7 @@ mod event_reconciliation_tests {
             compose::ComposeValidationResult {
                 version: None,
                 services: Vec::new(),
+                all_services: Vec::new(),
                 outcome: Ok(()),
             },
         ));

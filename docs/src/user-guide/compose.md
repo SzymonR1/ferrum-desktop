@@ -43,7 +43,8 @@ selected path as a separate argument, with the base first and each override
 following in the chosen order:
 
 ```text
-docker compose --project-directory <base-parent> --file <base-file> --file <override-2> ... config --no-interpolate --no-env-resolution --services
+docker compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <selected-profile> ... config --no-interpolate --no-env-resolution --services
+docker compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile '*' config --no-interpolate --no-env-resolution --services
 ```
 Docker Compose merges files in the order supplied with `-f`/`--file`, with
 later files overriding or extending earlier configuration. Compose resolves
@@ -105,14 +106,13 @@ The selected paths remain subject to the trusted-file warning below: Compose
 can read local files referenced by `include` or service `extends.file`,
 including related environment files, under the logged-in user's permissions.
 
-On successful validation, Ferrum retains and displays the bounded service names
-reported by the same `config --services` invocation. Names are escaped before
-display in a virtualized list. Compose returns every service declared in the
-selected files, including profile-gated services regardless of selected
-profiles. The list is local CLI/file-derived, not running-container status; it
-does not contact the Engine or trigger status/log operations. A later status
-snapshot separately reports existing containers and may be empty even when
-services are declared.
+On successful validation, Ferrum retains two bounded service lists from
+read-only `config --services` queries: the selected-profile list used to gate
+existing service lifecycle actions, and an all-declared list queried with
+`--profile '*'` for inventory and scaling. Names are escaped before display in
+a virtualized list. Both are local CLI/file-derived, not Engine status; neither
+query starts services or triggers logs. A status snapshot separately reports
+existing containers and may be empty even when services are declared.
 On Linux, each Compose subprocess (version, discovery, validation, and status)
 runs with a 4 GiB `RLIMIT_AS` address-space ceiling and a 512 MiB `RLIMIT_DATA`
 ceiling, preserving lower inherited limits. These per-process limits apply to
@@ -164,20 +164,24 @@ After the selected base and overrides pass structural validation, click
 socket. Ferrum invokes Compose with the files in their selected order:
 
 ```text
-docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... ps --all --format json
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <selected-profile> ... ps --all --format json
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile '*' ps --all --format json
 ```
 
-This is a read-only status snapshot. `--all` includes stopped containers; the
-Compose CLI's default orphan inclusion is preserved. Ferrum displays bounded,
-escaped container name, service, optional per-container `Project` metadata,
-state, and reported health. When Compose omits `Project`, the row shows
-`Not reported`; rows may report different values. This engine-reported label is
-untrusted metadata: it does not establish file ownership, canonical project
-identity, authentication, or authorization, and it does not determine lifecycle
-scope. Ferrum discards container IDs, command text, published ports, exit-code
-data, and other response fields. No output means no existing containers for that
-selection; it does not mean the Compose file declares no services. The page does
-not poll automatically; refresh status when needed.
+The selected-profile query remains the status source for regular service
+actions. The additional all-profile query is read-only and provides accurate
+scale counts for profile-gated services, including stopped containers. Both
+queries use `--all`, which includes stopped containers; Compose's default
+orphan inclusion is preserved. Ferrum displays bounded, escaped container
+name, service, optional per-container `Project` metadata, state, and reported
+health. When Compose omits `Project`, the row shows `Not reported`; rows may
+report different values. This engine-reported label is untrusted metadata: it
+does not establish file ownership, canonical project identity, authentication,
+or authorization, and it does not determine lifecycle scope. Ferrum discards
+container IDs, command text, published ports, exit-code data, and other response
+fields. No output means no existing containers for that query; it does not mean
+the Compose file declares no services. The page does not poll automatically;
+refresh status when needed.
 Status also clears inherited environment values and disables the selected
 project's default `.env`. Values normally supplied by the shell or that file may
 therefore resolve differently; status can fail or match a different project
@@ -312,33 +316,38 @@ are described above.
 ## Scale one declared service
 
 For the current imported selection, after explicit successful validation and a
-successful current status refresh, the page shows one Scale control per declared
-service—not one per replica row. Each control shows the observed instance count
-from `compose ps --all --format json`, including stopped containers. The target
-starts empty: enter an integer from 1 through 32 to enable the Scale controls;
-no target is chosen automatically. Scaling to zero
-and project-wide scaling are not offered. Only declared services are eligible,
-including a declared service with zero observed containers.
+successful current status refresh, the Linux page shows one Scale control per
+declared service—not one per replica row, including services whose profiles
+are inactive. Each control shows the count from the read-only all-profile
+`compose --profile '*' ps --all --format json` query, including stopped
+containers. The target starts empty: enter an integer from 1 through 32 to
+enable the Scale controls; no target is chosen automatically. Scaling to zero
+and project-wide scaling are not offered. Every declared service is eligible,
+including one with zero observed containers.
 
 The explicit confirmation identifies the imported local label (not project
 identity), service, observed count, and target. It warns that scaling down can
 stop/remove excess containers, scaling up can create containers, and Compose
-`up` may recreate changed containers; volume behavior follows Compose semantics.
-Dependencies do not auto-start (`--no-deps`). If a target service is profile-
-gated, explicitly naming it activates that service's profile for this command;
-other services in that profile are not targeted. Ferrum requests no build,
-pull, volume removal, orphan removal, or force recreation. Cancelling submits
-no command.
+`up` may recreate changed containers. It can also start stopped containers and
+run the configured service code on the selected Engine. Scaling down/removing
+containers or configuration-driven recreation discards container writable-
+layer changes; mounted volumes follow Compose semantics. Dependencies do not
+auto-start (`--no-deps`). If a target service is profile-gated, explicitly
+naming it activates that service's profile for this command; sibling services
+in that profile are not targeted or started. Ferrum requests no build, pull,
+volume removal, orphan removal, or force recreation. Cancelling submits no
+command and records only static `scale/not_submitted` audit data.
 
 Before submission Ferrum rejects changed imports, files, profiles, validation,
 status, busy work, invalid targets, undeclared services, and a stale observed
 count. The worker snapshots selected files into write-sealed descriptors,
-revalidates those exact snapshots, and obtains a fresh `ps --all` status on the
-same selected local Docker Unix socket immediately before mutation. The command
-uses argument arrays:
+revalidates those exact snapshots using selected profiles, and obtains fresh
+selected-profile and all-profile `ps --all` status on the same selected local
+Docker Unix socket immediately before mutation. The command uses argument
+arrays and deliberately has no global `--profile` option:
 
 ```text
-docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <snapshot-fd> ... --profile <profile> ... up --detach --no-build --pull never --no-deps --scale SERVICE=N SERVICE
+docker --host unix://<selected-socket> compose --project-directory <base-parent> --file <snapshot-fd> ... up --detach --no-build --pull never --no-deps --scale SERVICE=N SERVICE
 ```
 
 The operation uses Ferrum's private isolated CLI environment, 30-second
