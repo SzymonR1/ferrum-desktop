@@ -7287,14 +7287,32 @@ exit 85
 
             let files = [file];
             let profiles = ["status-smoke".to_owned()];
-            let status =
-                existing_compose_containers(engine.local_socket_path(), &files, &profiles).await;
-            status
-                .outcome
-                .expect("read-only profile status for the temporary project should succeed");
+            let search_path = search_path();
+            let binary = docker_binary(&search_path).expect("Docker CLI should be installed");
+            let plugin = user_compose_plugin();
+            let prepared = prepare_compose_operation(
+                &binary,
+                &files,
+                &profiles,
+                &search_path,
+                plugin.as_deref(),
+            )
+            .await
+            .expect("the selected temporary project should validate from sealed snapshots");
+            let containers = containers_with_isolated_config(
+                &binary,
+                engine.local_socket_path(),
+                &prepared.files,
+                &prepared.project_directory,
+                &profiles,
+                &search_path,
+                &prepared.isolated,
+            )
+            .await
+            .expect("read-only status should succeed for the empty temporary project");
             assert!(
-                status.containers.is_empty(),
-                "status queries must not create Compose containers"
+                containers.is_empty(),
+                "snapshot status queries must not create Compose containers"
             );
         }
     }
