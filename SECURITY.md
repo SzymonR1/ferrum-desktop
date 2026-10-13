@@ -52,8 +52,17 @@ and pushes remain the default. Ferrum invokes only the selected
 `get`, sends the normalized registry key on stdin, and uses bounded helper
 output/time. Helper stderr and error text are discarded; malformed results,
 helper failures, and exceeded bounds stop the selected operation before Engine
-submission without anonymous fallback. Only the helper enum is stored in
-settings; credential material is not persisted or logged.
+submission without anonymous fallback. Registry-auth settings store only the
+helper enum; credential material is not persisted or logged.
+An explicitly opted-in saved Compose registration stores a bounded local label,
+ordered absolute UTF-8 paths, and validated profiles in the existing private
+settings file. It stores no project contents, environment values, credentials,
+Engine identity, or commands. The file cap is 256 KiB and the registry cap is
+32. Saved paths are not confined and persistence does not inspect project files;
+Compose's referenced-file reads remain under the user's permissions. Loading,
+selection, save, and forget do not execute Compose/Docker commands or contact
+an Engine. Invalid persisted records are skipped and never automatically
+selected or validated.
 
 After opt-in, the selected local Engine receives the helper credential over
 its Unix socket for that pull or push. Treat the selected host helper and Engine
@@ -320,18 +329,26 @@ Ferrum does not write, modify, delete, or extract project files. Success means
 structural validation only: interpolation and service `env_file` resolution
 are skipped. Ferrum displays bounded escaped basenames, static outcomes, and
 the bounded escaped declared-service rows returned on successful validation;
-Explicit profile selection affects validation, read-only status, one-shot and
+explicit profile selection affects validation, read-only status, one-shot and
 live service logs, and is passed to imported-project start/stop/restart. The
 declared-service inventory includes every declaration in the selected files
-regardless of active profiles. Transient imports retain only validated ordered
-paths, profiles, and a bounded local label in memory for this session. Import
-itself copies/persists no files and invokes no CLI/Engine operation. The label
-does not establish project identity or authorization.
-Persistent project storage, build/pull/up/down, remove, and project-file mutation
-remain unavailable. One-shot and live service logs are read-only.
+regardless of active profiles. Session imports retain validated ordered paths,
+profiles, and a bounded local label in memory. An explicit opt-in can persist a
+registration containing only that label, absolute ordered UTF-8 paths, and
+validated profiles in the existing private settings file. The settings file
+has a 256 KiB cap and a maximum of 32 saved registrations. Loading, selecting,
+saving, and forgetting do not invoke Compose/Docker or contact an Engine;
+restored entries remain unselected and unvalidated. Selecting one clears stale
+data and requires explicit revalidation. Forget removes only the registry
+entry and leaves the current session entry available. Neither selection nor
+persistence reads project contents or confines paths.
+Project lifecycle commands still use the selected files/profiles and local
+socket; the local label does not establish project identity or authorization.
+Build/pull/up/down, remove, and project-file mutations remain unavailable.
+One-shot and live service logs are read-only.
 
-Start/stop are available only for the currently selected, session-imported
-configuration after explicit successful revalidation. Before each mutation
+Start/stop are available only for the currently selected imported entry
+(session-only or explicitly saved) after explicit successful revalidation.
 Ferrum reruns structural validation; a failure prevents the lifecycle command.
 The command uses the selected base/override files, profiles, base-parent project
 directory, and the current local Docker Unix socket through argument arrays. It

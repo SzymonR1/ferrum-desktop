@@ -2,17 +2,33 @@
 
 Ferrum stores application preferences on Linux at `$XDG_CONFIG_HOME/ferrum/settings.toml` when `XDG_CONFIG_HOME` is an absolute path. Otherwise, it uses `$HOME/.config/ferrum/settings.toml`. If neither location can be determined, Ferrum remains usable with defaults and reports that settings cannot be saved.
 
-Preferences include `auto_connect_on_startup` (default `true`) and
+Preferences include `auto_connect_on_startup` (default `true`),
 `registry_credential_helper` (`none`, `secret_service`, or `pass`; default
-`none`). The helper setting stores only the selected enum, never credentials.
-When disabled, startup remains disconnected with an explanation, and the user
-can still connect manually with **Retry connection**; auto-connect takes effect
+`none`), and the saved Compose registration list (default empty). The helper
+setting stores only the selected enum, never credentials. When auto-connect is
+disabled, startup remains disconnected with an explanation, and the user can
+still connect manually with **Retry connection**; the preference takes effect
 at the next startup. A configured registry helper is used only after a separate
-explicit opt-in for each pull or push on the Images page. Changes are written
-only after explicitly selecting **Save**; **Cancel** discards edits.
+explicit opt-in for each pull or push on the Images page. Changes to preferences
+are written only after explicitly selecting **Save**; **Cancel** discards those
+preference edits.
 
-Missing files use defaults. Versionless legacy settings are migrated in memory
-while preserving recognized values. Invalid, oversized, or future-version files
+The Compose list is changed only by its explicit **Save for future sessions**
+and **Forget saved registration** row actions. It stores a unique local label,
+ordered absolute UTF-8 Compose file paths, and validated profiles only. It does
+not store project contents, environment variables, credentials, Engine
+identity, or commands. Forget removes only the saved registration; its entry
+remains session-only until Ferrum exits. Neither action runs Compose/Docker or
+contacts an Engine. On restart, saved entries are restored unselected and
+unvalidated; explicitly selecting one clears stale results and requires
+successful revalidation before operations.
+
+Settings schema v2 reads v1 and versionless settings with an empty saved list.
+Invalid saved registrations are skipped with a static warning. The settings
+file is capped at 256 KiB on load and before save; at most 32 registrations are
+retained. Each label is non-empty, trimmed, unique, and at most 256 UTF-8
+bytes; each record has 1–16 unique absolute UTF-8 paths in order and profiles
+within Compose's existing bounds. Invalid, oversized, or future-version files
 fall back to defaults and produce a safe warning; Ferrum does not overwrite the
 file until the user explicitly saves.
 

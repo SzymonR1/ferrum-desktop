@@ -7,8 +7,9 @@ profiles), and read-only status for existing containers. It also supports
 explicit imported-configuration `start`/`stop` and single-service `restart`
 operations for the current imported, revalidated selection. The declared-
 service list is local Compose CLI/file-derived and does not query an Engine;
-it is separate from running-container status. Imports are session-only labels,
-never Engine-discovered project identities.
+it is separate from running-container status. Import labels are local display
+labels, never Engine-discovered project identities; imports are session-only
+unless explicitly saved below.
 Project discovery uses Docker's Compose CLI:
 
 - `docker compose version --short`
@@ -79,15 +80,29 @@ are shown separately from Engine-discovered Compose projects. The in-memory
 list is limited to 32 entries and each name to 256 UTF-8 bytes; duplicate or
 empty names are rejected.
 
-Selecting an imported entry cancels any in-flight validation, status, or log
-task, restores its exact base/override paths and profile selection, and clears
-validation, declared services, container status, and logs. Explicitly choose
-**Validate selected files** before requesting status or logs. Importing starts
-no CLI/Engine operation; selecting one cancels prior work but starts no new
-command or Engine request. Neither action copies, writes, or persists project
-files. Entries are lost when the application session ends. The selected paths
-remain subject to the trusted-file warning below:
-Compose can read local files referenced by `include` or service `extends.file`,
+Choose **Save for future sessions** on a session entry to explicitly register
+its label, ordered absolute UTF-8 file paths, and validated profiles in Ferrum's
+private settings file. No project content, environment variable, credential,
+Engine identity, or command is stored. A saved entry is restored at startup as
+an unselected, unvalidated registration. Selecting it restores its ordered
+files and profiles, cancels any in-flight validation/status/log task, and
+clears validation, declared services, container status, and logs. Explicitly
+validate again before requesting status, logs, or lifecycle operations.
+Loading, selecting, saving, and forgetting registrations do not run
+Docker/Compose commands or contact an Engine.
+
+Use **Forget saved registration** to remove only the persistent registration.
+The entry remains available for the current session as session-only; this does
+not delete files or Compose resources. Save and forget use the existing
+atomic SettingsStore save, and a persistence failure leaves both the prior
+saved status and persisted record unchanged with a static UI message.
+Versionless and v1 settings migrate with an empty saved list. Invalid persisted
+records are skipped with a static warning. The settings file is capped at
+256 KiB, and registrations are capped at 32.
+
+Neither selection nor persistence reads project contents or confines paths.
+The selected paths remain subject to the trusted-file warning below: Compose
+can read local files referenced by `include` or service `extends.file`,
 including related environment files, under the logged-in user's permissions.
 
 On successful validation, Ferrum retains and displays the bounded service names
@@ -247,8 +262,9 @@ up-to-one-second flush of the initial audit marker before aborting the lifecycle
 worker. A submitted child may still be terminated, leaving Engine state
 uncertain; refresh after restart. Service names, paths, labels, profiles,
 endpoint values, raw diagnostics, and project metadata are never audited.
-`up`, `down`, create, build, pull, remove, persistent project registration,
-and project-file mutation remain outside this partial Issue #18 slice.
+`up`, `down`, create, build, pull, remove, and project-file mutation remain
+outside this partial Issue #18 slice. Explicitly saved local registrations are
+the only persistent Compose-project metadata and are described above.
 
 
 ## One-shot service log snapshot
@@ -357,10 +373,10 @@ cancelled by selection or navigation.
 See Docker's [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
 and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
 
-Project persistence, build/pull/up/down/removal, and project-file mutation
-remain unsupported. Transient import is session-only and
-does not persist files or project state. Structural validation skips
-interpolation and service `env_file` resolution; status uses the isolated
+Saved registrations are the only persistent Compose-project metadata; ordinary
+imports remain session-only until explicitly saved. Registration data excludes
+project contents and does not confine selected paths. Structural validation
+skips interpolation and service `env_file` resolution; status uses the isolated
 environment above and may differ from a normal shell invocation. Start/stop/
 restart use only the currently selected imported and revalidated configuration,
 as described above. Restart requires the service in a successful status

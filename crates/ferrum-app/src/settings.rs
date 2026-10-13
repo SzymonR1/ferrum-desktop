@@ -15,10 +15,15 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use crate::compose_selection::{
+    MAX_COMPOSE_FILES, MAX_COMPOSE_REGISTRATION_LABEL_BYTES, MAX_COMPOSE_REGISTRATIONS,
+    valid_profile_list,
+};
 use serde::{Deserialize, Serialize};
 
-const SCHEMA_VERSION: u32 = 1;
-const MAX_SETTINGS_BYTES: u64 = 16 * 1024;
+const SCHEMA_VERSION: u32 = 2;
+const MAX_SETTINGS_BYTES: u64 = 256 * 1024;
+pub(super) const MAX_SAVED_COMPOSE_PROJECTS: usize = MAX_COMPOSE_REGISTRATIONS;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -32,6 +37,76 @@ pub(super) enum RegistryCredentialHelper {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct SavedComposeProject {
+    pub(super) label: String,
+    pub(super) files: Vec<String>,
+    #[serde(default)]
+    pub(super) profiles: Vec<String>,
+}
+
+pub(super) fn valid_saved_compose_project(project: &SavedComposeProject) -> bool {
+    let label = project.label.trim();
+    !label.is_empty()
+        && label == project.label
+        && label.len() <= MAX_COMPOSE_REGISTRATION_LABEL_BYTES
+        && !project.files.is_empty()
+        && project.files.len() <= MAX_COMPOSE_FILES
+        && project.files.iter().enumerate().all(|(index, file)| {
+            Path::new(file).is_absolute()
+                && !file.as_bytes().contains(&0)
+                && !project.files[..index]
+                    .iter()
+                    .any(|previous| previous == file)
+        })
+        && valid_profile_list(&project.profiles)
+}
+
+fn valid_saved_compose_projects(projects: &[SavedComposeProject]) -> bool {
+    projects.len() <= MAX_SAVED_COMPOSE_PROJECTS
+        && projects.iter().enumerate().all(|(index, project)| {
+            valid_saved_compose_project(project)
+                && !projects[..index]
+                    .iter()
+                    .any(|previous| previous.label == project.label)
+        })
+}
+
+// Keep records untyped until each can be checked independently; one malformed
+// registration must not discard unrelated settings or valid saved entries.
+fn parse_saved_compose_projects(value: Option<toml::Value>) -> (Vec<SavedComposeProject>, bool) {
+    let Some(value) = value else {
+        return (Vec::new(), false);
+    };
+    let Some(records) = value.as_array() else {
+        return (Vec::new(), true);
+    };
+    let mut projects: Vec<SavedComposeProject> =
+        Vec::with_capacity(records.len().min(MAX_SAVED_COMPOSE_PROJECTS));
+    let mut warning = false;
+    for record in records {
+        if projects.len() >= MAX_SAVED_COMPOSE_PROJECTS {
+            warning = true;
+            break;
+        }
+        let Ok(project) = record.clone().try_into::<SavedComposeProject>() else {
+            warning = true;
+            continue;
+        };
+        if valid_saved_compose_project(&project)
+            && !projects
+                .iter()
+                .any(|existing| existing.label == project.label)
+        {
+            projects.push(project);
+        } else {
+            warning = true;
+        }
+    }
+    (projects, warning)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Settings {
     #[serde(default = "current_schema_version")]
     schema_version: u32,
@@ -39,6 +114,8 @@ pub(super) struct Settings {
     pub(super) auto_connect_on_startup: bool,
     #[serde(default)]
     pub(super) registry_credential_helper: RegistryCredentialHelper,
+    #[serde(default)]
+    pub(super) saved_compose_projects: Vec<SavedComposeProject>,
 }
 
 impl Default for Settings {
@@ -47,8 +124,22 @@ impl Default for Settings {
             schema_version: SCHEMA_VERSION,
             auto_connect_on_startup: true,
             registry_credential_helper: RegistryCredentialHelper::None,
+            saved_compose_projects: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsDocument {
+    #[serde(default = "current_schema_version")]
+    schema_version: u32,
+    #[serde(default = "default_auto_connect")]
+    auto_connect_on_startup: bool,
+    #[serde(default)]
+    registry_credential_helper: RegistryCredentialHelper,
+    #[serde(default)]
+    saved_compose_projects: Option<toml::Value>,
 }
 
 fn current_schema_version() -> u32 {
@@ -119,11 +210,33 @@ impl SettingsStore {
         if bytes_read as u64 > MAX_SETTINGS_BYTES {
             return (Settings::default(), Some(SettingsError::Invalid));
         }
-        match toml::from_str::<Settings>(&content) {
-            Ok(settings) if settings.schema_version <= SCHEMA_VERSION => {
-                let mut settings = settings;
-                settings.schema_version = SCHEMA_VERSION;
-                (settings, None)
+        match toml::from_str::<SettingsDocument>(&content) {
+            Ok(document) if document.schema_version <= SCHEMA_VERSION => {
+                let SettingsDocument {
+                    schema_version,
+                    auto_connect_on_startup,
+                    registry_credential_helper,
+                    saved_compose_projects,
+                } = document;
+                let mut warning = false;
+                let saved_compose_projects = if schema_version < SCHEMA_VERSION {
+                    warning = saved_compose_projects.is_some();
+                    None
+                } else {
+                    saved_compose_projects
+                };
+                let (saved_compose_projects, invalid_records) =
+                    parse_saved_compose_projects(saved_compose_projects);
+                warning |= invalid_records;
+                (
+                    Settings {
+                        schema_version: SCHEMA_VERSION,
+                        auto_connect_on_startup,
+                        registry_credential_helper,
+                        saved_compose_projects,
+                    },
+                    warning.then_some(SettingsError::InvalidComposeRegistration),
+                )
             }
             _ => (Settings::default(), Some(SettingsError::Invalid)),
         }
@@ -153,6 +266,9 @@ impl SettingsStore {
         settings: &Settings,
         replace: impl FnOnce(&File, &CStr, &CStr) -> std::io::Result<()>,
     ) -> Result<(), SettingsError> {
+        if !valid_saved_compose_projects(&settings.saved_compose_projects) {
+            return Err(SettingsError::InvalidComposeRegistration);
+        }
         let location = self
             .location
             .as_ref()
@@ -169,6 +285,9 @@ impl SettingsStore {
         let mut persisted = settings.clone();
         persisted.schema_version = SCHEMA_VERSION;
         let serialized = toml::to_string_pretty(&persisted).map_err(|_| SettingsError::Write)?;
+        if serialized.len() as u64 > MAX_SETTINGS_BYTES {
+            return Err(SettingsError::TooLarge);
+        }
         let (temp_name, mut file) = create_temp(&directory)?;
         let result = (|| {
             file.write_all(serialized.as_bytes())
@@ -558,6 +677,8 @@ pub(super) enum SettingsError {
     Unavailable,
     Read,
     Invalid,
+    InvalidComposeRegistration,
+    TooLarge,
     Write,
 }
 
@@ -571,6 +692,10 @@ impl SettingsError {
             Self::Invalid => {
                 "Settings are invalid or from a newer version; defaults are being used."
             }
+            Self::InvalidComposeRegistration => {
+                "Invalid saved Compose registrations were skipped on load or rejected on save."
+            }
+            Self::TooLarge => "Settings exceed the maximum supported file size.",
             Self::Write => "Settings could not be saved.",
         }
     }
@@ -588,12 +713,12 @@ mod tests {
         let serialized = toml::to_string(&settings).unwrap();
         assert!(serialized.contains("registry_credential_helper = \"pass\""));
         assert!(!serialized.contains("Secret"));
-        let decoded: Settings = toml::from_str(&serialized).unwrap();
+        let decoded: SettingsDocument = toml::from_str(&serialized).unwrap();
         assert_eq!(
             decoded.registry_credential_helper,
             RegistryCredentialHelper::Pass
         );
-        let legacy: Settings = toml::from_str("auto_connect_on_startup = true").unwrap();
+        let legacy: SettingsDocument = toml::from_str("auto_connect_on_startup = true").unwrap();
         assert_eq!(
             legacy.registry_credential_helper,
             RegistryCredentialHelper::None
@@ -739,7 +864,183 @@ mod tests {
         assert_eq!(settings.schema_version, SCHEMA_VERSION);
         let _ = fs::remove_dir_all(dir);
     }
+    #[test]
+    fn migrates_v1_settings_with_empty_saved_compose_projects() {
+        let (dir, store) = store();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("settings.toml"),
+            "schema_version = 1\nauto_connect_on_startup = false\nregistry_credential_helper = 'pass'\n",
+        )
+        .unwrap();
+        let (settings, error) = store.load();
+        assert_eq!(error, None);
+        assert!(!settings.auto_connect_on_startup);
+        assert_eq!(settings.schema_version, SCHEMA_VERSION);
+        assert_eq!(
+            settings.registry_credential_helper,
+            RegistryCredentialHelper::Pass
+        );
+        assert!(settings.saved_compose_projects.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
 
+    #[test]
+    fn saved_compose_registration_round_trips_through_settings_store() {
+        let (dir, store) = store();
+        let project = SavedComposeProject {
+            label: "dev-stack".into(),
+            files: vec!["/work/base.yml".into(), "/work/override.yaml".into()],
+            profiles: vec!["dev".into(), "qa".into()],
+        };
+        let settings = Settings {
+            saved_compose_projects: vec![project],
+            ..Settings::default()
+        };
+        store.save(&settings).unwrap();
+        assert_eq!(store.load(), (settings, None));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oversized_serialized_settings_do_not_replace_existing_file() {
+        let (dir, store) = store();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.toml");
+        let original = b"auto_connect_on_startup = false\n";
+        fs::write(&path, original).unwrap();
+        let settings = Settings {
+            saved_compose_projects: vec![SavedComposeProject {
+                label: "oversize".into(),
+                files: vec![format!("/{}", "x".repeat(300_000))],
+                profiles: Vec::new(),
+            }],
+            ..Settings::default()
+        };
+        assert_eq!(store.save(&settings), Err(SettingsError::TooLarge));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let _ = fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn skips_invalid_saved_compose_records_with_static_warning() {
+        let (dir, store) = store();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("settings.toml"),
+            "schema_version = 2\n\
+             auto_connect_on_startup = false\n\
+             [[saved_compose_projects]]\n\
+             label = 'valid'\n\
+             files = ['/private/base.yaml', '/private/override.yml']\n\
+             profiles = ['dev', 'qa']\n\
+             [[saved_compose_projects]]\n\
+             label = 'invalid-path'\n\
+             files = ['relative.yaml']\n\
+             profiles = []\n\
+             [[saved_compose_projects]]\n\
+             label = 'malformed-fields'\n\
+             files = ['/private/malformed.yaml']\n\
+             profiles = 7\n",
+        )
+        .unwrap();
+        let (settings, warning) = store.load();
+        assert!(!settings.auto_connect_on_startup);
+        assert_eq!(warning, Some(SettingsError::InvalidComposeRegistration));
+        assert_eq!(
+            settings.saved_compose_projects,
+            [SavedComposeProject {
+                label: "valid".into(),
+                files: vec!["/private/base.yaml".into(), "/private/override.yml".into()],
+                profiles: vec!["dev".into(), "qa".into()],
+            }]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn malformed_saved_compose_collection_does_not_discard_other_settings() {
+        let (dir, store) = store();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("settings.toml"),
+            "schema_version = 2\n\
+             auto_connect_on_startup = false\n\
+             registry_credential_helper = 'pass'\n\
+             saved_compose_projects = 7\n",
+        )
+        .unwrap();
+
+        let (settings, warning) = store.load();
+
+        assert!(!settings.auto_connect_on_startup);
+        assert_eq!(
+            settings.registry_credential_helper,
+            RegistryCredentialHelper::Pass
+        );
+        assert!(settings.saved_compose_projects.is_empty());
+        assert_eq!(warning, Some(SettingsError::InvalidComposeRegistration));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn saved_compose_records_enforce_registry_and_compose_bounds() {
+        let valid = SavedComposeProject {
+            label: "local stack".into(),
+            files: vec!["/private/base.yaml".into(), "/private/override.yml".into()],
+            profiles: vec!["dev".into(), "*".into()],
+        };
+        assert!(!valid_saved_compose_project(&valid));
+        let valid = SavedComposeProject {
+            profiles: vec!["dev".into(), "qa".into()],
+            ..valid
+        };
+        assert!(valid_saved_compose_project(&valid));
+        assert!(valid_saved_compose_projects(std::slice::from_ref(&valid)));
+        assert!(!valid_saved_compose_project(&SavedComposeProject {
+            label: " padded ".into(),
+            ..valid.clone()
+        }));
+        assert!(!valid_saved_compose_project(&SavedComposeProject {
+            files: vec!["/private/base.yaml".into(), "/private/base.yaml".into()],
+            ..valid.clone()
+        }));
+        assert!(!valid_saved_compose_project(&SavedComposeProject {
+            files: vec!["relative.yaml".into()],
+            ..valid.clone()
+        }));
+        assert!(!valid_saved_compose_project(&SavedComposeProject {
+            profiles: vec!["bad profile".into()],
+            ..valid.clone()
+        }));
+        let repeated = SavedComposeProject {
+            label: "same".into(),
+            files: vec!["/private/base.yaml".into()],
+            profiles: vec![],
+        };
+        assert!(!valid_saved_compose_project(&SavedComposeProject {
+            label: "x".repeat(257),
+            ..valid.clone()
+        }));
+        assert!(!valid_saved_compose_project(&SavedComposeProject {
+            files: (0..17)
+                .map(|index| format!("/private/file-{index}.yaml"))
+                .collect(),
+            ..valid.clone()
+        }));
+        assert!(!valid_saved_compose_project(&SavedComposeProject {
+            profiles: vec!["dev".into(); 17],
+            ..valid.clone()
+        }));
+        assert!(!valid_saved_compose_project(&SavedComposeProject {
+            profiles: vec!["x".repeat(65)],
+            ..valid.clone()
+        }));
+        assert!(!valid_saved_compose_projects(&vec![
+            repeated;
+            MAX_SAVED_COMPOSE_PROJECTS
+                + 1
+        ]));
+    }
     #[test]
     fn loading_existing_settings_restricts_file_permissions() {
         let (dir, store) = store();

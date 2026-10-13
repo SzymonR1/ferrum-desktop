@@ -3,6 +3,15 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Added explicit saved Compose registrations through the existing bounded,
+  descriptor-pinned SettingsStore. Schema v2 migrates v1/versionless files with
+  an empty registry, enforces a 256 KiB serialized settings cap and 32-entry
+  limit, and validates labels, ordered absolute UTF-8 paths, and profiles.
+  Restored rows are unselected and unvalidated; save and forget are explicit
+  local persistence actions with no Compose/Engine operation. Forget retains a
+  session-only entry. Invalid persisted registrations are skipped with a static
+  SettingsStore, headless Compose UI, and app persistence regressions passed
+  locally; no live Compose/Engine access or full Issue #18 acceptance is claimed.
 - Added read-only live Compose log follow for one listed service using the
   selected imported/revalidated files, profiles, pinned local Unix socket, and a
   fresh status-membership check. `logs --follow --tail 200 --no-color SERVICE`
