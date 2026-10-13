@@ -24,6 +24,28 @@ per-array limits, nested high-fan-out `Names`/`RepoTags` below the 16 MiB body
 cap, and exact/over aggregate-counter boundaries. The default suite does not
 contact a live Engine or mutate resources.
 
+## Compose mutation input snapshots
+
+Confirmed Compose mutations use the same write-sealed memfd descriptors for
+preflight validation and the submitted command; service restart also reuses
+them for its fresh read-only status query. A controlled fake-CLI regression
+replaces selected source files after preflight and verifies the operation still
+receives the bytes that were validated. Run it with:
+
+```sh
+cargo test -p ferrum-app compose::tests::subprocess::compose_mutation_uses_the_validated_file_snapshot -- --exact
+```
+
+The optional real-CLI smoke checks ordered base/override files and a local
+`include` through `/proc/self/fd` while retaining the original project
+directory. It runs only `docker compose config --services` on owned temporary
+files; it requires Docker CLI/Compose but does not contact an Engine, registry,
+or user project:
+
+```sh
+cargo test -p ferrum-app compose::tests::subprocess::local_compose_validation_reads_the_sealed_operation_snapshot -- --exact --ignored
+```
+
 Settings tests cover missing/corrupt settings, file-symlink rejection without
 changing target permissions, non-regular and hard-linked file rejection, and
 refusal to chmod or write through symlinked settings directories. The hard-link

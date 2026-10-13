@@ -302,16 +302,29 @@ the project directory to the base file's parent. See Docker's [Compose CLI refer
 for ordered merging and path resolution and [`config`](https://docs.docker.com/reference/cli/docker/compose/config)
 for the command flags.
 
-Before launching any Docker/Compose process, Ferrum rejects an aggregate
-selected base-and-override file size greater than 16 MiB; exactly 16 MiB is
-accepted. This is a point-in-time check, not atomic against same-UID changes:
-a same-UID process may change or replace a selected file after the check.
-After the Compose version preflight, Compose reopens the original selected
-paths for validation, so the contents read may differ from those measured.
-The size check covers only explicitly selected files. Local
-`include`/`extends.file` files may remain outside it and are read by the same
-limited CLI process under the logged-in user's permissions.
+Before launching Docker/Compose processes, Ferrum rejects an aggregate
+selected base-and-override size greater than 16 MiB; exactly 16 MiB is
+accepted. Standalone structural validation uses the original selected paths
+after a point-in-time size check, so a same-UID process can still change or
+replace their contents during that read. Local `include`/`extends.file` files
+remain outside the selected-input size bound and are read under the logged-in
+user's permissions.
 
+Before a confirmed Compose mutation, Ferrum opens each explicitly selected
+file without following a final-component symlink, copies the ordered bytes to
+write-sealed Linux memfds under the same 16 MiB aggregate limit, and validates
+and submits using the same descriptors. A fresh status query preceding service
+restart also uses those descriptors. Compose receives `/proc/self/fd/N` file
+references while retaining the original base-parent `--project-directory` for
+relative path semantics. Ferrum creates no named on-disk copy; host swap or
+core dumps may retain memory pages, so these descriptors do not guarantee
+secret erasure. If snapshot creation or descriptor passing is unavailable, the
+operation fails closed. This binds only the explicitly selected files and is
+not a path-containment boundary. Compose may still read live local
+`include`/`extends.file`, `.env`, `include.env_file`, and service `env_file`
+inputs; builds also consume live Dockerfiles and build contexts. Only trusted
+project trees should be used. Same-UID and privileged processes remain inside
+Ferrum's trust boundary; Compose and builder execution are not sandboxed.
 On Linux, each Compose subprocess for version, discovery, validation, status,
 one-shot and live service-log queries, and start/stop/restart has
 `RLIMIT_AS` capped at 4 GiB and `RLIMIT_DATA` capped at 512 MiB, preserving
@@ -350,26 +363,24 @@ remove, and project-file mutations remain unavailable.
 
 Start/stop are available only for the currently selected imported entry
 (session-only or explicitly saved) after explicit successful revalidation.
-Ferrum reruns structural validation; a failure prevents the lifecycle command.
-The command uses the selected base/override files, profiles, base-parent project
-directory, and the current local Docker Unix socket through argument arrays. It
-does not use the import label or engine-reported `Project` metadata as identity
-or authorization. Docker Compose `start` starts existing containers only;
-`stop` does not remove them.
+The local import label and Engine-reported `Project` metadata do not establish
+identity or authorize scope.
 
-Single-service restart is offered only beside a service in the current
-successful status snapshot and only for the selected, imported, explicitly
-revalidated file/profile selection. Before mutation, Ferrum revalidates the
-selection, then issues fresh read-only `compose ps --all --format json` against
-the same selected local Docker Unix socket and submits no restart if the query
-fails or the service is absent. It invokes only
-`restart --no-deps <SERVICE>` via argument arrays; the local import label and
-reported `Project` metadata never authorize scope. Docker Compose restart does
-not apply changes to Compose configuration, and `--no-deps` excludes dependent
-service restarts. Confirmation names service, imported label, ordered safe
-basenames, profiles, and action; cancel submits nothing. Lifecycle audit records
-contain only static action/outcome values, never service names, project data,
-paths, or profiles.
+Before each confirmed mutation, Ferrum opens each selected file without
+following a final-component symlink, captures the ordered bytes in write-sealed
+Linux memfds under a 16 MiB aggregate limit, and validates those snapshots. The
+submitted start/stop/restart command uses the same `/proc/self/fd/N` descriptor
+paths and original base-parent project directory. Restart's fresh read-only
+`compose ps --all --format json` query also uses those descriptors and the
+selected local Docker Unix socket; it submits no restart if the service is
+absent or the query fails. Snapshot or validation failure submits no mutation.
+No on-disk copy of the selected YAML is created.
+
+Docker Compose `start` starts existing containers only; `stop` does not remove
+them. Ferrum invokes only `restart --no-deps <SERVICE>` for restart; it does
+not apply Compose configuration changes, and dependent services are not
+restarted. Confirmation names service, imported label, ordered safe basenames,
+profiles, and action; cancel submits nothing.
 
 These commands are Linux local Docker Unix-socket only. Outcome errors are
 static and exclude CLI diagnostics. Navigation does not cancel an in-flight
@@ -378,15 +389,18 @@ accepted; Ferrum keeps a redacted session outcome. Context switching remains
 blocked while the task runs and status refresh occurs only for the same current
 selection/context after terminal completion. On shutdown Ferrum flushes the
 started audit marker before issuing the command; a submitted child may still be
-terminated, leaving Engine state uncertain. Selected/include files remain
-trusted local inputs under the logged-in user's permissions.
+terminated, leaving Engine state uncertain. Explicitly selected source files
+are captured at operation start; changes after capture do not affect that
+invocation. Recursive includes, `extends.file`, environment sources,
+Dockerfiles, and build contexts remain live trusted local inputs under the
+logged-in user's permissions. There is no path containment or sandbox.
 
 Confirmed imported-configuration image pulls use the current imported and
 successfully revalidated ordered files/profiles and the selected Linux local
 Docker Unix socket:
 
 ```text
-docker --host unix://<selected-socket> compose --progress plain --parallel 4 --project-directory <base-parent> --file <base-file> --file <override-2> ... --profile <profile> ... pull --ignore-buildable
+docker --host unix://<selected-socket> compose --progress plain --parallel 4 --project-directory <base-parent> --file <snapshot-fd-1> --file <snapshot-fd-2> ... --profile <profile> ... pull --ignore-buildable
 ```
 
 Compose pulls are anonymous only. Ferrum uses private Docker config/HOME and a
@@ -419,8 +433,8 @@ Podman, remote Docker, Windows, or macOS support.
 Confirmed Compose builds run only for the same selected, imported,
 successfully revalidated ordered files/profiles and selected Linux local Docker
 Unix socket. The fixed argv is `docker --host unix://<selected-socket> compose
---progress plain --parallel 2 --project-directory <base-parent> --file ...
-`--profile ... build`; Ferrum adds no `--push`, command-line `--ssh`, builder
+--progress plain --parallel 2 --project-directory <base-parent> --file <snapshot-fd-1> --file <snapshot-fd-2> ...
+--profile ... build`; Ferrum adds no `--push`, command-line `--ssh`, builder
 options, or extra command-line build arguments. Compose-file `build.args` remain
 active and may expose secrets; do not store credentials there. Compose-file
 `build.ssh` may grant SSH-agent access, and `build.secrets` may expose
