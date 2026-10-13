@@ -9,6 +9,9 @@ flowchart LR
     APP -->|anonymous by default; optional RegistryAuth on pull or push| CLIENT[EngineClient]
     APP -->|separate per-pull or per-push opt-in| HELPER[Allowlisted Secret Service/pass helper]
     HELPER -->|bounded credential response, transient in app| APP
+    APP -->|selected files and profiles| COMPOSE[Docker Compose CLI]
+    COMPOSE -->|pinned local Unix socket| SOCKET
+    COMPOSE -->|bounded follow events| APP
     CLIENT -->|bounded version, inventory, inspect, lifecycle requests| SOCKET[Selected local Linux Unix socket]
     SOCKET --> ENGINE[Docker-compatible engine]
     ENGINE -->|container events| SOCKET
@@ -49,6 +52,15 @@ lines do not renew the budget. Clean EOF ends without retry; after exhaustion,
 manual Refresh starts a fresh bounded session. Reconnect reloads recent history
 and clears buffered rows to avoid replay duplicates. Closing Logs or inspection,
 context switch, or app teardown cancels log streaming.
+Compose service follow uses a separate Docker Compose CLI process, not the
+Engine event/log channel. It rechecks selected-service membership on the pinned
+local socket and streams escaped lines through a dedicated bounded 16-event
+channel. Raw lines are capped at 4096 bytes and the UI retains at most 200
+combined lines/256 KiB. Output is not logged, audited, or persisted. The follow
+has no total deadline; Stop, selection/status/page/context invalidation, and
+shutdown abort the CLI process group. This is read-only; no real service logs
+were read.
+
 
 The experimental embedded terminal uses Docker exec create/start with an
 argument array and attached stdin/stdout/stderr in TTY mode, then upgrades the

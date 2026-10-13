@@ -3,6 +3,16 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Added read-only live Compose log follow for one listed service using the
+  selected imported/revalidated files, profiles, pinned local Unix socket, and a
+  fresh status-membership check. `logs --follow --tail 200 --no-color SERVICE`
+  runs in the isolated CLI environment, with a dedicated 16-event backpressure
+  queue, 4096-byte raw-line cap, escaped rolling 200-line/256 KiB UI buffer, and
+  process-group cancellation on Stop, state/page/context invalidation, and shutdown.
+  Follow output is transient, excluded from audit/tracing/files, and is not
+  automatically retried; no total stream deadline is claimed. Fake-CLI/headless
+  tests only; no real service logs or native visual workflow were validated.
+  Issue #18 remains partial/open.
 - Corrected the threat model, settings, architecture diagram, and Engine API docs
   to distinguish anonymous-by-default Linux local-Docker pull and push flows
   with separate per-operation helper opt-ins from deferred credential
@@ -60,10 +70,10 @@ All notable project changes are documented here. The project has not published a
   `logs`, never via an environment variable, and reuses the selection for the
   status recheck before logs. Invalid or changed selection clears results,
   cancels in-flight work, and requires revalidation. Private Docker config/HOME
-  and the cleared environment remain in effect. No persistent project storage,
-  build/pull, live log follow, or project file mutation is added. Imported
-  configurations may use the separately documented start/stop slice.
-  Issue #18 remains partial/open.
+  and the cleared environment remain in effect. This profile-selection slice did
+  not add persistent project storage, build/pull, live follow, or project-file
+  mutation. Imported configurations may use the separately documented start/
+  stop slice. Issue #18 remains partial/open.
 - Added a bounded read-only declared-service inventory to successful Linux
   Compose validation using the same `config --services` command, selected
   ordered files/profile argv, and isolated CLI environment. The output includes
@@ -77,7 +87,12 @@ All notable project changes are documented here. The project has not published a
   temporary-project smoke verifies all declared names, including a service in
   an inactive profile, without Engine access or mutation. Issue #18 remains
   open/partial.
-- Added a read-only one-shot Compose service-log snapshot for a listed service. Ferrum rechecks service membership with a fresh status query before logs; Compose `--tail 200` applies per container, while Ferrum keeps the first 200 combined lines/256 KiB without a global chronological merge. Escaped output is transient, cancellation/stale-state safe, and not persisted or audited. Live follow and project lifecycle operations remain unsupported; Issue #18 stays open/partial.
+- Added a read-only one-shot Compose service-log snapshot for a listed service.
+  Ferrum rechecks membership with fresh status; Compose `--tail 200` is per
+  container, while Ferrum keeps the first 200 combined lines/256 KiB without a
+  global chronological merge. Output is escaped/transient, cancellation/stale-
+  state safe, and not persisted/audited. This snapshot did not add live follow
+  or lifecycle operations; Issue #18 remains partial/open.
 
 - Added automatic Linux discovery of the documented rootless Podman user
   socket at `$XDG_RUNTIME_DIR/podman/podman.sock`, after the XDG Docker socket

@@ -572,15 +572,22 @@ selected project's default `.env`; `--no-interpolate` and
 loaders are explicitly disabled, so remote include/extends references fail
 without fetching. The CLI/plugin remains unsandboxed; validate only trusted
 files. Bounded profile selection applies to structural validation, read-only
-status, one-shot service logs, imported-project start/stop, and single-service
-restart; the declared-service inventory is not profile-filtered and lists all
-declarations from selected files. Profiles are passed as explicit `--profile`
-arguments and are not inherited from the environment. Transient import is
-session-only; no persistent project registry, build/pull, live log follow, or
-project-file mutation is introduced. Service restart is covered by controlled
-fake-CLI/headless regressions only; no live restart is run.
-The one-shot service logs are covered by fake-CLI and headless tests; no real
-service logs are read by default. A temporary-project profile-validation smoke
+status, one-shot service logs and live follow, imported-project start/stop, and
+single-service restart; the declared-service inventory is not profile-filtered
+and lists all declarations from selected files. Profiles are passed as explicit
+`--profile` arguments and are not inherited from the environment. Transient
+import is session-only; persistent project registration, build/pull/up/down,
+removal, and project-file mutation remain unsupported. Service restart is
+covered by controlled fake-CLI/headless regressions only; no live restart runs.
+
+Controlled live-follow fixtures cover exact selected-file/profile/socket argv
+and fresh status-before-stream ordering, absent/failed service-membership
+refusal, post-status file-size rechecks, split lines, overlong-line recovery,
+escaping, bounded queue and rolling output, cancellation, stale-event rejection,
+and process-group cleanup. Headless controls test Stop, imported-selection
+cancellation, and output retained after EOF. Neither one-shot snapshots nor live
+follow read real service logs; no project or Engine resource is mutated.
+A temporary-project profile-validation smoke
 verifies that `config --services` lists all declarations, including one in
 inactive profile `other`, with Compose v5.6.0 and no Engine access. An ignored
 profile status smoke uses a unique temporary project and the selected local

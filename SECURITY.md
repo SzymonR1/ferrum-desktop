@@ -303,8 +303,9 @@ The size check covers only explicitly selected files. Local
 limited CLI process under the logged-in user's permissions.
 
 On Linux, each Compose subprocess for version, discovery, validation, status,
-one-shot logs, and start/stop/restart has `RLIMIT_AS` capped at 4 GiB and
-`RLIMIT_DATA` capped at 512 MiB, preserving lower inherited limits. The
+one-shot and live service-log queries, and start/stop/restart has
+`RLIMIT_AS` capped at 4 GiB and `RLIMIT_DATA` capped at 512 MiB, preserving
+lower inherited limits. The
 per-process limits apply while selected and included files; child processes
 inherit them, so they bound each process, not aggregate process-tree RSS. The
 private child environment sets `GOMEMLIMIT=402653184` (384 MiB) for Go runtimes.
@@ -319,15 +320,15 @@ Ferrum does not write, modify, delete, or extract project files. Success means
 structural validation only: interpolation and service `env_file` resolution
 are skipped. Ferrum displays bounded escaped basenames, static outcomes, and
 the bounded escaped declared-service rows returned on successful validation;
-Explicit profile selection affects validation, read-only status and one-shot
-service logs, and is passed to imported-project start/stop/restart. The
+Explicit profile selection affects validation, read-only status, one-shot and
+live service logs, and is passed to imported-project start/stop/restart. The
 declared-service inventory includes every declaration in the selected files
 regardless of active profiles. Transient imports retain only validated ordered
 paths, profiles, and a bounded local label in memory for this session. Import
 itself copies/persists no files and invokes no CLI/Engine operation. The label
-does not establish project identity or authorization. Persistent project
-storage, build/pull/up/down, remove, live log follow, and project-file mutation
-remain unavailable.
+does not establish project identity or authorization.
+Persistent project storage, build/pull/up/down, remove, and project-file mutation
+remain unavailable. One-shot and live service logs are read-only.
 
 Start/stop are available only for the currently selected, session-imported
 configuration after explicit successful revalidation. Before each mutation
@@ -380,7 +381,8 @@ services; the inventory remains all declarations in the selected files
 regardless of active profiles or container state.
 Ferrum passes each profile through an individual `--profile <name>` argv pair
 before the Compose subcommand, never through an environment variable. The same
-profiles are used for immediate status rechecks before one-shot logs and restart.
+profiles are used for immediate status rechecks before one-shot logs, live
+follow, and restart.
 Invalid or changed selection clears prior validation, service inventory,
 status, and log state, cancels in-flight Compose work, and requires
 revalidation. Private Docker config/HOME and the cleared environment remain in
@@ -423,6 +425,16 @@ per call. A selected local file may still change between the status and logs
 calls; the trusted CLI may read includes and included-project environment
 sources under the logged-in user's permissions. This is not a sandbox or an
 engine lifecycle operation.
+Live Compose follow is a separate read-only `logs --follow --tail 200 --no-color
+SERVICE` session after selected-file validation. Before starting, Ferrum repeats
+the bounded status membership query with the same selected files, profiles, and
+local Docker Unix socket. Compose's tail is per container; Ferrum retains a
+rolling 200-line/256 KiB UI buffer behind a 16-event bounded channel and caps
+raw lines at 4096 bytes, dropping overlong tails through newline. Escaped output
+is transient and excluded from files, audit, tracing, Debug, and errors. Stop,
+selection/status/page/context invalidation, and app shutdown abort the local CLI
+process group; there is no overall stream deadline or automatic retry. This
+read-only stream does not change container state; no live service logs were read.
 
 Status uses the private cleared environment described below and disables the
 selected project's default `.env`; environment-dependent projects may fail or

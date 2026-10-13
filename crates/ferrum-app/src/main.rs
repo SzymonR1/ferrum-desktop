@@ -58,6 +58,8 @@ use ferrum_core::{NetworkSummary, VolumeDetails, VolumeSummary};
 mod terminal;
 #[cfg(target_os = "linux")]
 const LOG_CHANNEL_CAPACITY: usize = 16;
+#[cfg(target_os = "linux")]
+const COMPOSE_FOLLOW_CHANNEL_CAPACITY: usize = 16;
 mod settings;
 
 #[cfg(target_os = "linux")]
@@ -881,6 +883,10 @@ struct FerrumApp {
     compose_validation_task: Option<JoinHandle<()>>,
     compose_status_task: Option<JoinHandle<()>>,
     compose_logs_task: Option<JoinHandle<()>>,
+    #[cfg(target_os = "linux")]
+    compose_follow_task: Option<JoinHandle<()>>,
+    #[cfg(target_os = "linux")]
+    compose_follow_receiver: Option<mpsc::Receiver<(u64, compose::ComposeFollowEvent)>>,
     compose_lifecycle_task: Option<JoinHandle<()>>,
     compose_lifecycle_audit_task: Option<JoinHandle<()>>,
     image_list_task: Option<JoinHandle<()>>,
@@ -1091,6 +1097,10 @@ impl FerrumApp {
             compose_validation_task: None,
             compose_status_task: None,
             compose_logs_task: None,
+            #[cfg(target_os = "linux")]
+            compose_follow_task: None,
+            #[cfg(target_os = "linux")]
+            compose_follow_receiver: None,
             compose_lifecycle_task: None,
             compose_lifecycle_audit_task: None,
             image_list_task: None,
@@ -1295,6 +1305,8 @@ impl FerrumApp {
         if let Some(task) = self.compose_logs_task.take() {
             task.abort();
         }
+        #[cfg(target_os = "linux")]
+        self.abort_compose_service_follow();
         self.compose.invalidate();
     }
 
@@ -1321,6 +1333,7 @@ impl FerrumApp {
             if let Some(task) = self.compose_logs_task.take() {
                 task.abort();
             }
+            self.abort_compose_service_follow();
             let generation = if override_file {
                 self.compose.begin_override_selection()
             } else {
@@ -1366,6 +1379,7 @@ impl FerrumApp {
         if let Some(task) = self.compose_logs_task.take() {
             task.abort();
         }
+        self.abort_compose_service_follow();
         self.compose_validation_task = Some(self.runtime.spawn(async move {
             let result = compose::validate_compose_files(&files, &profiles).await;
             if sender
@@ -1399,6 +1413,7 @@ impl FerrumApp {
         if let Some(task) = self.compose_logs_task.take() {
             task.abort();
         }
+        self.abort_compose_service_follow();
         context.request_repaint();
         let sender = self.sender.clone();
         self.compose_status_task = Some(self.runtime.spawn(async move {
@@ -1463,6 +1478,68 @@ impl FerrumApp {
         context.request_repaint();
     }
     #[cfg(target_os = "linux")]
+    fn start_compose_service_follow(&mut self, service: &str, context: egui::Context) {
+        if !matches!(&self.connection, ConnectionState::Connected) || self.compose.is_loading() {
+            return;
+        }
+        let Some(socket_path) = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.local_socket_path().to_path_buf())
+        else {
+            return;
+        };
+        let Some(request) = self.compose.begin_service_follow(service) else {
+            return;
+        };
+        if let Some(task) = self.compose_logs_task.take() {
+            task.abort();
+            self.compose.cancel_service_logs();
+        }
+        if let Some(task) = self.compose_follow_task.take() {
+            task.abort();
+        }
+        let (sender, receiver) = mpsc::channel(COMPOSE_FOLLOW_CHANNEL_CAPACITY);
+        self.compose_follow_receiver = Some(receiver);
+        context.request_repaint();
+        let repaint = context.clone();
+        self.compose_follow_task = Some(self.runtime.spawn(async move {
+            if let Err(error) = compose::compose_service_log_follow(
+                &socket_path,
+                &request.files,
+                &request.profiles,
+                &request.service,
+                request.generation,
+                &repaint,
+                &sender,
+            )
+            .await
+            {
+                let _ = sender
+                    .send((
+                        request.generation,
+                        compose::ComposeFollowEvent::Failed(error),
+                    ))
+                    .await;
+            }
+            repaint.request_repaint();
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cancel_compose_service_follow(&mut self, context: egui::Context) {
+        self.abort_compose_service_follow();
+        context.request_repaint();
+    }
+    #[cfg(target_os = "linux")]
+    fn abort_compose_service_follow(&mut self) {
+        if let Some(task) = self.compose_follow_task.take() {
+            task.abort();
+        }
+        self.compose_follow_receiver = None;
+        self.compose.cancel_service_follow();
+    }
+    #[cfg(target_os = "linux")]
     fn start_compose_lifecycle(
         &mut self,
         task: compose::ComposeLifecycleTask,
@@ -1474,6 +1551,7 @@ impl FerrumApp {
         if let Some(task) = self.compose_logs_task.take() {
             task.abort();
         }
+        self.abort_compose_service_follow();
         let precondition_failed =
             !matches!(&self.connection, ConnectionState::Connected) || self.compose.is_loading();
         let socket_path = self
@@ -2827,6 +2905,27 @@ impl FerrumApp {
     fn receive_events(&mut self, context: egui::Context) {
         let mut selected_container_changed = false;
         let mut action_error_after_reinspection = None;
+        #[cfg(target_os = "linux")]
+        for _ in 0..16 {
+            let message = self
+                .compose_follow_receiver
+                .as_mut()
+                .and_then(|receiver| receiver.try_recv().ok());
+            let Some((generation, event)) = message else {
+                break;
+            };
+            let terminal = matches!(
+                &event,
+                compose::ComposeFollowEvent::Ended | compose::ComposeFollowEvent::Failed(_)
+            );
+            if self.compose.apply_service_follow_event(generation, event) {
+                context.request_repaint();
+                if terminal {
+                    self.compose_follow_task = None;
+                    self.compose_follow_receiver = None;
+                }
+            }
+        }
         #[cfg(target_os = "linux")]
         if !self.log_paused {
             for _ in 0..256 {
@@ -4904,6 +5003,8 @@ impl eframe::App for FerrumApp {
             if let Some(task) = self.compose_logs_task.take() {
                 task.abort();
             }
+            #[cfg(target_os = "linux")]
+            self.abort_compose_service_follow();
             self.compose.profiles_changed();
             context.request_repaint();
         }
@@ -4916,6 +5017,10 @@ impl eframe::App for FerrumApp {
         if compose_actions.cancel_logs {
             self.cancel_compose_service_logs(context.clone());
         }
+        if compose_actions.cancel_follow {
+            #[cfg(target_os = "linux")]
+            self.cancel_compose_service_follow(context.clone());
+        }
         if let Some(index) = compose_actions.remove_override {
             self.compose.remove_override(index);
             if let Some(task) = self.compose_logs_task.take() {
@@ -4924,6 +5029,8 @@ impl eframe::App for FerrumApp {
             if let Some(task) = self.compose_status_task.take() {
                 task.abort();
             }
+            #[cfg(target_os = "linux")]
+            self.abort_compose_service_follow();
         }
         if compose_actions.select_base_file {
             self.select_compose_file(false, context.clone());
@@ -4941,6 +5048,10 @@ impl eframe::App for FerrumApp {
         if let Some(service) = compose_actions.logs_service.as_deref() {
             #[cfg(target_os = "linux")]
             self.start_compose_service_logs(service, context.clone());
+        }
+        if let Some(service) = compose_actions.follow_service.as_deref() {
+            #[cfg(target_os = "linux")]
+            self.start_compose_service_follow(service, context.clone());
         }
         if let Some(service) = compose_actions.restart_service.as_deref() {
             self.compose.request_service_restart_confirmation(service);
@@ -5068,6 +5179,35 @@ fn container_state_display(state: &ContainerState) -> &str {
     match state {
         ContainerState::Unknown(value) if value.is_empty() => r#""""#,
         _ => state.label(),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod compose_follow_delivery_tests {
+    use super::*;
+
+    #[test]
+    fn compose_follow_delivery_queue_is_bounded_and_debug_redacts_text() {
+        let (sender, _receiver) =
+            mpsc::channel::<(u64, compose::ComposeFollowEvent)>(COMPOSE_FOLLOW_CHANNEL_CAPACITY);
+        for _ in 0..COMPOSE_FOLLOW_CHANNEL_CAPACITY {
+            sender
+                .try_send((
+                    4,
+                    compose::ComposeFollowEvent::Line("sensitive output".to_owned()),
+                ))
+                .expect("the queue should accept up to its fixed capacity");
+        }
+        assert!(matches!(
+            sender.try_send((4, compose::ComposeFollowEvent::Line("overflow".to_owned()),)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        let debug = format!(
+            "{:?}",
+            compose::ComposeFollowEvent::Line("sensitive output".to_owned())
+        );
+        assert!(!debug.contains("sensitive output"));
+        assert!(debug.contains("line_bytes"));
     }
 }
 
@@ -5488,6 +5628,10 @@ mod event_reconciliation_tests {
             compose_validation_task: None,
             compose_status_task: None,
             compose_logs_task: None,
+            #[cfg(target_os = "linux")]
+            compose_follow_task: None,
+            #[cfg(target_os = "linux")]
+            compose_follow_receiver: None,
             compose_lifecycle_task: None,
             compose_lifecycle_audit_task: None,
             pending_resource_read: None,

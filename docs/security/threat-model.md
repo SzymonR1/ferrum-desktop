@@ -49,8 +49,9 @@ the original selected paths for validation, so the contents read may differ
 from those measured by the check. The check does not include local files read
 through `include` or service `extends.file`.
 Linux Compose subprocesses for version, discovery, validation, status, one-shot
-logs, and start/stop/restart have per-process `RLIMIT_AS` of 4 GiB and
-`RLIMIT_DATA` of 512 MiB, preserving lower inherited limits. These limits apply
+and live service-log queries, and start/stop/restart have per-process `RLIMIT_AS`
+of 4 GiB and `RLIMIT_DATA` of 512 MiB, preserving lower inherited limits.
+These limits apply
 while Compose reads selected and included files. They are inherited by child
 processes and bound each process, not aggregate process-tree RSS; they are not a
 sandbox. The private child environment sets `GOMEMLIMIT=402653184` (384 MiB), a
@@ -70,8 +71,8 @@ local `include`/`extends.file` Compose files and included projects' default
 permissions, potentially outside the base directory. Remote Git/OCI loaders
 are disabled. The selected files and private CLI environment do not sandbox
 those reads; validate only trusted files. Explicit profiles affect validation,
-read-only status, one-shot service logs, and imported configuration
-start/stop/restart. The declared-service inventory includes every declaration
+read-only status, one-shot service logs and live service-log follow, and imported
+configuration start/stop/restart. The declared-service inventory includes every service
 regardless of active profiles. Lifecycle is available only for the currently
 selected, session-imported, explicitly revalidated files/profiles and the
 selected local Docker Unix socket. Before service restart Ferrum additionally
@@ -136,10 +137,24 @@ They are treated as untrusted text, escaped before rendering, and kept only in
 transient UI state; no log content enters tracing, audit, error strings, or
 disk. Each of the fresh status and logs subprocesses is bounded to eight
 seconds and 1 MiB stdout and inherits the private CLI environment and process
-resource limits above. The selected local files may change between the two
-calls, and local includes remain within the trusted-Compose caveat. The command
-does not follow logs or mutate project/engine state. Tests use fake CLI output;
-no real user project logs are read.
+resource limits above. Selected files can change between status and snapshot;
+local includes remain in the trusted-Compose caveat. This is a one-shot
+snapshot, not a follow stream, and it does not mutate project/engine state.
+Tests use fake CLI output; no real user project logs were read.
+
+Live Compose service follow is available only for an imported, explicitly
+validated selection and a service in current status. Before `logs --follow
+--tail 200 --no-color SERVICE`, Ferrum repeats `compose ps --all --format json`
+with the same selected files, profiles, and local socket and refuses absent or
+failed membership checks. The CLI stream is read-only, has no total deadline,
+and does not retry; a separate 16-event channel provides backpressure. Raw
+lines are capped at 4096 bytes, overlong tails are discarded through newline,
+and the UI retains at most 200 combined lines/256 KiB. Output is escaped and
+transient, never stored, logged, or audited. Stop, config/status/page/context
+invalidation, and shutdown terminate Ferrum's CLI process group. This does not
+mutate containers; no real service logs were read or visually validated.
+Selected and included Compose files remain trusted local inputs as described
+above.
 
 Ferrum runs as the logged-in desktop user and communicates with a Docker-compatible engine through a local Linux Unix socket. Access to a Docker socket is effectively host-level control; UI action gating and confirmation do not make the endpoint unprivileged. Windows/macOS engine APIs are not implemented here. Engine responses, container names, image references, state strings, status text, and mount paths are untrusted input.
 
@@ -207,16 +222,17 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   diagnostics private; display only a bounded escaped basename and static result.
 
 - Accept optional comma-separated Compose profiles for validation, read-only
-  status, one-shot service logs, and imported-configuration start/stop/restart.
+  status, one-shot service logs and live follow, and imported-configuration
+  start/stop/restart.
   Limit input to 1024 UTF-8 bytes, 16 profiles, and 64 UTF-8 bytes per name.
   Trim outer whitespace per token; blank means no explicit profiles. Reject
   empty entries and duplicate names. Accept `[A-Za-z0-9][A-Za-z0-9_.-]+` names
   and standalone `*`; pass each as its own `--profile <name>` argv before
   `config`, `ps`, `logs`, `start`, `stop`, or `restart`, never through an
-  environment variable. Reuse profiles for status rechecks before logs and
-  restart. Invalid or changed selection clears validation/status/log state,
-  cancels read-only tasks, and requires revalidation; already-submitted
-  lifecycle work is not cancelled.
+  environment variable. Use the same selected profiles for the immediate
+  status rechecks before one-shot logs and live follow. Invalid or changed
+  selection clears validation/status/log output, cancels read-only/follow tasks,
+  and requires revalidation; already-submitted lifecycle work is not cancelled.
 - Keep private Docker config/HOME, cleared allowlisted environment, disabled
   selected-project `.env`, and disabled remote Git/OCI loaders. A transient
   import retains validated ordered file paths, profiles, and a bounded local
@@ -231,8 +247,9 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   engine-reported `Project` metadata. Docker `start` starts existing containers;
   `stop` does not remove them. Restart uses only
   `restart --no-deps <SERVICE>`; Compose restart does not apply configuration
-  changes. No persistent storage, build/pull/up/down, remove, live log follow,
-  or project-file mutation is added. Controlled fake-CLI/headless tests cover
+  changes. No persistent storage, build/pull/up/down, remove, or project-file
+  mutation is added by these lifecycle operations.
+  Controlled fake-CLI/headless tests cover
   argv and states; no live lifecycle mutation was performed. See Docker's
   [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
   and [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/).
@@ -477,7 +494,7 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   loaders are disabled during validation) remain trust risks. The transient
   configuration import stores only session-local path/profile metadata and a
   local label; file-content import, persistent project registration, build/
-  pull/up/down/removal, live log follow, and project-file mutations remain
+  pull/up/down/removal, and project-file mutations remain
   deferred. Scoped start/stop and a confirmed service-scoped restart are
   available only for a selected imported and revalidated configuration; restart
   also requires current and freshly rechecked status membership. The bounded
