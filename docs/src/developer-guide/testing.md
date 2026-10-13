@@ -24,6 +24,21 @@ per-array limits, nested high-fan-out `Names`/`RepoTags` below the 16 MiB body
 cap, and exact/over aggregate-counter boundaries. The default suite does not
 contact a live Engine or mutate resources.
 
+## Engine connection handshake
+
+Fake-Unix fixtures exercise the Linux handshake and first inventory request on a
+temporary local socket passed through the `DOCKER_HOST` selection path. They
+verify negotiated API-version use, successful empty inventories, typed and
+redacted inventory errors, and that a version response missing its API version
+fails connection before any inventory request. The fixtures validate Ferrum's
+protocol and error mapping only; they do not establish compatibility with
+Docker, Podman, or cross-platform endpoints. Run them with:
+
+```sh
+cargo test -p ferrum-engine connection_handshake_tests
+```
+
+
 ## Compose mutation input snapshots
 
 Confirmed Compose mutations use the same write-sealed memfd descriptors for
