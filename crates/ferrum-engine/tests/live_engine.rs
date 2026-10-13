@@ -471,54 +471,97 @@ async fn local_engine_lists_inspects_and_reads_history_for_preinstalled_image_re
 #[tokio::test]
 #[ignore = "probes a missing loopback manifest, pulls one generated image, and removes only its verified tag"]
 async fn local_engine_loopback_registry_pull_reports_progress_and_cleans_only_test_tag() {
+    run_loopback_registry_pull(LoopbackRegistryAuth::Anonymous).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires local Docker with loopback insecure-registry support; synthetic Basic credential only"]
+async fn local_engine_loopback_registry_synthetic_basic_auth_pull_reports_progress() {
+    run_loopback_registry_pull(LoopbackRegistryAuth::SyntheticBasic).await;
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum LoopbackRegistryAuth {
+    Anonymous,
+    SyntheticBasic,
+}
+
+#[cfg(target_os = "linux")]
+async fn run_loopback_registry_pull(auth_mode: LoopbackRegistryAuth) {
+    use zeroize::Zeroizing;
+
     let contexts = EngineClient::available_contexts()
         .await
-        .expect("Docker CLI context discovery should succeed");
+        .expect("discover Docker contexts");
     let context = contexts
         .iter()
         .find(|context| context.is_current())
-        .expect("Docker CLI should report its current context");
-    assert_eq!(
-        context.transport(),
-        ContextTransport::LocalUnix,
-        "the pull smoke requires the current local Unix Docker context"
-    );
+        .expect("current context");
+    assert_eq!(context.transport(), ContextTransport::LocalUnix);
     let context_name = context.name().to_owned();
     let engine = EngineClient::connect_context(&context_name)
         .await
-        .expect("the current local Docker context should connect");
-
+        .expect("connect current local context");
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock should be after the Unix epoch")
+        .expect("clock")
         .as_nanos();
     let sequence = NEXT_IMAGE_PULL_NAME.fetch_add(1, Ordering::Relaxed);
     let nonce = format!("{}-{timestamp}-{sequence}", std::process::id());
     let image_repository = format!("ferrum-pull-smoke-{nonce}");
     let missing_manifest_tag = format!("missing-{nonce}");
     let fixture = LivePullImageFixture::new(&nonce);
+    let credentials = match auth_mode {
+        LoopbackRegistryAuth::Anonymous => None,
+        LoopbackRegistryAuth::SyntheticBasic => {
+            let username = Zeroizing::new(format!("ferrum-{nonce}"));
+            let secret = Zeroizing::new(format!("synthetic-{nonce}"));
+            let payload = Zeroizing::new(format!("{}:{}", username.as_str(), secret.as_str()));
+            let encoded_authorization = Zeroizing::new(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                payload.as_bytes(),
+            ));
+            let authorization = Zeroizing::new(format!("Basic {}", encoded_authorization.as_str()));
+            Some((username, secret, authorization))
+        }
+    };
+    let (auth_credentials, expected_authorization) = match credentials {
+        Some((username, secret, authorization)) => (Some((username, secret)), Some(authorization)),
+        None => (None, None),
+    };
     let registry = LoopbackRegistry::start(
         image_repository.clone(),
         missing_manifest_tag.clone(),
         fixture,
+        expected_authorization,
     )
     .await;
     let registry_host = format!("127.0.0.1:{}", registry.port());
     let image_reference = format!("{registry_host}/{image_repository}:progress");
     let missing_manifest_reference =
         format!("{registry_host}/{image_repository}:{missing_manifest_tag}");
+    let auth = auth_credentials.map(|(mut username, mut secret)| {
+        ferrum_engine::RegistryAuth::from_helper_credentials(
+            std::mem::take(&mut *username),
+            std::mem::take(&mut *secret),
+            &registry_host,
+        )
+        .expect("synthetic credentials form Engine AuthConfig")
+    });
+    let auth_ref = auth.as_ref();
 
     let before = engine
         .list_images()
         .await
-        .expect("image inventory should be readable before the smoke");
+        .expect("preflight image inventory");
     assert!(
         !image_tag_is_present(&before, &image_reference)
-            && !image_tag_is_present(&before, &missing_manifest_reference),
-        "the generated pull and probe references must be unused before the smoke"
+            && !image_tag_is_present(&before, &missing_manifest_reference)
     );
     let missing_manifest_rejected = match engine
-        .open_image_pull(&missing_manifest_reference, None)
+        .open_image_pull(&missing_manifest_reference, auth_ref)
         .await
     {
         Err(_) => true,
@@ -528,61 +571,54 @@ async fn local_engine_loopback_registry_pull_reports_progress_and_cleans_only_te
             Err(error) => {
                 drop(stream);
                 drop(registry);
-                panic!("the missing-manifest probe exceeded its bounds: {error}");
+                panic!("missing-manifest probe exceeded bounds: {error}");
             }
         },
     };
     assert!(
         registry.missing_manifest_was_requested(),
-        "the Engine should request the intentionally missing fixture manifest"
+        "Engine must reach missing manifest"
     );
+    if auth_ref.is_some() {
+        assert!(
+            registry.valid_authorization_was_observed(),
+            "registry must observe exact synthetic authorization"
+        );
+    }
     assert!(
         missing_manifest_rejected,
-        "the Engine should reject the intentionally missing manifest"
+        "Engine must reject missing manifest"
     );
-    let images_after_probe = engine
-        .list_images()
-        .await
-        .expect("image inventory should be readable after the rejected probe");
+    let after_probe = engine.list_images().await.expect("post-probe inventory");
     assert!(
-        !image_tag_is_present(&images_after_probe, &missing_manifest_reference)
-            && !image_tag_is_present(&images_after_probe, &image_reference),
-        "the rejected probe must not create either generated image tag"
+        !image_tag_is_present(&after_probe, &missing_manifest_reference)
+            && !image_tag_is_present(&after_probe, &image_reference)
     );
 
-    let mut stream = match engine.open_image_pull(&image_reference, None).await {
+    let mut stream = match engine.open_image_pull(&image_reference, auth_ref).await {
         Ok(stream) => stream,
         Err(error) => {
             drop(registry);
             let images = engine
                 .list_images()
                 .await
-                .expect("image inventory should be readable after a rejected pull");
-            assert!(
-                !image_tag_is_present(&images, &image_reference),
-                "a rejected pull must not create the generated tag"
-            );
-            panic!("the local registry pull stream should open: {error}");
+                .expect("inventory after rejected pull");
+            assert!(!image_tag_is_present(&images, &image_reference));
+            panic!("local registry pull stream should open: {error}");
         }
     };
     let progress_result = drain_pull_progress(&mut stream).await;
     drop(stream);
     drop(registry);
-    let (saw_status_progress, stream_error) = match progress_result {
-        Ok(result) => result,
-        Err(error) => (false, Some(error)),
-    };
-
-    let images_after_pull = engine
-        .list_images()
-        .await
-        .expect("image inventory should be readable after the pull");
-    let Some(image) = images_after_pull
+    let (saw_status_progress, stream_error) =
+        progress_result.unwrap_or_else(|error| (false, Some(error)));
+    let images = engine.list_images().await.expect("post-pull inventory");
+    let Some(image) = images
         .iter()
         .find(|image| image.repo_tags.iter().any(|tag| tag == &image_reference))
     else {
         panic!(
-            "the loopback pull should create the unique generated image tag; stream error: {}",
+            "pull should create generated image tag; stream error: {}",
             stream_error.as_deref().unwrap_or("none")
         );
     };
@@ -592,31 +628,23 @@ async fn local_engine_loopback_registry_pull_reports_progress_and_cleans_only_te
             && image.id[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
             && image.repo_tags.len() == 1
             && image.repo_tags[0] == image_reference,
-        "the generated tag must identify one full-ID test image before cleanup"
+        "generated tag must identify one full-ID test image before cleanup"
     );
     let mut disposable = DisposableImageTag::new(context_name, image_reference.clone());
     disposable.arm();
-    let cleanup = disposable.remove();
     assert!(
-        cleanup.is_ok_and(|status| status.success()),
-        "Docker CLI should remove only the generated tag without force"
+        disposable.remove().is_ok_and(|status| status.success()),
+        "remove generated tag without force"
     );
-    let remaining_images = engine
-        .list_images()
-        .await
-        .expect("image inventory should be readable after exact-tag cleanup");
-    assert!(
-        !image_tag_is_present(&remaining_images, &image_reference),
-        "the generated tag should be absent after cleanup"
-    );
+    let remaining = engine.list_images().await.expect("post-cleanup inventory");
+    assert!(!image_tag_is_present(&remaining, &image_reference));
     disposable.disarm();
-
     if let Some(error) = stream_error {
-        panic!("the Engine pull progress stream should complete: {error}");
+        panic!("Engine pull progress stream should complete: {error}");
     }
     assert!(
         saw_status_progress,
-        "the Engine should report at least one non-empty pull status"
+        "Engine should report non-empty pull status"
     );
 }
 
@@ -1575,6 +1603,7 @@ struct LoopbackRegistry {
     port: u16,
     task: tokio::task::JoinHandle<()>,
     missing_manifest_requested: Arc<AtomicBool>,
+    valid_authorization_observed: Arc<AtomicBool>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1583,16 +1612,19 @@ impl LoopbackRegistry {
         image_repository: String,
         missing_manifest_tag: String,
         fixture: LivePullImageFixture,
+        expected_authorization: Option<zeroize::Zeroizing<String>>,
     ) -> Self {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("the loopback registry should bind an ephemeral local port");
         let port = listener
             .local_addr()
-            .expect("the loopback listener should have an address")
+            .expect("bound loopback address")
             .port();
         let missing_manifest_requested = Arc::new(AtomicBool::new(false));
+        let valid_authorization_observed = Arc::new(AtomicBool::new(false));
         let handler_observed_manifest = Arc::clone(&missing_manifest_requested);
+        let handler_observed_auth = Arc::clone(&valid_authorization_observed);
         let task = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 serve_loopback_registry_request(
@@ -1601,6 +1633,8 @@ impl LoopbackRegistry {
                     &missing_manifest_tag,
                     &fixture,
                     &handler_observed_manifest,
+                    &handler_observed_auth,
+                    expected_authorization.as_ref().map(|value| value.as_str()),
                 )
                 .await;
             }
@@ -1609,6 +1643,7 @@ impl LoopbackRegistry {
             port,
             task,
             missing_manifest_requested,
+            valid_authorization_observed,
         }
     }
 
@@ -1618,6 +1653,10 @@ impl LoopbackRegistry {
 
     fn missing_manifest_was_requested(&self) -> bool {
         self.missing_manifest_requested.load(Ordering::Relaxed)
+    }
+
+    fn valid_authorization_was_observed(&self) -> bool {
+        self.valid_authorization_observed.load(Ordering::Relaxed)
     }
 }
 
@@ -1635,10 +1674,20 @@ async fn serve_loopback_registry_request(
     missing_manifest_tag: &str,
     fixture: &LivePullImageFixture,
     missing_manifest_requested: &AtomicBool,
+    valid_authorization_observed: &AtomicBool,
+    expected_authorization: Option<&str>,
 ) {
-    let Some((method, raw_path)) = read_loopback_registry_request(stream).await else {
+    let Some((method, raw_path, authorization)) = read_loopback_registry_request(stream).await
+    else {
         return;
     };
+    if let Some(expected) = expected_authorization {
+        if authorization.as_deref().map(String::as_str) != Some(expected) {
+            write_loopback_registry_unauthorized(stream).await;
+            return;
+        }
+        valid_authorization_observed.store(true, Ordering::Relaxed);
+    }
     let path = raw_path
         .split('?')
         .next()
@@ -1724,13 +1773,13 @@ async fn serve_loopback_registry_request(
 #[cfg(target_os = "linux")]
 async fn read_loopback_registry_request(
     stream: &mut tokio::net::TcpStream,
-) -> Option<(String, String)> {
+) -> Option<(String, String, Option<zeroize::Zeroizing<String>>)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut request = Vec::with_capacity(1024);
-    let mut chunk = [0; 1024];
+    let mut request = zeroize::Zeroizing::new(Vec::with_capacity(1024));
+    let mut chunk = zeroize::Zeroizing::new([0u8; 1024]);
     loop {
-        let count = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+        let count = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk[..]))
             .await
             .ok()?
             .ok()?;
@@ -1754,10 +1803,35 @@ async fn read_loopback_registry_request(
         }
     }
 
-    let line_end = request.windows(2).position(|window| window == b"\r\n")?;
-    let line = std::str::from_utf8(&request[..line_end]).ok()?;
-    let mut fields = line.split_ascii_whitespace();
-    Some((fields.next()?.to_owned(), fields.next()?.to_owned()))
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?;
+    let headers = std::str::from_utf8(&request[..header_end]).ok()?;
+    let mut lines = headers.split("\r\n");
+    let mut fields = lines.next()?.split_ascii_whitespace();
+    let method = fields.next()?.to_owned();
+    let path = fields.next()?.to_owned();
+    let mut authorization = None;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("authorization")
+        {
+            if authorization.is_some() {
+                authorization = Some(zeroize::Zeroizing::new(String::new()));
+                continue;
+            }
+            authorization = Some(zeroize::Zeroizing::new(value.trim().to_owned()));
+        }
+    }
+    Some((method, path, authorization))
+}
+
+#[cfg(target_os = "linux")]
+async fn write_loopback_registry_unauthorized(stream: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncWriteExt;
+    let _ = stream.write_all(
+        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Ferrum loopback fixture\"\r\nContent-Length: 0\r\nConnection: close\r\nDocker-Distribution-API-Version: registry/2.0\r\n\r\n",
+    ).await;
 }
 
 #[cfg(target_os = "linux")]
