@@ -28,8 +28,14 @@ On 2026-10-13, two ignored live tests passed against Docker Engine 29.9.0/API
   `DOCKER_HOST` override, read engine information and inventory, and inspected
   one existing container. It requires at least one existing container.
 
-Both tests are read-only and do not mutate resources. They do not validate
-non-current Docker contexts, Podman, or remote endpoints. Run them with:
+The current-context and direct-host tests above do not exercise non-current
+contexts. Separately, a read-only smoke on 2026-10-11 used a temporary
+`DOCKER_CONFIG` with a non-current `ferrum-readonly-context-probe` context
+pointing to the same local Unix engine. The two existing network list/inspect
+and verbose-IPAM tests passed (2/2), then the temporary config was removed.
+This validates selection of a named non-current context against the same
+daemon; it does not validate a distinct engine, remote context, or UI
+context-switch workflow.
 
 ```sh
 cargo test -p ferrum-engine --test live_engine current_local_docker_context_connects_and_returns_a_valid_inventory -- --exact --ignored
