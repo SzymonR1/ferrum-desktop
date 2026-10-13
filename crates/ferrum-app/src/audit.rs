@@ -346,6 +346,71 @@ pub(super) fn record_compose_pull_result(outcome: ComposePullOutcome) -> AuditRe
     }
     AuditRecord::new("compose_pull", "pull", outcome_label, None, None)
 }
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+pub(super) enum ComposeBuildOutcome {
+    Started,
+    Success,
+    NotSubmitted,
+    RequestError,
+    Uncertain,
+}
+
+#[cfg(target_os = "linux")]
+impl ComposeBuildOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Success => "success",
+            Self::NotSubmitted => "not_submitted",
+            Self::RequestError => "request_error",
+            Self::Uncertain => "uncertain",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn record_compose_build_result(outcome: ComposeBuildOutcome) -> AuditRecord {
+    let outcome_label = outcome.label();
+    match outcome {
+        ComposeBuildOutcome::Started => tracing::info!(
+            target: "ferrum::audit",
+            audit_event = "compose_build",
+            action = "build",
+            outcome = outcome_label,
+            "Compose build attempt started"
+        ),
+        ComposeBuildOutcome::Success => tracing::info!(
+            target: "ferrum::audit",
+            audit_event = "compose_build",
+            action = "build",
+            outcome = outcome_label,
+            "Compose build completed"
+        ),
+        ComposeBuildOutcome::NotSubmitted => tracing::warn!(
+            target: "ferrum::audit",
+            audit_event = "compose_build",
+            action = "build",
+            outcome = outcome_label,
+            "Compose build was not submitted"
+        ),
+        ComposeBuildOutcome::RequestError => tracing::warn!(
+            target: "ferrum::audit",
+            audit_event = "compose_build",
+            action = "build",
+            outcome = outcome_label,
+            "Compose build returned an error"
+        ),
+        ComposeBuildOutcome::Uncertain => tracing::warn!(
+            target: "ferrum::audit",
+            audit_event = "compose_build",
+            action = "build",
+            outcome = outcome_label,
+            "Compose build outcome is uncertain"
+        ),
+    }
+    AuditRecord::new("compose_build", "build", outcome_label, None, None)
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum NetworkMutation {
@@ -912,6 +977,63 @@ mod tests {
             ] {
                 assert!(!line.contains(private_field));
             }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compose_build_audit_is_static_and_redacted() {
+        use super::{ComposeBuildOutcome, record_compose_build_result};
+
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(writer.clone())
+            .finish();
+        let dispatcher = tracing::Dispatch::new(subscriber);
+        let attempts = [
+            (ComposeBuildOutcome::Started, "started"),
+            (ComposeBuildOutcome::Success, "success"),
+            (ComposeBuildOutcome::NotSubmitted, "not_submitted"),
+            (ComposeBuildOutcome::RequestError, "request_error"),
+            (ComposeBuildOutcome::Uncertain, "uncertain"),
+        ];
+        let records = tracing::dispatcher::with_default(&dispatcher, || {
+            attempts.map(|(outcome, _)| {
+                serde_json::to_string(&record_compose_build_result(outcome))
+                    .expect("the static Compose build audit record should serialize")
+            })
+        });
+        for ((_, outcome), record) in attempts.iter().zip(&records) {
+            assert!(record.contains("\"event\":\"compose_build\""));
+            assert!(record.contains("\"action\":\"build\""));
+            assert!(record.contains(&format!("\"outcome\":\"{outcome}\"")));
+            for private_field in [
+                "project",
+                "file",
+                "service",
+                "context",
+                "image",
+                "credential",
+                "output",
+            ] {
+                assert!(!record.contains(private_field));
+            }
+        }
+        let captured = match writer.0.lock() {
+            Ok(output) => output.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let events = String::from_utf8(captured).expect("audit events should be UTF-8");
+        let events = events.lines().collect::<Vec<_>>();
+        assert_eq!(events.len(), attempts.len());
+        for (line, (_, outcome)) in events.iter().zip(attempts) {
+            assert!(line.contains("audit_event=\"compose_build\""));
+            assert!(line.contains("action=\"build\""));
+            assert!(line.contains(&format!("outcome=\"{outcome}\"")));
+            assert!(!line.contains("project="));
+            assert!(!line.contains("context="));
+            assert!(!line.contains("image="));
         }
     }
     #[cfg(target_os = "linux")]

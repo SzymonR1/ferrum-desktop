@@ -283,6 +283,31 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   cancellation submits no pull. After submission, cancellation, timeout, or
   output-limit termination kills only the local CLI process group; Engine-side
   image downloads may continue and the result is uncertain.
+  Compose build is separately confirmed and limited to the same selected,
+  imported, successfully revalidated ordered files/profiles and local socket.
+  It uses fixed `compose --progress plain --parallel 2 ... build` argv. Ferrum
+  adds no `--push`, command-line `--ssh`, builder options, or extra command-line
+  build args. Compose-file `build.args` remain active and may expose secrets; never
+  store credentials there. Compose-file `build.ssh` may grant SSH-agent access,
+  and `build.secrets` may expose configured secret contents to build instructions.
+  Inspect both and build only trusted projects. Saved credentials/helpers,
+  proxy environment, and user Docker config are not passed. The private CLI
+  config/HOME,
+  disabled selected `.env`/remote Git/OCI includes, child limits, two-hour
+  deadline, and 1 MiB output cap constrain Ferrum's CLI, not project behavior.
+  Only bounded, rate-limited allowlisted phase/count summaries are shown; no raw
+  output is persisted.
+  Build runs project-controlled instructions with access to Compose-defined contexts and
+  may read beyond selected YAML, fetch remote contexts/base images, execute
+  arbitrary builder/network code, consume resources, and change the selected Engine
+  image store; existing local image tags may be reassigned. Review `.dockerignore`;
+  build only trusted project files. This is not sandboxed or path-contained.
+  Anonymous auth only; private credentialed registries may fail. Preflight
+  process group before submission. Once submitted, cancellation kills only the
+  local CLI group; the builder/daemon may continue. Timeout/output overflow
+  leave image state uncertain; no retry occurs. Build audit retains only static
+  `compose_build`/`build` start and outcome values. Fake-CLI/temp-fixture tests
+  do not mutate Engine resources or contact registries/remote contexts.
   Controlled fake-CLI/headless tests cover
   argv and states; no live lifecycle mutation was performed. See Docker's
   [Compose profiles guide](https://docs.docker.com/compose/how-tos/profiles/)
@@ -533,14 +558,16 @@ identities. Ignore ConfigFiles, paths, raw stderr, and daemon errors.
   loaders are disabled during validation) remain trust risks. Session imports
   retain path/profile metadata and a local label in memory only; explicit saved
   registrations persist only validated labels, ordered absolute paths, and
-  profiles as described above. Project-content import, Compose build/up/down,
-  removal, and project-file mutation remain deferred. Pulls are limited to the
-  confirmed anonymous local-Docker operation described above; authenticated
-  Compose pulls and remote engines remain unsupported. Scoped start/stop and a
-  confirmed service-scoped restart are available only for a selected imported
-  and revalidated configuration; restart also requires current and freshly
-  rechecked status membership. The bounded one-shot service log snapshot is
-  implemented as described above.
+  profiles as described above. Compose `up`/`down`, removal, and project-file
+  mutation remain deferred. Pulls are limited to the confirmed anonymous
+  local-Docker operation described above; authenticated Compose pulls and remote
+  engines remain unsupported. Confirmed Compose build is supported only for
+  selected imported, revalidated files/profiles on the selected local Docker
+  socket as described above; arbitrary credentials and remote engines remain
+  unsupported. Scoped start/stop and a confirmed service-scoped restart are
+  available only for a selected imported and revalidated configuration;
+  restart also requires current and freshly rechecked status membership. The
+  bounded one-shot service log snapshot is implemented as described above.
 - The explicit local Docker CLI Buildx invocation is an added external build process. Other external process integrations, archive extraction, and file-path surfaces remain deferred.
 - Ferrum-managed credential persistence and helper integrations beyond the
   Linux Secret Service/`pass` choices; authenticated Podman/remote-engine

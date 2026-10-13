@@ -35,7 +35,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(target_os = "linux")]
 const LIFECYCLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
-const PULL_COMMAND_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const COMPOSE_OPERATION_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const MAX_COMPOSE_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const CHILD_ADDRESS_SPACE_LIMIT: libc::rlim_t = 4 * 1024 * 1024 * 1024;
@@ -105,7 +105,7 @@ enum ComposeStatusState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum ComposeLifecycleError {
+pub(super) enum ComposeOperationError {
     DockerCliMissing,
     CommandStartFailed,
     PrivateConfigSetupFailed,
@@ -114,11 +114,11 @@ pub(super) enum ComposeLifecycleError {
     ServiceUnavailable,
     StatusUnavailable,
     OperationFailed,
-    PullCancelledBeforeSpawn,
-    PullOutcomeUncertain,
+    OperationCancelledBeforeSpawn,
+    OperationOutcomeUncertain,
 }
 
-impl ComposeLifecycleError {
+impl ComposeOperationError {
     fn message(&self) -> &'static str {
         match self {
             Self::DockerCliMissing => "Docker Compose CLI is unavailable.",
@@ -138,40 +138,43 @@ impl ComposeLifecycleError {
             Self::StatusUnavailable => {
                 "Could not verify current Compose status; no restart command was run. Refresh and retry."
             }
-            Self::OperationFailed => "Compose lifecycle operation failed.",
-            Self::PullCancelledBeforeSpawn => {
-                "Compose pull was cancelled before the pull command was submitted."
+            Self::OperationFailed => "Compose operation failed.",
+            Self::OperationCancelledBeforeSpawn => {
+                "Compose operation was cancelled before its command was submitted."
             }
-            Self::PullOutcomeUncertain => {
-                "Pull outcome uncertain; images may be partial or still downloading. Refresh before retrying."
+            Self::OperationOutcomeUncertain => {
+                "Compose operation outcome is uncertain; refresh the Engine state before retrying."
             }
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ComposeLifecycleResult {
-    pub(super) outcome: Result<(), ComposeLifecycleError>,
+pub(super) struct ComposeOperationResult {
+    pub(super) outcome: Result<(), ComposeOperationError>,
     pub(super) submitted: bool,
 }
 #[cfg(target_os = "linux")]
-pub(super) const COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY: usize = 8;
+pub(super) const COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY: usize = 8;
 #[cfg(target_os = "linux")]
-const COMPOSE_PULL_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const COMPOSE_OPERATION_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(target_os = "linux")]
-const COMPOSE_PULL_PROGRESS_LINE_BYTES: usize = 512;
+const COMPOSE_OPERATION_PROGRESS_LINE_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ComposePullProgressPhase {
+pub(super) enum ComposeOperationProgressPhase {
     Pulling,
     Downloading,
     Extracting,
     Verifying,
     Waiting,
     Pulled,
+    Building,
+    Exporting,
+    Loading,
 }
 
-impl ComposePullProgressPhase {
+impl ComposeOperationProgressPhase {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Pulling => "Pulling",
@@ -180,82 +183,87 @@ impl ComposePullProgressPhase {
             Self::Verifying => "Verifying",
             Self::Waiting => "Waiting",
             Self::Pulled => "Pulled",
+            Self::Building => "Building",
+            Self::Exporting => "Exporting",
+            Self::Loading => "Loading",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ComposePullProgress {
-    pub(super) phase: ComposePullProgressPhase,
+pub(super) struct ComposeOperationProgress {
+    pub(super) phase: ComposeOperationProgressPhase,
     pub(super) recognized_records: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ComposeLifecycleSelection {
+pub(super) struct ComposeOperationSelection {
     pub(super) imported_label: String,
     pub(super) files: Vec<std::path::PathBuf>,
     pub(super) profiles: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct ComposeLifecycleConfirmation {
-    action: ComposeLifecycleAction,
-    selection: ComposeLifecycleSelection,
+struct ComposeOperationConfirmation {
+    action: ComposeOperationAction,
+    selection: ComposeOperationSelection,
     ordered_files: Vec<String>,
     service: Option<String>,
 }
 
 #[derive(Default)]
-enum ComposeLifecycleState {
+enum ComposeOperationState {
     #[default]
     Idle,
-    Confirming(ComposeLifecycleConfirmation),
+    Confirming(ComposeOperationConfirmation),
     Running {
-        action: ComposeLifecycleAction,
+        action: ComposeOperationAction,
         file_name: String,
         service: Option<String>,
-        pull_progress: Option<ComposePullProgress>,
+        operation_progress: Option<ComposeOperationProgress>,
         cancel_requested: bool,
     },
     Succeeded {
-        action: ComposeLifecycleAction,
+        action: ComposeOperationAction,
         file_name: String,
         service: Option<String>,
     },
     Failed {
-        action: ComposeLifecycleAction,
+        action: ComposeOperationAction,
         file_name: String,
         service: Option<String>,
-        error: ComposeLifecycleError,
+        error: ComposeOperationError,
     },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ComposeLifecycleAction {
+pub(super) enum ComposeOperationAction {
     Start,
     Stop,
     Restart,
     Pull,
+    Build,
 }
 
-impl ComposeLifecycleAction {
+impl ComposeOperationAction {
     fn label(self) -> &'static str {
         match self {
             Self::Start => "start",
             Self::Stop => "stop",
             Self::Restart => "restart",
             Self::Pull => "pull",
+            Self::Build => "build",
         }
     }
 }
 
-pub(super) struct ComposeLifecycleTask {
+pub(super) struct ComposeOperationTask {
     pub(super) generation: u64,
-    pub(super) action: ComposeLifecycleAction,
-    pub(super) selection: ComposeLifecycleSelection,
+    pub(super) action: ComposeOperationAction,
+    pub(super) selection: ComposeOperationSelection,
     pub(super) service: Option<String>,
-    pub(super) pull_cancellation: Option<tokio::sync::oneshot::Receiver<()>>,
-    pub(super) pull_cancellation_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(super) cancellation: Option<tokio::sync::oneshot::Receiver<()>>,
+    pub(super) cancellation_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ComposeLogsError {
@@ -507,10 +515,11 @@ pub(super) struct ComposeActions {
     pub(super) cancel_status: bool,
     pub(super) start_imported: bool,
     pub(super) stop_imported: bool,
-    pub(super) confirm_lifecycle: bool,
+    pub(super) build_imported: bool,
+    pub(super) confirm_operation: bool,
     pub(super) pull_imported: bool,
-    pub(super) cancel_pull: bool,
-    pub(super) cancel_lifecycle: bool,
+    pub(super) cancel_operation_confirmation: bool,
+    pub(super) cancel_operation: bool,
     pub(super) profiles_changed: bool,
     pub(super) save_imported: Option<usize>,
     pub(super) forget_saved: Option<usize>,
@@ -581,8 +590,8 @@ pub(super) struct ComposeView {
     selected_import_label: Option<String>,
     import_name_input: String,
     import_feedback: Option<&'static str>,
-    lifecycle_generation: u64,
-    lifecycle: ComposeLifecycleState,
+    operation_generation: u64,
+    operation: ComposeOperationState,
 }
 
 impl ComposeView {
@@ -631,11 +640,11 @@ impl ComposeView {
     pub(super) fn can_refresh_containers(&self) -> bool {
         matches!(&self.validation, ComposeValidationState::Succeeded { .. })
     }
-    pub(super) fn request_lifecycle_confirmation(
+    pub(super) fn request_operation_confirmation(
         &mut self,
-        action: ComposeLifecycleAction,
+        action: ComposeOperationAction,
     ) -> bool {
-        self.set_lifecycle_confirmation(action, None)
+        self.set_operation_confirmation(action, None)
     }
 
     pub(super) fn request_service_restart_confirmation(&mut self, service: &str) -> bool {
@@ -651,15 +660,15 @@ impl ComposeView {
         {
             return false;
         }
-        self.set_lifecycle_confirmation(ComposeLifecycleAction::Restart, Some(service.to_owned()))
+        self.set_operation_confirmation(ComposeOperationAction::Restart, Some(service.to_owned()))
     }
 
-    fn set_lifecycle_confirmation(
+    fn set_operation_confirmation(
         &mut self,
-        action: ComposeLifecycleAction,
+        action: ComposeOperationAction,
         service: Option<String>,
     ) -> bool {
-        if !self.can_start_lifecycle() {
+        if !self.can_start_operation() {
             return false;
         }
         if service.is_some() && !matches!(&self.status, ComposeStatusState::Succeeded { .. }) {
@@ -670,7 +679,7 @@ impl ComposeView {
         else {
             return false;
         };
-        let selection = ComposeLifecycleSelection {
+        let selection = ComposeOperationSelection {
             imported_label,
             files: self.selected_files.clone(),
             profiles,
@@ -680,7 +689,7 @@ impl ComposeView {
             .iter()
             .map(|file| display_compose_basename(file))
             .collect();
-        self.lifecycle = ComposeLifecycleState::Confirming(ComposeLifecycleConfirmation {
+        self.operation = ComposeOperationState::Confirming(ComposeOperationConfirmation {
             action,
             selection,
             ordered_files,
@@ -689,8 +698,8 @@ impl ComposeView {
         true
     }
 
-    pub(super) fn confirm_lifecycle(&mut self) -> Option<ComposeLifecycleTask> {
-        let ComposeLifecycleState::Confirming(confirmation) = &self.lifecycle else {
+    pub(super) fn confirm_operation(&mut self) -> Option<ComposeOperationTask> {
+        let ComposeOperationState::Confirming(confirmation) = &self.operation else {
             return None;
         };
         let action = confirmation.action;
@@ -709,61 +718,63 @@ impl ComposeView {
                         .any(|container| &container.service == service)
             })
         {
-            self.lifecycle = ComposeLifecycleState::Idle;
+            self.operation = ComposeOperationState::Idle;
             return None;
         }
         let selection = confirmation.selection.clone();
         self.invalidate_status();
         self.cancel_service_logs();
-        self.lifecycle_generation = self.lifecycle_generation.wrapping_add(1);
-        let generation = self.lifecycle_generation;
+        self.operation_generation = self.operation_generation.wrapping_add(1);
+        let generation = self.operation_generation;
         let file_name = display_compose_file_list(&selection.files);
-        let (pull_cancellation_sender, pull_cancellation) = (action
-            == ComposeLifecycleAction::Pull)
-            .then(tokio::sync::oneshot::channel)
-            .unzip();
-        self.lifecycle = ComposeLifecycleState::Running {
+        let (cancellation_sender, cancellation) = (matches!(
+            action,
+            ComposeOperationAction::Pull | ComposeOperationAction::Build
+        ))
+        .then(tokio::sync::oneshot::channel)
+        .unzip();
+        self.operation = ComposeOperationState::Running {
             action,
             file_name,
             service: service.clone(),
-            pull_progress: None,
+            operation_progress: None,
             cancel_requested: false,
         };
-        Some(ComposeLifecycleTask {
+        Some(ComposeOperationTask {
             generation,
             action,
             selection,
             service,
-            pull_cancellation,
-            pull_cancellation_sender,
+            cancellation,
+            cancellation_sender,
         })
     }
 
-    pub(super) fn cancel_lifecycle_confirmation(&mut self) -> Option<ComposeLifecycleAction> {
-        let ComposeLifecycleState::Confirming(confirmation) = &self.lifecycle else {
+    pub(super) fn cancel_operation_confirmation(&mut self) -> Option<ComposeOperationAction> {
+        let ComposeOperationState::Confirming(confirmation) = &self.operation else {
             return None;
         };
         let action = confirmation.action;
-        self.lifecycle = ComposeLifecycleState::Idle;
+        self.operation = ComposeOperationState::Idle;
         Some(action)
     }
 
     #[cfg(test)]
-    fn lifecycle_confirmation(&self) -> Option<&ComposeLifecycleConfirmation> {
-        match &self.lifecycle {
-            ComposeLifecycleState::Confirming(confirmation) => Some(confirmation),
+    fn operation_confirmation(&self) -> Option<&ComposeOperationConfirmation> {
+        match &self.operation {
+            ComposeOperationState::Confirming(confirmation) => Some(confirmation),
             _ => None,
         }
     }
 
     #[cfg(test)]
-    pub(super) fn lifecycle_confirmation_open(&self) -> bool {
-        self.lifecycle_confirmation().is_some()
+    pub(super) fn operation_confirmation_open(&self) -> bool {
+        self.operation_confirmation().is_some()
     }
 
-    pub(super) fn current_lifecycle_selection_matches(
+    pub(super) fn current_operation_selection_matches(
         &self,
-        selection: &ComposeLifecycleSelection,
+        selection: &ComposeOperationSelection,
     ) -> bool {
         self.current_imported_selection_validated()
             && self.selected_import_label.as_deref() == Some(selection.imported_label.as_str())
@@ -772,32 +783,32 @@ impl ComposeView {
                 .selected_profiles()
                 .is_ok_and(|current| current == selection.profiles)
     }
-    pub(super) fn note_pull_progress(
+    pub(super) fn note_operation_progress(
         &mut self,
         generation: u64,
-        progress: ComposePullProgress,
+        progress: ComposeOperationProgress,
     ) -> bool {
-        if generation != self.lifecycle_generation {
+        if generation != self.operation_generation {
             return false;
         }
-        let ComposeLifecycleState::Running {
-            action: ComposeLifecycleAction::Pull,
-            pull_progress,
+        let ComposeOperationState::Running {
+            action: ComposeOperationAction::Pull | ComposeOperationAction::Build,
+            operation_progress,
             ..
-        } = &mut self.lifecycle
+        } = &mut self.operation
         else {
             return false;
         };
-        *pull_progress = Some(progress);
+        *operation_progress = Some(progress);
         true
     }
 
-    pub(super) fn request_pull_cancellation(&mut self) -> bool {
-        let ComposeLifecycleState::Running {
-            action: ComposeLifecycleAction::Pull,
+    pub(super) fn request_operation_cancellation(&mut self) -> bool {
+        let ComposeOperationState::Running {
+            action: ComposeOperationAction::Pull | ComposeOperationAction::Build,
             cancel_requested,
             ..
-        } = &mut self.lifecycle
+        } = &mut self.operation
         else {
             return false;
         };
@@ -808,32 +819,32 @@ impl ComposeView {
         true
     }
 
-    pub(super) fn finish_lifecycle(
+    pub(super) fn finish_operation(
         &mut self,
         generation: u64,
-        result: ComposeLifecycleResult,
+        result: ComposeOperationResult,
     ) -> bool {
-        if generation != self.lifecycle_generation
-            || !matches!(&self.lifecycle, ComposeLifecycleState::Running { .. })
+        if generation != self.operation_generation
+            || !matches!(&self.operation, ComposeOperationState::Running { .. })
         {
             return false;
         }
-        let ComposeLifecycleState::Running {
+        let ComposeOperationState::Running {
             action,
             file_name,
             service,
             ..
-        } = std::mem::take(&mut self.lifecycle)
+        } = std::mem::take(&mut self.operation)
         else {
             return false;
         };
-        self.lifecycle = match result.outcome {
-            Ok(()) => ComposeLifecycleState::Succeeded {
+        self.operation = match result.outcome {
+            Ok(()) => ComposeOperationState::Succeeded {
                 action,
                 file_name,
                 service,
             },
-            Err(error) => ComposeLifecycleState::Failed {
+            Err(error) => ComposeOperationState::Failed {
                 action,
                 file_name,
                 service,
@@ -849,11 +860,11 @@ impl ComposeView {
             && self.is_current_selection_validated()
     }
 
-    fn can_start_lifecycle(&self) -> bool {
+    fn can_start_operation(&self) -> bool {
         self.current_imported_selection_validated()
             && !matches!(
-                &self.lifecycle,
-                ComposeLifecycleState::Confirming(_) | ComposeLifecycleState::Running { .. }
+                &self.operation,
+                ComposeOperationState::Confirming(_) | ComposeOperationState::Running { .. }
             )
     }
     fn can_request_service_restart(&self, service: &str) -> bool {
@@ -867,8 +878,8 @@ impl ComposeView {
                 .iter()
                 .any(|container| container.service == service)
             && !matches!(
-                &self.lifecycle,
-                ComposeLifecycleState::Confirming(_) | ComposeLifecycleState::Running { .. }
+                &self.operation,
+                ComposeOperationState::Confirming(_) | ComposeOperationState::Running { .. }
             )
     }
 
@@ -879,8 +890,8 @@ impl ComposeView {
         if !self.can_refresh_containers()
             || matches!(&self.status, ComposeStatusState::Loading { .. })
             || matches!(
-                &self.lifecycle,
-                ComposeLifecycleState::Confirming(_) | ComposeLifecycleState::Running { .. }
+                &self.operation,
+                ComposeOperationState::Confirming(_) | ComposeOperationState::Running { .. }
             )
         {
             return None;
@@ -1115,7 +1126,7 @@ impl ComposeView {
         self.validated_generation = None;
         self.imported_selection = false;
         self.selected_import_label = None;
-        self.clear_lifecycle_result();
+        self.clear_operation_result();
         self.validated_services.clear();
         self.validation_generation = self.validation_generation.wrapping_add(1);
         self.invalidate_status();
@@ -1207,8 +1218,8 @@ impl ComposeView {
         self.is_current_selection_validated()
             && profiles_valid
             && !matches!(
-                &self.lifecycle,
-                ComposeLifecycleState::Confirming(_) | ComposeLifecycleState::Running { .. }
+                &self.operation,
+                ComposeOperationState::Confirming(_) | ComposeOperationState::Running { .. }
             )
     }
 
@@ -1216,8 +1227,8 @@ impl ComposeView {
         let name = name.trim();
         if !self.is_current_selection_validated()
             || matches!(
-                &self.lifecycle,
-                ComposeLifecycleState::Confirming(_) | ComposeLifecycleState::Running { .. }
+                &self.operation,
+                ComposeOperationState::Confirming(_) | ComposeOperationState::Running { .. }
             )
             || name.is_empty()
             || name.len() > MAX_IMPORTED_COMPOSE_NAME_BYTES
@@ -1242,14 +1253,14 @@ impl ComposeView {
         });
         self.imported_selection = true;
         self.selected_import_label = Some(display_name);
-        self.clear_lifecycle_result();
+        self.clear_operation_result();
         self.import_name_input.clear();
         self.import_feedback = Some("Imported for this session only.");
         true
     }
 
     fn select_imported_project(&mut self, index: usize) -> bool {
-        if matches!(&self.lifecycle, ComposeLifecycleState::Running { .. }) {
+        if matches!(&self.operation, ComposeOperationState::Running { .. }) {
             return false;
         }
         let Some((files, profile_input, display_name)) =
@@ -1272,7 +1283,7 @@ impl ComposeView {
         self.profile_input = profile_input;
         self.imported_selection = true;
         self.selected_import_label = Some(display_name);
-        self.clear_lifecycle_result();
+        self.clear_operation_result();
         self.import_feedback = None;
         true
     }
@@ -1301,11 +1312,11 @@ impl ComposeView {
         self.validation_generation = self.validation_generation.wrapping_add(1);
         self.invalidate_status();
         self.validation = ComposeValidationState::Idle;
-        self.clear_lifecycle_result();
+        self.clear_operation_result();
     }
-    fn clear_lifecycle_result(&mut self) {
-        if !matches!(&self.lifecycle, ComposeLifecycleState::Running { .. }) {
-            self.lifecycle = ComposeLifecycleState::Idle;
+    fn clear_operation_result(&mut self) {
+        if !matches!(&self.operation, ComposeOperationState::Running { .. }) {
+            self.operation = ComposeOperationState::Idle;
         }
     }
     pub(super) fn finish_validation(
@@ -1390,7 +1401,7 @@ impl ComposeView {
         }
         self.imported_selection = false;
         self.selected_import_label = None;
-        self.clear_lifecycle_result();
+        self.clear_operation_result();
         let file_name = display_compose_file_list(&self.selected_files);
         self.validation = ComposeValidationState::Validating { file_name };
         true
@@ -1406,7 +1417,7 @@ impl ComposeView {
             self.validation_generation = self.validation_generation.wrapping_add(1);
             self.selected_files.remove(index);
             self.validation = ComposeValidationState::Idle;
-            self.clear_lifecycle_result();
+            self.clear_operation_result();
         }
     }
     pub(super) fn begin_validation(
@@ -1415,7 +1426,7 @@ impl ComposeView {
         if self.selected_files.is_empty()
             || self.is_file_selection_running()
             || self.is_validation_running()
-            || matches!(&self.lifecycle, ComposeLifecycleState::Running { .. })
+            || matches!(&self.operation, ComposeOperationState::Running { .. })
         {
             return None;
         }
@@ -1431,7 +1442,7 @@ impl ComposeView {
                 return None;
             }
         };
-        self.clear_lifecycle_result();
+        self.clear_operation_result();
         let generation = self.validation_generation;
         let file_name = display_compose_file_list(&self.selected_files);
         self.validation = ComposeValidationState::Validating { file_name };
@@ -1450,8 +1461,8 @@ impl ComposeView {
     }
 
     pub(super) fn invalidate(&mut self) {
-        if matches!(&self.lifecycle, ComposeLifecycleState::Confirming(_)) {
-            self.lifecycle = ComposeLifecycleState::Idle;
+        if matches!(&self.operation, ComposeOperationState::Confirming(_)) {
+            self.operation = ComposeOperationState::Idle;
         }
         self.validated_generation = None;
         self.validated_services.clear();
@@ -1496,9 +1507,9 @@ impl ComposeView {
                 .add_enabled(
                     !self.is_file_selection_running()
                         && !matches!(
-                            &self.lifecycle,
-                            ComposeLifecycleState::Confirming(_)
-                                | ComposeLifecycleState::Running { .. }
+                            &self.operation,
+                            ComposeOperationState::Confirming(_)
+                                | ComposeOperationState::Running { .. }
                         ),
                     egui::TextEdit::singleline(&mut self.profile_input)
                         .char_limit(MAX_COMPOSE_PROFILE_INPUT_BYTES)
@@ -1523,8 +1534,8 @@ impl ComposeView {
             && !self.is_file_selection_running()
             && !self.is_validation_running()
             && !matches!(
-                &self.lifecycle,
-                ComposeLifecycleState::Confirming(_) | ComposeLifecycleState::Running { .. }
+                &self.operation,
+                ComposeOperationState::Confirming(_) | ComposeOperationState::Running { .. }
             );
         let validation_action_enabled = selection_enabled && profiles_valid;
         ui.horizontal(|ui| {
@@ -1649,9 +1660,9 @@ impl ComposeView {
                 if ui
                     .add_enabled(
                         !matches!(
-                            &self.lifecycle,
-                            ComposeLifecycleState::Confirming(_)
-                                | ComposeLifecycleState::Running { .. }
+                            &self.operation,
+                            ComposeOperationState::Confirming(_)
+                                | ComposeOperationState::Running { .. }
                         ),
                         egui::Button::new("Use imported configuration"),
                     )
@@ -1761,9 +1772,9 @@ impl ComposeView {
                     && self.can_refresh_containers()
                     && !matches!(&self.status, ComposeStatusState::Loading { .. })
                     && !matches!(
-                        &self.lifecycle,
-                        ComposeLifecycleState::Confirming(_)
-                            | ComposeLifecycleState::Running { .. }
+                        &self.operation,
+                        ComposeOperationState::Confirming(_)
+                            | ComposeOperationState::Running { .. }
                     ),
                 egui::Button::new("Refresh existing containers"),
             )
@@ -1928,29 +1939,35 @@ impl ComposeView {
         }
         ui.heading("Imported configuration operations");
         ui.label("Start or stop affects only the currently selected, imported, and explicitly revalidated local files. Start requires existing containers; it does not create or build. Stop does not remove containers. Restart is offered only for a service in the current successful status snapshot.");
-        let lifecycle_enabled = status_enabled && self.can_start_lifecycle();
+        let operation_enabled = status_enabled && self.can_start_operation();
         ui.horizontal(|ui| {
             actions.start_imported = ui
                 .add_enabled(
-                    lifecycle_enabled,
+                    operation_enabled,
                     egui::Button::new("Start imported project"),
                 )
                 .clicked();
             actions.stop_imported = ui
                 .add_enabled(
-                    lifecycle_enabled,
+                    operation_enabled,
                     egui::Button::new("Stop imported project"),
                 )
                 .clicked();
         });
         ui.horizontal(|ui| {
             actions.pull_imported = ui
-                .add_enabled(lifecycle_enabled, egui::Button::new("Pull imported images"))
+                .add_enabled(operation_enabled, egui::Button::new("Pull imported images"))
+                .clicked();
+            actions.build_imported = ui
+                .add_enabled(
+                    operation_enabled,
+                    egui::Button::new("Build imported images"),
+                )
                 .clicked();
         });
-        match &self.lifecycle {
-            ComposeLifecycleState::Idle => {}
-            ComposeLifecycleState::Confirming(confirmation) => {
+        match &self.operation {
+            ComposeOperationState::Idle => {}
+            ComposeOperationState::Confirming(confirmation) => {
                 ui.group(|ui| {
                     ui.heading(format!("Confirm Compose {}", confirmation.action.label()));
                     ui.label(format!(
@@ -1969,15 +1986,21 @@ impl ComposeView {
                             confirmation.selection.profiles.join(", ")
                         }
                     ));
-                    if confirmation.action == ComposeLifecycleAction::Pull {
+                    if confirmation.action == ComposeOperationAction::Pull {
                         ui.label("Downloads eligible images to the selected local Docker Engine image store. This uses bandwidth and disk space; downloads may continue after cancellation. Only anonymous public pulls are supported; private-registry credentials are not imported.");
+                    } else if confirmation.action == ComposeOperationAction::Build {
+                        ui.label("Build safety warning");
+                        ui.label("Build runs project-controlled Dockerfiles with access to Compose-defined build contexts, may read beyond the selected YAML, fetch remote contexts/base images, execute arbitrary builder/network code, consume resources, change the Engine image store, and reassign existing local image tags. This is not sandboxed or path-contained. Review .dockerignore and build only trusted projects.");
+                        ui.label("Compose-file build arguments remain active and may expose secrets; do not store credentials there.");
+                        ui.label("Build credential warning");
+                        ui.label("Compose-file build.ssh may grant SSH-agent access, while build.secrets may expose configured secret contents to build instructions. Inspect both before building, and never build untrusted project files.");
                     }
                     if !status_enabled {
                         ui.label(
                             "The engine or Compose configuration is not ready; reconnect or wait before confirming.",
                         );
                     }
-                    actions.confirm_lifecycle = ui
+                    actions.confirm_operation = ui
                         .add_enabled(
                             status_enabled,
                             egui::Button::new(format!(
@@ -1986,19 +2009,19 @@ impl ComposeView {
                             )),
                         )
                         .clicked();
-                    let cancel_label = if confirmation.action == ComposeLifecycleAction::Pull {
-                        "Cancel pull"
-                    } else {
-                        "Cancel lifecycle action"
+                    let cancel_label = match confirmation.action {
+                        ComposeOperationAction::Pull => "Cancel pull",
+                        ComposeOperationAction::Build => "Cancel build",
+                        ComposeOperationAction::Start | ComposeOperationAction::Stop | ComposeOperationAction::Restart => "Cancel lifecycle action",
                     };
-                    actions.cancel_lifecycle = ui.button(cancel_label).clicked();
+                    actions.cancel_operation_confirmation = ui.button(cancel_label).clicked();
                 });
             }
-            ComposeLifecycleState::Running {
+            ComposeOperationState::Running {
                 action,
                 file_name,
                 service,
-                pull_progress,
+                operation_progress,
                 cancel_requested,
             } => {
                 ui.spinner();
@@ -2010,27 +2033,34 @@ impl ComposeView {
                         .map(|service| format!(" service {service}"))
                         .unwrap_or_default()
                 ));
-                if *action == ComposeLifecycleAction::Pull {
-                    if let Some(progress) = pull_progress {
+                if matches!(
+                    action,
+                    ComposeOperationAction::Pull | ComposeOperationAction::Build
+                ) {
+                    let operation_label = action.label();
+                    if let Some(progress) = operation_progress {
                         ui.label(format!(
-                            "Compose pull: {} ({} recognized progress updates; details hidden).",
+                            "Compose {operation_label}: {} ({} recognized progress updates; details hidden).",
                             progress.phase.label(),
                             progress.recognized_records
                         ));
                     } else {
-                        ui.label(
-                            "Waiting for Compose pull progress; revalidation or the pull may still be running.",
-                        );
+                        ui.label(format!(
+                            "Waiting for Compose {operation_label} progress; revalidation or the {operation_label} may still be running."
+                        ));
                     }
-                    actions.cancel_pull = ui
-                        .add_enabled(!cancel_requested, egui::Button::new("Cancel pull"))
+                    actions.cancel_operation = ui
+                        .add_enabled(
+                            !cancel_requested,
+                            egui::Button::new(format!("Cancel {operation_label}")),
+                        )
                         .clicked();
                     if *cancel_requested {
-                        ui.label("Stopping Ferrum's local Compose CLI. Engine downloads may continue if pulling already started.");
+                        ui.label("Stopping Ferrum's local Compose CLI. Engine-side work may continue if the operation was submitted.");
                     }
                 }
             }
-            ComposeLifecycleState::Succeeded {
+            ComposeOperationState::Succeeded {
                 action,
                 file_name,
                 service,
@@ -2044,7 +2074,7 @@ impl ComposeView {
                         .unwrap_or_default()
                 ));
             }
-            ComposeLifecycleState::Failed {
+            ComposeOperationState::Failed {
                 action,
                 file_name,
                 service,
@@ -3538,20 +3568,27 @@ async fn lifecycle_with_binary(
     socket_path: &std::path::Path,
     files: &[std::path::PathBuf],
     profiles: &[String],
-    action: ComposeLifecycleAction,
+    action: ComposeOperationAction,
     search_path: &std::ffi::OsStr,
     user_compose_plugin: Option<&std::path::Path>,
-) -> ComposeLifecycleResult {
+) -> ComposeOperationResult {
     if matches!(
         action,
-        ComposeLifecycleAction::Restart | ComposeLifecycleAction::Pull
+        ComposeOperationAction::Restart
+            | ComposeOperationAction::Pull
+            | ComposeOperationAction::Build
     ) {
-        return ComposeLifecycleResult {
-            outcome: Err(if action == ComposeLifecycleAction::Pull {
-                ComposeLifecycleError::ValidationFailed
-            } else {
-                ComposeLifecycleError::ServiceUnavailable
-            }),
+        return ComposeOperationResult {
+            outcome: Err(
+                if matches!(
+                    action,
+                    ComposeOperationAction::Pull | ComposeOperationAction::Build
+                ) {
+                    ComposeOperationError::ValidationFailed
+                } else {
+                    ComposeOperationError::ServiceUnavailable
+                },
+            ),
             submitted: false,
         };
     }
@@ -3569,15 +3606,15 @@ async fn lifecycle_with_binary(
         let error = match error {
             ComposeValidationError::DockerCliMissing
             | ComposeValidationError::ComposePluginUnavailable => {
-                ComposeLifecycleError::DockerCliMissing
+                ComposeOperationError::DockerCliMissing
             }
-            ComposeValidationError::CommandStartFailed => ComposeLifecycleError::CommandStartFailed,
+            ComposeValidationError::CommandStartFailed => ComposeOperationError::CommandStartFailed,
             ComposeValidationError::PrivateConfigSetupFailed => {
-                ComposeLifecycleError::PrivateConfigSetupFailed
+                ComposeOperationError::PrivateConfigSetupFailed
             }
-            _ => ComposeLifecycleError::ValidationFailed,
+            _ => ComposeOperationError::ValidationFailed,
         };
-        return ComposeLifecycleResult {
+        return ComposeOperationResult {
             outcome: Err(error),
             submitted: false,
         };
@@ -3585,21 +3622,21 @@ async fn lifecycle_with_binary(
     let isolated = match PrivateDockerConfig::new(user_compose_plugin) {
         Ok(isolated) => isolated,
         Err(_) => {
-            return ComposeLifecycleResult {
-                outcome: Err(ComposeLifecycleError::PrivateConfigSetupFailed),
+            return ComposeOperationResult {
+                outcome: Err(ComposeOperationError::PrivateConfigSetupFailed),
                 submitted: false,
             };
         }
     };
     let Some(socket_path) = socket_path.to_str() else {
-        return ComposeLifecycleResult {
-            outcome: Err(ComposeLifecycleError::OperationFailed),
+        return ComposeOperationResult {
+            outcome: Err(ComposeOperationError::OperationFailed),
             submitted: false,
         };
     };
     let Some(parent) = files.first().and_then(|file| file.parent()) else {
-        return ComposeLifecycleResult {
-            outcome: Err(ComposeLifecycleError::ValidationFailed),
+        return ComposeOperationResult {
+            outcome: Err(ComposeOperationError::ValidationFailed),
             submitted: false,
         };
     };
@@ -3621,21 +3658,31 @@ async fn lifecycle_with_binary(
     run_lifecycle_command_with_timeout(&mut command, LIFECYCLE_COMMAND_TIMEOUT).await
 }
 #[cfg(target_os = "linux")]
-fn classify_compose_pull_progress_line(line: &[u8]) -> Option<ComposePullProgressPhase> {
+fn classify_compose_operation_progress_line(line: &[u8]) -> Option<ComposeOperationProgressPhase> {
     line.split(|byte| !byte.is_ascii_alphabetic())
         .find_map(|token| {
             if token.eq_ignore_ascii_case(b"pulling") {
-                Some(ComposePullProgressPhase::Pulling)
+                Some(ComposeOperationProgressPhase::Pulling)
             } else if token.eq_ignore_ascii_case(b"downloading") {
-                Some(ComposePullProgressPhase::Downloading)
+                Some(ComposeOperationProgressPhase::Downloading)
             } else if token.eq_ignore_ascii_case(b"extracting") {
-                Some(ComposePullProgressPhase::Extracting)
+                Some(ComposeOperationProgressPhase::Extracting)
             } else if token.eq_ignore_ascii_case(b"verifying") {
-                Some(ComposePullProgressPhase::Verifying)
+                Some(ComposeOperationProgressPhase::Verifying)
             } else if token.eq_ignore_ascii_case(b"waiting") {
-                Some(ComposePullProgressPhase::Waiting)
+                Some(ComposeOperationProgressPhase::Waiting)
             } else if token.eq_ignore_ascii_case(b"pulled") {
-                Some(ComposePullProgressPhase::Pulled)
+                Some(ComposeOperationProgressPhase::Pulled)
+            } else if token.eq_ignore_ascii_case(b"building") {
+                Some(ComposeOperationProgressPhase::Building)
+            } else if token.eq_ignore_ascii_case(b"exporting") {
+                Some(ComposeOperationProgressPhase::Exporting)
+            } else if token.eq_ignore_ascii_case(b"loading")
+                || token.eq_ignore_ascii_case(b"load")
+                || token.eq_ignore_ascii_case(b"resolving")
+                || token.eq_ignore_ascii_case(b"resolve")
+            {
+                Some(ComposeOperationProgressPhase::Loading)
             } else {
                 None
             }
@@ -3643,21 +3690,21 @@ fn classify_compose_pull_progress_line(line: &[u8]) -> Option<ComposePullProgres
 }
 
 #[cfg(target_os = "linux")]
-struct ComposePullProgressAccumulator {
-    line: [u8; COMPOSE_PULL_PROGRESS_LINE_BYTES],
+struct ComposeOperationProgressAccumulator {
+    line: [u8; COMPOSE_OPERATION_PROGRESS_LINE_BYTES],
     line_len: usize,
     dropping_line: bool,
-    phase: Option<ComposePullProgressPhase>,
+    phase: Option<ComposeOperationProgressPhase>,
     recognized_records: u32,
     pending: bool,
     last_sent: Option<std::time::Instant>,
 }
 
 #[cfg(target_os = "linux")]
-impl ComposePullProgressAccumulator {
+impl ComposeOperationProgressAccumulator {
     fn new() -> Self {
         Self {
-            line: [0; COMPOSE_PULL_PROGRESS_LINE_BYTES],
+            line: [0; COMPOSE_OPERATION_PROGRESS_LINE_BYTES],
             line_len: 0,
             dropping_line: false,
             phase: None,
@@ -3667,12 +3714,16 @@ impl ComposePullProgressAccumulator {
         }
     }
 
-    fn consume(&mut self, bytes: &[u8], sender: &tokio::sync::mpsc::Sender<ComposePullProgress>) {
+    fn consume(
+        &mut self,
+        bytes: &[u8],
+        sender: &tokio::sync::mpsc::Sender<ComposeOperationProgress>,
+    ) {
         for byte in bytes {
             if matches!(*byte, b'\n' | b'\r') {
                 if !self.dropping_line
                     && let Some(phase) =
-                        classify_compose_pull_progress_line(&self.line[..self.line_len])
+                        classify_compose_operation_progress_line(&self.line[..self.line_len])
                 {
                     self.phase = Some(phase);
                     self.recognized_records = self.recognized_records.saturating_add(1);
@@ -3695,10 +3746,11 @@ impl ComposePullProgressAccumulator {
         }
     }
 
-    fn finish(&mut self, sender: &tokio::sync::mpsc::Sender<ComposePullProgress>) {
+    fn finish(&mut self, sender: &tokio::sync::mpsc::Sender<ComposeOperationProgress>) {
         if !self.dropping_line
             && self.line_len > 0
-            && let Some(phase) = classify_compose_pull_progress_line(&self.line[..self.line_len])
+            && let Some(phase) =
+                classify_compose_operation_progress_line(&self.line[..self.line_len])
         {
             self.phase = Some(phase);
             self.recognized_records = self.recognized_records.saturating_add(1);
@@ -3710,7 +3762,7 @@ impl ComposePullProgressAccumulator {
     }
     fn emit_if_due(
         &mut self,
-        sender: &tokio::sync::mpsc::Sender<ComposePullProgress>,
+        sender: &tokio::sync::mpsc::Sender<ComposeOperationProgress>,
         flush: bool,
     ) {
         if !self.pending {
@@ -3719,7 +3771,7 @@ impl ComposePullProgressAccumulator {
         let now = std::time::Instant::now();
         let due = flush
             || self.last_sent.is_none_or(|last_sent| {
-                now.duration_since(last_sent) >= COMPOSE_PULL_PROGRESS_INTERVAL
+                now.duration_since(last_sent) >= COMPOSE_OPERATION_PROGRESS_INTERVAL
             });
         if !due {
             return;
@@ -3727,7 +3779,7 @@ impl ComposePullProgressAccumulator {
         self.last_sent = Some(now);
         if let Some(phase) = self.phase
             && sender
-                .try_send(ComposePullProgress {
+                .try_send(ComposeOperationProgress {
                     phase,
                     recognized_records: self.recognized_records,
                 })
@@ -3738,19 +3790,20 @@ impl ComposePullProgressAccumulator {
     }
 }
 #[cfg(target_os = "linux")]
-async fn run_pull_with_progress(
+async fn run_operation_with_progress(
     command: &mut tokio::process::Command,
     mut cancellation: tokio::sync::oneshot::Receiver<()>,
-    progress: &tokio::sync::mpsc::Sender<ComposePullProgress>,
-) -> ComposeLifecycleResult {
+    progress: &tokio::sync::mpsc::Sender<ComposeOperationProgress>,
+    deadline: Duration,
+) -> ComposeOperationResult {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
     #[cfg(test)]
     let _test_subprocess_guard = crate::TEST_SUBPROCESS_LOCK.lock().await;
 
     if matches!(cancellation.try_recv(), Ok(())) {
-        return ComposeLifecycleResult {
-            outcome: Err(ComposeLifecycleError::PullCancelledBeforeSpawn),
+        return ComposeOperationResult {
+            outcome: Err(ComposeOperationError::OperationCancelledBeforeSpawn),
             submitted: false,
         };
     }
@@ -3764,11 +3817,11 @@ async fn run_pull_with_progress(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return ComposeLifecycleResult {
+            return ComposeOperationResult {
                 outcome: Err(if error.kind() == std::io::ErrorKind::NotFound {
-                    ComposeLifecycleError::DockerCliMissing
+                    ComposeOperationError::DockerCliMissing
                 } else {
-                    ComposeLifecycleError::CommandStartFailed
+                    ComposeOperationError::CommandStartFailed
                 }),
                 submitted: false,
             };
@@ -3776,8 +3829,8 @@ async fn run_pull_with_progress(
     };
     let Some(process_id) = child.id().and_then(|id| libc::pid_t::try_from(id).ok()) else {
         let _ = child.kill().await;
-        return ComposeLifecycleResult {
-            outcome: Err(ComposeLifecycleError::PullOutcomeUncertain),
+        return ComposeOperationResult {
+            outcome: Err(ComposeOperationError::OperationOutcomeUncertain),
             submitted: true,
         };
     };
@@ -3788,21 +3841,21 @@ async fn run_pull_with_progress(
     let Some(mut stdout) = child.stdout.take() else {
         process_group.terminate();
         let _ = child.wait().await;
-        return ComposeLifecycleResult {
-            outcome: Err(ComposeLifecycleError::PullOutcomeUncertain),
+        return ComposeOperationResult {
+            outcome: Err(ComposeOperationError::OperationOutcomeUncertain),
             submitted: true,
         };
     };
     let Some(mut stderr) = child.stderr.take() else {
         process_group.terminate();
         let _ = child.wait().await;
-        return ComposeLifecycleResult {
-            outcome: Err(ComposeLifecycleError::PullOutcomeUncertain),
+        return ComposeOperationResult {
+            outcome: Err(ComposeOperationError::OperationOutcomeUncertain),
             submitted: true,
         };
     };
-    let mut progress_accumulator = ComposePullProgressAccumulator::new();
-    let process_result = tokio::time::timeout(PULL_COMMAND_TIMEOUT, async {
+    let mut progress_accumulator = ComposeOperationProgressAccumulator::new();
+    let process_result = tokio::time::timeout(deadline, async {
         let mut stdout_buffer = [0_u8; 4096];
         let mut stderr_buffer = [0_u8; 4096];
         let mut stdout_open = true;
@@ -3812,7 +3865,7 @@ async fn run_pull_with_progress(
             tokio::select! {
                 cancellation = &mut cancellation => {
                     let _ = cancellation;
-                    return Err(ComposeLifecycleError::PullOutcomeUncertain);
+                    return Err(ComposeOperationError::OperationOutcomeUncertain);
                 }
                 count = stdout.read(&mut stdout_buffer), if stdout_open => {
                     match count {
@@ -3820,11 +3873,11 @@ async fn run_pull_with_progress(
                         Ok(count) => {
                             received_bytes = received_bytes.saturating_add(count);
                             if received_bytes > MAX_COMMAND_OUTPUT_BYTES {
-                                return Err(ComposeLifecycleError::PullOutcomeUncertain);
+                                return Err(ComposeOperationError::OperationOutcomeUncertain);
                             }
                             progress_accumulator.consume(&stdout_buffer[..count], progress);
                         }
-                        Err(_) => return Err(ComposeLifecycleError::PullOutcomeUncertain),
+                        Err(_) => return Err(ComposeOperationError::OperationOutcomeUncertain),
                     }
                 }
                 count = stderr.read(&mut stderr_buffer), if stderr_open => {
@@ -3833,28 +3886,28 @@ async fn run_pull_with_progress(
                         Ok(count) => {
                             received_bytes = received_bytes.saturating_add(count);
                             if received_bytes > MAX_COMMAND_OUTPUT_BYTES {
-                                return Err(ComposeLifecycleError::PullOutcomeUncertain);
+                                return Err(ComposeOperationError::OperationOutcomeUncertain);
                             }
                             progress_accumulator.consume(&stderr_buffer[..count], progress);
                         }
-                        Err(_) => return Err(ComposeLifecycleError::PullOutcomeUncertain),
+                        Err(_) => return Err(ComposeOperationError::OperationOutcomeUncertain),
                     }
                 }
             }
         }
         let status = tokio::select! {
             status = child.wait() => {
-                status.map_err(|_| ComposeLifecycleError::PullOutcomeUncertain)?
+                status.map_err(|_| ComposeOperationError::OperationOutcomeUncertain)?
             }
             cancellation = &mut cancellation => {
                 let _ = cancellation;
-                return Err(ComposeLifecycleError::PullOutcomeUncertain);
+                return Err(ComposeOperationError::OperationOutcomeUncertain);
             }
         };
         if status.success() {
             Ok(())
         } else {
-            Err(ComposeLifecycleError::PullOutcomeUncertain)
+            Err(ComposeOperationError::OperationOutcomeUncertain)
         }
     })
     .await;
@@ -3873,17 +3926,17 @@ async fn run_pull_with_progress(
             process_group.terminate();
             let _ = child.kill().await;
             let _ = child.wait().await;
-            Err(ComposeLifecycleError::PullOutcomeUncertain)
+            Err(ComposeOperationError::OperationOutcomeUncertain)
         }
     };
-    ComposeLifecycleResult {
+    ComposeOperationResult {
         submitted: true,
         outcome,
     }
 }
 
 #[cfg(target_os = "linux")]
-struct ComposePullRequest<'a> {
+struct ComposeOperationRequest<'a> {
     binary: &'a std::path::Path,
     socket_path: &'a std::path::Path,
     files: &'a [std::path::PathBuf],
@@ -3891,69 +3944,80 @@ struct ComposePullRequest<'a> {
     search_path: &'a std::ffi::OsStr,
     plugin: Option<&'a std::path::Path>,
 }
+#[cfg(target_os = "linux")]
+fn compose_validation_operation_error(error: ComposeValidationError) -> ComposeOperationError {
+    match error {
+        ComposeValidationError::DockerCliMissing
+        | ComposeValidationError::ComposePluginUnavailable => {
+            ComposeOperationError::DockerCliMissing
+        }
+        ComposeValidationError::CommandStartFailed => ComposeOperationError::CommandStartFailed,
+        ComposeValidationError::PrivateConfigSetupFailed => {
+            ComposeOperationError::PrivateConfigSetupFailed
+        }
+        _ => ComposeOperationError::ValidationFailed,
+    }
+}
 
 #[cfg(target_os = "linux")]
-async fn compose_pull_with_binary(
-    request: ComposePullRequest<'_>,
-    mut cancellation: tokio::sync::oneshot::Receiver<()>,
-    progress: &tokio::sync::mpsc::Sender<ComposePullProgress>,
-) -> ComposeLifecycleResult {
-    let ComposePullRequest {
-        binary,
-        socket_path,
-        files,
-        profiles,
-        search_path,
-        plugin,
-    } = request;
-    let failure = |error| ComposeLifecycleResult {
-        outcome: Err(error),
-        submitted: false,
-    };
-    if !valid_profile_list(profiles)
-        || !selected_compose_files_are_valid(files)
-        || selected_compose_files_size_exceeds_limit(files)
+async fn compose_operation_preflight(
+    request: &ComposeOperationRequest<'_>,
+    cancellation: &mut tokio::sync::oneshot::Receiver<()>,
+) -> Result<PrivateDockerConfig, ComposeOperationError> {
+    if !valid_profile_list(request.profiles)
+        || !selected_compose_files_are_valid(request.files)
+        || selected_compose_files_size_exceeds_limit(request.files)
     {
-        return failure(ComposeLifecycleError::ValidationFailed);
+        return Err(ComposeOperationError::ValidationFailed);
     }
     let validation = tokio::select! {
         validation = validate_with_profiles_report(
-            binary,
-            files,
-            profiles,
-            search_path,
-            plugin,
+            request.binary,
+            request.files,
+            request.profiles,
+            request.search_path,
+            request.plugin,
             COMMAND_TIMEOUT,
         ) => validation,
-        _ = &mut cancellation => {
-            return failure(ComposeLifecycleError::PullCancelledBeforeSpawn);
+        _ = &mut *cancellation => {
+            return Err(ComposeOperationError::OperationCancelledBeforeSpawn);
         }
     };
-    if let Err(error) = validation.outcome {
-        return failure(match error {
-            ComposeValidationError::DockerCliMissing
-            | ComposeValidationError::ComposePluginUnavailable => {
-                ComposeLifecycleError::DockerCliMissing
-            }
-            ComposeValidationError::CommandStartFailed => ComposeLifecycleError::CommandStartFailed,
-            ComposeValidationError::PrivateConfigSetupFailed => {
-                ComposeLifecycleError::PrivateConfigSetupFailed
-            }
-            _ => ComposeLifecycleError::ValidationFailed,
-        });
+    validation
+        .outcome
+        .map_err(compose_validation_operation_error)?;
+    if request.socket_path.to_str().is_none() {
+        return Err(ComposeOperationError::OperationFailed);
     }
-    let isolated = match PrivateDockerConfig::new(plugin) {
-        Ok(isolated) => isolated,
-        Err(_) => return failure(ComposeLifecycleError::PrivateConfigSetupFailed),
-    };
-    let Some(socket_path) = socket_path.to_str() else {
-        return failure(ComposeLifecycleError::OperationFailed);
-    };
-    let Some(parent) = files.first().and_then(|file| file.parent()) else {
-        return failure(ComposeLifecycleError::ValidationFailed);
-    };
-    let mut command = tokio::process::Command::new(binary);
-    isolated.configure(&mut command, search_path);
+    if request
+        .files
+        .first()
+        .and_then(|file| file.parent())
+        .is_none()
+    {
+        return Err(ComposeOperationError::ValidationFailed);
+    }
+    PrivateDockerConfig::new(request.plugin)
+        .map_err(|_| ComposeOperationError::PrivateConfigSetupFailed)
+}
+
+#[cfg(target_os = "linux")]
+fn configured_compose_command(
+    request: &ComposeOperationRequest<'_>,
+    isolated: &PrivateDockerConfig,
+    parallelism: &'static str,
+) -> Result<tokio::process::Command, ComposeOperationError> {
+    let socket_path = request
+        .socket_path
+        .to_str()
+        .ok_or(ComposeOperationError::OperationFailed)?;
+    let project_directory = request
+        .files
+        .first()
+        .and_then(|file| file.parent())
+        .ok_or(ComposeOperationError::ValidationFailed)?;
+    let mut command = tokio::process::Command::new(request.binary);
+    isolated.configure(&mut command, request.search_path);
     command
         .env("COMPOSE_DISABLE_ENV_FILE", "1")
         .arg("--host")
@@ -3963,18 +4027,108 @@ async fn compose_pull_with_binary(
             "--progress",
             "plain",
             "--parallel",
-            "4",
+            parallelism,
             "--project-directory",
         ])
-        .arg(parent);
-    for file in files {
+        .arg(project_directory);
+    for file in request.files {
         command.arg("--file").arg(file);
     }
-    for profile in profiles {
+    for profile in request.profiles {
         command.arg("--profile").arg(profile);
     }
+    Ok(command)
+}
+
+#[cfg(target_os = "linux")]
+async fn compose_pull_with_binary(
+    request: ComposeOperationRequest<'_>,
+    mut cancellation: tokio::sync::oneshot::Receiver<()>,
+    progress: &tokio::sync::mpsc::Sender<ComposeOperationProgress>,
+) -> ComposeOperationResult {
+    let failure = |error| ComposeOperationResult {
+        outcome: Err(error),
+        submitted: false,
+    };
+    let isolated = match compose_operation_preflight(&request, &mut cancellation).await {
+        Ok(isolated) => isolated,
+        Err(error) => return failure(error),
+    };
+    let mut command = match configured_compose_command(&request, &isolated, "4") {
+        Ok(command) => command,
+        Err(error) => return failure(error),
+    };
     command.args(["pull", "--ignore-buildable"]);
-    run_pull_with_progress(&mut command, cancellation, progress).await
+    run_operation_with_progress(
+        &mut command,
+        cancellation,
+        progress,
+        COMPOSE_OPERATION_TIMEOUT,
+    )
+    .await
+}
+#[cfg(target_os = "linux")]
+async fn compose_build_with_binary(
+    request: ComposeOperationRequest<'_>,
+    mut cancellation: tokio::sync::oneshot::Receiver<()>,
+    progress: &tokio::sync::mpsc::Sender<ComposeOperationProgress>,
+) -> ComposeOperationResult {
+    let failure = |error| ComposeOperationResult {
+        outcome: Err(error),
+        submitted: false,
+    };
+    let isolated = match compose_operation_preflight(&request, &mut cancellation).await {
+        Ok(isolated) => isolated,
+        Err(error) => return failure(error),
+    };
+    let mut command = match configured_compose_command(&request, &isolated, "2") {
+        Ok(command) => command,
+        Err(error) => return failure(error),
+    };
+    command.arg("build");
+    run_operation_with_progress(
+        &mut command,
+        cancellation,
+        progress,
+        COMPOSE_OPERATION_TIMEOUT,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+pub(super) async fn compose_build(
+    socket_path: &std::path::Path,
+    files: &[std::path::PathBuf],
+    profiles: &[String],
+    cancellation: tokio::sync::oneshot::Receiver<()>,
+    progress: &tokio::sync::mpsc::Sender<ComposeOperationProgress>,
+) -> ComposeOperationResult {
+    let Some(search_path) = std::env::var_os("PATH") else {
+        return ComposeOperationResult {
+            outcome: Err(ComposeOperationError::DockerCliMissing),
+            submitted: false,
+        };
+    };
+    let Some(binary) = docker_binary(&search_path) else {
+        return ComposeOperationResult {
+            outcome: Err(ComposeOperationError::DockerCliMissing),
+            submitted: false,
+        };
+    };
+    let plugin = user_compose_plugin();
+    compose_build_with_binary(
+        ComposeOperationRequest {
+            binary: &binary,
+            socket_path,
+            files,
+            profiles,
+            search_path: &search_path,
+            plugin: plugin.as_deref(),
+        },
+        cancellation,
+        progress,
+    )
+    .await
 }
 
 #[cfg(target_os = "linux")]
@@ -3983,23 +4137,23 @@ pub(super) async fn compose_pull(
     files: &[std::path::PathBuf],
     profiles: &[String],
     cancellation: tokio::sync::oneshot::Receiver<()>,
-    progress: &tokio::sync::mpsc::Sender<ComposePullProgress>,
-) -> ComposeLifecycleResult {
+    progress: &tokio::sync::mpsc::Sender<ComposeOperationProgress>,
+) -> ComposeOperationResult {
     let Some(search_path) = std::env::var_os("PATH") else {
-        return ComposeLifecycleResult {
-            outcome: Err(ComposeLifecycleError::DockerCliMissing),
+        return ComposeOperationResult {
+            outcome: Err(ComposeOperationError::DockerCliMissing),
             submitted: false,
         };
     };
     let Some(binary) = docker_binary(&search_path) else {
-        return ComposeLifecycleResult {
-            outcome: Err(ComposeLifecycleError::DockerCliMissing),
+        return ComposeOperationResult {
+            outcome: Err(ComposeOperationError::DockerCliMissing),
             submitted: false,
         };
     };
     let plugin = user_compose_plugin();
     compose_pull_with_binary(
-        ComposePullRequest {
+        ComposeOperationRequest {
             binary: &binary,
             socket_path,
             files,
@@ -4021,14 +4175,14 @@ async fn service_restart_with_binary(
     service: &str,
     search_path: &std::ffi::OsStr,
     user_compose_plugin: Option<&std::path::Path>,
-) -> ComposeLifecycleResult {
+) -> ComposeOperationResult {
     use tokio::process::Command;
-    let failure = |error| ComposeLifecycleResult {
+    let failure = |error| ComposeOperationResult {
         outcome: Err(error),
         submitted: false,
     };
     let Some(service) = validate_service_selector(service) else {
-        return failure(ComposeLifecycleError::ServiceUnavailable);
+        return failure(ComposeOperationError::ServiceUnavailable);
     };
     let validation = validate_with_profiles_report(
         binary,
@@ -4043,13 +4197,13 @@ async fn service_restart_with_binary(
         return failure(match error {
             ComposeValidationError::DockerCliMissing
             | ComposeValidationError::ComposePluginUnavailable => {
-                ComposeLifecycleError::DockerCliMissing
+                ComposeOperationError::DockerCliMissing
             }
-            ComposeValidationError::CommandStartFailed => ComposeLifecycleError::CommandStartFailed,
+            ComposeValidationError::CommandStartFailed => ComposeOperationError::CommandStartFailed,
             ComposeValidationError::PrivateConfigSetupFailed => {
-                ComposeLifecycleError::PrivateConfigSetupFailed
+                ComposeOperationError::PrivateConfigSetupFailed
             }
-            _ => ComposeLifecycleError::ValidationFailed,
+            _ => ComposeOperationError::ValidationFailed,
         });
     }
     let containers = match containers_with_binary(
@@ -4064,36 +4218,36 @@ async fn service_restart_with_binary(
     {
         Ok(containers) => containers,
         Err(ComposeStatusError::DockerCliMissing) => {
-            return failure(ComposeLifecycleError::DockerCliMissing);
+            return failure(ComposeOperationError::DockerCliMissing);
         }
         Err(ComposeStatusError::PrivateConfigSetupFailed) => {
-            return failure(ComposeLifecycleError::PrivateConfigSetupFailed);
+            return failure(ComposeOperationError::PrivateConfigSetupFailed);
         }
         Err(ComposeStatusError::QueryFailed | ComposeStatusError::InvalidOutput) => {
-            return failure(ComposeLifecycleError::StatusUnavailable);
+            return failure(ComposeOperationError::StatusUnavailable);
         }
     };
     if !containers
         .iter()
         .any(|container| container.service == service)
     {
-        return failure(ComposeLifecycleError::ServiceUnavailable);
+        return failure(ComposeOperationError::ServiceUnavailable);
     }
     if !valid_profile_list(profiles)
         || !selected_compose_files_are_valid(files)
         || selected_compose_files_size_exceeds_limit(files)
     {
-        return failure(ComposeLifecycleError::ValidationFailed);
+        return failure(ComposeOperationError::ValidationFailed);
     }
     let isolated = match PrivateDockerConfig::new(user_compose_plugin) {
         Ok(isolated) => isolated,
-        Err(_) => return failure(ComposeLifecycleError::PrivateConfigSetupFailed),
+        Err(_) => return failure(ComposeOperationError::PrivateConfigSetupFailed),
     };
     let Some(socket_path) = socket_path.to_str() else {
-        return failure(ComposeLifecycleError::OperationFailed);
+        return failure(ComposeOperationError::OperationFailed);
     };
     let Some(parent) = files.first().and_then(|file| file.parent()) else {
-        return failure(ComposeLifecycleError::ValidationFailed);
+        return failure(ComposeOperationError::ValidationFailed);
     };
     let mut command = Command::new(binary);
     isolated.configure(&mut command, search_path);
@@ -4117,45 +4271,52 @@ async fn service_restart_with_binary(
 async fn run_lifecycle_command_with_timeout(
     command: &mut tokio::process::Command,
     deadline: Duration,
-) -> ComposeLifecycleResult {
+) -> ComposeOperationResult {
     let (outcome, submitted) = match run_command_with_timeout(command, deadline).await {
         Ok(_) => (Ok(()), true),
-        Err(CommandFailure::Launch) => (Err(ComposeLifecycleError::DockerCliMissing), false),
-        Err(CommandFailure::Spawn) => (Err(ComposeLifecycleError::CommandStartFailed), false),
-        Err(_) => (Err(ComposeLifecycleError::OperationFailed), true),
+        Err(CommandFailure::Launch) => (Err(ComposeOperationError::DockerCliMissing), false),
+        Err(CommandFailure::Spawn) => (Err(ComposeOperationError::CommandStartFailed), false),
+        Err(_) => (Err(ComposeOperationError::OperationFailed), true),
     };
-    ComposeLifecycleResult { outcome, submitted }
+    ComposeOperationResult { outcome, submitted }
 }
 
 #[cfg(target_os = "linux")]
-pub(super) async fn compose_lifecycle(
+pub(super) async fn compose_operation(
     socket_path: &std::path::Path,
     files: &[std::path::PathBuf],
     profiles: &[String],
-    action: ComposeLifecycleAction,
-) -> ComposeLifecycleResult {
+    action: ComposeOperationAction,
+) -> ComposeOperationResult {
     if matches!(
         action,
-        ComposeLifecycleAction::Restart | ComposeLifecycleAction::Pull
+        ComposeOperationAction::Restart
+            | ComposeOperationAction::Pull
+            | ComposeOperationAction::Build
     ) {
-        return ComposeLifecycleResult {
-            outcome: Err(if action == ComposeLifecycleAction::Pull {
-                ComposeLifecycleError::ValidationFailed
-            } else {
-                ComposeLifecycleError::ServiceUnavailable
-            }),
+        return ComposeOperationResult {
+            outcome: Err(
+                if matches!(
+                    action,
+                    ComposeOperationAction::Pull | ComposeOperationAction::Build
+                ) {
+                    ComposeOperationError::ValidationFailed
+                } else {
+                    ComposeOperationError::ServiceUnavailable
+                },
+            ),
             submitted: false,
         };
     }
     let Some(search_path) = std::env::var_os("PATH") else {
-        return ComposeLifecycleResult {
-            outcome: Err(ComposeLifecycleError::DockerCliMissing),
+        return ComposeOperationResult {
+            outcome: Err(ComposeOperationError::DockerCliMissing),
             submitted: false,
         };
     };
     let Some(binary) = docker_binary(&search_path) else {
-        return ComposeLifecycleResult {
-            outcome: Err(ComposeLifecycleError::DockerCliMissing),
+        return ComposeOperationResult {
+            outcome: Err(ComposeOperationError::DockerCliMissing),
             submitted: false,
         };
     };
@@ -4178,16 +4339,16 @@ pub(super) async fn compose_service_restart(
     files: &[std::path::PathBuf],
     profiles: &[String],
     service: &str,
-) -> ComposeLifecycleResult {
+) -> ComposeOperationResult {
     let Some(search_path) = std::env::var_os("PATH") else {
-        return ComposeLifecycleResult {
-            outcome: Err(ComposeLifecycleError::DockerCliMissing),
+        return ComposeOperationResult {
+            outcome: Err(ComposeOperationError::DockerCliMissing),
             submitted: false,
         };
     };
     let Some(binary) = docker_binary(&search_path) else {
-        return ComposeLifecycleResult {
-            outcome: Err(ComposeLifecycleError::DockerCliMissing),
+        return ComposeOperationResult {
+            outcome: Err(ComposeOperationError::DockerCliMissing),
             submitted: false,
         };
     };
@@ -5996,16 +6157,16 @@ mod tests {
                 .expect("the fake Docker CLI should be executable");
 
             for (action, expected) in [
-                (ComposeLifecycleAction::Start, "start"),
-                (ComposeLifecycleAction::Stop, "stop"),
-                (ComposeLifecycleAction::Pull, "pull"),
+                (ComposeOperationAction::Start, "start"),
+                (ComposeOperationAction::Stop, "stop"),
+                (ComposeOperationAction::Pull, "pull"),
             ] {
-                let result = if action == ComposeLifecycleAction::Pull {
+                let result = if action == ComposeOperationAction::Pull {
                     let (_cancel_sender, cancellation) = tokio::sync::oneshot::channel();
                     let (progress_sender, mut progress_receiver) =
-                        tokio::sync::mpsc::channel(COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+                        tokio::sync::mpsc::channel(COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
                     let result = compose_pull_with_binary(
-                        ComposePullRequest {
+                        ComposeOperationRequest {
                             binary: &binary,
                             socket_path: &socket,
                             files: &files,
@@ -6019,14 +6180,14 @@ mod tests {
                     .await;
                     let progress = std::iter::from_fn(|| progress_receiver.try_recv().ok())
                         .collect::<Vec<_>>();
-                    assert!(progress.len() <= COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+                    assert!(progress.len() <= COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
                     assert!(!format!("{progress:?}").contains("fixture"));
                     assert!(progress.len() >= 2);
-                    assert_eq!(progress[0].phase, ComposePullProgressPhase::Pulling);
+                    assert_eq!(progress[0].phase, ComposeOperationProgressPhase::Pulling);
                     assert_eq!(progress[0].recognized_records, 1);
                     assert_eq!(
                         progress.last().unwrap().phase,
-                        ComposePullProgressPhase::Pulled
+                        ComposeOperationProgressPhase::Pulled
                     );
                     assert_eq!(progress.last().unwrap().recognized_records, 3);
                     result
@@ -6054,6 +6215,99 @@ mod tests {
             }
         }
         #[tokio::test]
+        async fn compose_build_uses_fixed_argv_isolation_and_redacted_progress() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("project with spaces");
+            fs::create_dir(&project).unwrap();
+            let file = project.join("compose file.yaml");
+            fs::write(&file, "services:\n  web:\n    build: .\n").unwrap();
+            let socket = directory.path().join("selected socket.sock");
+            let marker = directory.path().join("build-argv");
+            let binary = directory.path().join("docker-build-fixture");
+            let script = format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = compose ]; then\n\
+                   if [ \"$2\" = version ]; then printf 'v5.6.0\\n'; else printf 'web\\n'; fi\n\
+                   exit 0\n\
+                 fi\n\
+                 [ \"$1\" = --host ] || exit 80\n\
+                 for argument do [ \"$argument\" = config ] && {{ printf 'web\\n'; exit 0; }}; done\n\
+                 [ \"$COMPOSE_DISABLE_ENV_FILE\" = 1 ] && [ -d \"$HOME\" ] && [ -d \"$DOCKER_CONFIG\" ] || exit 81\n\
+                 [ \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\" = false ] && [ \"$COMPOSE_EXPERIMENTAL_OCI_REMOTE\" = false ] || exit 82\n\
+                 [ -z \"${{HTTP_PROXY+x}}${{HTTPS_PROXY+x}}${{DOCKER_HOST+x}}${{COMPOSE_FILE+x}}\" ] || exit 83\n\
+                 printf '%s\\n' \"$@\" > {}\n\
+                 printf 'Building private/path\\n#1 [internal] load build definition\\nExporting private:image\\n'\n",
+                shell_quote(&marker.to_string_lossy()),
+            );
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let (_cancel_sender, cancellation) = tokio::sync::oneshot::channel();
+            let (progress_sender, mut progress_receiver) =
+                tokio::sync::mpsc::channel(COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
+            let result = compose_build_with_binary(
+                ComposeOperationRequest {
+                    binary: &binary,
+                    socket_path: &socket,
+                    files: std::slice::from_ref(&file),
+                    profiles: &["qa".to_owned()],
+                    search_path: OsStr::new("/usr/bin"),
+                    plugin: None,
+                },
+                cancellation,
+                &progress_sender,
+            )
+            .await;
+            assert_eq!(result.outcome, Ok(()));
+            assert!(result.submitted);
+            let argv = fs::read_to_string(marker).unwrap();
+            assert_eq!(
+                argv.lines().collect::<Vec<_>>(),
+                [
+                    "--host",
+                    &format!("unix://{}", socket.display()),
+                    "compose",
+                    "--progress",
+                    "plain",
+                    "--parallel",
+                    "2",
+                    "--project-directory",
+                    &project.display().to_string(),
+                    "--file",
+                    &file.display().to_string(),
+                    "--profile",
+                    "qa",
+                    "build",
+                ]
+            );
+            assert!(!argv.contains("--push"));
+            assert!(!argv.contains("--ssh"));
+            let progress =
+                std::iter::from_fn(|| progress_receiver.try_recv().ok()).collect::<Vec<_>>();
+            assert_eq!(
+                progress.last().unwrap().phase,
+                ComposeOperationProgressPhase::Exporting
+            );
+            assert_eq!(progress.last().unwrap().recognized_records, 3);
+            assert!(!format!("{progress:?}").contains("private"));
+            assert!(progress.len() <= COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
+        }
+        #[test]
+        fn compose_build_progress_recognizes_buildkit_load_records_without_retaining_text() {
+            let (sender, mut receiver) =
+                tokio::sync::mpsc::channel(COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
+            let mut accumulator = ComposeOperationProgressAccumulator::new();
+            accumulator.consume(
+                b"#1 [internal] load build definition from Dockerfile\n",
+                &sender,
+            );
+            accumulator.finish(&sender);
+            let summary = receiver.try_recv().unwrap();
+            assert_eq!(summary.phase, ComposeOperationProgressPhase::Loading);
+            assert_eq!(summary.recognized_records, 1);
+            assert!(!format!("{summary:?}").contains("Dockerfile"));
+        }
+
+        #[tokio::test]
         async fn compose_pull_cancellation_before_spawn_is_not_submitted_and_after_spawn_is_uncertain()
          {
             let directory = FixtureDirectory::new();
@@ -6069,16 +6323,21 @@ mod tests {
             fs::write(&binary, script).unwrap();
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
             let (progress_sender, mut progress_receiver) =
-                tokio::sync::mpsc::channel(COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+                tokio::sync::mpsc::channel(COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
 
             let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
             cancel_sender.send(()).unwrap();
             let mut command = tokio::process::Command::new(&binary);
-            let before_spawn =
-                run_pull_with_progress(&mut command, cancel_receiver, &progress_sender).await;
+            let before_spawn = run_operation_with_progress(
+                &mut command,
+                cancel_receiver,
+                &progress_sender,
+                COMPOSE_OPERATION_TIMEOUT,
+            )
+            .await;
             assert_eq!(
                 before_spawn.outcome,
-                Err(ComposeLifecycleError::PullCancelledBeforeSpawn)
+                Err(ComposeOperationError::OperationCancelledBeforeSpawn)
             );
             assert!(!before_spawn.submitted);
             assert!(!marker.exists());
@@ -6088,15 +6347,20 @@ mod tests {
             let binary_for_task = binary.clone();
             let task = tokio::spawn(async move {
                 let mut command = tokio::process::Command::new(binary_for_task);
-                run_pull_with_progress(&mut command, cancel_receiver, &progress_sender_for_task)
-                    .await
+                run_operation_with_progress(
+                    &mut command,
+                    cancel_receiver,
+                    &progress_sender_for_task,
+                    COMPOSE_OPERATION_TIMEOUT,
+                )
+                .await
             });
             let first_progress =
                 tokio::time::timeout(Duration::from_secs(3), progress_receiver.recv())
                     .await
                     .expect("the controlled CLI should emit a recognized progress record")
                     .expect("the bounded progress summary should be delivered");
-            assert_eq!(first_progress.phase, ComposePullProgressPhase::Pulling);
+            assert_eq!(first_progress.phase, ComposeOperationProgressPhase::Pulling);
             assert_eq!(first_progress.recognized_records, 1);
             cancel_sender.send(()).unwrap();
             let after_spawn = tokio::time::timeout(Duration::from_secs(3), task)
@@ -6105,7 +6369,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 after_spawn.outcome,
-                Err(ComposeLifecycleError::PullOutcomeUncertain)
+                Err(ComposeOperationError::OperationOutcomeUncertain)
             );
             assert!(after_spawn.submitted);
         }
@@ -6136,14 +6400,14 @@ mod tests {
             fs::write(&binary, script).unwrap();
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
             let (progress_sender, _progress_receiver) =
-                tokio::sync::mpsc::channel(COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+                tokio::sync::mpsc::channel(COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
             let (cancel_sender, cancellation) = tokio::sync::oneshot::channel();
             let binary_for_task = binary.clone();
             let socket_for_task = socket.clone();
             let files_for_task = files.clone();
             let task = tokio::spawn(async move {
                 compose_pull_with_binary(
-                    ComposePullRequest {
+                    ComposeOperationRequest {
                         binary: &binary_for_task,
                         socket_path: &socket_for_task,
                         files: &files_for_task,
@@ -6173,12 +6437,134 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 result.outcome,
-                Err(ComposeLifecycleError::PullCancelledBeforeSpawn)
+                Err(ComposeOperationError::OperationCancelledBeforeSpawn)
             );
             assert!(!result.submitted);
             assert!(!pull_started.exists());
         }
 
+        #[tokio::test]
+        async fn cancelling_during_build_preflight_prevents_build_submission() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("project");
+            fs::create_dir(&project).unwrap();
+            let file = project.join("compose.yaml");
+            fs::write(&file, "services:\n  web:\n    build: .\n").unwrap();
+            let socket = directory.path().join("selected.sock");
+            let validation_started = directory.path().join("validation-started");
+            let build_started = directory.path().join("build-started");
+            let binary = directory.path().join("docker-build-validation-cancel");
+            let script = format!(
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                   *' version --short'*) printf 'v5.6.0\\n'; exit 0 ;;\n\
+                   *' config '*) : > {}; sleep 60; exit 0 ;;\n\
+                   *' build'*) : > {}; exit 0 ;;\n\
+                 esac\n\
+                 exit 98\n",
+                shell_quote(&validation_started.to_string_lossy()),
+                shell_quote(&build_started.to_string_lossy()),
+            );
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let (progress_sender, _progress_receiver) =
+                tokio::sync::mpsc::channel(COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
+            let (cancel_sender, cancellation) = tokio::sync::oneshot::channel();
+            let binary_for_task = binary.clone();
+            let socket_for_task = socket.clone();
+            let file_for_task = file.clone();
+            let task = tokio::spawn(async move {
+                compose_build_with_binary(
+                    ComposeOperationRequest {
+                        binary: &binary_for_task,
+                        socket_path: &socket_for_task,
+                        files: &[file_for_task],
+                        profiles: &[],
+                        search_path: OsStr::new("/usr/bin"),
+                        plugin: None,
+                    },
+                    cancellation,
+                    &progress_sender,
+                )
+                .await
+            });
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while !validation_started.exists() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(validation_started.exists());
+            cancel_sender.send(()).unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("preflight cancellation should terminate the validation CLI group")
+                .unwrap();
+            assert_eq!(
+                result.outcome,
+                Err(ComposeOperationError::OperationCancelledBeforeSpawn)
+            );
+            assert!(!result.submitted);
+            assert!(!build_started.exists());
+        }
+        #[tokio::test]
+        async fn cancelling_submitted_build_leaves_the_result_uncertain() {
+            let directory = FixtureDirectory::new();
+            let project = directory.path().join("project");
+            fs::create_dir(&project).unwrap();
+            let file = project.join("compose.yaml");
+            fs::write(&file, "services:\n  web:\n    build: .\n").unwrap();
+            let socket = directory.path().join("selected.sock");
+            let build_started = directory.path().join("build-started");
+            let binary = directory.path().join("docker-build-cancel");
+            let script = format!(
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                   *' version --short'*) printf 'v5.6.0\\n'; exit 0 ;;\n\
+                   *' config '*) printf 'web\\n'; exit 0 ;;\n\
+                   *' build'*) : > {}; printf 'Building private/path\\n'; sleep 60 ;;\n\
+                 esac\n\
+                 exit 98\n",
+                shell_quote(&build_started.to_string_lossy()),
+            );
+            fs::write(&binary, script).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let (progress_sender, mut progress_receiver) =
+                tokio::sync::mpsc::channel(COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
+            let (cancel_sender, cancellation) = tokio::sync::oneshot::channel();
+            let binary_for_task = binary.clone();
+            let socket_for_task = socket.clone();
+            let file_for_task = file.clone();
+            let task = tokio::spawn(async move {
+                compose_build_with_binary(
+                    ComposeOperationRequest {
+                        binary: &binary_for_task,
+                        socket_path: &socket_for_task,
+                        files: &[file_for_task],
+                        profiles: &[],
+                        search_path: OsStr::new("/usr/bin"),
+                        plugin: None,
+                    },
+                    cancellation,
+                    &progress_sender,
+                )
+                .await
+            });
+            let progress = tokio::time::timeout(Duration::from_secs(3), progress_receiver.recv())
+                .await
+                .expect("the submitted fake build should emit a summary")
+                .expect("the build summary channel should remain open");
+            assert_eq!(progress.phase, ComposeOperationProgressPhase::Building);
+            assert!(build_started.exists());
+            cancel_sender.send(()).unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("cancellation should stop Ferrum's CLI process group")
+                .unwrap();
+            assert_eq!(
+                result.outcome,
+                Err(ComposeOperationError::OperationOutcomeUncertain)
+            );
+            assert!(result.submitted);
+        }
         #[tokio::test]
         async fn compose_pull_output_over_limit_is_uncertain_and_not_retained() {
             let directory = FixtureDirectory::new();
@@ -6187,39 +6573,68 @@ mod tests {
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
             let (_cancel_sender, cancellation) = tokio::sync::oneshot::channel();
             let (progress_sender, mut progress_receiver) =
-                tokio::sync::mpsc::channel(COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+                tokio::sync::mpsc::channel(COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
             let mut command = tokio::process::Command::new(binary);
-            let result = run_pull_with_progress(&mut command, cancellation, &progress_sender).await;
+            let result = run_operation_with_progress(
+                &mut command,
+                cancellation,
+                &progress_sender,
+                COMPOSE_OPERATION_TIMEOUT,
+            )
+            .await;
             assert_eq!(
                 result.outcome,
-                Err(ComposeLifecycleError::PullOutcomeUncertain)
+                Err(ComposeOperationError::OperationOutcomeUncertain)
             );
             assert!(result.submitted);
             assert!(progress_receiver.try_recv().is_err());
         }
+        #[tokio::test]
+        async fn submitted_image_command_timeout_is_uncertain() {
+            let directory = FixtureDirectory::new();
+            let binary = directory.path().join("docker-image-timeout");
+            fs::write(&binary, "#!/bin/sh\nsleep 60\n").unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let (_cancel_sender, cancellation) = tokio::sync::oneshot::channel();
+            let (progress_sender, _progress_receiver) =
+                tokio::sync::mpsc::channel(COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
+            let mut command = tokio::process::Command::new(binary);
+            let result = run_operation_with_progress(
+                &mut command,
+                cancellation,
+                &progress_sender,
+                Duration::from_millis(20),
+            )
+            .await;
+            assert_eq!(
+                result.outcome,
+                Err(ComposeOperationError::OperationOutcomeUncertain)
+            );
+            assert!(result.submitted);
+        }
         #[test]
         fn compose_pull_progress_summary_recognizes_only_bounded_status_tokens() {
             let (sender, mut receiver) =
-                tokio::sync::mpsc::channel(COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
-            let mut accumulator = ComposePullProgressAccumulator::new();
-            let mut overlong = vec![b'x'; COMPOSE_PULL_PROGRESS_LINE_BYTES + 32];
+                tokio::sync::mpsc::channel(COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
+            let mut accumulator = ComposeOperationProgressAccumulator::new();
+            let mut overlong = vec![b'x'; COMPOSE_OPERATION_PROGRESS_LINE_BYTES + 32];
             overlong.extend_from_slice(b" Pulling\n");
             accumulator.consume(&overlong, &sender);
             accumulator.finish(&sender);
             assert!(receiver.try_recv().is_err());
 
-            let mut accumulator = ComposePullProgressAccumulator::new();
+            let mut accumulator = ComposeOperationProgressAccumulator::new();
             for _ in 0..32 {
                 accumulator.consume(b"private/image:tag Downloading layer\n", &sender);
             }
             accumulator.finish(&sender);
             let summaries = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
             assert!(!summaries.is_empty());
-            assert!(summaries.len() <= COMPOSE_PULL_PROGRESS_CHANNEL_CAPACITY);
+            assert!(summaries.len() <= COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
             assert!(
                 summaries
                     .iter()
-                    .all(|summary| summary.phase == ComposePullProgressPhase::Downloading)
+                    .all(|summary| summary.phase == ComposeOperationProgressPhase::Downloading)
             );
             assert!(!format!("{summaries:?}").contains("private/image"));
         }
@@ -6350,11 +6765,11 @@ mod tests {
         #[tokio::test]
         async fn service_restart_rejects_failed_invalid_or_absent_fresh_status() {
             for (status_response, expected_error) in [
-                ("", ComposeLifecycleError::StatusUnavailable),
-                ("not-json", ComposeLifecycleError::StatusUnavailable),
+                ("", ComposeOperationError::StatusUnavailable),
+                ("not-json", ComposeOperationError::StatusUnavailable),
                 (
                     "{\"Name\":\"worker-1\",\"Service\":\"worker\",\"State\":\"running\"}\n",
-                    ComposeLifecycleError::ServiceUnavailable,
+                    ComposeOperationError::ServiceUnavailable,
                 ),
             ] {
                 let directory = FixtureDirectory::new();
@@ -6425,13 +6840,13 @@ mod tests {
                 &directory.path().join("selected.sock"),
                 std::slice::from_ref(&file),
                 &[],
-                ComposeLifecycleAction::Start,
+                ComposeOperationAction::Start,
                 OsStr::new("/usr/bin"),
                 None,
             )
             .await;
 
-            assert_eq!(result.outcome, Err(ComposeLifecycleError::ValidationFailed));
+            assert_eq!(result.outcome, Err(ComposeOperationError::ValidationFailed));
             assert!(!result.submitted, "validation failure is not submitted");
             assert!(
                 !marker.exists(),
@@ -6457,7 +6872,7 @@ mod tests {
                     .expect("the fake Docker CLI should be executable");
                 let mut command = tokio::process::Command::new(&binary);
                 let result = run_lifecycle_command_with_timeout(&mut command, deadline).await;
-                assert_eq!(result.outcome, Err(ComposeLifecycleError::OperationFailed));
+                assert_eq!(result.outcome, Err(ComposeOperationError::OperationFailed));
                 assert!(
                     result.submitted,
                     "the lifecycle process started before {mode}"
@@ -6470,7 +6885,7 @@ mod tests {
             let result = run_lifecycle_command_with_timeout(&mut command, COMMAND_TIMEOUT).await;
             assert_eq!(
                 result.outcome,
-                Err(ComposeLifecycleError::CommandStartFailed)
+                Err(ComposeOperationError::CommandStartFailed)
             );
             assert!(!result.submitted, "the process could not be started");
             let project_file = directory.path().join("compose.yaml");
@@ -6493,7 +6908,7 @@ mod tests {
             let missing = directory.path().join("missing-docker-command");
             let mut command = tokio::process::Command::new(missing);
             let result = run_lifecycle_command_with_timeout(&mut command, COMMAND_TIMEOUT).await;
-            assert_eq!(result.outcome, Err(ComposeLifecycleError::DockerCliMissing));
+            assert_eq!(result.outcome, Err(ComposeOperationError::DockerCliMissing));
             assert!(!result.submitted, "a missing CLI did not submit a process");
         }
         #[tokio::test]
@@ -8053,7 +8468,7 @@ mod tests {
             );
             assert!(view.request_service_restart_confirmation("worker"));
             view.profile_input = "qa".to_owned();
-            assert!(view.confirm_lifecycle().is_none());
+            assert!(view.confirm_operation().is_none());
         }
 
         #[test]
@@ -8134,15 +8549,15 @@ mod tests {
                 .get_by_role_and_label(Role::Button, "Cancel lifecycle action")
                 .click_accesskit();
             harness.step();
-            assert!(harness.state().actions.cancel_lifecycle);
+            assert!(harness.state().actions.cancel_operation_confirmation);
             assert!(
                 harness
                     .state_mut()
                     .view
-                    .cancel_lifecycle_confirmation()
+                    .cancel_operation_confirmation()
                     .is_some()
             );
-            assert!(harness.state_mut().view.confirm_lifecycle().is_none());
+            assert!(harness.state_mut().view.confirm_operation().is_none());
         }
         #[test]
         fn lifecycle_confirmation_is_accessible_and_cancel_does_not_create_a_task() {
@@ -8159,7 +8574,7 @@ mod tests {
                 harness
                     .state_mut()
                     .view
-                    .request_lifecycle_confirmation(ComposeLifecycleAction::Pull)
+                    .request_operation_confirmation(ComposeOperationAction::Pull)
             );
             harness.step();
             let _label =
@@ -8177,36 +8592,72 @@ mod tests {
                 .get_by_role_and_label(Role::Button, "Cancel pull")
                 .click_accesskit();
             harness.step();
-            assert!(harness.state().actions.cancel_lifecycle);
+            assert!(harness.state().actions.cancel_operation_confirmation);
             assert!(
                 harness
                     .state_mut()
                     .view
-                    .cancel_lifecycle_confirmation()
+                    .cancel_operation_confirmation()
                     .is_some()
             );
-            assert!(harness.state_mut().view.confirm_lifecycle().is_none());
+            assert!(harness.state_mut().view.confirm_operation().is_none());
+        }
+        #[test]
+        fn build_confirmation_warns_and_cancel_does_not_create_a_task() {
+            let mut view = validated_compose_view();
+            assert!(view.import_current_project("Local label"));
+            let mut harness = harness_for(view);
+            harness.run();
+            harness
+                .get_by_role_and_label(Role::Button, "Build imported images")
+                .click_accesskit();
+            harness.step();
+            assert!(harness.state().actions.build_imported);
+            assert!(
+                harness
+                    .state_mut()
+                    .view
+                    .request_operation_confirmation(ComposeOperationAction::Build)
+            );
+            harness.step();
+            let _warning = harness.get_by_role_and_label(Role::Label, "Build safety warning");
+            let _credential_warning =
+                harness.get_by_role_and_label(Role::Label, "Build credential warning");
+            let _confirmation = harness.get_by_role_and_label(Role::Button, "Confirm build");
+            harness
+                .get_by_role_and_label(Role::Button, "Cancel build")
+                .click_accesskit();
+            harness.step();
+            assert!(harness.state().actions.cancel_operation_confirmation);
+            assert!(
+                harness
+                    .state_mut()
+                    .view
+                    .cancel_operation_confirmation()
+                    .is_some()
+            );
+            assert!(harness.state_mut().view.confirm_operation().is_none());
         }
 
         #[test]
         fn confirmed_pull_shows_live_progress_and_cancel_keeps_operation_running() {
             let mut view = validated_compose_view();
             assert!(view.import_current_project("Local label"));
-            assert!(view.request_lifecycle_confirmation(ComposeLifecycleAction::Pull));
-            let task = view.confirm_lifecycle().unwrap();
+            assert!(view.request_operation_confirmation(ComposeOperationAction::Pull));
+            let task = view.confirm_operation().unwrap();
             let generation = task.generation;
-            let mut cancellation = task.pull_cancellation.unwrap();
-            let cancellation_sender = task.pull_cancellation_sender.unwrap();
+            let mut cancellation = task.cancellation.unwrap();
+            let cancellation_sender = task.cancellation_sender.unwrap();
             let mut harness = harness_for(view);
             harness.run();
             let _progress = harness.get_by_role_and_label(
                 Role::Label,
                 "Waiting for Compose pull progress; revalidation or the pull may still be running.",
             );
-            assert!(harness.state_mut().view.note_pull_progress(
+            assert!(harness.state_mut().view.note_operation_progress(
                 generation,
-                ComposePullProgress {
-                    phase: ComposePullProgressPhase::Downloading,
+                ComposeOperationProgress {
+                    phase: ComposeOperationProgressPhase::Downloading,
                     recognized_records: 3,
                 },
             ));
@@ -8219,12 +8670,12 @@ mod tests {
                 .get_by_role_and_label(Role::Button, "Cancel pull")
                 .click_accesskit();
             harness.step();
-            assert!(harness.state().actions.cancel_pull);
-            assert!(harness.state_mut().view.request_pull_cancellation());
+            assert!(harness.state().actions.cancel_operation);
+            assert!(harness.state_mut().view.request_operation_cancellation());
             assert!(matches!(
-                &harness.state().view.lifecycle,
-                ComposeLifecycleState::Running {
-                    action: ComposeLifecycleAction::Pull,
+                &harness.state().view.operation,
+                ComposeOperationState::Running {
+                    action: ComposeOperationAction::Pull,
                     ..
                 }
             ));
@@ -8235,7 +8686,7 @@ mod tests {
         fn unavailable_engine_disables_lifecycle_confirmation() {
             let mut view = validated_compose_view();
             assert!(view.import_current_project("Local label"));
-            assert!(view.request_lifecycle_confirmation(ComposeLifecycleAction::Start));
+            assert!(view.request_operation_confirmation(ComposeOperationAction::Start));
             let mut harness = harness_for_availability(view, false);
             harness.run();
 
@@ -8255,8 +8706,8 @@ mod tests {
         fn status_refresh_is_disabled_during_running_lifecycle_operation() {
             let mut view = validated_compose_view();
             assert!(view.import_current_project("Local label"));
-            assert!(view.request_lifecycle_confirmation(ComposeLifecycleAction::Start));
-            assert!(view.confirm_lifecycle().is_some());
+            assert!(view.request_operation_confirmation(ComposeOperationAction::Start));
+            assert!(view.confirm_operation().is_some());
             let mut harness = harness_for(view);
             harness.run();
 
@@ -8271,39 +8722,39 @@ mod tests {
         fn lifecycle_confirmation_requires_imported_revalidated_selection_and_survives_page_invalidation()
          {
             let mut view = validated_compose_view();
-            assert!(!view.request_lifecycle_confirmation(ComposeLifecycleAction::Start));
+            assert!(!view.request_operation_confirmation(ComposeOperationAction::Start));
             assert!(view.import_current_project("Local label"));
-            assert!(view.request_lifecycle_confirmation(ComposeLifecycleAction::Start));
-            assert!(view.lifecycle_confirmation_open());
+            assert!(view.request_operation_confirmation(ComposeOperationAction::Start));
+            assert!(view.operation_confirmation_open());
             assert_eq!(
-                view.lifecycle_confirmation()
+                view.operation_confirmation()
                     .map(|confirmation| confirmation.selection.imported_label.as_str()),
                 Some("Local label")
             );
-            assert!(view.cancel_lifecycle_confirmation().is_some());
-            assert!(view.cancel_lifecycle_confirmation().is_none());
-            assert!(view.request_lifecycle_confirmation(ComposeLifecycleAction::Start));
+            assert!(view.cancel_operation_confirmation().is_some());
+            assert!(view.cancel_operation_confirmation().is_none());
+            assert!(view.request_operation_confirmation(ComposeOperationAction::Start));
             let task = view
-                .confirm_lifecycle()
+                .confirm_operation()
                 .expect("the imported, validated selection should be actionable");
-            assert!(!view.request_lifecycle_confirmation(ComposeLifecycleAction::Stop));
+            assert!(!view.request_operation_confirmation(ComposeOperationAction::Stop));
             assert!(
                 view.begin_status_refresh().is_none(),
                 "status reconciliation must wait until lifecycle completion"
             );
 
             view.invalidate();
-            assert!(view.finish_lifecycle(
+            assert!(view.finish_operation(
                 task.generation,
-                ComposeLifecycleResult {
+                ComposeOperationResult {
                     outcome: Ok(()),
                     submitted: true,
                 },
             ));
             assert!(matches!(
-                &view.lifecycle,
-                ComposeLifecycleState::Succeeded {
-                    action: ComposeLifecycleAction::Start,
+                &view.operation,
+                ComposeOperationState::Succeeded {
+                    action: ComposeOperationAction::Start,
                     ..
                 }
             ));
@@ -8313,27 +8764,32 @@ mod tests {
         fn page_invalidation_cancels_unconfirmed_lifecycle_action() {
             let mut view = validated_compose_view();
             assert!(view.import_current_project("Local label"));
-            assert!(view.request_lifecycle_confirmation(ComposeLifecycleAction::Stop));
+            assert!(view.request_operation_confirmation(ComposeOperationAction::Stop));
 
             view.invalidate();
 
-            assert!(!view.lifecycle_confirmation_open());
-            assert!(view.confirm_lifecycle().is_none());
+            assert!(!view.operation_confirmation_open());
+            assert!(view.confirm_operation().is_none());
         }
         #[test]
         fn lifecycle_confirmation_rejects_changed_files_profiles_or_validation() {
-            for change in 0..4 {
-                let mut view = validated_compose_view();
-                assert!(view.import_current_project("Local label"));
-                assert!(view.request_lifecycle_confirmation(ComposeLifecycleAction::Pull));
-                match change {
-                    0 => view.selected_files[0] = std::path::PathBuf::from("/private/changed.yaml"),
-                    1 => view.profile_input = "qa".to_owned(),
-                    2 => view.selected_import_label = Some("Different label".to_owned()),
-                    _ => view.profiles_changed(),
+            for action in [ComposeOperationAction::Pull, ComposeOperationAction::Build] {
+                for change in 0..4 {
+                    let mut view = validated_compose_view();
+                    assert!(view.import_current_project("Local label"));
+                    assert!(view.request_operation_confirmation(action));
+                    match change {
+                        0 => {
+                            view.selected_files[0] =
+                                std::path::PathBuf::from("/private/changed.yaml")
+                        }
+                        1 => view.profile_input = "qa".to_owned(),
+                        2 => view.selected_import_label = Some("Different label".to_owned()),
+                        _ => view.profiles_changed(),
+                    }
+                    assert!(view.confirm_operation().is_none());
+                    assert!(matches!(view.operation, ComposeOperationState::Idle));
                 }
-                assert!(view.confirm_lifecycle().is_none());
-                assert!(matches!(view.lifecycle, ComposeLifecycleState::Idle));
             }
         }
         #[test]

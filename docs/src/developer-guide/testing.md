@@ -585,19 +585,26 @@ selected project's default `.env`; `--no-interpolate` and
 loaders are explicitly disabled, so remote include/extends references fail
 without fetching. The CLI/plugin remains unsandboxed; validate only trusted
 files. Bounded profile selection applies to structural validation, read-only
-status, one-shot service logs and live follow, imported-project start/stop/pull,
-and single-service restart; the declared-service inventory is not profile-filtered
-and lists all declarations from selected files. Profiles are passed as explicit
-`--profile` arguments and are not inherited from the environment. Imports remain
-session-only unless explicitly saved. Saved registrations use bounded
-SettingsStore metadata, restore unselected/unvalidated, and require explicit
-revalidation; persistence adds no CLI/Engine request or project-file access.
-Compose pull has fake-CLI/temp-file coverage for exact argv, isolated
-environment, preflight cancellation, bounded progress, and uncertain post-spawn
-outcomes; it uses anonymous auth only. No live pull, registry request, or image
-mutation is claimed. Build/up/down, removal, and project-file mutation remain
-unsupported.
-Service restart is covered by controlled fake-CLI/headless regressions only; no live restart runs.
+status, one-shot service logs and live follow, imported-project start/stop/pull/
+build, and single-service restart; the declared-service inventory is not
+profile-filtered and lists all declarations from selected files. Profiles are
+passed as explicit `--profile` arguments and are not inherited from the
+environment. Imports remain session-only unless explicitly saved. Saved
+registrations use bounded SettingsStore metadata, restore unselected/
+unvalidated, and require explicit revalidation; persistence adds no CLI/Engine
+request or project-file access.
+Compose pull and build use fake-CLI/temp-file fixtures only. Pull regressions
+cover exact argv, isolated environment, preflight cancellation, bounded
+progress, and uncertain post-spawn outcomes. Build checks exact fixed argv
+including spaced paths/profiles, private environment/socket selection,
+allowlisted progress, explicit-confirmation cancellation, stale selection,
+preflight cancellation, and uncertain submitted cancellation. Shared image
+command-runner regressions exercise output overflow and short test-injected
+deadline uncertainty. Build audit tests verify static redaction. Neither
+operation contacts a live Engine or registry, executes a user project, mutates
+an image store, or tests remote contexts. Build uses anonymous registry access
+only. Build/up/down, removal, and project-file mutation are not supported except
+the confirmed local build slice.
 
 Controlled live-follow fixtures cover exact selected-file/profile/socket argv
 and fresh status-before-stream ordering, absent/failed service-membership
