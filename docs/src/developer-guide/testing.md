@@ -16,6 +16,26 @@ version, inventory, and Docker CLI contexts are read-only. The general
 local-engine inventory test may inspect an existing container; these tests do
 not mutate resources.
 
+## Read-only Docker endpoint and context smokes
+
+On 2026-10-13, two ignored live tests passed against Docker Engine 29.9.0/API
+1.56 via `unix:///var/run/docker.sock`:
+
+- `current_local_docker_context_connects_and_returns_a_valid_inventory`
+  discovered and connected to the current `default` context, read engine
+  information, and listed containers.
+- `local_engine_returns_a_well_formed_container_inventory` used a direct
+  `DOCKER_HOST` override, read engine information and inventory, and inspected
+  one existing container. It requires at least one existing container.
+
+Both tests are read-only and do not mutate resources. They do not validate
+non-current Docker contexts, Podman, or remote endpoints. Run them with:
+
+```sh
+cargo test -p ferrum-engine --test live_engine current_local_docker_context_connects_and_returns_a_valid_inventory -- --exact --ignored
+DOCKER_CONTEXT='' DOCKER_HOST=unix:///var/run/docker.sock cargo test -p ferrum-engine --test live_engine local_engine_returns_a_well_formed_container_inventory -- --exact --ignored
+```
+
 Fake-Unix Engine inventory tests exercise the public container, image, network,
 and volume list methods. Each typed sequence is capped at 65,536 entries; a
 preflight counts array entries recursively across the complete response and
