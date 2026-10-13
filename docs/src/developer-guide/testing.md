@@ -254,41 +254,57 @@ The 2026-10-11 read-only history smoke passed against Docker Engine 29.9.0/API
 1.56 using the preinstalled `ghcr.io/catthehacker/ubuntu:rust-latest` image
 and current local Unix context; it read history without mutating the image.
 
-## Opt-in local Docker image-pull progress smoke
+## Opt-in local Docker image-pull progress smokes
 
 `local_engine_loopback_registry_pull_reports_progress_and_cleans_only_test_tag`
-is an ignored Linux integration test for the Engine pull stream, not the Images
-page or credential-helper path. It requires the current Docker context to use a
-local Unix socket and the daemon's existing loopback-insecure-registry policy.
-The test starts an in-process OCI registry bound only to `127.0.0.1` on an
-ephemeral port and changes no daemon configuration. It preflights both generated
-references as absent. The missing-manifest probe must reach the fixture, be
-rejected, and leave both references absent. Each Engine progress stream has a
-30-second total deadline and a 1,024-record cap; the smoke retains only whether
-a non-empty status was observed. On a completed pull, cleanup is armed only
-after inventory confirms a full SHA-256 image ID and exactly the generated tag.
-It removes only that tag using `docker image rm --no-prune` without force. If
-inventory cannot confirm ownership, the test does not attempt removal. The
-explicit cleanup and Drop fallback use a CLI child with a five-second deadline;
-the helper attempts to kill and reap it on timeout. A failed explicit cleanup
-fails the test; no force or prune is attempted. No container, external registry,
-credentials, user image, or daemon setting is used. A failed pull stream is
-dropped and the loopback fixture is stopped, but Engine-side cancellation is
+and `local_engine_loopback_registry_synthetic_basic_auth_pull_reports_progress`
+are ignored Linux integration tests for the Engine pull stream, not the Images
+page or credential-helper path. Both require the current Docker context to use
+a local Unix socket and the daemon's existing loopback-insecure-registry policy.
+Each starts an in-process OCI registry bound only to `127.0.0.1` on an ephemeral
+port and changes no daemon configuration. Both preflight generated references
+as absent and probe a missing manifest that must reach the fixture, be rejected,
+and leave both references absent. Each Engine progress stream has a 30-second
+total deadline and a 1,024-record cap; the smoke retains only whether a
+non-empty status was observed. On a completed pull, cleanup is armed only after
+inventory confirms a full SHA-256 image ID and exactly the generated tag. It
+removes only that tag using `docker image rm --no-prune` without force. If
+inventory cannot confirm ownership, the test does not attempt removal. Explicit
+cleanup and Drop fallback use a CLI child with a five-second deadline and
+attempt to kill and reap it on timeout.
+
+The authenticated test creates a nonce username and synthetic secret in memory,
+constructs `RegistryAuth` directly, and authenticates both the missing-manifest
+probe and pull. The fixture rejects requests without the exact expected Basic
+authorization using HTTP 401 and a Basic challenge, and records only whether a
+valid header was seen. Temporary secret/header strings are zeroized where
+practical; neither user credentials nor Docker config/helpers are read. This is
+synthetic direct Engine AuthConfig transport over the existing loopback
+HTTP/insecure-registry setup. It does not validate helper selection, per-pull UI
+opt-in, real secrets, TLS, external/private registry deployment, or production
+authentication. Issues #16 and #19 remain partial/open.
+
+No container, external registry, user image, or daemon setting is used. A failed
+pull stream is dropped and the fixture stopped, but Engine-side cancellation is
 not guaranteed; interrupted pulls may leave untagged blob data or an unknown
-outcome.
-Run only against a disposable local Docker Engine:
+outcome. Run only against a disposable local Docker Engine:
 
 ```sh
 env -u DOCKER_HOST DOCKER_CONTEXT=default cargo test -p ferrum-engine --test live_engine local_engine_loopback_registry_pull_reports_progress_and_cleans_only_test_tag -- --exact --ignored
+env -u DOCKER_HOST DOCKER_CONTEXT=default cargo test -p ferrum-engine --test live_engine local_engine_loopback_registry_synthetic_basic_auth_pull_reports_progress -- --exact --ignored
 ```
 
-This smoke is one local anonymous pull path, not registry-helper auth, external
-registry, push, Ferrum image removal, Podman/rootless, or broader platform
-validation.
-
-On 2026-10-13, this smoke passed on Fedora Linux 44 x86_64 against Docker
-Engine 29.9.0/API 1.56 through the local `default` context. The Engine returned
-non-empty status/progress records; this response did not include byte counters.
+On 2026-10-13, both smokes passed on Fedora Linux 44 x86_64 against Docker
+Engine 29.9.0/API 1.56 through the local `default` context. Both assert at
+least one non-empty Engine status; numeric byte counters are not claimed. The
+authenticated smoke sends nonce-generated credentials directly as
+`RegistryAuth` and verifies that the loopback fixture accepts the expected
+Basic header; it does not exercise the configured helper or per-pull UI opt-in.
+Docker Engine's `X-Registry-Auth` AuthConfig is documented in the
+[Engine API reference](https://docs.docker.com/reference/api/engine/version/v1.56/).
+No real credentials are used, and the smoke does not validate TLS or production
+registry setup; CNCF Distribution requires TLS for Basic auth
+([configuration](https://distribution.github.io/distribution/about/configuration/)).
 
 Image-build regressions exercise only temporary files and controlled helper
 processes. They do not invoke Docker or Buildx against an engine, build an image,
@@ -857,12 +873,13 @@ tests use fixed image data and local state/events only; they never contact an
 engine or registry or mutate images.
 
 Pull presentation tests use fixed progress values. Tag, push, and removal tests
-use fake completion events and do not mutate image resources. The separate
-live smoke is an Engine-level anonymous pull with exact-tag cleanup; it does
-not exercise Ferrum's UI. No live Ferrum UI pull, tag/removal, or registry-push
-operation is claimed. Push tests use fake sockets and headless UI state only;
-they do not mutate images or contact a registry. Tests must not pull, tag, push,
-delete, or otherwise mutate user images or engines.
+use fake completion events and do not mutate image resources. Separate opt-in
+Engine-level smokes exercise an anonymous pull and a synthetic Basic-auth pull
+with exact-tag cleanup; neither exercises the Ferrum UI or configured helper.
+No live Ferrum UI pull, tag/removal, or registry-push operation is claimed.
+Push tests use fake sockets and headless UI state only; they do not mutate
+images or contact a registry. Tests must not pull, tag, push, delete, or
+otherwise mutate user images or engines.
 
 Engine image pull, push, tag, removal, and history contract tests use fake Unix
 sockets, not a Docker engine or registry. Tag cases cover encoded request
@@ -890,17 +907,19 @@ cargo test -p ferrum-core image_push_target_tests
 
 The separate opt-in ignored
 `local_engine_lists_inspects_and_reads_history_for_preinstalled_image_read_only`
-test lists and inspects a preinstalled image, then reads its history through the
-selected local Docker Unix socket. It is read-only and does not pull, tag,
-push, remove, or modify images. No live image mutation or registry contact is
-claimed.
+test lists and inspects an already-installed image, then reads history through
+the selected local Docker Unix socket. It is read-only and does not pull, tag,
+push, remove, or modify images. The separate live pull smokes documented above
+are the only live image-transfer operations in this guide.
 
 Image pull, push, tag, and removal use the validated local Docker Unix-socket
 endpoint. Pulls and pushes are anonymous by default; fake-helper tests cover the
-helper protocol and fake Unix-engine tests cover the authenticated pull/push
-headers without invoking real helpers or contacting a registry. No live
-helper-authenticated pull or push is claimed. Ferrum does not read saved Docker
-credential entries; Buildx remains credential-free.
+helper protocol and fake Unix-engine tests cover authenticated headers without
+invoking real helpers or contacting a registry. One separate synthetic-auth
+live pull uses `RegistryAuth` directly; it does not test helper selection or
+per-pull UI consent. No live helper-authenticated pull or push is claimed.
+Ferrum does not read saved Docker credential entries; Buildx remains
+credential-free.
 
 Manual release-mode performance samples are opt-in and have no timing
 thresholds. See the [performance and accessibility evidence](../performance.md)
