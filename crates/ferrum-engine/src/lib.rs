@@ -4641,6 +4641,165 @@ mod container_inspection_tests {
         );
     }
 }
+#[cfg(all(test, target_os = "linux"))]
+mod connection_handshake_tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+    };
+
+    fn http_response(status: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    async fn receive_request(listener: &UnixListener, response: Vec<u8>) -> String {
+        let (stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .expect("client should connect within the deadline")
+                .expect("fake engine should accept the connection");
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut request_line),
+        )
+        .await
+        .expect("request line should arrive within the deadline")
+        .expect("request line should be readable");
+        reader
+            .get_mut()
+            .write_all(&response)
+            .await
+            .expect("fake engine response should be written");
+        request_line.trim().to_owned()
+    }
+
+    fn version_response() -> Vec<u8> {
+        http_response("200 OK", br#"{"Version":"28.0.0","ApiVersion":"1.45"}"#)
+    }
+
+    async fn fixture(
+        name: &str,
+        responses: Vec<Vec<u8>>,
+    ) -> (
+        std::path::PathBuf,
+        tokio::task::JoinHandle<Vec<String>>,
+        std::path::PathBuf,
+    ) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("fe-{name}-{}-{timestamp}", std::process::id()));
+        std::fs::create_dir(&directory).expect("temporary directory should be created");
+        let socket_path = directory.join("s");
+        let listener = UnixListener::bind(&socket_path).expect("fake engine socket should bind");
+        let server = tokio::spawn(async move {
+            let mut request_lines = Vec::with_capacity(responses.len());
+            for response in responses {
+                request_lines.push(receive_request(&listener, response).await);
+            }
+            request_lines
+        });
+        (socket_path, server, directory)
+    }
+
+    async fn cleanup(
+        socket_path: &std::path::Path,
+        server: tokio::task::JoinHandle<Vec<String>>,
+        directory: &std::path::Path,
+    ) -> Vec<String> {
+        let requests = server
+            .await
+            .expect("fake engine should serve all expected requests");
+        std::fs::remove_file(socket_path).expect("fake engine socket should be removed");
+        std::fs::remove_dir(directory).expect("fake engine directory should be removed");
+        requests
+    }
+
+    #[tokio::test]
+    async fn negotiates_api_version_before_returning_an_empty_container_inventory() {
+        let (socket_path, server, directory) = fixture(
+            "empty",
+            vec![version_response(), http_response("200 OK", b"[]")],
+        )
+        .await;
+        let docker_host = format!("unix://{}", socket_path.display());
+        let client = EngineClient::connect_with_startup_environment(None, Some(docker_host))
+            .await
+            .expect("valid fake engine should connect");
+        assert_eq!(client.api_version, "1.45");
+
+        let containers = client.list_containers().await;
+        let requests = cleanup(&socket_path, server, &directory).await;
+
+        assert_eq!(requests[0], "GET /version HTTP/1.1");
+        assert_eq!(requests[1], "GET /v1.45/containers/json?all=true HTTP/1.1");
+        assert!(
+            containers
+                .expect("successful empty inventory should not be a connection error")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_request_failure_is_not_reported_as_an_empty_inventory() {
+        let (socket_path, server, directory) = fixture(
+            "error",
+            vec![
+                version_response(),
+                http_response(
+                    "503 Service Unavailable",
+                    br#"{"message":"private engine response"}"#,
+                ),
+            ],
+        )
+        .await;
+        let docker_host = format!("unix://{}", socket_path.display());
+        let client = EngineClient::connect_with_startup_environment(None, Some(docker_host))
+            .await
+            .expect("valid fake engine should connect");
+        assert_eq!(client.api_version, "1.45");
+
+        let containers = client.list_containers().await;
+        let requests = cleanup(&socket_path, server, &directory).await;
+
+        assert_eq!(requests[0], "GET /version HTTP/1.1");
+        assert_eq!(requests[1], "GET /v1.45/containers/json?all=true HTTP/1.1");
+        let error = containers.expect_err("failed inventory request should return an error");
+        assert!(matches!(error, EngineError::InventoryRequest { .. }));
+        assert!(!error.to_string().contains("private engine response"));
+    }
+
+    #[tokio::test]
+    async fn missing_api_version_fails_connection_before_container_inventory() {
+        let (socket_path, server, directory) = fixture(
+            "version",
+            vec![http_response("200 OK", br#"{"Version":"28.0.0"}"#)],
+        )
+        .await;
+        let docker_host = format!("unix://{}", socket_path.display());
+        let connection =
+            EngineClient::connect_with_startup_environment(None, Some(docker_host)).await;
+        let requests = cleanup(&socket_path, server, &directory).await;
+
+        assert_eq!(requests, ["GET /version HTTP/1.1"]);
+        let error = match connection {
+            Ok(_) => panic!("incomplete version response must not establish a client"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, EngineError::MissingApiVersion { .. }));
+    }
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod container_inventory_api_tests {
