@@ -912,27 +912,27 @@ impl ComposeView {
     fn can_start_up(&self) -> bool {
         self.can_start_operation() && self.has_current_status_snapshot()
     }
-    fn can_request_service_restart(&self, service: &str) -> bool {
-        validate_service_selector(service).is_some()
-            && self.current_imported_selection_validated()
-            && matches!(&self.status, ComposeStatusState::Succeeded { .. })
+    fn can_request_service_operation(&self) -> bool {
+        self.current_imported_selection_validated()
+            && self.has_current_status_snapshot()
             && self.selected_profiles().is_ok()
             && matches!(&self.validation, ComposeValidationState::Succeeded { .. })
-            && self
-                .containers
-                .iter()
-                .any(|container| container.service == service)
             && !matches!(
                 &self.operation,
                 ComposeOperationState::Confirming(_) | ComposeOperationState::Running { .. }
             )
     }
+    fn can_request_service_restart(&self, service: &str) -> bool {
+        validate_service_selector(service).is_some()
+            && self.can_request_service_operation()
+            && self
+                .containers
+                .iter()
+                .any(|container| container.service == service)
+    }
     fn can_request_service_action(&self, service: &str, expected_state: &str) -> bool {
         validate_service_selector(service).is_some()
-            && self.current_imported_selection_validated()
-            && matches!(&self.status, ComposeStatusState::Succeeded { .. })
-            && self.selected_profiles().is_ok()
-            && matches!(&self.validation, ComposeValidationState::Succeeded { .. })
+            && self.can_request_service_operation()
             && self
                 .validated_services
                 .iter()
@@ -941,10 +941,6 @@ impl ComposeView {
                 .containers
                 .iter()
                 .any(|container| container.service == service && container.state == expected_state)
-            && !matches!(
-                &self.operation,
-                ComposeOperationState::Confirming(_) | ComposeOperationState::Running { .. }
-            )
     }
 
     pub(super) fn begin_status_refresh(
