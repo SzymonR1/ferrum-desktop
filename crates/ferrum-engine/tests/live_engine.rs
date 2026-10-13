@@ -8,7 +8,10 @@ use ferrum_engine::ContainerLogsOptions;
 #[cfg(target_os = "linux")]
 use std::{
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -466,7 +469,7 @@ async fn local_engine_lists_inspects_and_reads_history_for_preinstalled_image_re
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "pulls one uniquely tagged image from a loopback registry and removes only the verified test tag"]
+#[ignore = "probes a missing loopback manifest, pulls one generated image, and removes only its verified tag"]
 async fn local_engine_loopback_registry_pull_reports_progress_and_cleans_only_test_tag() {
     let contexts = EngineClient::available_contexts()
         .await
@@ -492,21 +495,64 @@ async fn local_engine_loopback_registry_pull_reports_progress_and_cleans_only_te
     let sequence = NEXT_IMAGE_PULL_NAME.fetch_add(1, Ordering::Relaxed);
     let nonce = format!("{}-{timestamp}-{sequence}", std::process::id());
     let image_repository = format!("ferrum-pull-smoke-{nonce}");
+    let missing_manifest_tag = format!("missing-{nonce}");
     let fixture = LivePullImageFixture::new(&nonce);
-    let registry = LoopbackRegistry::start(image_repository.clone(), fixture).await;
-    let image_reference = format!(
-        "127.0.0.1:{}/{}:progress",
-        registry.port(),
-        image_repository
-    );
+    let registry = LoopbackRegistry::start(
+        image_repository.clone(),
+        missing_manifest_tag.clone(),
+        fixture,
+    )
+    .await;
+    let registry_host = format!("127.0.0.1:{}", registry.port());
+    let image_reference = format!("{registry_host}/{image_repository}:progress");
+    let missing_manifest_reference =
+        format!("{registry_host}/{image_repository}:{missing_manifest_tag}");
 
     let before = engine
         .list_images()
         .await
         .expect("image inventory should be readable before the smoke");
     assert!(
-        !image_tag_is_present(&before, &image_reference),
-        "the generated image reference must be unused before pulling"
+        !image_tag_is_present(&before, &image_reference)
+            && !image_tag_is_present(&before, &missing_manifest_reference),
+        "the generated pull and probe references must be unused before the smoke"
+    );
+    let missing_manifest_rejected = match engine
+        .open_image_pull(&missing_manifest_reference, None)
+        .await
+    {
+        Err(_) => true,
+        Ok(mut stream) => {
+            let mut rejected = false;
+            loop {
+                match stream.next_progress().await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {
+                        rejected = true;
+                        break;
+                    }
+                }
+            }
+            rejected
+        }
+    };
+    assert!(
+        registry.missing_manifest_was_requested(),
+        "the Engine should request the intentionally missing fixture manifest"
+    );
+    assert!(
+        missing_manifest_rejected,
+        "the Engine should reject the intentionally missing manifest"
+    );
+    let images_after_probe = engine
+        .list_images()
+        .await
+        .expect("image inventory should be readable after the rejected probe");
+    assert!(
+        !image_tag_is_present(&images_after_probe, &missing_manifest_reference)
+            && !image_tag_is_present(&images_after_probe, &image_reference),
+        "the rejected probe must not create either generated image tag"
     );
 
     let mut stream = match engine.open_image_pull(&image_reference, None).await {
@@ -1542,11 +1588,16 @@ fn live_pull_layer(nonce: &str) -> Vec<u8> {
 struct LoopbackRegistry {
     port: u16,
     task: tokio::task::JoinHandle<()>,
+    missing_manifest_requested: Arc<AtomicBool>,
 }
 
 #[cfg(target_os = "linux")]
 impl LoopbackRegistry {
-    async fn start(image_repository: String, fixture: LivePullImageFixture) -> Self {
+    async fn start(
+        image_repository: String,
+        missing_manifest_tag: String,
+        fixture: LivePullImageFixture,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("the loopback registry should bind an ephemeral local port");
@@ -1554,16 +1605,33 @@ impl LoopbackRegistry {
             .local_addr()
             .expect("the loopback listener should have an address")
             .port();
+        let missing_manifest_requested = Arc::new(AtomicBool::new(false));
+        let handler_observed_manifest = Arc::clone(&missing_manifest_requested);
         let task = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
-                serve_loopback_registry_request(&mut stream, &image_repository, &fixture).await;
+                serve_loopback_registry_request(
+                    &mut stream,
+                    &image_repository,
+                    &missing_manifest_tag,
+                    &fixture,
+                    &handler_observed_manifest,
+                )
+                .await;
             }
         });
-        Self { port, task }
+        Self {
+            port,
+            task,
+            missing_manifest_requested,
+        }
     }
 
     fn port(&self) -> u16 {
         self.port
+    }
+
+    fn missing_manifest_was_requested(&self) -> bool {
+        self.missing_manifest_requested.load(Ordering::Relaxed)
     }
 }
 
@@ -1578,7 +1646,9 @@ impl Drop for LoopbackRegistry {
 async fn serve_loopback_registry_request(
     stream: &mut tokio::net::TcpStream,
     image_repository: &str,
+    missing_manifest_tag: &str,
     fixture: &LivePullImageFixture,
+    missing_manifest_requested: &AtomicBool,
 ) {
     let Some((method, raw_path)) = read_loopback_registry_request(stream).await else {
         return;
@@ -1596,7 +1666,24 @@ async fn serve_loopback_registry_request(
     }
 
     let manifest_prefix = format!("/v2/{image_repository}/manifests/");
-    if path.starts_with(&manifest_prefix) {
+    if let Some(requested_manifest) = path.strip_prefix(&manifest_prefix) {
+        if requested_manifest == missing_manifest_tag {
+            missing_manifest_requested.store(true, Ordering::Relaxed);
+        }
+        if requested_manifest != "progress"
+            && requested_manifest != fixture.manifest_digest.as_str()
+        {
+            write_loopback_registry_response(
+                stream,
+                &method,
+                "404 Not Found",
+                LOOPBACK_REGISTRY_NOT_FOUND,
+                "application/json",
+                None,
+            )
+            .await;
+            return;
+        }
         write_loopback_registry_response(
             stream,
             &method,
@@ -1722,6 +1809,16 @@ fn image_tag_is_present(images: &[ImageSummary], reference: &str) -> bool {
         .iter()
         .any(|image| image.repo_tags.iter().any(|tag| tag == reference))
 }
+#[cfg(target_os = "linux")]
+fn docker_remove_disposable_image_tag(
+    context_name: &str,
+    reference: &str,
+) -> std::io::Result<std::process::Output> {
+    Command::new("docker")
+        .args(["--context", context_name, "image", "rm", "--no-prune"])
+        .arg(reference)
+        .output()
+}
 
 #[cfg(target_os = "linux")]
 struct DisposableImageTag {
@@ -1749,16 +1846,7 @@ impl DisposableImageTag {
     }
 
     fn remove(&self) -> std::io::Result<std::process::Output> {
-        Command::new("docker")
-            .args([
-                "--context",
-                self.context_name.as_str(),
-                "image",
-                "rm",
-                "--no-prune",
-            ])
-            .arg(&self.reference)
-            .output()
+        docker_remove_disposable_image_tag(&self.context_name, &self.reference)
     }
 }
 
@@ -1769,16 +1857,7 @@ impl Drop for DisposableImageTag {
             let context_name = self.context_name.clone();
             let reference = self.reference.clone();
             run_cleanup_on_thread(move || {
-                let _ = Command::new("docker")
-                    .args([
-                        "--context",
-                        context_name.as_str(),
-                        "image",
-                        "rm",
-                        "--no-prune",
-                    ])
-                    .arg(reference)
-                    .output();
+                let _ = docker_remove_disposable_image_tag(&context_name, &reference);
             });
         }
     }

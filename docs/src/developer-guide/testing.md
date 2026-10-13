@@ -261,13 +261,14 @@ is an ignored Linux integration test for the Engine pull stream, not the Images
 page or credential-helper path. It requires the current Docker context to use a
 local Unix socket and the daemon's existing loopback-insecure-registry policy.
 The test starts an in-process OCI registry bound only to `127.0.0.1` on an
-ephemeral port and changes no daemon configuration. It preflights the generated
-repository:tag as absent, then requests an intentionally missing manifest to
-verify the daemon reaches the fixture without creating an image. Only then does
-it pull a generated, content-addressed OCI image and check for non-empty Engine
-status progress. It removes only the generated tag using
-`docker image rm --no-prune` without force. Cleanup is armed only after inventory
-confirms a full SHA-256 image ID and the sole generated tag; ownership
+ephemeral port and changes no daemon configuration. It preflights both generated
+references as absent, then asks the Engine to pull a separate intentionally
+missing manifest tag. The fixture confirms that request reached its missing-
+manifest handler, the Engine rejects it, and the image inventory remains
+unchanged. Only then does it pull a generated, content-addressed OCI image and
+check for non-empty Engine status progress. It removes only the generated tag
+using `docker image rm --no-prune` without force. Cleanup is armed only after
+inventory confirms a full SHA-256 image ID and the sole generated tag; ownership
 uncertainty causes no removal. No container, external registry, credentials,
 user image, daemon setting, or prune operation is used. A failed transfer can
 leave untagged blob data; the test never runs image prune.
@@ -853,11 +854,12 @@ tests use fixed image data and local state/events only; they never contact an
 engine or registry or mutate images.
 
 Pull presentation tests use fixed progress values. Tag, push, and removal tests
-use fake completion events and do not mutate image resources. No live pull,
-tag, removal, or registry-push operation is claimed. Push tests use fake
-sockets and headless UI state only; they do not mutate images or contact a
-registry. Tests must not pull, tag, push, delete, or otherwise mutate user
-images or engines.
+use fake completion events and do not mutate image resources. The separate
+live smoke is an Engine-level anonymous pull with exact-tag cleanup; it does
+not exercise Ferrum's UI. No live Ferrum UI pull, tag/removal, or registry-push
+operation is claimed. Push tests use fake sockets and headless UI state only;
+they do not mutate images or contact a registry. Tests must not pull, tag, push,
+delete, or otherwise mutate user images or engines.
 
 Engine image pull, push, tag, removal, and history contract tests use fake Unix
 sockets, not a Docker engine or registry. Tag cases cover encoded request

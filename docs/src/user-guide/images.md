@@ -1,6 +1,6 @@
 # Images
 
-**Status:** Linux local Docker Unix-socket image listing/inspection and bounded read-only layer history, anonymous-by-default pulls and pushes with explicit per-operation Secret Service/pass helper authentication, local tagging/removal, and confirmed local Buildx builds. An opt-in read-only history smoke passed on Docker Engine 29.9.0/API 1.56. No live helper-authenticated pull/push, registry push, tag, removal, or build integration was performed or validated; no image mutation is claimed. Native Images-page visual validation remains unverified.
+**Status:** Linux local Docker Unix-socket image listing/inspection and bounded read-only layer history, anonymous-by-default pulls and pushes with explicit per-operation Secret Service/pass helper authentication, local tagging/removal, and confirmed local Buildx builds are implemented. One opt-in live smoke verified an anonymous Engine pull from an in-process loopback registry and exact cleanup of its generated tag on Docker Engine 29.9.0/API 1.56. No live helper-authenticated pull/push, external registry push, Ferrum UI tag/removal/build, or native Images-page visual validation is claimed.
 
 Open **Images** in the sidebar to view images returned by the connected local
 Docker engine. Search is case-insensitive across repository tags and image IDs.
