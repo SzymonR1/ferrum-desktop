@@ -105,6 +105,9 @@ Terminal exec-open records use `terminal_exec/exec` with static `started`,
 before Engine submission; if it cannot be written, exec is not submitted.
 Shell/command, terminal input/output, raw Engine errors, credentials, paths, and
 endpoints are never recorded.
+If cancellation or shutdown interrupts an in-flight open, only `started` may
+remain; the absence of a final outcome does not prove whether the Engine began
+a shell.
 
 A Compose lifecycle entry contains only the static `compose_mutation` event,
 `start`/`stop`/`restart`/`pause`/`unpause`/`up` action, and `started`,

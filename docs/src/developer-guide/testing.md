@@ -226,6 +226,12 @@ to an exact child-test process; the parent uses the shared subprocess lock, a
 private temporary directory, and bounded fake-server reads/accepts so parallel
 test threads do not observe environment mutation or contact a host Engine. This
 is partial Issue #19 coverage, not full audit completion.
+
+The fake Engine tests do not exercise cancellation during an in-flight open.
+If cancellation or shutdown aborts the worker after the `started` record but
+before a final outcome, that record may be the only durable event and the
+final Engine state is unknown.
+
 Settings tests cover missing/corrupt settings, file-symlink rejection without
 changing target permissions, non-regular and hard-linked file rejection, and
 refusal to chmod or write through symlinked settings directories. The hard-link

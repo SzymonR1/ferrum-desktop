@@ -82,6 +82,9 @@ and produces a static UI failure.
   the already-observed Engine/UI result for an already-submitted action remains
   unchanged. A terminal exec whose `started` record cannot be persisted is not
   submitted and instead produces a static UI failure.
+- Cancellation or shutdown while an exec-open request is in flight may leave
+  only its `started` record; that records an attempt, not whether the Engine
+  began a shell.
 - Only validated full IDs already available to the mutation trace may appear;
   no names or other resource descriptors are included.
 - This is a partial Issue #19 slice. Issues #19 and #17 remain open/ready; #10
