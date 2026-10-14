@@ -8154,10 +8154,9 @@ mod event_reconciliation_tests {
             );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while app.terminal_notice.is_none() {
-                app.runtime
-                    .block_on(async {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    });
+                app.runtime.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                });
                 app.receive_terminal_opened();
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -8236,10 +8235,9 @@ mod event_reconciliation_tests {
             );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while app.terminal.is_none() {
-                app.runtime
-                    .block_on(async {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    });
+                app.runtime.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                });
                 app.receive_terminal_opened();
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -8340,10 +8338,9 @@ mod event_reconciliation_tests {
             );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while app.terminal_notice.is_none() {
-                app.runtime
-                    .block_on(async {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    });
+                app.runtime.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                });
                 app.receive_terminal_opened();
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -8378,7 +8375,6 @@ mod event_reconciliation_tests {
             loop {
                 match listener.accept() {
                     Ok(_) => {
-                        accepted_count += 1;
                         return true;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
