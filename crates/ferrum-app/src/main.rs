@@ -5939,7 +5939,6 @@ mod event_reconciliation_tests {
         expected_request: &str,
         accepted_count: &mut usize,
     ) -> std::os::unix::net::UnixStream {
-
         let listener_path = listener
             .local_addr()
             .unwrap()
@@ -5976,9 +5975,7 @@ mod event_reconciliation_tests {
         use std::os::unix::fs::FileTypeExt;
 
         let metadata = std::fs::symlink_metadata(path).unwrap_or_else(|error| {
-            panic!(
-                "{side} fake Engine socket path is unavailable: path={path:?}, error={error}"
-            )
+            panic!("{side} fake Engine socket path is unavailable: path={path:?}, error={error}")
         });
         let is_socket = metadata.file_type().is_socket();
         eprintln!(
@@ -6012,7 +6009,6 @@ mod event_reconciliation_tests {
     ) {
         use std::process::{Command, Stdio};
 
-        let _subprocess_guard = crate::TEST_SUBPROCESS_LOCK.blocking_lock();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", test_name, "--nocapture"])
@@ -8176,20 +8172,16 @@ mod event_reconciliation_tests {
                 "sentinel-shell".to_owned(),
                 egui::Context::default(),
             );
-            let runtime = app.runtime.handle().clone();
-            runtime.block_on(async {
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    loop {
-                        app.receive_terminal_opened();
-                        if app.terminal_notice.is_some() {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                })
-                .await
-                .expect("safe terminal error should be delivered");
-            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while app.terminal_notice.is_none() {
+                app.runtime
+                    .block_on(tokio::time::sleep(std::time::Duration::from_millis(1)));
+                app.receive_terminal_opened();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "safe terminal error should be delivered"
+                );
+            }
             let audit = std::fs::read_to_string(config_home.join("ferrum/audit.jsonl")).unwrap();
             assert!(audit.contains("\"outcome\":\"started\""));
             assert!(audit.contains("\"outcome\":\"request_error\""));
@@ -8209,6 +8201,7 @@ mod event_reconciliation_tests {
             return;
         }
 
+        let _subprocess_guard = crate::TEST_SUBPROCESS_LOCK.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("engine.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -8222,8 +8215,7 @@ mod event_reconciliation_tests {
             terminal_write_version_response(&mut version);
             drop(version);
 
-            let mut exec =
-                terminal_accept(&listener, "exec create", &mut accepted_count);
+            let mut exec = terminal_accept(&listener, "exec create", &mut accepted_count);
             let audit =
                 std::fs::read_to_string(audit_path).expect("started audit must precede exec");
             assert!(audit.contains("\"event\":\"terminal_exec\""));
@@ -8261,20 +8253,16 @@ mod event_reconciliation_tests {
                 "sentinel-shell".to_owned(),
                 egui::Context::default(),
             );
-            let runtime = app.runtime.handle().clone();
-            runtime.block_on(async {
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    loop {
-                        app.receive_terminal_opened();
-                        if app.terminal.is_some() {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                })
-                .await
-                .expect("successful terminal open should be delivered");
-            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while app.terminal.is_none() {
+                app.runtime
+                    .block_on(tokio::time::sleep(std::time::Duration::from_millis(1)));
+                app.receive_terminal_opened();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "successful terminal open should be delivered"
+                );
+            }
             app.terminal
                 .as_ref()
                 .and_then(|terminal| terminal.input.as_ref())
@@ -8305,6 +8293,7 @@ mod event_reconciliation_tests {
             return;
         }
 
+        let _subprocess_guard = crate::TEST_SUBPROCESS_LOCK.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("engine.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -8318,8 +8307,7 @@ mod event_reconciliation_tests {
             terminal_write_version_response(&mut version);
             drop(version);
 
-            let mut create =
-                terminal_accept(&listener, "exec create", &mut accepted_count);
+            let mut create = terminal_accept(&listener, "exec create", &mut accepted_count);
             let started = std::fs::read_to_string(server_root.join("ferrum/audit.jsonl"))
                 .expect("started audit record must precede exec creation");
             assert!(started.contains("\"outcome\":\"started\""));
@@ -8329,8 +8317,7 @@ mod event_reconciliation_tests {
                 .unwrap();
             drop(create);
 
-            let mut start =
-                terminal_accept(&listener, "exec start", &mut accepted_count);
+            let mut start = terminal_accept(&listener, "exec start", &mut accepted_count);
             let _ = terminal_http_request(&mut start);
             start
                 .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
@@ -8369,20 +8356,16 @@ mod event_reconciliation_tests {
                 "sentinel-shell".to_owned(),
                 egui::Context::default(),
             );
-            let runtime = app.runtime.handle().clone();
-            runtime.block_on(async {
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    loop {
-                        app.receive_terminal_opened();
-                        if app.terminal_notice.is_some() {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                })
-                .await
-                .expect("static audit failure should be delivered");
-            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while app.terminal_notice.is_none() {
+                app.runtime
+                    .block_on(tokio::time::sleep(std::time::Duration::from_millis(1)));
+                app.receive_terminal_opened();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "static audit failure should be delivered"
+                );
+            }
             assert_eq!(
                 app.terminal_notice.as_deref(),
                 Some(
@@ -8393,6 +8376,7 @@ mod event_reconciliation_tests {
             return;
         }
 
+        let _subprocess_guard = crate::TEST_SUBPROCESS_LOCK.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let blocker = root.path().join("not-a-directory");
         std::fs::write(&blocker, b"block").unwrap();
