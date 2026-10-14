@@ -8169,7 +8169,7 @@ mod event_reconciliation_tests {
             let mut version = terminal_accept(&listener);
             let _ = terminal_http_request(&mut version);
             version
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"ApiVersion\":\"1.52\"}")
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{\"Version\":\"29.9.0\",\"ApiVersion\":\"1.52\"}")
                 .unwrap();
             drop(version);
 
@@ -8261,7 +8261,7 @@ mod event_reconciliation_tests {
             let mut version = terminal_accept(&listener);
             let _ = terminal_http_request(&mut version);
             version
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"ApiVersion\":\"1.52\"}")
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{\"Version\":\"29.9.0\",\"ApiVersion\":\"1.52\"}")
                 .unwrap();
             drop(version);
 
@@ -8346,7 +8346,7 @@ mod event_reconciliation_tests {
             let mut version = terminal_accept(&listener);
             let _ = terminal_http_request(&mut version);
             version
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"ApiVersion\":\"1.52\"}")
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{\"Version\":\"29.9.0\",\"ApiVersion\":\"1.52\"}")
                 .unwrap();
             drop(version);
 
