@@ -15,9 +15,10 @@ unchanged.
 ## Decision
 
 Add a separate, bounded Linux-local JSONL sink for Ferrum-initiated outcomes
-from container lifecycle, image pull/push/tag/removal and Buildx image builds,
-volume create/removal, network create/removal/connect/disconnect operations,
-and embedded terminal exec opens. Store it as `audit.jsonl`
+from container lifecycle; confirmed Compose start/stop/restart/pause/unpause,
+one-service scale, `up`, pull, and build; image pull/push/tag/removal and
+Buildx image builds; volume create/removal; network create/removal/connect/
+disconnect; and embedded terminal exec opens. Store it as `audit.jsonl`
 in the same descriptor-anchored private Ferrum configuration directory used by
 settings, and open it lazily on the first supported record. Require a `0700`
 directory and a regular `0600` file. Do not follow symlink targets or accept
@@ -90,9 +91,8 @@ and produces a static UI failure.
   began a shell.
 - Only validated full IDs already available to the mutation trace may appear;
   no names or other resource descriptors are included.
-- This is a partial Issue #19 slice. Issues #19 and #17 remain open/ready; #10
-  remains open/blocked for Podman/rootless behavior and broader endpoint
-  validation. No release or support for other endpoints or platforms is
-  claimed.
+- This is a partial Issue #19 slice. Issue #19 remains open; issue #10 remains
+  open/blocked for Podman/rootless behavior and broader endpoint validation.
+  No release or support for other endpoints or platforms is claimed.
 - Existing UI safety constraints and native visual-validation limitations
   remain unchanged.

@@ -560,14 +560,16 @@ store but does not build or change project containers, networks, or volumes.
   errors, or daemon bodies. A `request_error` does not prove that engine state
   remained unchanged; the durable copy is described below.
 
-- Maintain a Linux-local bounded JSONL copy of Ferrum-originated mutation
-  outcomes for container lifecycle, image pull/push/tag/removal and Buildx
-  image builds, volume create/removal, and network
-  create/removal/connect/disconnect. Lazily create `audit.jsonl` in the
-  descriptor-anchored Ferrum config directory, with directory mode `0700` and
-  file mode `0600`. Schema v1 contains a timestamp, static event/action/outcome,
-  and validated full resource IDs only where existing traces permit. A build
-  record contains only static `image_mutation` / `build` and outcome fields;
+- Maintain a Linux-local bounded JSONL copy of Ferrum-originated audit
+  outcomes for container lifecycle; confirmed Compose start/stop/restart/
+  pause/unpause, one-service scale, `up`, pull, and build; image pull/push/tag/
+  removal and Buildx image builds; volume create/removal; network create/
+  removal/connect/disconnect; and embedded terminal exec opens.
+  `audit.jsonl` is created lazily in the descriptor-anchored Ferrum config
+  directory with mode `0700` and file mode `0600`. Schema v1 contains a
+  timestamp, static event/action/outcome, and validated full resource IDs only
+  where existing traces permit. A build record contains only static
+  `image_mutation` / `build` and outcome fields;
   build output and build-specific metadata are never persisted. Exclude names,
   image references/tags, endpoints, credentials, raw errors, daemon bodies, and
   terminal/log contents. Sync each record; enforce a 16 MiB hard cap without

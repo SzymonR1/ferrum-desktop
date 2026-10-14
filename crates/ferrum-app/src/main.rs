@@ -1211,7 +1211,6 @@ impl FerrumApp {
         self.terminal_notice = None;
         let sender = self.terminal_open_sender.clone();
         let audit_store = self.audit_store.clone();
-        let start_container_id = container_id.clone();
         self.terminal_open_task = Some(self.runtime.spawn(async move {
             if let Err(error) = audit_store
                 .persist(audit::record_terminal_exec_started(&container_id))
@@ -1237,7 +1236,7 @@ impl FerrumApp {
             let session = engine.open_exec_session(&container_id, &command, size).await;
             persist_audit_record(
                 &audit_store,
-                audit::record_terminal_exec_result(&start_container_id, session.is_ok()),
+                audit::record_terminal_exec_result(&container_id, session.is_ok()),
             )
             .await;
             let session = match session {
