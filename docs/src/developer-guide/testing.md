@@ -159,26 +159,29 @@ Explicit cancel and page/context invalidation tests assert static
 The optional ignored live test preflights that a unique generated project and
 its default network are unused, then scales the profile-gated `scale-probe`
 service up to exactly two replicas and down to one. A same-profile sibling
-service verifies that explicit target activation does not start siblings. It
-uses an already-installed `FERRUM_TEST_IMAGE` with `/bin/sleep`, no host mounts
-or published ports, and requests no pull or build. Read-only inventory/status
-and generated-project cleanup may use `--profile '*'`; scale mutations never
-do. A scoped cleanup runs `compose down` only with the generated project name,
-directory, and known Compose file; it does not force-remove, prune, or remove
-volumes:
+service verifies that explicit target activation does not start siblings. The
+smoke then invokes the production project `Stop` and `Start` worker with only
+the `scale-check` profile selected, verifying the sole target container is
+`exited` after Stop and `running` after Start while the sibling remains absent.
+It uses an already-installed `FERRUM_TEST_IMAGE` with `/bin/sleep`, no host
+mounts or published ports, and requests no pull or build. Read-only
+inventory/status and generated-project cleanup may use `--profile '*'`; scale
+mutations never do. A scoped cleanup runs `compose down` only with the
+generated project name, directory, and known Compose file; it does not
+force-remove, prune, or remove volumes:
 
 ```sh
 env -u DOCKER_HOST DOCKER_CONTEXT=default FERRUM_TEST_IMAGE=ghcr.io/catthehacker/ubuntu:rust-latest cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_service_scale_scales_and_cleans_only_verified_project -- --exact --ignored
 ```
 
-The test passed on 2026-10-13 against Fedora Linux 44 x86_64, Docker Engine
-29.9.0/API 1.56, and Compose v5.6.0 via the local `default` Unix-socket
-context: one test passed, the target reached two replicas and downscaled to one,
-the same-profile sibling remained absent, and scoped cleanup succeeded with no
-generated-project containers left. This is one Linux local Docker smoke, not
-general engine/platform support. Do not run it against an Engine containing
-valuable resources; it remains opt-in and touches only its preflighted,
-uniquely named generated project.
+The prior scale-only version passed on 2026-10-13 against Fedora Linux 44
+x86_64, Docker Engine 29.9.0/API 1.56, and Compose v5.6.0 via the local
+`default` Unix-socket context. That run verified scale-up/down, sibling
+absence, and scoped cleanup; it did not exercise the newly added Stop/Start
+checks. This opt-in smoke covers only this local Docker Engine path: it does
+not establish UI, Podman, remote, Windows, macOS, or full Issue #18 acceptance.
+Do not run it against an Engine containing valuable resources; it touches only
+its preflighted, uniquely named generated project.
 
 ## Compose up with local images
 
