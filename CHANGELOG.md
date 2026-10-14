@@ -3,6 +3,22 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Added an ignored Linux FerrumApp image-helper/consent live smoke, isolated in
+  a child test process pinned to the exact current local Docker Unix socket with
+  private HOME/XDG/PATH and cleared Docker context/TLS/cert/config overrides.
+  It loads `SecretService` from a private SettingsStore and drives the production
+  Images view and pull worker with headless egui/AccessKit. The first unchecked
+  pull uses a generated missing reference and must be rejected by the loopback
+  registry without invoking the helper or importing an image; explicit
+  per-pull consent then invokes only the private fake helper with synthetic
+  nonce credentials, verifies the exact synthetic Basic authorization and
+  imports the generated image through the real Engine. It preflights both
+  references absent and removes only the image whose full SHA-256 ID has the
+  generated target as its sole tag, using the same socket, bounded
+  `--no-prune`, and no force; ambiguity leaves it for manual inspection. The
+  default suite remains Engine-free. This narrow slice excludes production
+  credentials, real helper binaries, external TLS registries, UI visual
+  validation, and broader Engine support; Issues #16 and #19 remain open.
 - Added static local audit records for embedded terminal exec opens. The
   existing bounded, private JSONL store durably syncs `terminal_exec/exec/started`
   before an exec request; if that write fails, the request is not submitted and

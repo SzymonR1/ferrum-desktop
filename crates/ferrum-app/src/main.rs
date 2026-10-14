@@ -9011,6 +9011,396 @@ mod event_reconciliation_tests {
         assert_eq!(app.containers[0].state, Some(ContainerState::Running));
     }
     #[cfg(target_os = "linux")]
+    const IMAGE_CONSENT_CHILD_ENV: &str = "FERRUM_IMAGE_CONSENT_SMOKE_CHILD";
+
+    #[cfg(target_os = "linux")]
+    fn image_consent_child_token() -> Option<String> {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+        let token = std::env::var(IMAGE_CONSENT_CHILD_ENV).ok()?;
+        assert!(
+            token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "image-consent child marker must be a fresh 256-bit hex nonce"
+        );
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("private HOME"));
+        assert_eq!(
+            std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let host = std::env::var("DOCKER_HOST").expect("pinned DOCKER_HOST");
+        let socket = std::path::PathBuf::from(
+            host.strip_prefix("unix://")
+                .expect("child Engine must use the exact Unix socket"),
+        );
+        let metadata = std::fs::symlink_metadata(&socket).expect("pinned socket exists");
+        assert!(metadata.file_type().is_socket());
+        assert!(
+            !socket.as_os_str().is_empty()
+                && std::env::var_os("DOCKER_CONTEXT").is_none()
+                && std::env::var_os("DOCKER_CERT_PATH").is_none()
+                && std::env::var_os("DOCKER_TLS").is_none()
+                && std::env::var_os("DOCKER_TLS_VERIFY").is_none()
+                && std::env::var_os("DOCKER_CONFIG").is_none()
+                && std::env::var_os("DOCKER_API_VERSION").is_none()
+                && std::env::var_os("DOCKER_CUSTOM_HEADERS").is_none()
+                && std::env::var_os("DOCKER_DEFAULT_PLATFORM").is_none()
+                && std::env::var_os("DOCKER_AUTH_CONFIG").is_none(),
+            "child Engine endpoint/config overrides must be isolated"
+        );
+        assert_eq!(
+            std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from),
+            Some(home.clone())
+        );
+        for variable in ["XDG_DATA_HOME", "XDG_CACHE_HOME"] {
+            let directory =
+                std::path::PathBuf::from(std::env::var_os(variable).expect("private XDG location"));
+            assert!(directory.starts_with(&home), "{variable} must stay private");
+        }
+        let path_entries: Vec<_> =
+            std::env::split_paths(&std::env::var_os("PATH").expect("private PATH")).collect();
+        assert_eq!(
+            path_entries.len(),
+            2,
+            "child PATH must contain only fake helper and Docker CLI directories"
+        );
+        assert_eq!(path_entries[0], home.join("helper-bin"));
+        assert!(path_entries[1].join("docker").is_file());
+        let settings_path = std::path::PathBuf::from(
+            std::env::var_os("FERRUM_IMAGE_CONSENT_SETTINGS").expect("private SettingsStore path"),
+        );
+        assert!(settings_path.starts_with(&home));
+        Some(token)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_image_helper_consent_child(token: &str) {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use egui::accesskit::Role;
+        use egui_kittest::{Harness, kittest::Queryable};
+        use ferrum_test_support::{DisposableImageTag, LivePullImageFixture, LoopbackRegistry};
+        use zeroize::Zeroizing;
+
+        let root = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let settings_path =
+            std::path::PathBuf::from(std::env::var_os("FERRUM_IMAGE_CONSENT_SETTINGS").unwrap());
+        let settings_store = Arc::new(settings::SettingsStore::at(settings_path));
+        let (settings, warning) = settings_store.load();
+        assert!(warning.is_none());
+        assert_eq!(
+            settings.registry_credential_helper,
+            settings::RegistryCredentialHelper::SecretService
+        );
+        let repository = format!("ferrum-image-consent-{token}");
+        let missing_tag = format!("missing-{token}");
+        let username = Zeroizing::new(format!("ferrum-{token}"));
+        let secret = Zeroizing::new(format!("synthetic-{token}"));
+        let payload = Zeroizing::new(format!("{}:{}", username.as_str(), secret.as_str()));
+        let encoded = Zeroizing::new(STANDARD.encode(payload.as_bytes()));
+        let expected_auth = Zeroizing::new(format!("Basic {}", encoded.as_str()));
+        let (mut app, _) = app_with_open_inspection();
+        app.settings_store = Arc::clone(&settings_store);
+        app.settings = settings;
+        app.audit_store = audit::AuditStore::new(Arc::clone(&settings_store));
+        let registry = app.runtime.block_on(LoopbackRegistry::start(
+            repository.clone(),
+            token.to_owned(),
+            missing_tag.clone(),
+            LivePullImageFixture::new(token),
+            Some(expected_auth),
+        ));
+        let host = format!("127.0.0.1:{}", registry.port());
+        let target_reference = format!("{host}/{repository}:{token}");
+        let opt_out_reference = format!("{host}/{repository}:{missing_tag}");
+        let response = format!(
+            "{{\"ServerURL\":\"{host}\",\"Username\":\"{}\",\"Secret\":\"{}\"}}",
+            username.as_str(),
+            secret.as_str()
+        );
+        let helper_dir = root.join("helper-bin");
+        let helper = registry_auth::tests::FakeHelper::new_named_at(
+            &response,
+            &helper_dir,
+            "docker-credential-secretservice",
+            None,
+        );
+
+        let engine = app
+            .runtime
+            .block_on(EngineClient::connect_default())
+            .expect("child should connect only to its pinned local Unix socket");
+        assert_eq!(
+            engine.local_socket_path(),
+            std::path::Path::new(
+                std::env::var("DOCKER_HOST")
+                    .unwrap()
+                    .strip_prefix("unix://")
+                    .unwrap()
+            )
+        );
+        app.engine = Some(engine.clone());
+
+        let before = app.runtime.block_on(engine.list_images()).unwrap();
+        let initial_image_ids: std::collections::HashSet<_> =
+            before.iter().map(|image| image.id.clone()).collect();
+        assert!(!before.iter().any(|image| {
+            image
+                .repo_tags
+                .iter()
+                .any(|tag| tag == &target_reference || tag == &opt_out_reference)
+        }));
+        assert!(
+            !helper.input.exists(),
+            "fake helper must not run before consent"
+        );
+
+        let mut harness = Harness::new_ui_state(
+            |ui, app: &mut FerrumApp| {
+                let context = ui.ctx().clone();
+                app.receive_events(context);
+                app.draw_images(ui);
+            },
+            app,
+        );
+        harness
+            .state_mut()
+            .images
+            .set_pull_reference(opt_out_reference.clone());
+        let load_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !harness.state().images.has_loaded() {
+            harness.step();
+            harness.state_mut().runtime.block_on(async {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            });
+            assert!(
+                std::time::Instant::now() < load_deadline,
+                "image view inventory load timed out"
+            );
+        }
+        harness
+            .get_by_role_and_label(Role::Button, "Pull image")
+            .click_accesskit();
+        harness.step();
+        let opt_out_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while harness.state().images.is_pulling() {
+            harness.step();
+            harness.state_mut().runtime.block_on(async {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            });
+            assert!(
+                std::time::Instant::now() < opt_out_deadline,
+                "anonymous opt-out pull timed out"
+            );
+        }
+        assert!(registry.unauthorized_request_was_observed());
+        assert!(registry.missing_manifest_was_requested());
+        assert!(!registry.valid_authorization_was_observed());
+        assert!(
+            !helper.input.exists(),
+            "opt-out pull must not invoke the configured helper"
+        );
+        let after_opt_out = harness
+            .state()
+            .runtime
+            .block_on(engine.list_images())
+            .expect("post-opt-out inventory");
+        assert!(!after_opt_out.iter().any(|image| {
+            image
+                .repo_tags
+                .iter()
+                .any(|tag| tag == &target_reference || tag == &opt_out_reference)
+        }));
+        assert!(
+            after_opt_out
+                .iter()
+                .all(|image| initial_image_ids.contains(image.id.as_str())),
+            "unchecked pull must not import any new image ID"
+        );
+
+        harness
+            .state_mut()
+            .images
+            .set_pull_reference(target_reference.clone());
+        harness
+            .get_by_role_and_label(
+                Role::CheckBox,
+                "Use the configured credential helper for this pull only",
+            )
+            .click_accesskit();
+        harness.step();
+        harness
+            .get_by_role_and_label(Role::Button, "Pull image")
+            .click_accesskit();
+        harness.step();
+        let pull_deadline = std::time::Instant::now() + Duration::from_secs(45);
+        while !harness.state().images.is_pull_complete() {
+            harness.step();
+            harness.state_mut().runtime.block_on(async {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            });
+            assert!(
+                std::time::Instant::now() < pull_deadline,
+                "authenticated app pull did not complete"
+            );
+        }
+        let images = harness
+            .state()
+            .runtime
+            .block_on(engine.list_images())
+            .expect("post-pull inventory");
+        let matching: Vec<_> = images
+            .iter()
+            .filter(|image| image.repo_tags.iter().any(|tag| tag == &target_reference))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "generated target must be imported exactly once"
+        );
+        let mut cleanup = DisposableImageTag::new(
+            engine.local_socket_path().to_owned(),
+            target_reference.clone(),
+        );
+        assert!(
+            cleanup.arm_if_verified(&matching[0].id, &matching[0].repo_tags),
+            "only a full-ID image with the target as its sole tag may be cleaned"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&helper.input)
+                .expect("selected fake helper invocation evidence"),
+            format!("{host}\n")
+        );
+        assert!(registry.valid_authorization_was_observed());
+        assert!(
+            cleanup.remove().unwrap().success(),
+            "verified generated image removal"
+        );
+        let remaining = harness
+            .state()
+            .runtime
+            .block_on(engine.list_images())
+            .unwrap();
+        assert!(
+            !remaining
+                .iter()
+                .any(|image| { image.repo_tags.iter().any(|tag| tag == &target_reference) })
+        );
+        cleanup.disarm();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "only launched by the image-helper consent parent fixture"]
+    fn image_helper_consent_smoke_child_entry() {
+        let Some(token) = image_consent_child_token() else {
+            return;
+        };
+        run_image_helper_consent_child(&token);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a disposable current local Docker Unix Engine configured for loopback insecure-registry pulls; synthetic fake-helper credentials only"]
+    fn real_engine_image_helper_consent_smoke() {
+        use std::{io::Read, os::unix::fs::PermissionsExt};
+
+        let _subprocess_guard = crate::TEST_SUBPROCESS_LOCK.blocking_lock();
+        let (parent_app, _) = app_with_open_inspection();
+        let (engine, _) = parent_app.runtime.block_on(local_terminal_smoke_engine());
+        let socket = engine.local_socket_path().to_owned();
+        let socket_uri = format!(
+            "unix://{}",
+            socket
+                .to_str()
+                .expect("current local Engine socket path should be UTF-8")
+        );
+        let root = tempfile::tempdir().expect("private smoke root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut random = [0u8; 32];
+        std::fs::File::open("/dev/urandom")
+            .unwrap()
+            .read_exact(&mut random)
+            .unwrap();
+        let token = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let store = settings::SettingsStore::at(root.path().join("settings.toml"));
+        let mut saved_settings = settings::Settings::default();
+        saved_settings.registry_credential_helper =
+            settings::RegistryCredentialHelper::SecretService;
+        store
+            .save(&saved_settings)
+            .expect("private SettingsStore should select Secret Service");
+        let child = std::env::current_exe().unwrap();
+        let mut command = std::process::Command::new(child);
+        let docker_bin = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .find(|directory| directory.join("docker").is_file())
+            .expect("Docker CLI executable directory should be available");
+        let helper_bin = root.path().join("helper-bin");
+        std::fs::create_dir(&helper_bin).unwrap();
+        std::fs::set_permissions(&helper_bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        command
+            .args([
+                "--exact",
+                "event_reconciliation_tests::image_helper_consent_smoke_child_entry",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(IMAGE_CONSENT_CHILD_ENV, &token)
+            .env("DOCKER_HOST", &socket_uri)
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path())
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env(
+                "FERRUM_IMAGE_CONSENT_SETTINGS",
+                root.path().join("settings.toml"),
+            )
+            .env(
+                "PATH",
+                std::env::join_paths([&helper_bin, &docker_bin]).unwrap(),
+            )
+            .env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_CERT_PATH")
+            .env_remove("DOCKER_TLS")
+            .env_remove("DOCKER_TLS_VERIFY")
+            .env_remove("DOCKER_CONFIG")
+            .env_remove("DOCKER_API_VERSION")
+            .env_remove("DOCKER_CUSTOM_HEADERS")
+            .env_remove("DOCKER_DEFAULT_PLATFORM")
+            .env_remove("DOCKER_AUTH_CONFIG")
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+        let mut process = command.spawn().expect("smoke child should start");
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        let status = loop {
+            if let Some(status) = process.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = process.kill();
+                let _ = process.wait();
+                panic!("image-consent child exceeded its three-minute bound");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(status.success(), "image-consent child failed: {status}");
+        let helper_response_metadata = std::fs::metadata(
+            root.path()
+                .join("helper-bin/docker-credential-secretservice.response"),
+        )
+        .expect("child fake helper response should exist");
+        let helper_input_metadata = std::fs::metadata(
+            root.path()
+                .join("helper-bin/docker-credential-secretservice.input"),
+        )
+        .expect("child fake helper invocation evidence should exist");
+        assert_eq!(helper_input_metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(helper_response_metadata.permissions().mode() & 0o777, 0o600);
+        assert!(helper_response_metadata.len() > 0);
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "only launched by the terminal audit parent fixture"]
     fn terminal_audit_child_entry() {

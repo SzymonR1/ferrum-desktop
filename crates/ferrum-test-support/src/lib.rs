@@ -145,6 +145,7 @@ pub struct LoopbackRegistry {
     task: tokio::task::JoinHandle<()>,
     missing_manifest_requested: Arc<AtomicBool>,
     valid_authorization_observed: Arc<AtomicBool>,
+    unauthorized_request_observed: Arc<AtomicBool>,
 }
 
 #[cfg(target_os = "linux")]
@@ -189,6 +190,7 @@ impl LoopbackRegistry {
             .port();
         let missing_manifest_requested = Arc::new(AtomicBool::new(false));
         let valid_authorization_observed = Arc::new(AtomicBool::new(false));
+        let unauthorized_request_observed = Arc::new(AtomicBool::new(false));
         let registry_state = LoopbackRegistryState {
             image_repository,
             image_tag,
@@ -196,6 +198,7 @@ impl LoopbackRegistry {
             fixture,
             missing_manifest_requested: Arc::clone(&missing_manifest_requested),
             valid_authorization_observed: Arc::clone(&valid_authorization_observed),
+            unauthorized_request_observed: Arc::clone(&unauthorized_request_observed),
             expected_authorization,
         };
         let task = tokio::spawn(async move {
@@ -208,6 +211,7 @@ impl LoopbackRegistry {
             task,
             missing_manifest_requested,
             valid_authorization_observed,
+            unauthorized_request_observed,
         }
     }
 
@@ -224,6 +228,10 @@ impl LoopbackRegistry {
     /// Reports whether exact synthetic Basic authorization was observed.
     pub fn valid_authorization_was_observed(&self) -> bool {
         self.valid_authorization_observed.load(Ordering::Relaxed)
+    }
+    /// Reports that a request without the expected synthetic authorization was rejected.
+    pub fn unauthorized_request_was_observed(&self) -> bool {
+        self.unauthorized_request_observed.load(Ordering::Relaxed)
     }
 }
 
@@ -391,6 +399,7 @@ struct LoopbackRegistryState {
     fixture: LivePullImageFixture,
     missing_manifest_requested: Arc<AtomicBool>,
     valid_authorization_observed: Arc<AtomicBool>,
+    unauthorized_request_observed: Arc<AtomicBool>,
     expected_authorization: Option<zeroize::Zeroizing<String>>,
 }
 
@@ -405,6 +414,7 @@ async fn serve_loopback_registry_request(
     let fixture = &state.fixture;
     let missing_manifest_requested = &state.missing_manifest_requested;
     let valid_authorization_observed = &state.valid_authorization_observed;
+    let unauthorized_request_observed = &state.unauthorized_request_observed;
     let expected_authorization = state
         .expected_authorization
         .as_ref()
@@ -413,30 +423,34 @@ async fn serve_loopback_registry_request(
     else {
         return;
     };
-    if let Some(expected) = expected_authorization {
-        if authorization.as_deref().map(String::as_str) != Some(expected) {
-            write_loopback_registry_unauthorized(stream).await;
-            return;
-        }
-        valid_authorization_observed.store(true, Ordering::Relaxed);
-    }
     let path = raw_path
         .split('?')
         .next()
         .unwrap_or(&raw_path)
         .replace("%3A", ":")
         .replace("%3a", ":");
+    let manifest_prefix = format!("/v2/{image_repository}/manifests/");
+    if path
+        .strip_prefix(&manifest_prefix)
+        .is_some_and(|tag| tag == missing_manifest_tag)
+    {
+        missing_manifest_requested.store(true, Ordering::Relaxed);
+    }
+    if let Some(expected) = expected_authorization {
+        if authorization.as_deref().map(String::as_str) != Some(expected) {
+            unauthorized_request_observed.store(true, Ordering::Relaxed);
+            write_loopback_registry_unauthorized(stream).await;
+            return;
+        }
+        valid_authorization_observed.store(true, Ordering::Relaxed);
+    }
     if matches!(path.as_str(), "/v2" | "/v2/") {
         write_loopback_registry_response(stream, &method, "200 OK", b"", "application/json", None)
             .await;
         return;
     }
 
-    let manifest_prefix = format!("/v2/{image_repository}/manifests/");
     if let Some(requested_manifest) = path.strip_prefix(&manifest_prefix) {
-        if requested_manifest == missing_manifest_tag {
-            missing_manifest_requested.store(true, Ordering::Relaxed);
-        }
         if requested_manifest != image_tag && requested_manifest != fixture.manifest_digest.as_str()
         {
             write_loopback_registry_response(

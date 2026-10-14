@@ -296,7 +296,7 @@ async fn run_helper_with_deadline(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
     /// Live loopback smoke for the fake-helper execution seam using synthetic Basic credentials.
@@ -489,10 +489,10 @@ mod tests {
         }
     }
 
-    struct FakeHelper {
-        path: PathBuf,
-        input: PathBuf,
-        _directory: tempfile::TempDir,
+    pub(crate) struct FakeHelper {
+        pub(crate) path: PathBuf,
+        pub(crate) input: PathBuf,
+        _directory: Option<tempfile::TempDir>,
     }
 
     impl FakeHelper {
@@ -502,11 +502,21 @@ mod tests {
                 .permissions(fs::Permissions::from_mode(0o700))
                 .tempdir()
                 .unwrap();
-            let path = directory.path().join("helper");
+            let directory_path = directory.path().to_owned();
+            Self::new_named_at(body, &directory_path, "helper", Some(directory))
+        }
+
+        pub(crate) fn new_named_at(
+            body: &str,
+            directory_path: &Path,
+            executable_name: &str,
+            directory: Option<tempfile::TempDir>,
+        ) -> Self {
+            let path = directory_path.join(executable_name);
             let input = path.with_extension("input");
             let response = path.with_extension("response");
             write_private_file(&response, body.as_bytes(), 0o600);
-            let script = b"#!/bin/sh\ntest \"$1\" = get || exit 7\nIFS= read -r authority || exit 8\nprintf '%s\\n' \"$authority\" > \"$0.input\"\nIFS= read -r response < \"$0.response\" || [ -n \"$response\" ] || exit 9\nprintf '%s' \"$response\"\n";
+            let script = b"#!/bin/sh\numask 077\ntest \"$1\" = get || exit 7\nIFS= read -r authority || exit 8\nprintf '%s\\n' \"$authority\" >> \"$0.input\"\nIFS= read -r response < \"$0.response\" || [ -n \"$response\" ] || exit 9\nprintf '%s' \"$response\"\n";
             write_private_file(&path, script, 0o700);
             Self {
                 path,
@@ -527,7 +537,7 @@ mod tests {
             Self {
                 path,
                 input,
-                _directory: directory,
+                _directory: Some(directory),
             }
         }
     }
