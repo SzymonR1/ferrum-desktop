@@ -215,6 +215,8 @@ exercises an exec-open rejection: the fake Engine checks that the synced
 `started` JSONL record already exists when its exec request arrives, and the
 test checks the static `request_error` outcome plus absence of shell, daemon
 error, input, and output sentinels from the audit file.
+`successful_terminal_exec_open_persists_only_static_outcomes` covers the
+successful create/start upgrade and the static `success` outcome.
 `terminal_exec_is_not_submitted_when_started_audit_cannot_be_saved` gives the
 temporary SettingsStore an unusable parent path and verifies the fake Engine
 receives no exec request and the UI receives a static failure notice. No live

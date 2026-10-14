@@ -5905,6 +5905,34 @@ mod event_reconciliation_tests {
     #[cfg(target_os = "linux")]
     static TERMINAL_AUDIT_TEST_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    #[cfg(target_os = "linux")]
+    fn terminal_http_request(
+        stream: &mut std::os::unix::net::UnixStream,
+    ) -> Vec<u8> {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            let length = stream.read(&mut buffer).unwrap();
+            assert_ne!(length, 0);
+            bytes.extend_from_slice(&buffer[..length]);
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let content_length = String::from_utf8_lossy(&bytes[..header_end])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if bytes.len() >= header_end + 4 + content_length {
+                return bytes;
+            }
+        }
+    }
     #[test]
     fn build_engine_source_label_distinguishes_configured_socket_from_discovery() {
         assert_eq!(
@@ -8015,36 +8043,12 @@ mod event_reconciliation_tests {
     fn terminal_exec_is_audited_before_the_engine_receives_its_request() {
         use std::{
             io::{Read, Write},
-            os::unix::net::{UnixListener, UnixStream},
+            os::unix::net::UnixListener,
         };
 
         let _env_lock = TERMINAL_AUDIT_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        fn read_request(stream: &mut UnixStream) -> Vec<u8> {
-            let mut bytes = Vec::new();
-            let mut buffer = [0u8; 1024];
-            loop {
-                let length = stream.read(&mut buffer).unwrap();
-                assert_ne!(length, 0);
-                bytes.extend_from_slice(&buffer[..length]);
-                let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
-                else {
-                    continue;
-                };
-                let content_length = String::from_utf8_lossy(&bytes[..header_end])
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length: ")
-                            .and_then(|value| value.parse::<usize>().ok())
-                    })
-                    .unwrap_or(0);
-                if bytes.len() >= header_end + 4 + content_length {
-                    return bytes;
-                }
-            }
-        }
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -8077,23 +8081,23 @@ mod event_reconciliation_tests {
         let server_root = root.clone();
         let engine_thread = std::thread::spawn(move || {
             let (mut version, _) = listener.accept().unwrap();
-            let _ = read_request(&mut version);
+            let _ = terminal_http_request(&mut version);
             version
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"ApiVersion\":\"1.52\"}")
                 .unwrap();
             drop(version);
 
             let (mut exec, _) = listener.accept().unwrap();
-            let bytes = read_request(&mut exec);
-            let request = String::from_utf8_lossy(&bytes);
-            assert!(request.contains("/containers/"));
-            assert!(request.contains("sentinel-shell"));
             let audit = std::fs::read_to_string(server_root.join("audit.jsonl"))
                 .expect("started audit entry must be durable before exec submission");
             assert!(audit.contains("\"event\":\"terminal_exec\""));
             assert!(audit.contains("\"outcome\":\"started\""));
             assert!(!audit.contains("sentinel-shell"));
             assert!(!audit.contains("sentinel-engine-error"));
+            let bytes = terminal_http_request(&mut exec);
+            let request = String::from_utf8_lossy(&bytes);
+            assert!(request.contains("/containers/"));
+            assert!(request.contains("sentinel-shell"));
             exec.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 21\r\nConnection: close\r\n\r\nsentinel-engine-error")
                 .unwrap();
             exec.flush().unwrap();
@@ -8164,6 +8168,147 @@ mod event_reconciliation_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_terminal_exec_open_persists_only_static_outcomes() {
+        use std::{
+            io::{Read, Write},
+            os::unix::net::UnixListener,
+            sync::mpsc as std_mpsc,
+        };
+
+        let _env_lock = TERMINAL_AUDIT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-terminal-audit-success-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("engine.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let engine_host = format!("unix://{}", socket.display());
+        let saved_host = std::env::var_os("DOCKER_HOST");
+        let saved_context = std::env::var_os("DOCKER_CONTEXT");
+        unsafe {
+            std::env::set_var("DOCKER_HOST", &engine_host);
+            std::env::remove_var("DOCKER_CONTEXT");
+        }
+
+        let (stop_sender, stop_receiver) = std_mpsc::channel();
+        let (input_sent_sender, input_sent_receiver) = std_mpsc::channel();
+        let engine_thread = std::thread::spawn(move || {
+            let (mut version, _) = listener.accept().unwrap();
+            let _ = terminal_http_request(&mut version);
+            version
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"ApiVersion\":\"1.52\"}")
+                .unwrap();
+            drop(version);
+
+            let (mut create, _) = listener.accept().unwrap();
+            let started = std::fs::read_to_string(server_root.join("audit.jsonl"))
+                .expect("started audit record must be durable before exec creation");
+            assert!(started.contains("\"outcome\":\"started\""));
+            let _ = terminal_http_request(&mut create);
+            create
+                .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"Id\":\"exec-id\"}")
+                .unwrap();
+            drop(create);
+
+            let (mut start, _) = listener.accept().unwrap();
+            let _ = terminal_http_request(&mut start);
+            start
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
+                .unwrap();
+            start.write_all(b"sentinel-output").unwrap();
+            start
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut input = [0u8; 64];
+            let length = start.read(&mut input).unwrap();
+            assert_eq!(&input[..length], b"sentinel-input");
+            input_sent_sender.send(()).unwrap();
+            stop_receiver.recv().unwrap();
+        });
+
+        let (mut app, _) = app_with_open_inspection();
+        app.engine = Some(
+            app.runtime
+                .block_on(EngineClient::connect_default())
+                .expect("fake local Engine should complete the connection handshake"),
+        );
+        app.audit_store = audit::AuditStore::new(Arc::new(settings::SettingsStore::at(
+            root.join("settings.toml"),
+        )));
+        app.start_terminal(
+            "a".repeat(64),
+            "sentinel-shell".to_owned(),
+            egui::Context::default(),
+        );
+        app.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    app.receive_terminal_opened();
+                    if app.terminal.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("successful terminal open should be delivered");
+        });
+        app.terminal
+            .as_ref()
+            .and_then(|terminal| terminal.input.as_ref())
+            .expect("successful terminal session should accept input")
+            .try_send(b"sentinel-input".to_vec())
+            .unwrap();
+        app.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if input_sent_receiver.try_recv().is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("fake Engine should receive terminal input");
+        });
+        let audit = std::fs::read_to_string(root.join("audit.jsonl")).unwrap();
+        assert!(audit.contains("\"event\":\"terminal_exec\""));
+        assert!(audit.contains("\"outcome\":\"started\""));
+        assert!(audit.contains("\"outcome\":\"success\""));
+        for secret in [
+            "sentinel-shell",
+            "sentinel-engine-error",
+            "sentinel-input",
+            "sentinel-output",
+        ] {
+            assert!(!audit.contains(secret));
+        }
+        app.cancel_terminal_session();
+        stop_sender.send(()).unwrap();
+        engine_thread.join().unwrap();
+        unsafe {
+            if let Some(value) = saved_host {
+                std::env::set_var("DOCKER_HOST", value);
+            } else {
+                std::env::remove_var("DOCKER_HOST");
+            }
+            if let Some(value) = saved_context {
+                std::env::set_var("DOCKER_CONTEXT", value);
+            } else {
+                std::env::remove_var("DOCKER_CONTEXT");
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn terminal_exec_is_not_submitted_when_started_audit_cannot_be_saved() {
@@ -8250,6 +8395,7 @@ mod event_reconciliation_tests {
             app.terminal_notice.as_deref(),
             Some("Terminal execution was not started because its audit record could not be saved.")
         );
+        assert!(!root.join("audit.jsonl").exists());
         assert!(
             !engine_thread.join().unwrap(),
             "fake Engine must not receive an exec request"
