@@ -5970,20 +5970,6 @@ mod event_reconciliation_tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
-    #[cfg(target_os = "linux")]
-    fn diagnose_terminal_socket(path: &std::path::Path, side: &str) {
-        use std::os::unix::fs::FileTypeExt;
-
-        let metadata = std::fs::symlink_metadata(path).unwrap_or_else(|error| {
-            panic!("{side} fake Engine socket path is unavailable: path={path:?}, error={error}")
-        });
-        let is_socket = metadata.file_type().is_socket();
-        eprintln!(
-            "{side} fake Engine socket diagnostic: path={path:?}, exists=true, is_socket={is_socket}, path_bytes={}",
-            path.as_os_str().len()
-        );
-        assert!(is_socket, "fake Engine path is not a Unix socket: {path:?}");
-    }
 
     #[cfg(target_os = "linux")]
     fn terminal_write_version_response(stream: &mut std::os::unix::net::UnixStream) {
@@ -6037,12 +6023,6 @@ mod event_reconciliation_tests {
 
     #[cfg(target_os = "linux")]
     fn terminal_audit_app() -> FerrumApp {
-        let host = std::env::var("DOCKER_HOST").expect("child should receive DOCKER_HOST");
-        let socket_path = host
-            .strip_prefix("unix://")
-            .expect("child endpoint should use a Unix socket");
-        eprintln!("child DOCKER_HOST={host:?}");
-        diagnose_terminal_socket(std::path::Path::new(socket_path), "child");
         let (mut app, _) = app_with_open_inspection();
         app.engine = Some(
             app.runtime
@@ -8175,7 +8155,9 @@ mod event_reconciliation_tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while app.terminal_notice.is_none() {
                 app.runtime
-                    .block_on(tokio::time::sleep(std::time::Duration::from_millis(1)));
+                    .block_on(async {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    });
                 app.receive_terminal_opened();
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -8206,7 +8188,6 @@ mod event_reconciliation_tests {
         let socket = root.path().join("engine.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        diagnose_terminal_socket(&socket, "parent");
         let audit_path = root.path().join("ferrum/audit.jsonl");
         let server = std::thread::spawn(move || {
             let mut accepted_count = 0;
@@ -8256,7 +8237,9 @@ mod event_reconciliation_tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while app.terminal.is_none() {
                 app.runtime
-                    .block_on(tokio::time::sleep(std::time::Duration::from_millis(1)));
+                    .block_on(async {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    });
                 app.receive_terminal_opened();
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -8298,7 +8281,6 @@ mod event_reconciliation_tests {
         let socket = root.path().join("engine.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        diagnose_terminal_socket(&socket, "parent");
         let server_root = root.path().to_path_buf();
         let server = std::thread::spawn(move || {
             let mut accepted_count = 0;
@@ -8359,7 +8341,9 @@ mod event_reconciliation_tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while app.terminal_notice.is_none() {
                 app.runtime
-                    .block_on(tokio::time::sleep(std::time::Duration::from_millis(1)));
+                    .block_on(async {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    });
                 app.receive_terminal_opened();
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -8383,7 +8367,6 @@ mod event_reconciliation_tests {
         let socket = root.path().join("engine.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        diagnose_terminal_socket(&socket, "parent");
         let server = std::thread::spawn(move || {
             let mut accepted_count = 0;
             let mut version = terminal_accept(&listener, "version", &mut accepted_count);
