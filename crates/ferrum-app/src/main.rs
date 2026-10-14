@@ -5936,11 +5936,21 @@ mod event_reconciliation_tests {
     #[cfg(target_os = "linux")]
     fn terminal_accept(
         listener: &std::os::unix::net::UnixListener,
+        expected_request: &str,
+        accepted_count: &mut usize,
     ) -> std::os::unix::net::UnixStream {
+
+        let listener_path = listener
+            .local_addr()
+            .unwrap()
+            .as_pathname()
+            .unwrap()
+            .to_path_buf();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    *accepted_count += 1;
                     stream
                         .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                         .unwrap();
@@ -5954,10 +5964,28 @@ mod event_reconciliation_tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "fake Engine timed out waiting for a request"
+                "fake Engine timed out waiting for {expected_request}; prior accepts={}; path={listener_path:?}; socket_exists={}",
+                *accepted_count,
+                listener_path.exists()
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+    #[cfg(target_os = "linux")]
+    fn diagnose_terminal_socket(path: &std::path::Path, side: &str) {
+        use std::os::unix::fs::FileTypeExt;
+
+        let metadata = std::fs::symlink_metadata(path).unwrap_or_else(|error| {
+            panic!(
+                "{side} fake Engine socket path is unavailable: path={path:?}, error={error}"
+            )
+        });
+        let is_socket = metadata.file_type().is_socket();
+        eprintln!(
+            "{side} fake Engine socket diagnostic: path={path:?}, exists=true, is_socket={is_socket}, path_bytes={}",
+            path.as_os_str().len()
+        );
+        assert!(is_socket, "fake Engine path is not a Unix socket: {path:?}");
     }
 
     #[cfg(target_os = "linux")]
@@ -6013,6 +6041,12 @@ mod event_reconciliation_tests {
 
     #[cfg(target_os = "linux")]
     fn terminal_audit_app() -> FerrumApp {
+        let host = std::env::var("DOCKER_HOST").expect("child should receive DOCKER_HOST");
+        let socket_path = host
+            .strip_prefix("unix://")
+            .expect("child endpoint should use a Unix socket");
+        eprintln!("child DOCKER_HOST={host:?}");
+        diagnose_terminal_socket(std::path::Path::new(socket_path), "child");
         let (mut app, _) = app_with_open_inspection();
         app.engine = Some(
             app.runtime
@@ -8179,14 +8213,17 @@ mod event_reconciliation_tests {
         let socket = root.path().join("engine.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
+        diagnose_terminal_socket(&socket, "parent");
         let audit_path = root.path().join("ferrum/audit.jsonl");
         let server = std::thread::spawn(move || {
-            let mut version = terminal_accept(&listener);
+            let mut accepted_count = 0;
+            let mut version = terminal_accept(&listener, "version", &mut accepted_count);
             let _ = terminal_http_request(&mut version);
             terminal_write_version_response(&mut version);
             drop(version);
 
-            let mut exec = terminal_accept(&listener);
+            let mut exec =
+                terminal_accept(&listener, "exec create", &mut accepted_count);
             let audit =
                 std::fs::read_to_string(audit_path).expect("started audit must precede exec");
             assert!(audit.contains("\"event\":\"terminal_exec\""));
@@ -8272,14 +8309,17 @@ mod event_reconciliation_tests {
         let socket = root.path().join("engine.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
+        diagnose_terminal_socket(&socket, "parent");
         let server_root = root.path().to_path_buf();
         let server = std::thread::spawn(move || {
-            let mut version = terminal_accept(&listener);
+            let mut accepted_count = 0;
+            let mut version = terminal_accept(&listener, "version", &mut accepted_count);
             let _ = terminal_http_request(&mut version);
             terminal_write_version_response(&mut version);
             drop(version);
 
-            let mut create = terminal_accept(&listener);
+            let mut create =
+                terminal_accept(&listener, "exec create", &mut accepted_count);
             let started = std::fs::read_to_string(server_root.join("ferrum/audit.jsonl"))
                 .expect("started audit record must precede exec creation");
             assert!(started.contains("\"outcome\":\"started\""));
@@ -8289,7 +8329,8 @@ mod event_reconciliation_tests {
                 .unwrap();
             drop(create);
 
-            let mut start = terminal_accept(&listener);
+            let mut start =
+                terminal_accept(&listener, "exec start", &mut accepted_count);
             let _ = terminal_http_request(&mut start);
             start
                 .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
@@ -8358,8 +8399,10 @@ mod event_reconciliation_tests {
         let socket = root.path().join("engine.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
+        diagnose_terminal_socket(&socket, "parent");
         let server = std::thread::spawn(move || {
-            let mut version = terminal_accept(&listener);
+            let mut accepted_count = 0;
+            let mut version = terminal_accept(&listener, "version", &mut accepted_count);
             let _ = terminal_http_request(&mut version);
             terminal_write_version_response(&mut version);
             drop(version);
@@ -8367,11 +8410,17 @@ mod event_reconciliation_tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
             loop {
                 match listener.accept() {
-                    Ok(_) => return true,
+                    Ok(_) => {
+                        accepted_count += 1;
+                        return true;
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(error) => panic!("fake Engine accept failed: {error}"),
                 }
                 if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "fake Engine fail-closed accept check: no exec request; accepted_count={accepted_count}"
+                    );
                     return false;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
