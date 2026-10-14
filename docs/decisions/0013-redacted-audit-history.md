@@ -67,15 +67,21 @@ engine-provided bodies. Anchoring file access to the existing settings
 filesystem descriptor carries forward the established private-directory
 boundary. A hard size ceiling and refusal to overwrite existing history keep
 storage bounded without silently replacing records. Persistence is best-effort
-and must never turn an audit-file failure into a changed engine-action result.
+for final outcomes and actions already submitted to the Engine: a failure emits
+a static warning but does not change the already-observed Engine/UI result.
+Terminal exec is an explicit exception: its synced `started` record is a
+prerequisite to submission, so failure to persist it blocks the exec request
+and produces a static UI failure.
 
 ## Consequences
 
 - The record is local history only: it is not tamper-proof, does not capture
   mutations made outside Ferrum, and does not prove the engine's final state.
 - When the file reaches 16 MiB or cannot be safely opened/appended/synced, later
-  outcomes may have no durable record. A static warning is emitted, while the
-  engine result remains unchanged.
+  final outcomes may have no durable record. A static warning is emitted, while
+  the already-observed Engine/UI result for an already-submitted action remains
+  unchanged. A terminal exec whose `started` record cannot be persisted is not
+  submitted and instead produces a static UI failure.
 - Only validated full IDs already available to the mutation trace may appear;
   no names or other resource descriptors are included.
 - This is a partial Issue #19 slice. Issues #19 and #17 remain open/ready; #10
