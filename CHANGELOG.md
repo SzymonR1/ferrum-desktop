@@ -18,6 +18,30 @@ All notable project changes are documented here. The project has not published a
   Cancellation or shutdown during the in-flight open may leave only the
   `started` marker; this records an attempt, not whether the Engine began a
   shell.
+- Added an ignored Linux FerrumApp real-Engine terminal/audit smoke. With a
+  caller-selected trusted, already-local image and a current local Unix Docker
+  context, it pins every Docker CLI operation to the exact
+  `EngineClient::local_socket_path()` selected for the app. It creates one
+  uniquely named, labeled, `--network none` container through argv-only
+  `docker create --pull never`, passing the inspected immutable `sha256:` image
+  ID instead of the mutable tag and rejecting non-empty image-declared volumes
+  and healthchecks. It arms cleanup once the full ID matches the private cidfile
+  and the generated name and label verify; image identity, created state, and
+  empty mounts, `NetworkMode == "none"`, and absent/null/empty host port bindings
+  are checked afterward. The test opens the production terminal and sends a
+  command through its input channel, then pumps the headless egui terminal
+  parser until output appears and checks the exact static durable
+  `terminal_exec/exec` start/success audit records and marker exclusion. It
+  closes the session and confirms the container remains running. Successful
+  cleanup removes Created/Exited containers directly, stops Running containers
+  first, removes only the exact ID without force, and confirms its absence from
+  fresh Engine inventory. The Drop fallback tries non-force removal first,
+  then bounded stop and non-force removal. No volumes or images are removed.
+  This is opt-in headless runtime evidence only, not native visual validation or
+  completion of Issue #19. It passed on 2026-10-14 on Fedora Linux 44 x86_64
+  against Docker Engine 29.9.0/API 1.56 using a preinstalled
+  `node:22-bookworm-slim` image; one test passed and the generated container was
+  removed. No image was pulled or modified.
 - Added an ignored Linux local-Engine Compose build smoke through Ferrum's
   production `compose_build` worker. It creates a unique temporary Compose
   project and generated image from `FROM scratch` plus one small `COPY` input,
