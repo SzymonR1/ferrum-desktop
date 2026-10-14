@@ -5972,6 +5972,18 @@ mod event_reconciliation_tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn terminal_audit_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::os::unix::net::UnixListener,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        (root, socket, listener)
+    }
+    #[cfg(target_os = "linux")]
     fn terminal_write_version_response(stream: &mut std::os::unix::net::UnixStream) {
         use std::io::Write;
 
@@ -8187,7 +8199,7 @@ mod event_reconciliation_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn terminal_exec_is_audited_before_the_engine_receives_its_request() {
-        use std::{io::Write, os::unix::net::UnixListener};
+        use std::io::Write;
 
         if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("request_error") {
             let (mut app, config_home) = start_terminal_audit_session();
@@ -8209,10 +8221,7 @@ mod event_reconciliation_tests {
         }
 
         let _subprocess_guard = crate::TEST_SUBPROCESS_LOCK.blocking_lock();
-        let root = tempfile::tempdir().unwrap();
-        let socket = root.path().join("engine.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        listener.set_nonblocking(true).unwrap();
+        let (root, socket, listener) = terminal_audit_fixture();
         let audit_path = root.path().join("ferrum/audit.jsonl");
         let server = std::thread::spawn(move || {
             let mut accepted_count = 0;
@@ -8242,10 +8251,7 @@ mod event_reconciliation_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn successful_terminal_exec_open_persists_only_static_outcomes() {
-        use std::{
-            io::{Read, Write},
-            os::unix::net::UnixListener,
-        };
+        use std::io::{Read, Write};
 
         if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("success") {
             let (mut app, config_home) = start_terminal_audit_session();
@@ -8278,10 +8284,7 @@ mod event_reconciliation_tests {
         }
 
         let _subprocess_guard = crate::TEST_SUBPROCESS_LOCK.blocking_lock();
-        let root = tempfile::tempdir().unwrap();
-        let socket = root.path().join("engine.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        listener.set_nonblocking(true).unwrap();
+        let (root, socket, listener) = terminal_audit_fixture();
         let server_root = root.path().to_path_buf();
         let server = std::thread::spawn(move || {
             let mut accepted_count = 0;
@@ -8325,8 +8328,6 @@ mod event_reconciliation_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn terminal_exec_is_not_submitted_when_started_audit_cannot_be_saved() {
-        use std::os::unix::net::UnixListener;
-
         if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("audit_failure") {
             let (mut app, config_home) = start_terminal_audit_session();
             pump_terminal_until(
@@ -8345,12 +8346,9 @@ mod event_reconciliation_tests {
         }
 
         let _subprocess_guard = crate::TEST_SUBPROCESS_LOCK.blocking_lock();
-        let root = tempfile::tempdir().unwrap();
+        let (root, socket, listener) = terminal_audit_fixture();
         let blocker = root.path().join("not-a-directory");
         std::fs::write(&blocker, b"block").unwrap();
-        let socket = root.path().join("engine.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
             let mut accepted_count = 0;
             terminal_respond_to_version(&listener, &mut accepted_count);
