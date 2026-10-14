@@ -6033,6 +6033,17 @@ mod event_reconciliation_tests {
         app.audit_store = audit::AuditStore::new(Arc::clone(&app.settings_store));
         app
     }
+    #[cfg(target_os = "linux")]
+    fn start_terminal_audit_session() -> (FerrumApp, std::path::PathBuf) {
+        let mut app = terminal_audit_app();
+        let config_home = std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+        app.start_terminal(
+            "a".repeat(64),
+            "sentinel-shell".to_owned(),
+            egui::Context::default(),
+        );
+        (app, config_home)
+    }
     #[test]
     fn build_engine_source_label_distinguishes_configured_socket_from_discovery() {
         assert_eq!(
@@ -8144,14 +8155,7 @@ mod event_reconciliation_tests {
         use std::{io::Write, os::unix::net::UnixListener};
 
         if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("request_error") {
-            let mut app = terminal_audit_app();
-            let config_home =
-                std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
-            app.start_terminal(
-                "a".repeat(64),
-                "sentinel-shell".to_owned(),
-                egui::Context::default(),
-            );
+            let (mut app, config_home) = start_terminal_audit_session();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while app.terminal_notice.is_none() {
                 app.runtime.block_on(async {
@@ -8225,14 +8229,7 @@ mod event_reconciliation_tests {
         };
 
         if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("success") {
-            let mut app = terminal_audit_app();
-            let config_home =
-                std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
-            app.start_terminal(
-                "a".repeat(64),
-                "sentinel-shell".to_owned(),
-                egui::Context::default(),
-            );
+            let (mut app, config_home) = start_terminal_audit_session();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while app.terminal.is_none() {
                 app.runtime.block_on(async {
@@ -8328,14 +8325,7 @@ mod event_reconciliation_tests {
         use std::os::unix::net::UnixListener;
 
         if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("audit_failure") {
-            let mut app = terminal_audit_app();
-            let config_home =
-                std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
-            app.start_terminal(
-                "a".repeat(64),
-                "sentinel-shell".to_owned(),
-                egui::Context::default(),
-            );
+            let (mut app, config_home) = start_terminal_audit_session();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while app.terminal_notice.is_none() {
                 app.runtime.block_on(async {
