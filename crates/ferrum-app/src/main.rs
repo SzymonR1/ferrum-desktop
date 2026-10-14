@@ -5961,6 +5961,20 @@ mod event_reconciliation_tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn terminal_write_version_response(stream: &mut std::os::unix::net::UnixStream) {
+        use std::io::Write;
+
+        const BODY: &[u8] = br#"{"Version":"29.9.0","ApiVersion":"1.52"}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            BODY.len()
+        )
+        .unwrap();
+        stream.write_all(BODY).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
     fn run_terminal_audit_child(
         test_name: &str,
         marker: &str,
@@ -8169,9 +8183,7 @@ mod event_reconciliation_tests {
         let server = std::thread::spawn(move || {
             let mut version = terminal_accept(&listener);
             let _ = terminal_http_request(&mut version);
-            version
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{\"Version\":\"29.9.0\",\"ApiVersion\":\"1.52\"}")
-                .unwrap();
+            terminal_write_version_response(&mut version);
             drop(version);
 
             let mut exec = terminal_accept(&listener);
@@ -8256,7 +8268,6 @@ mod event_reconciliation_tests {
             return;
         }
 
-        use std::io::Write;
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("engine.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -8265,9 +8276,7 @@ mod event_reconciliation_tests {
         let server = std::thread::spawn(move || {
             let mut version = terminal_accept(&listener);
             let _ = terminal_http_request(&mut version);
-            version
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{\"Version\":\"29.9.0\",\"ApiVersion\":\"1.52\"}")
-                .unwrap();
+            terminal_write_version_response(&mut version);
             drop(version);
 
             let mut create = terminal_accept(&listener);
@@ -8343,7 +8352,6 @@ mod event_reconciliation_tests {
             return;
         }
 
-        use std::io::Write;
         let root = tempfile::tempdir().unwrap();
         let blocker = root.path().join("not-a-directory");
         std::fs::write(&blocker, b"block").unwrap();
@@ -8353,9 +8361,7 @@ mod event_reconciliation_tests {
         let server = std::thread::spawn(move || {
             let mut version = terminal_accept(&listener);
             let _ = terminal_http_request(&mut version);
-            version
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{\"Version\":\"29.9.0\",\"ApiVersion\":\"1.52\"}")
-                .unwrap();
+            terminal_write_version_response(&mut version);
             drop(version);
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
