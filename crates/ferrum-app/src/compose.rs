@@ -8881,6 +8881,165 @@ exit 85
                 "image inventory must confirm one full-ID image with only the generated tag; any residue requires manual inspection"
             );
         }
+
+        /// Opt-in local Engine smoke for the production Compose pull worker.
+        ///
+        /// It pulls one generated image from an in-process registry bound only
+        /// to loopback; the temporary project starts no services.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        #[ignore = "requires Docker CLI/Compose and an accessible local Engine with loopback registry access; pulls and removes one uniquely generated image"]
+        async fn local_compose_pull_uses_production_worker_and_cleans_only_verified_image() {
+            use ferrum_engine::EngineClient;
+            use ferrum_test_support::{DisposableImageTag, LivePullImageFixture, LoopbackRegistry};
+            use std::time::Duration;
+
+            let engine = EngineClient::connect_default()
+                .await
+                .expect("the local Engine should be accessible");
+            let socket = engine.local_socket_path().to_path_buf();
+            let directory = tempfile::Builder::new()
+                .prefix("ferrum-compose-pull-smoke-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .expect("create private isolated Compose pull directory");
+            let project_name = directory
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("generated temporary directory name should be UTF-8")
+                .to_ascii_lowercase();
+            let nonce = project_name
+                .strip_prefix("ferrum-compose-pull-smoke-")
+                .expect("temporary directory should retain the generated prefix");
+            let repository = format!("ferrum-compose-pull-{nonce}");
+            let image_tag = format!("generated-{nonce}");
+            let missing_manifest_tag = format!("missing-{nonce}");
+            let fixture = LivePullImageFixture::new(nonce);
+            let registry = LoopbackRegistry::start(
+                repository.clone(),
+                image_tag.clone(),
+                missing_manifest_tag,
+                fixture,
+                None,
+            )
+            .await;
+            let image_reference = format!("127.0.0.1:{}/{repository}:{image_tag}", registry.port());
+            let compose_file = directory.path().join("compose.yaml");
+            std::fs::write(
+                &compose_file,
+                format!(
+                    "name: {project_name}\nservices:\n  pull-probe:\n    image: {image_reference}\n"
+                ),
+            )
+            .expect("write generated Compose pull project");
+
+            let before = engine
+                .list_images()
+                .await
+                .expect("preflight local image inventory");
+            assert!(
+                !before
+                    .iter()
+                    .any(|image| image.repo_tags.iter().any(|tag| tag == &image_reference)),
+                "generated image reference must be absent before pull"
+            );
+            let mut disposable = DisposableImageTag::new(socket.clone(), image_reference.clone());
+            let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+            let (progress_sender, mut progress_receiver) =
+                tokio::sync::mpsc::channel(COMPOSE_OPERATION_PROGRESS_CHANNEL_CAPACITY);
+            let files = vec![compose_file];
+            let worker_socket = socket.clone();
+            let mut worker = tokio::spawn(async move {
+                compose_pull(
+                    &worker_socket,
+                    &files,
+                    &[],
+                    cancel_receiver,
+                    &progress_sender,
+                )
+                .await
+            });
+
+            let operation = match tokio::time::timeout(Duration::from_secs(120), &mut worker).await
+            {
+                Ok(joined) => joined.ok(),
+                Err(_) => {
+                    let _ = cancel_sender.send(());
+                    match tokio::time::timeout(Duration::from_secs(10), &mut worker).await {
+                        Ok(joined) => joined.ok(),
+                        Err(_) => {
+                            worker.abort();
+                            let _ = worker.await;
+                            None
+                        }
+                    }
+                }
+            };
+            let progress =
+                std::iter::from_fn(|| progress_receiver.try_recv().ok()).collect::<Vec<_>>();
+            let after = engine.list_images().await.expect(
+                "post-pull image inventory; any image residue is left untouched if this fails",
+            );
+            let mut matching = after
+                .iter()
+                .filter(|image| image.repo_tags.iter().any(|tag| tag == &image_reference));
+            let may_have_submitted = operation.as_ref().is_none_or(|result| result.submitted);
+            let safely_armed = if may_have_submitted {
+                matching.next().is_some_and(|image| {
+                    matching.next().is_none()
+                        && disposable.arm_if_verified(&image.id, &image.repo_tags)
+                })
+            } else {
+                false
+            };
+            if safely_armed {
+                let status = disposable.remove().expect(
+                    "verified generated image cleanup should finish within five seconds; if Docker refuses removal, inspect the exact test-owned image manually",
+                );
+                assert!(
+                    status.success(),
+                    "Docker refused safe removal of the generated test image; inspect {image_reference} manually"
+                );
+                let remaining = engine
+                    .list_images()
+                    .await
+                    .expect("verify generated image cleanup");
+                assert!(
+                    !remaining
+                        .iter()
+                        .any(|image| { image.repo_tags.iter().any(|tag| tag == &image_reference) }),
+                    "the generated image tag should be absent after cleanup"
+                );
+                disposable.disarm();
+            }
+
+            let operation = operation.expect(
+                "Compose pull did not finish within the bounded cancellation window; any unverified test image is left untouched",
+            );
+            assert!(operation.submitted, "the Compose pull should be submitted");
+            assert_eq!(
+                operation.outcome,
+                Ok(()),
+                "the local Compose pull should succeed"
+            );
+            assert!(
+                safely_armed,
+                "image inventory must confirm one full-ID image with only the generated tag; any residue requires manual inspection"
+            );
+            assert!(
+                progress.iter().any(|update| {
+                    matches!(
+                        update.phase,
+                        ComposeOperationProgressPhase::Pulling
+                            | ComposeOperationProgressPhase::Downloading
+                            | ComposeOperationProgressPhase::Extracting
+                            | ComposeOperationProgressPhase::Pulled
+                    )
+                }),
+                "the production Compose worker should surface bounded pull progress"
+            );
+        }
     }
     #[cfg(test)]
     mod page {

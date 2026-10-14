@@ -797,10 +797,21 @@ mod tests {
             Ok(())
         }
     }
+    // Scoped Dispatch instances register with tracing's process-wide callsite
+    // registry. Serialize event-capture tests to keep assertions deterministic
+    // under the default-parallel test runner.
+    static TRACE_CAPTURE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn trace_capture_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        TRACE_CAPTURE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn records_outcomes_with_validated_ids_and_redacts_untrusted_ids() {
         let writer = SharedWriter::default();
+        let _trace_guard = trace_capture_test_guard();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_target(false)
@@ -833,6 +844,7 @@ mod tests {
     #[test]
     fn records_network_mutation_outcomes_with_validated_ids() {
         let writer = SharedWriter::default();
+        let _trace_guard = trace_capture_test_guard();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_target(false)
@@ -892,6 +904,7 @@ mod tests {
     #[test]
     fn compose_mutation_audit_is_static_and_contains_no_project_metadata() {
         let writer = SharedWriter::default();
+        let _trace_guard = trace_capture_test_guard();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_target(false)
@@ -1046,6 +1059,7 @@ mod tests {
         use super::{ComposePullOutcome, record_compose_pull_result};
 
         let writer = SharedWriter::default();
+        let _trace_guard = trace_capture_test_guard();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_target(false)
@@ -1113,6 +1127,7 @@ mod tests {
         use super::{ComposeBuildOutcome, record_compose_build_result};
 
         let writer = SharedWriter::default();
+        let _trace_guard = trace_capture_test_guard();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_target(false)
@@ -1168,6 +1183,7 @@ mod tests {
     #[test]
     fn records_image_mutation_action_outcomes_without_resource_metadata() {
         let writer = SharedWriter::default();
+        let _trace_guard = trace_capture_test_guard();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_target(false)
@@ -1240,7 +1256,11 @@ mod tests {
             ("push", "not_submitted"),
             ("push", "not_submitted"),
         ];
-        assert_eq!(events.len(), expected.len());
+        assert_eq!(
+            events.len(),
+            expected.len(),
+            "captured audit output: {output}"
+        );
         for (line, (action, outcome)) in events.iter().zip(expected) {
             assert!(line.contains("audit_event=\"image_mutation\""));
             assert!(line.contains(&format!("action=\"{action}\"")));
@@ -1257,6 +1277,7 @@ mod tests {
     #[test]
     fn records_static_image_build_outcomes() {
         let writer = SharedWriter::default();
+        let _trace_guard = trace_capture_test_guard();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_target(false)
@@ -1290,6 +1311,7 @@ mod tests {
         use ferrum_core::VolumeDetails;
 
         let writer = SharedWriter::default();
+        let _trace_guard = trace_capture_test_guard();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_target(false)
@@ -1343,6 +1365,7 @@ mod tests {
     #[test]
     fn records_volume_removal_outcomes_without_resource_metadata() {
         let writer = SharedWriter::default();
+        let _trace_guard = trace_capture_test_guard();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_target(false)
@@ -1402,31 +1425,46 @@ mod tests {
         let valid_container_id = "b".repeat(64);
         let invalid_network_id = "invalid-network-ID-SECRET";
         let invalid_container_id = "invalid-container-ID-SECRET";
-        let writer = SharedWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_target(false)
-            .with_writer(writer.clone())
-            .finish();
-        let dispatcher = tracing::Dispatch::new(subscriber);
+        let (trace, attachment_records) = {
+            let _trace_guard = trace_capture_test_guard();
+            let writer = SharedWriter::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_target(false)
+                .with_writer(writer.clone())
+                .finish();
+            let dispatcher = tracing::Dispatch::new(subscriber);
+            let mut attachment_records = Vec::new();
 
-        for (network_id, container_id, action, succeeded) in [
+            for (network_id, container_id, action, succeeded) in [
+                (
+                    invalid_network_id,
+                    valid_container_id.as_str(),
+                    NetworkMutation::Connect,
+                    true,
+                ),
+                (
+                    valid_network_id.as_str(),
+                    invalid_container_id,
+                    NetworkMutation::Disconnect,
+                    false,
+                ),
+            ] {
+                attachment_records.push(tracing::dispatcher::with_default(&dispatcher, || {
+                    record_network_attachment_result(network_id, container_id, action, succeeded)
+                }));
+            }
+
+            let captured = match writer.0.lock() {
+                Ok(output) => output.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
             (
-                invalid_network_id,
-                valid_container_id.as_str(),
-                NetworkMutation::Connect,
-                true,
-            ),
-            (
-                valid_network_id.as_str(),
-                invalid_container_id,
-                NetworkMutation::Disconnect,
-                false,
-            ),
-        ] {
-            let record = tracing::dispatcher::with_default(&dispatcher, || {
-                record_network_attachment_result(network_id, container_id, action, succeeded)
-            });
+                String::from_utf8(captured).expect("audit events should be UTF-8"),
+                attachment_records,
+            )
+        };
+        for record in attachment_records {
             store.persist(record).await.unwrap();
         }
 
@@ -1436,11 +1474,6 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
-        let captured = match writer.0.lock() {
-            Ok(output) => output.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
-        let trace = String::from_utf8(captured).expect("audit events should be UTF-8");
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(records.len(), 2);
