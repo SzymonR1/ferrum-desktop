@@ -5980,7 +5980,9 @@ mod event_reconciliation_tests {
         tempfile::TempDir,
         std::path::PathBuf,
         std::os::unix::net::UnixListener,
+        String,
     ) {
+        use std::io::Read;
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().unwrap();
@@ -5988,7 +5990,89 @@ mod event_reconciliation_tests {
         let socket = root.path().join("engine.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        (root, socket, listener)
+        let mut entropy = [0u8; 32];
+        std::fs::File::open("/dev/urandom")
+            .unwrap()
+            .read_exact(&mut entropy)
+            .unwrap();
+        let token = entropy.iter().map(|byte| format!("{byte:02x}")).collect();
+        (root, socket, listener, token)
+    }
+    #[cfg(target_os = "linux")]
+    fn terminal_respond_to_fixture_probe(
+        listener: &std::os::unix::net::UnixListener,
+        accepted_count: &mut usize,
+        token: &str,
+    ) {
+        use std::io::Write;
+
+        let mut stream = terminal_accept(listener, "fixture identity probe", accepted_count);
+        let request = terminal_http_request(&mut stream);
+        assert!(
+            String::from_utf8_lossy(&request).starts_with("GET /__ferrum_fixture_probe__ "),
+            "fake Engine received an unexpected fixture probe"
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{token}",
+            token.len()
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn terminal_verify_fixture_identity(socket_path: &std::path::Path, expected: &str) {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        const MAX_RESPONSE: usize = 1024 + 64;
+        let mut stream = UnixStream::connect(socket_path)
+            .expect("terminal audit child could not reach fixture identity probe");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(b"GET /__ferrum_fixture_probe__ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = Vec::new();
+        stream
+            .take((MAX_RESPONSE + 1) as u64)
+            .read_to_end(&mut response)
+            .unwrap();
+        assert!(
+            response.len() <= MAX_RESPONSE,
+            "fixture identity response exceeded its bound"
+        );
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("fixture identity response has no complete HTTP header");
+        let headers = std::str::from_utf8(&response[..header_end])
+            .expect("fixture identity response headers are not UTF-8");
+        assert!(
+            headers.starts_with("HTTP/1.1 200 "),
+            "fixture identity probe was rejected"
+        );
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .expect("fixture identity response has no valid Content-Length");
+        assert_eq!(
+            content_length,
+            expected.len(),
+            "fixture identity response has an unexpected body length"
+        );
+        assert!(
+            &response[header_end + 4..] == expected.as_bytes(),
+            "terminal audit child reached the wrong Engine fixture"
+        );
     }
     #[cfg(target_os = "linux")]
     fn terminal_write_version_response(stream: &mut std::os::unix::net::UnixStream) {
@@ -6014,30 +6098,27 @@ mod event_reconciliation_tests {
         terminal_write_version_response(&mut stream);
     }
     #[cfg(target_os = "linux")]
-    fn is_terminal_audit_child(expected_case: &str) -> bool {
+    fn terminal_audit_child_identity() -> Option<String> {
         use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
-        let Ok(marker) = std::env::var(TERMINAL_AUDIT_CHILD_ENV) else {
-            return false;
-        };
-        let (case, root_basename) = marker
+        let marker = std::env::var_os(TERMINAL_AUDIT_CHILD_ENV)?;
+        let marker = marker
+            .into_string()
+            .unwrap_or_else(|_| panic!("terminal audit child marker is not valid UTF-8"));
+        let (case, token) = marker
             .split_once(':')
-            .expect("terminal audit child marker must include a private root token");
-        assert_eq!(case, expected_case, "terminal audit child case mismatch");
+            .expect("terminal audit child marker must include its fixture identity");
         assert!(
-            !root_basename.is_empty() && !root_basename.contains('/'),
-            "terminal audit child root token is invalid"
+            matches!(case, "request_error" | "success" | "audit_failure"),
+            "terminal audit child case is invalid"
+        );
+        assert!(
+            token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "terminal audit child fixture identity is invalid"
         );
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .expect("terminal audit child HOME is missing");
-        assert_eq!(
-            home.file_name()
-                .map(|name| name.to_string_lossy())
-                .as_deref(),
-            Some(root_basename),
-            "terminal audit child HOME does not match its private root token"
-        );
         let home_metadata =
             std::fs::metadata(&home).expect("terminal audit child HOME metadata is unavailable");
         let home_mode = home_metadata.permissions().mode() & 0o777;
@@ -6065,11 +6146,23 @@ mod event_reconciliation_tests {
             socket_metadata.file_type().is_socket(),
             "terminal audit child endpoint is not a Unix socket: {socket_path:?}"
         );
+        assert!(
+            std::env::var_os("DOCKER_CONTEXT").is_none()
+                && std::env::var_os("DOCKER_CERT_PATH").is_none()
+                && std::env::var_os("DOCKER_TLS").is_none()
+                && std::env::var_os("DOCKER_TLS_VERIFY").is_none()
+                && std::env::var_os("DOCKER_CONFIG").is_none()
+                && std::env::var_os("DOCKER_API_VERSION").is_none()
+                && std::env::var_os("DOCKER_CUSTOM_HEADERS").is_none()
+                && std::env::var_os("DOCKER_DEFAULT_PLATFORM").is_none()
+                && std::env::var_os("DOCKER_AUTH_CONFIG").is_none(),
+            "terminal audit child inherited an Engine endpoint/config override"
+        );
 
         let config_home = std::env::var_os("XDG_CONFIG_HOME")
             .map(std::path::PathBuf::from)
             .expect("terminal audit child XDG_CONFIG_HOME is missing");
-        let expected_config_home = if expected_case == "audit_failure" {
+        let expected_config_home = if case == "audit_failure" {
             home.join("not-a-directory")
         } else {
             home.clone()
@@ -6078,35 +6171,45 @@ mod event_reconciliation_tests {
             config_home, expected_config_home,
             "terminal audit child XDG_CONFIG_HOME is outside its private root"
         );
-        if expected_case == "audit_failure" {
+        if case == "audit_failure" {
             assert!(
                 std::fs::metadata(&config_home).is_ok_and(|metadata| metadata.is_file()),
                 "terminal audit child fail-closed blocker must be a regular file"
             );
         }
-        true
+        terminal_verify_fixture_identity(socket_path, token);
+        Some(case.to_owned())
     }
     #[cfg(target_os = "linux")]
     fn run_terminal_audit_child(
-        test_name: &str,
         marker: &str,
+        token: &str,
         root: &std::path::Path,
         socket: &std::path::Path,
         config_home: &std::path::Path,
     ) {
         use std::process::{Command, Stdio};
 
-        let root_basename = root
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .expect("temporary root should have a UTF-8 basename");
-        let child_marker = format!("{marker}:{root_basename}");
+        let child_marker = format!("{marker}:{token}");
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args(["--exact", test_name, "--nocapture"])
+            .args([
+                "--exact",
+                "event_reconciliation_tests::terminal_audit_child_entry",
+                "--ignored",
+                "--nocapture",
+            ])
             .env(TERMINAL_AUDIT_CHILD_ENV, &child_marker)
             .env("DOCKER_HOST", format!("unix://{}", socket.display()))
             .env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_CERT_PATH")
+            .env_remove("DOCKER_TLS")
+            .env_remove("DOCKER_TLS_VERIFY")
+            .env_remove("DOCKER_CONFIG")
+            .env_remove("DOCKER_API_VERSION")
+            .env_remove("DOCKER_CUSTOM_HEADERS")
+            .env_remove("DOCKER_DEFAULT_PLATFORM")
+            .env_remove("DOCKER_AUTH_CONFIG")
             .env("XDG_CONFIG_HOME", config_home)
             .env("HOME", root)
             .stdout(Stdio::inherit())
@@ -8280,36 +8383,92 @@ mod event_reconciliation_tests {
         assert!(!app.container_inventory_fresh);
         assert_eq!(app.containers[0].state, Some(ContainerState::Running));
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "only launched by the terminal audit parent fixture"]
+    fn terminal_audit_child_entry() {
+        let Some(case) = terminal_audit_child_identity() else {
+            return;
+        };
+        match case.as_str() {
+            "request_error" => {
+                let (mut app, config_home) = start_terminal_audit_session();
+                pump_terminal_until(
+                    &mut app,
+                    |app| app.terminal_notice.is_some(),
+                    "safe terminal error should be delivered",
+                );
+                let audit =
+                    std::fs::read_to_string(config_home.join("ferrum/audit.jsonl")).unwrap();
+                assert!(audit.contains("\"outcome\":\"started\""));
+                assert!(audit.contains("\"outcome\":\"request_error\""));
+                assert_terminal_audit_redacts(&audit);
+                assert!(
+                    app.terminal_notice
+                        .as_deref()
+                        .is_some_and(|notice| !notice.contains("sentinel-engine-error"))
+                );
+            }
+            "success" => {
+                let (mut app, config_home) = start_terminal_audit_session();
+                pump_terminal_until(
+                    &mut app,
+                    |app| app.terminal.is_some(),
+                    "successful terminal open should be delivered",
+                );
+                app.terminal
+                    .as_ref()
+                    .and_then(|terminal| terminal.input.as_ref())
+                    .expect("successful terminal session should accept input")
+                    .try_send(b"sentinel-input".to_vec())
+                    .unwrap();
+                app.runtime.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while !config_home.join("input.received").exists() {
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .expect("fake Engine should receive terminal input");
+                });
+                let audit =
+                    std::fs::read_to_string(config_home.join("ferrum/audit.jsonl")).unwrap();
+                assert!(audit.contains("\"outcome\":\"started\""));
+                assert!(audit.contains("\"outcome\":\"success\""));
+                assert_terminal_audit_redacts(&audit);
+                app.cancel_terminal_session();
+            }
+            "audit_failure" => {
+                let (mut app, config_home) = start_terminal_audit_session();
+                pump_terminal_until(
+                    &mut app,
+                    |app| app.terminal_notice.is_some(),
+                    "static audit failure should be delivered",
+                );
+                assert_eq!(
+                    app.terminal_notice.as_deref(),
+                    Some(
+                        "Terminal execution was not started because its audit record could not be saved."
+                    )
+                );
+                assert!(!config_home.join("ferrum/audit.jsonl").exists());
+            }
+            _ => unreachable!("terminal_audit_child_identity validates child cases"),
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn terminal_exec_is_audited_before_the_engine_receives_its_request() {
         use std::io::Write;
 
-        if is_terminal_audit_child("request_error") {
-            let (mut app, config_home) = start_terminal_audit_session();
-            pump_terminal_until(
-                &mut app,
-                |app| app.terminal_notice.is_some(),
-                "safe terminal error should be delivered",
-            );
-            let audit = std::fs::read_to_string(config_home.join("ferrum/audit.jsonl")).unwrap();
-            assert!(audit.contains("\"outcome\":\"started\""));
-            assert!(audit.contains("\"outcome\":\"request_error\""));
-            assert_terminal_audit_redacts(&audit);
-            assert!(
-                app.terminal_notice
-                    .as_deref()
-                    .is_some_and(|notice| !notice.contains("sentinel-engine-error"))
-            );
-            return;
-        }
-
         let _subprocess_guard = crate::TEST_SUBPROCESS_LOCK.blocking_lock();
-        let (root, socket, listener) = terminal_audit_fixture();
+        let (root, socket, listener, token) = terminal_audit_fixture();
         let audit_path = root.path().join("ferrum/audit.jsonl");
+        let server_token = token.clone();
         let server = std::thread::spawn(move || {
             let mut accepted_count = 0;
+            terminal_respond_to_fixture_probe(&listener, &mut accepted_count, &server_token);
             terminal_respond_to_version(&listener, &mut accepted_count);
 
             let mut exec = terminal_accept(&listener, "exec create", &mut accepted_count);
@@ -8324,13 +8483,7 @@ mod event_reconciliation_tests {
             exec.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 21\r\nConnection: close\r\n\r\nsentinel-engine-error")
                 .unwrap();
         });
-        run_terminal_audit_child(
-            "event_reconciliation_tests::terminal_exec_is_audited_before_the_engine_receives_its_request",
-            "request_error",
-            root.path(),
-            &socket,
-            root.path(),
-        );
+        run_terminal_audit_child("request_error", &token, root.path(), &socket, root.path());
         server.join().unwrap();
     }
     #[cfg(target_os = "linux")]
@@ -8338,41 +8491,13 @@ mod event_reconciliation_tests {
     fn successful_terminal_exec_open_persists_only_static_outcomes() {
         use std::io::{Read, Write};
 
-        if is_terminal_audit_child("success") {
-            let (mut app, config_home) = start_terminal_audit_session();
-            pump_terminal_until(
-                &mut app,
-                |app| app.terminal.is_some(),
-                "successful terminal open should be delivered",
-            );
-            app.terminal
-                .as_ref()
-                .and_then(|terminal| terminal.input.as_ref())
-                .expect("successful terminal session should accept input")
-                .try_send(b"sentinel-input".to_vec())
-                .unwrap();
-            app.runtime.block_on(async {
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    while !config_home.join("input.received").exists() {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                })
-                .await
-                .expect("fake Engine should receive terminal input");
-            });
-            let audit = std::fs::read_to_string(config_home.join("ferrum/audit.jsonl")).unwrap();
-            assert!(audit.contains("\"outcome\":\"started\""));
-            assert!(audit.contains("\"outcome\":\"success\""));
-            assert_terminal_audit_redacts(&audit);
-            app.cancel_terminal_session();
-            return;
-        }
-
         let _subprocess_guard = crate::TEST_SUBPROCESS_LOCK.blocking_lock();
-        let (root, socket, listener) = terminal_audit_fixture();
+        let (root, socket, listener, token) = terminal_audit_fixture();
         let server_root = root.path().to_path_buf();
+        let server_token = token.clone();
         let server = std::thread::spawn(move || {
             let mut accepted_count = 0;
+            terminal_respond_to_fixture_probe(&listener, &mut accepted_count, &server_token);
             terminal_respond_to_version(&listener, &mut accepted_count);
 
             let mut create = terminal_accept(&listener, "exec create", &mut accepted_count);
@@ -8401,41 +8526,20 @@ mod event_reconciliation_tests {
             assert_eq!(&input[..received], b"sentinel-input");
             std::fs::write(server_root.join("input.received"), b"ok").unwrap();
         });
-        run_terminal_audit_child(
-            "event_reconciliation_tests::successful_terminal_exec_open_persists_only_static_outcomes",
-            "success",
-            root.path(),
-            &socket,
-            root.path(),
-        );
+        run_terminal_audit_child("success", &token, root.path(), &socket, root.path());
         server.join().unwrap();
     }
     #[cfg(target_os = "linux")]
     #[test]
     fn terminal_exec_is_not_submitted_when_started_audit_cannot_be_saved() {
-        if is_terminal_audit_child("audit_failure") {
-            let (mut app, config_home) = start_terminal_audit_session();
-            pump_terminal_until(
-                &mut app,
-                |app| app.terminal_notice.is_some(),
-                "static audit failure should be delivered",
-            );
-            assert_eq!(
-                app.terminal_notice.as_deref(),
-                Some(
-                    "Terminal execution was not started because its audit record could not be saved."
-                )
-            );
-            assert!(!config_home.join("ferrum/audit.jsonl").exists());
-            return;
-        }
-
         let _subprocess_guard = crate::TEST_SUBPROCESS_LOCK.blocking_lock();
-        let (root, socket, listener) = terminal_audit_fixture();
+        let (root, socket, listener, token) = terminal_audit_fixture();
         let blocker = root.path().join("not-a-directory");
         std::fs::write(&blocker, b"block").unwrap();
+        let server_token = token.clone();
         let server = std::thread::spawn(move || {
             let mut accepted_count = 0;
+            terminal_respond_to_fixture_probe(&listener, &mut accepted_count, &server_token);
             terminal_respond_to_version(&listener, &mut accepted_count);
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
@@ -8456,13 +8560,7 @@ mod event_reconciliation_tests {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         });
-        run_terminal_audit_child(
-            "event_reconciliation_tests::terminal_exec_is_not_submitted_when_started_audit_cannot_be_saved",
-            "audit_failure",
-            root.path(),
-            &socket,
-            &blocker,
-        );
+        run_terminal_audit_child("audit_failure", &token, root.path(), &socket, &blocker);
         assert!(
             !server.join().unwrap(),
             "fake Engine must not receive an exec request"
