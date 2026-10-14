@@ -5905,9 +5905,7 @@ mod event_reconciliation_tests {
     #[cfg(target_os = "linux")]
     const TERMINAL_AUDIT_CHILD_ENV: &str = "FERRUM_TERMINAL_AUDIT_CHILD";
     #[cfg(target_os = "linux")]
-    fn terminal_http_request(
-        stream: &mut std::os::unix::net::UnixStream,
-    ) -> Vec<u8> {
+    fn terminal_http_request(stream: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
         use std::io::Read;
         let mut bytes = Vec::new();
         let mut buffer = [0u8; 1024];
@@ -5915,9 +5913,11 @@ mod event_reconciliation_tests {
             let length = stream.read(&mut buffer).unwrap();
             assert_ne!(length, 0);
             bytes.extend_from_slice(&buffer[..length]);
-            assert!(bytes.len() <= 64 * 1024, "fake Engine request exceeded its test bound");
-            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
-            else {
+            assert!(
+                bytes.len() <= 64 * 1024,
+                "fake Engine request exceeded its test bound"
+            );
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
                 continue;
             };
             let content_length = String::from_utf8_lossy(&bytes[..header_end])
@@ -8117,11 +8117,12 @@ mod event_reconciliation_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn terminal_exec_is_audited_before_the_engine_receives_its_request() {
-        use std::os::unix::net::UnixListener;
+        use std::{io::Write, os::unix::net::UnixListener};
 
         if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("request_error") {
             let mut app = terminal_audit_app();
-            let config_home = std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+            let config_home =
+                std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
             app.start_terminal(
                 "a".repeat(64),
                 "sentinel-shell".to_owned(),
@@ -8197,11 +8198,15 @@ mod event_reconciliation_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn successful_terminal_exec_open_persists_only_static_outcomes() {
-        use std::os::unix::net::UnixListener;
+        use std::{
+            io::{Read, Write},
+            os::unix::net::UnixListener,
+        };
 
         if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("success") {
             let mut app = terminal_audit_app();
-            let config_home = std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+            let config_home =
+                std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
             app.start_terminal(
                 "a".repeat(64),
                 "sentinel-shell".to_owned(),
@@ -8307,7 +8312,8 @@ mod event_reconciliation_tests {
 
         if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("audit_failure") {
             let mut app = terminal_audit_app();
-            let config_home = std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+            let config_home =
+                std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
             app.start_terminal(
                 "a".repeat(64),
                 "sentinel-shell".to_owned(),
@@ -8329,7 +8335,9 @@ mod event_reconciliation_tests {
             });
             assert_eq!(
                 app.terminal_notice.as_deref(),
-                Some("Terminal execution was not started because its audit record could not be saved.")
+                Some(
+                    "Terminal execution was not started because its audit record could not be saved."
+                )
             );
             assert!(!config_home.join("ferrum/audit.jsonl").exists());
             return;
