@@ -5981,7 +5981,10 @@ mod event_reconciliation_tests {
         std::path::PathBuf,
         std::os::unix::net::UnixListener,
     ) {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = root.path().join("engine.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
