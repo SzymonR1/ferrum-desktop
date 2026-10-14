@@ -221,8 +221,11 @@ successful create/start upgrade and the static `success` outcome.
 temporary SettingsStore an unusable parent path and verifies the fake Engine
 receives no exec request and the UI receives a static failure notice. No live
 Engine is contacted and no container resource is created or changed. Terminal
-content and resize events are not audited. This is partial Issue #19 coverage,
-not full audit completion.
+content and resize events are not audited. The Engine endpoint is supplied only
+to an exact child-test process; the parent uses the shared subprocess lock, a
+private temporary directory, and bounded fake-server reads/accepts so parallel
+test threads do not observe environment mutation or contact a host Engine. This
+is partial Issue #19 coverage, not full audit completion.
 Settings tests cover missing/corrupt settings, file-symlink rejection without
 changing target permissions, non-regular and hard-linked file rejection, and
 refusal to chmod or write through symlinked settings directories. The hard-link
