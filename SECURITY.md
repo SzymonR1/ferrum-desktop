@@ -90,15 +90,21 @@ helper failure before Engine HTTP submission. Image IDs, references, repository
 tags, endpoints, error text, and daemon response bodies are not included in
 those traces.
 
-Ferrum also maintains a Linux-local, bounded JSONL copy of mutation outcomes
-for container lifecycle, confirmed imported Compose start/stop/service
+Ferrum also maintains a Linux-local, bounded JSONL audit history for
+Ferrum-initiated mutation outcomes and embedded terminal exec opens. Mutation
+records cover container lifecycle, confirmed imported Compose start/stop/service
 restart/pause/unpause and `up`, Compose pulls, image pull/push/tag/removal and
-Buildx image builds, volume create/removal, and network
-create/removal/connect/disconnect requests. `audit.jsonl` is created lazily in
-Ferrum's descriptor-anchored config directory with directory mode `0700` and
-file mode `0600`. Schema version 1 records a timestamp, static
-event/action/outcome, and validated full resource IDs only where existing
-traces permit.
+Buildx image builds, volume create/removal, and network create/removal/connect/
+disconnect requests. `audit.jsonl` is created lazily in Ferrum's descriptor-
+anchored config directory with directory mode `0700` and file mode `0600`.
+Schema version 1 records a timestamp, static event/action/outcome, and validated
+full resource IDs only where existing traces permit.
+
+Terminal exec-open records use `terminal_exec/exec` with static `started`,
+`success`, and `request_error` outcomes. The synced `started` record is required
+before Engine submission; if it cannot be written, exec is not submitted.
+Shell/command, terminal input/output, raw Engine errors, credentials, paths, and
+endpoints are never recorded.
 
 A Compose lifecycle entry contains only the static `compose_mutation` event,
 `start`/`stop`/`restart`/`pause`/`unpause`/`up` action, and `started`,

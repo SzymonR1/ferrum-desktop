@@ -6044,6 +6044,21 @@ mod event_reconciliation_tests {
         );
         (app, config_home)
     }
+    #[cfg(target_os = "linux")]
+    fn pump_terminal_until(
+        app: &mut FerrumApp,
+        ready: impl Fn(&FerrumApp) -> bool,
+        timeout_message: &str,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready(app) {
+            app.runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            });
+            app.receive_terminal_opened();
+            assert!(std::time::Instant::now() < deadline, "{timeout_message}");
+        }
+    }
     #[test]
     fn build_engine_source_label_distinguishes_configured_socket_from_discovery() {
         assert_eq!(
@@ -8156,17 +8171,11 @@ mod event_reconciliation_tests {
 
         if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("request_error") {
             let (mut app, config_home) = start_terminal_audit_session();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while app.terminal_notice.is_none() {
-                app.runtime.block_on(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                });
-                app.receive_terminal_opened();
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "safe terminal error should be delivered"
-                );
-            }
+            pump_terminal_until(
+                &mut app,
+                |app| app.terminal_notice.is_some(),
+                "safe terminal error should be delivered",
+            );
             let audit = std::fs::read_to_string(config_home.join("ferrum/audit.jsonl")).unwrap();
             assert!(audit.contains("\"outcome\":\"started\""));
             assert!(audit.contains("\"outcome\":\"request_error\""));
@@ -8230,17 +8239,11 @@ mod event_reconciliation_tests {
 
         if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("success") {
             let (mut app, config_home) = start_terminal_audit_session();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while app.terminal.is_none() {
-                app.runtime.block_on(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                });
-                app.receive_terminal_opened();
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "successful terminal open should be delivered"
-                );
-            }
+            pump_terminal_until(
+                &mut app,
+                |app| app.terminal.is_some(),
+                "successful terminal open should be delivered",
+            );
             app.terminal
                 .as_ref()
                 .and_then(|terminal| terminal.input.as_ref())
@@ -8326,17 +8329,11 @@ mod event_reconciliation_tests {
 
         if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("audit_failure") {
             let (mut app, config_home) = start_terminal_audit_session();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while app.terminal_notice.is_none() {
-                app.runtime.block_on(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                });
-                app.receive_terminal_opened();
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "static audit failure should be delivered"
-                );
-            }
+            pump_terminal_until(
+                &mut app,
+                |app| app.terminal_notice.is_some(),
+                "static audit failure should be delivered",
+            );
             assert_eq!(
                 app.terminal_notice.as_deref(),
                 Some(
