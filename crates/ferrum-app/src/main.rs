@@ -5986,6 +5986,15 @@ mod event_reconciliation_tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn terminal_respond_to_version(
+        listener: &std::os::unix::net::UnixListener,
+        accepted_count: &mut usize,
+    ) {
+        let mut stream = terminal_accept(listener, "version", accepted_count);
+        let _ = terminal_http_request(&mut stream);
+        terminal_write_version_response(&mut stream);
+    }
+    #[cfg(target_os = "linux")]
     fn run_terminal_audit_child(
         test_name: &str,
         marker: &str,
@@ -8207,10 +8216,7 @@ mod event_reconciliation_tests {
         let audit_path = root.path().join("ferrum/audit.jsonl");
         let server = std::thread::spawn(move || {
             let mut accepted_count = 0;
-            let mut version = terminal_accept(&listener, "version", &mut accepted_count);
-            let _ = terminal_http_request(&mut version);
-            terminal_write_version_response(&mut version);
-            drop(version);
+            terminal_respond_to_version(&listener, &mut accepted_count);
 
             let mut exec = terminal_accept(&listener, "exec create", &mut accepted_count);
             let audit =
@@ -8279,10 +8285,7 @@ mod event_reconciliation_tests {
         let server_root = root.path().to_path_buf();
         let server = std::thread::spawn(move || {
             let mut accepted_count = 0;
-            let mut version = terminal_accept(&listener, "version", &mut accepted_count);
-            let _ = terminal_http_request(&mut version);
-            terminal_write_version_response(&mut version);
-            drop(version);
+            terminal_respond_to_version(&listener, &mut accepted_count);
 
             let mut create = terminal_accept(&listener, "exec create", &mut accepted_count);
             let started = std::fs::read_to_string(server_root.join("ferrum/audit.jsonl"))
@@ -8350,10 +8353,7 @@ mod event_reconciliation_tests {
         listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
             let mut accepted_count = 0;
-            let mut version = terminal_accept(&listener, "version", &mut accepted_count);
-            let _ = terminal_http_request(&mut version);
-            terminal_write_version_response(&mut version);
-            drop(version);
+            terminal_respond_to_version(&listener, &mut accepted_count);
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
             loop {
