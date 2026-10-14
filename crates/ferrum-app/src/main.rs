@@ -6021,15 +6021,12 @@ mod event_reconciliation_tests {
             return false;
         };
         let Some((case, root_basename)) = marker.split_once(':') else {
-            eprintln!("terminal child marker rejected: case/token");
             return false;
         };
         if case != expected_case || root_basename.is_empty() || root_basename.contains('/') {
-            eprintln!("terminal child marker rejected: case/root token");
             return false;
         }
         let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
-            eprintln!("terminal child marker rejected: HOME missing");
             return false;
         };
         if home
@@ -6038,46 +6035,42 @@ mod event_reconciliation_tests {
             .as_deref()
             != Some(root_basename)
         {
-            eprintln!("terminal child marker rejected: HOME basename");
             return false;
         }
         let Ok(home_metadata) = std::fs::metadata(&home) else {
-            eprintln!("terminal child marker rejected: HOME metadata");
             return false;
         };
         if !home_metadata.is_dir() || home_metadata.permissions().mode() & 0o777 != 0o700 {
-            eprintln!("terminal child marker rejected: HOME directory mode");
+            eprintln!(
+                "terminal child marker rejected: HOME={home:?} is_dir={} mode={:04o}",
+                home_metadata.is_dir(),
+                home_metadata.permissions().mode() & 0o777
+            );
             return false;
         }
 
         let Some(host) = std::env::var_os("DOCKER_HOST") else {
-            eprintln!("terminal child marker rejected: DOCKER_HOST missing");
             return false;
         };
         let host = host.to_string_lossy();
         let Some(socket_path) = host.strip_prefix("unix://") else {
-            eprintln!("terminal child marker rejected: DOCKER_HOST scheme");
             return false;
         };
         let socket_path = std::path::Path::new(socket_path);
         if socket_path.parent() != Some(home.as_path())
             || socket_path.file_name() != Some(std::ffi::OsStr::new("engine.sock"))
         {
-            eprintln!("terminal child marker rejected: socket parent/name");
             return false;
         }
         let Ok(socket_metadata) = std::fs::symlink_metadata(socket_path) else {
-            eprintln!("terminal child marker rejected: socket path missing");
             return false;
         };
         if !socket_metadata.file_type().is_socket() {
-            eprintln!("terminal child marker rejected: socket type");
             return false;
         }
 
         let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from)
         else {
-            eprintln!("terminal child marker rejected: XDG_CONFIG_HOME missing");
             return false;
         };
         let expected_config_home = if expected_case == "audit_failure" {
@@ -6086,15 +6079,10 @@ mod event_reconciliation_tests {
             home.clone()
         };
         if config_home != expected_config_home {
-            eprintln!("terminal child marker rejected: XDG_CONFIG_HOME path");
             return false;
         }
-        let valid = expected_case != "audit_failure"
-            || std::fs::metadata(config_home).is_ok_and(|metadata| metadata.is_file());
-        if !valid {
-            eprintln!("terminal child marker rejected: blocker-file type");
-        }
-        valid
+        expected_case != "audit_failure"
+            || std::fs::metadata(config_home).is_ok_and(|metadata| metadata.is_file())
     }
     #[cfg(target_os = "linux")]
     fn run_terminal_audit_child(
