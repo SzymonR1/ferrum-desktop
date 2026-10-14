@@ -92,6 +92,18 @@ pub(super) enum AuditStoreError {
     Serialization,
     Worker,
 }
+#[cfg(target_os = "linux")]
+impl AuditStoreError {
+    pub(super) fn category(&self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Unavailable => "unavailable",
+            Self::Write => "write",
+            Self::Serialization => "serialization",
+            Self::Worker => "worker",
+        }
+    }
+}
 
 impl AuditStore {
     #[cfg(target_os = "linux")]

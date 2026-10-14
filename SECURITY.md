@@ -138,8 +138,10 @@ endpoints, credentials, raw errors, daemon bodies, and terminal/log contents.
 Each record is synced; the file has a 16 MiB hard cap and is not automatically
 truncated or rotated. Interprocess lock acquisition uses nonblocking retries
 with a 250 ms deadline; continued contention is a persistence failure. When
-full or when persistence fails, Ferrum emits a static process warning and does
-not claim the event was persisted; the engine request outcome is unchanged.
+full or persistence fails, Ferrum logs a structured warning with only a static
+`audit_error` category, never raw storage errors or paths. Failed persistence
+of a final outcome for an already-submitted action does not change its result;
+failure to persist a required terminal `started` marker blocks exec submission.
 This is local Ferrum-request history only, mutable by the same-UID user, not
 tamper-proof, and does not prove final engine state or record external engine
 actions.

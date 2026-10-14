@@ -850,8 +850,11 @@ struct CachedDroppedLogNotice {
 
 #[cfg(target_os = "linux")]
 async fn persist_audit_record(store: &audit::AuditStore, record: audit::AuditRecord) {
-    if store.persist(record).await.is_err() {
-        tracing::warn!("Could not persist local audit record");
+    if let Err(error) = store.persist(record).await {
+        tracing::warn!(
+            audit_error = error.category(),
+            "Could not persist local audit record"
+        );
     }
 }
 
@@ -1210,12 +1213,14 @@ impl FerrumApp {
         let audit_store = self.audit_store.clone();
         let start_container_id = container_id.clone();
         self.terminal_open_task = Some(self.runtime.spawn(async move {
-            if audit_store
+            if let Err(error) = audit_store
                 .persist(audit::record_terminal_exec_started(&container_id))
                 .await
-                .is_err()
             {
-                tracing::warn!("Could not persist local audit record");
+                tracing::warn!(
+                    audit_error = error.category(),
+                    "Could not persist terminal exec start record"
+                );
                 let _ = sender
                     .send(TerminalOpened::Failed {
                         attempt_id,

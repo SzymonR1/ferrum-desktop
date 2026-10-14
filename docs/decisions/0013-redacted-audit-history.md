@@ -35,13 +35,16 @@ shell/command details, terminal input/output, names, image references or tags,
 endpoints, credentials, raw errors, daemon bodies, or filesystem paths.
 
 Cap the file at 16 MiB. Do not automatically delete, truncate, or rotate older
-records. When the cap is reached or persistence fails, claim no durable record,
-emit only a static process warning, and leave the already-returned engine
-result unchanged. Existing process trace events remain separate from this file.
+records. When the cap is reached or persistence fails, claim no durable record
+and emit a structured warning with only a static `audit_error` category; do not
+log raw storage errors or paths. Failure to persist the required terminal
+`started` marker blocks exec submission. Persistence failure for a final record
+or an already-submitted action leaves its observed Engine/UI result unchanged.
+Existing process trace events remain separate from this file.
 
 Serialize appends with nonblocking file-lock attempts bounded to 250 ms. If the
-lock remains contended, treat persistence as failed, emit the static warning,
-and leave the already-returned engine result unchanged.
+lock remains contended, classify persistence as `write` and apply the same
+terminal-start versus already-submitted outcome policy above.
 
 ## Alternatives
 

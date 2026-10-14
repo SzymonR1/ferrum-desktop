@@ -573,8 +573,10 @@ store but does not build or change project containers, networks, or volumes.
   terminal/log contents. Sync each record; enforce a 16 MiB hard cap without
   automatic truncation or rotation. Use nonblocking interprocess-lock attempts
   with a 250 ms deadline; continued contention counts as a persistence failure.
-  At capacity or on persistence failure, emit a static process warning and do
-  not claim the event is durable; do not change the engine request outcome.
+  At capacity or on persistence failure, emit a structured warning with only a
+  static `audit_error` category; do not log raw storage errors or paths. Failure
+  to persist a required terminal `started` marker blocks exec submission;
+  failures for already-submitted actions do not change their Engine result.
   This is local Ferrum-request history, mutable by the same-UID user, not
   tamper-proof, not proof of final engine state, and does not record external
   engine actions.
