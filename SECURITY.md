@@ -93,10 +93,11 @@ those traces.
 Ferrum also maintains a Linux-local, bounded JSONL audit history for
 Ferrum-initiated mutation outcomes and embedded terminal exec opens. Mutation
 records cover container lifecycle, confirmed imported Compose start/stop/service
-restart/pause/unpause and `up`, Compose pulls, image pull/push/tag/removal and
-Buildx image builds, volume create/removal, and network create/removal/connect/
-disconnect requests. `audit.jsonl` is created lazily in Ferrum's descriptor-
-anchored config directory with directory mode `0700` and file mode `0600`.
+restart/pause/unpause, one-service scale, and `up`, Compose pulls, image
+pull/push/tag/removal and Buildx image builds, volume create/removal, and network
+create/removal/connect/disconnect requests. `audit.jsonl` is created lazily in
+Ferrum's descriptor-anchored config directory with directory mode `0700` and
+file mode `0600`.
 Schema version 1 records a timestamp, static event/action/outcome, and validated
 full resource IDs only where existing traces permit.
 
