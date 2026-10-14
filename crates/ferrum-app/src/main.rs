@@ -1248,6 +1248,8 @@ impl FerrumApp {
                     return;
                 }
             };
+            let resize_handle = session.resize_handle();
+            let resize_worker_handle = resize_handle.clone();
             let resize_failed = Arc::new(AtomicBool::new(false));
             let worker_resize_failed = Arc::clone(&resize_failed);
             let resize_context = context.clone();
