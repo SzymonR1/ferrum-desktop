@@ -176,12 +176,17 @@ env -u DOCKER_HOST DOCKER_CONTEXT=default FERRUM_TEST_IMAGE=ghcr.io/catthehacker
 
 The prior scale-only version passed on 2026-10-13 against Fedora Linux 44
 x86_64, Docker Engine 29.9.0/API 1.56, and Compose v5.6.0 via the local
-`default` Unix-socket context. That run verified scale-up/down, sibling
-absence, and scoped cleanup; it did not exercise the newly added Stop/Start
-checks. This opt-in smoke covers only this local Docker Engine path: it does
-not establish UI, Podman, remote, Windows, macOS, or full Issue #18 acceptance.
-Do not run it against an Engine containing valuable resources; it touches only
-its preflighted, uniquely named generated project.
+`default` Unix-socket context. That run verified scale-up/down, sibling absence,
+and scoped cleanup; it did not exercise Stop/Start.
+
+The expanded smoke passed on 2026-10-14 against the same environment (1 passed,
+391 filtered). It verified scale-up to two replicas and down to one, Stop to
+`exited`, Start back to `running`, sibling absence, and successful scoped
+cleanup with no generated-project containers remaining. This opt-in smoke
+covers only this local Docker Engine path: it does not establish UI, Podman,
+remote, Windows, macOS, or full Issue #18 acceptance. Do not run it against an
+Engine containing valuable resources; it touches only its preflighted,
+uniquely named generated project.
 
 ## Compose up with local images
 

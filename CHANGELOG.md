@@ -42,13 +42,18 @@ All notable project changes are documented here. The project has not published a
   cancellation or page/context invalidation records static
   `scale/not_submitted`. Audit excludes
   service, project, count, path, profile, socket, and output data. The ignored
-  live smoke now uses a unique project with a profile-gated target and
-  same-profile sibling, preflights project/network absence, uses a preinstalled
-  image without mounts/ports/pull/build, and attempts scoped non-force,
-  non-prune, non-volume cleanup. The smoke passed on 2026-10-13 against Docker
-  Engine 29.9.0/API 1.56 and Compose v5.6.0; the same-profile sibling remained
-  absent and the generated project containers were cleaned. No broader
-  platform support or full Issue #18 completion is claimed.
+  live smoke uses a unique project with a profile-gated target and same-profile
+  sibling, preflights project/network absence, uses a preinstalled image
+  without mounts/ports/pull/build, and invokes the production project `Stop`
+  and `Start` worker only after verifying exact project ownership. It verifies
+  the sole target reaches `exited` after Stop and `running` after Start while
+  the sibling remains absent, then attempts scoped non-force, non-prune,
+  non-volume cleanup. The expanded smoke passed on 2026-10-14 against Fedora
+  Linux 44 x86_64, Docker Engine 29.9.0/API 1.56, and Compose v5.6.0 via the
+  local `default` Unix-socket context (1 passed, 391 filtered); scoped cleanup
+  succeeded and the generated project's container inventory was empty. The
+  prior 2026-10-13 run covered scaling only. No broader platform support or
+  full Issue #18 completion is claimed.
   Compose audit writes use one 32-entry bounded FIFO; operations fail closed
   before submission when a start marker cannot be queued. Cancellation audit
   remains best-effort if the queue or durable store is unavailable, and shutdown

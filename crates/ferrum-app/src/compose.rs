@@ -8622,10 +8622,7 @@ exit 85
             } else {
                 None
             };
-            let after_stop = if stop
-                .as_ref()
-                .is_some_and(|result| result.outcome.is_ok())
-            {
+            let after_stop = if stop.as_ref().is_some_and(|result| result.outcome.is_ok()) {
                 Some(existing_compose_containers(socket, &files, &lifecycle_profiles).await)
             } else {
                 None
@@ -8653,10 +8650,7 @@ exit 85
             } else {
                 None
             };
-            let after_start = if start
-                .as_ref()
-                .is_some_and(|result| result.outcome.is_ok())
-            {
+            let after_start = if start.as_ref().is_some_and(|result| result.outcome.is_ok()) {
                 Some(existing_compose_containers(socket, &files, &lifecycle_profiles).await)
             } else {
                 None
