@@ -990,13 +990,15 @@ engine or registry or mutate images.
 Pull presentation tests use fixed progress values. Tag, push, and removal tests
 use fake completion events and do not mutate image resources. Separate opt-in
 Engine-level smokes exercise anonymous and synthetic Basic-auth pulls through
-the Engine; the fake-helper app smoke separately validates the helper execution
-seam. All pull cleanup uses the same validated local Unix socket and verified
-full image ID without force or prune, after the generated tag is verified as
-sole; a concurrent additional tag makes Docker refuse removal and may leave the
-generated image for manual cleanup. These smokes do not exercise the Ferrum UI
-or configured production helper/credentials.
-No live Ferrum UI pull, tag/removal, or registry-push operation is claimed.
+the Engine. The ignored app smoke below drives FerrumApp's real image view and
+worker, including Settings helper selection and one-pull AccessKit consent. It
+complements, rather than replaces, the direct-helper authentication smoke. The
+app smoke preflights both generated references, confirms the unchecked attempt
+is rejected without helper invocation or image import, then opts in and verifies
+the synthetic authorization and imported image. Cleanup is limited to a verified
+generated image with one exact tag, removed by full ID from the same socket
+without force or prune. Ambiguous ownership leaves the image for manual
+inspection.
 Push tests use fake sockets and headless UI state only; they do not mutate
 images or contact a registry. Tests must not pull, tag, push, delete, or
 otherwise mutate user images or engines.
@@ -1037,29 +1039,56 @@ endpoint. Pulls and pushes are anonymous by default. Fake-helper tests cover
 helper protocol/response parsing; fake Unix-engine tests cover authenticated
 headers without invoking real helpers or contacting a registry. The ignored
 Engine synthetic-auth smoke constructs `RegistryAuth` directly and does not test
-the helper path. A separate ignored app smoke runs the fake helper through
-`authorization_with_binary`, then passes its result to a real local Engine and
-the shared test-only loopback registry. It passed on 2026-10-14 on Fedora Linux
-44 x86_64 with Docker Engine 29.9.0/API 1.56 through the default local Unix
-context:
+the helper path. A separate ignored app smoke runs `authorization_with_binary`
+through a fake helper to a real local Engine and the shared test-only loopback
+registry; it tests the helper execution seam but not Settings or UI consent.
+
+The lower-level helper smoke above remains independently runnable:
 
 ```sh
 env -u DOCKER_HOST DOCKER_CONTEXT=default cargo test -p ferrum-app --bin ferrum registry_auth::tests::fake_helper_authenticates_generated_loopback_pull_through_local_engine -- --exact --ignored
 ```
 
-The helper binary and Basic username/secret are generated and synthetic. The
-app smoke pulls a generated image into the test Engine and verifies its full
-SHA-256 ID and sole generated tag before arming cleanup. Explicit cleanup and
-Drop use the same validated local Unix socket as the EngineClient and remove
-only the retained full image ID with `docker image rm --no-prune` and no force.
-If another tag is added, Docker refuses non-forced ID removal and the generated
-image may remain for manual cleanup. No user image is intentionally targeted.
-Registry requests stay on `127.0.0.1` and HTTP/insecure-registry only; no TLS,
-saved Docker registry credential config, or external registry is used. The test
-does not exercise Settings enum selection or per-pull UI consent. Both
-helper-auth paths remain narrow evidence only; Issues #16 and #19 remain
-partial/open. Ferrum does not read saved Docker credential entries; Buildx
-remains credential-free.
+It runs only the fake-helper execution seam through a real local Engine and
+synthetic Basic credentials; it does not select Settings or exercise UI consent.
+
+The ignored app-level smoke combines the existing `SecretService` setting,
+production Images view and pull worker, per-pull AccessKit checkbox, fake helper,
+shared loopback registry, and real local Engine:
+
+```sh
+cargo test -p ferrum-app --bin ferrum event_reconciliation_tests::real_engine_image_helper_consent_smoke -- --exact --ignored
+```
+
+It is Linux-only and isolated in a child test process with a fresh random marker,
+exact `DOCKER_HOST=unix://<current-local-socket>`, cleared Docker context/TLS/
+certificate/config overrides, and private HOME/XDG/PATH. The private PATH puts
+the test fake `docker-credential-secretservice` first and contains only that
+helper directory and the Docker CLI directory. The parent writes the private
+SettingsStore; helper response and invocation evidence are private files.
+Synthetic nonce credentials are used only. The test preflights both generated
+references as absent, confirms the first unchecked pull is rejected by the
+loopback registry without helper execution or image import, then checks the
+opted-in pull's exact Basic authorization and imported image. Cleanup is armed
+only for the full SHA-256 image ID whose sole tag is the generated target, and
+is pinned to the same local socket with `--no-prune`, no force, and bounded
+execution; final inventory must confirm absence. If ownership or cleanup is
+ambiguous, the image is left for manual inspection.
+
+The smoke requires an accessible, disposable current local Docker Unix-socket
+Engine configured to permit loopback insecure-registry traffic. It does not use
+production credentials, real helper binaries, external TLS registries, or
+validate UI visuals. It does not establish Podman, remote, Windows, macOS, or
+broader Engine support; Issues #16 and #19 remain open/partial. The default test
+suite remains Engine-free and does not pull or mutate images. Ferrum does not
+read saved Docker credential entries; Buildx remains credential-free.
+
+Observed on 2026-10-14 on Fedora Linux 44 x86_64 with Docker Engine 29.9.0/API
+1.56 and the preinstalled `node:22-bookworm-slim` image, the exact smoke passed
+(the parent test and its spawned child entry both succeeded). The test's fresh
+Engine inventory confirmed the generated image tag was absent after verified
+full-ID cleanup. No production credential, real helper binary, pre-existing
+image mutation, or external host was involved.
 
 Manual release-mode performance samples are opt-in and have no timing
 thresholds. See the [performance and accessibility evidence](../performance.md)

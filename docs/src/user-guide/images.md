@@ -176,25 +176,34 @@ and pushes are anonymous unless a configured Secret Service or `pass` helper is
 explicitly enabled for that single operation. Buildx remains credential-free;
 private base-image authentication is unsupported. Fake-helper protocol tests and
 fake Unix-engine request tests are separate from live evidence. The direct
-Engine AuthConfig smoke uses synthetic credentials and does not exercise a
-helper. The new ignored app smoke runs the fake-helper execution seam through a
-real local Engine to the shared test-only loopback registry. It passed on
-2026-10-14 on Fedora Linux 44 x86_64 with Docker Engine 29.9.0/API 1.56 through
-the default local Unix context. The test pulls a nonce-generated image into the
-local image store and arms cleanup only after verifying its full image ID and
-sole generated tag. Cleanup is pinned to the same validated local Unix socket
-and removes by full ID without force or prune; if another tag is added, Docker
-refuses removal and the image may remain for manual cleanup. The helper is
-synthetic and the registry uses loopback HTTP with the existing
-insecure-registry setup. It does not validate Settings helper selection,
-per-pull UI consent, real credentials, TLS, production registry configuration,
-or external registries. Issues #16 and #19 remain partial/open.
-Run the ignored app smoke only with a disposable local Docker Unix context and
-existing loopback insecure-registry support:
+Engine AuthConfig smoke constructs `RegistryAuth` directly and does not test a
+helper.
+An additional ignored Linux FerrumApp smoke loads `SecretService` from
+a private SettingsStore, drives the production Images view and pull worker with
+headless egui/AccessKit, verifies an unchecked first request is rejected without
+helper invocation or image import, then explicitly opts in for one generated
+target and verifies the fake helper's synthetic Basic authorization at the
+shared test-only loopback registry and successful real-Engine import. It
+preflights both generated references as absent and cleans only a generated
+image with a verified full ID and sole target tag, pinned to the same local
+Unix socket with no force or prune. It requires a disposable local Docker Unix
+context with loopback insecure-registry support:
 
 ```sh
-env -u DOCKER_HOST DOCKER_CONTEXT=default cargo test -p ferrum-app --bin ferrum registry_auth::tests::fake_helper_authenticates_generated_loopback_pull_through_local_engine -- --exact --ignored
+cargo test -p ferrum-app --bin ferrum event_reconciliation_tests::real_engine_image_helper_consent_smoke -- --exact --ignored
 ```
+
+This smoke uses only synthetic nonce credentials, a private fake
+`docker-credential-secretservice` executable and private response/invocation
+files. It excludes production credentials, real helper binaries, external TLS
+registries, UI visual validation, and broader Engine support. An ambiguous
+image is left for manual inspection. This test is a narrow Issue #16/#19 slice;
+neither issue is closed by it.
+
+The existing ignored lower-level helper-to-Engine smoke remains separate: it
+tests `authorization_with_binary` but not Settings selection or UI consent.
+The live image pulls use the existing test-support loopback registry and
+`DisposableImageTag`; they do not use external registries.
 
 No live push, Ferrum tag/removal, or build was performed. Native Images-page
 visual validation remains unverified. Default fake-socket/headless tests do not
