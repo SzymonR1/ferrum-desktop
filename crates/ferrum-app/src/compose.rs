@@ -8548,8 +8548,8 @@ exit 85
                 .arg(&cleanup_scope.2)
                 .arg("down");
 
-            // From this point, every result is recorded before any assertion, and the
-            // generated-file/project-scoped down command is always attempted afterward.
+            // Record every result before assertions. Cleanup runs only after a
+            // successful scale-up and a fresh exact inventory check.
             let scale_up = compose_service_scale(
                 socket,
                 &files,
@@ -8566,7 +8566,9 @@ exit 85
                 format!("{project_name}-scale-probe-1"),
                 format!("{project_name}-scale-probe-2"),
             ];
-            let up_ownership = after_up.outcome.is_ok()
+            let up_ownership = scale_up.outcome.is_ok()
+                && scale_up.submitted
+                && after_up.outcome.is_ok()
                 && after_up.containers.len() == 2
                 && after_up.containers.iter().all(|container| {
                     container.service == "scale-probe"
@@ -8592,7 +8594,7 @@ exit 85
             };
             let after_downscale = if downscale
                 .as_ref()
-                .is_some_and(|result| result.outcome.is_ok())
+                .is_some_and(|result| result.outcome.is_ok() && result.submitted)
             {
                 Some(existing_compose_containers(socket, &files, &profiles).await)
             } else {
@@ -8608,10 +8610,87 @@ exit 85
                     })
             });
 
-            let cleanup_result =
-                run_command_with_timeout(&mut cleanup, LIFECYCLE_COMMAND_TIMEOUT).await;
-            let cleaned = existing_compose_containers(socket, &files, &profiles).await;
+            let lifecycle_profiles = ["scale-check".to_owned()];
+            let stop = if downscale_ownership {
+                Some(
+                    compose_operation(
+                        socket,
+                        &files,
+                        &lifecycle_profiles,
+                        ComposeOperationAction::Stop,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
+            let after_stop = if stop
+                .as_ref()
+                .is_some_and(|result| result.outcome.is_ok() && result.submitted)
+            {
+                Some(existing_compose_containers(socket, &files, &lifecycle_profiles).await)
+            } else {
+                None
+            };
+            let stopped_state = after_stop.as_ref().is_some_and(|status| {
+                status.outcome.is_ok()
+                    && status.containers.len() == 1
+                    && status.containers.iter().all(|container| {
+                        container.service == "scale-probe"
+                            && container.project.as_deref() == Some(project_name.as_str())
+                            && scale_container_names.contains(&container.name)
+                            && container.state == "exited"
+                    })
+            });
+            let start = if stopped_state {
+                Some(
+                    compose_operation(
+                        socket,
+                        &files,
+                        &lifecycle_profiles,
+                        ComposeOperationAction::Start,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
+            let after_start = if start
+                .as_ref()
+                .is_some_and(|result| result.outcome.is_ok() && result.submitted)
+            {
+                Some(existing_compose_containers(socket, &files, &lifecycle_profiles).await)
+            } else {
+                None
+            };
+            let started_state = after_start.as_ref().is_some_and(|status| {
+                status.outcome.is_ok()
+                    && status.containers.len() == 1
+                    && status.containers.iter().all(|container| {
+                        container.service == "scale-probe"
+                            && container.project.as_deref() == Some(project_name.as_str())
+                            && scale_container_names.contains(&container.name)
+                            && container.state == "running"
+                    })
+            });
 
+            let before_cleanup =
+                existing_compose_containers(socket, &files, &lifecycle_profiles).await;
+            let cleanup_ownership = scale_up.outcome.is_ok()
+                && scale_up.submitted
+                && before_cleanup.outcome.is_ok()
+                && (1..=2).contains(&before_cleanup.containers.len())
+                && before_cleanup.containers.iter().all(|container| {
+                    container.service == "scale-probe"
+                        && container.project.as_deref() == Some(project_name.as_str())
+                        && scale_container_names.contains(&container.name)
+                });
+            let cleanup_result = if cleanup_ownership {
+                Some(run_command_with_timeout(&mut cleanup, LIFECYCLE_COMMAND_TIMEOUT).await)
+            } else {
+                None
+            };
+            let cleaned = existing_compose_containers(socket, &files, &lifecycle_profiles).await;
             assert_eq!(scale_up.outcome, Ok(()), "scale-up should succeed");
             assert!(scale_up.submitted, "scale-up should be submitted");
             assert!(
@@ -8629,6 +8708,27 @@ exit 85
                 downscale_ownership,
                 "exactly one generated-project replica should remain"
             );
+            assert!(stop.is_some(), "stop runs only after ownership is verified");
+            let stop = stop.unwrap();
+            assert_eq!(stop.outcome, Ok(()), "project stop should succeed");
+            assert!(stop.submitted, "project stop should be submitted");
+            assert!(
+                stopped_state,
+                "the sole target service container should be exited after project stop"
+            );
+            assert!(start.is_some(), "start runs only after stop is verified");
+            let start = start.unwrap();
+            assert_eq!(start.outcome, Ok(()), "project start should succeed");
+            assert!(start.submitted, "project start should be submitted");
+            assert!(
+                started_state,
+                "the sole target service container should be running after project start, with no sibling"
+            );
+            assert!(
+                cleanup_result.is_some(),
+                "cleanup requires a successful scale-up and a fresh exact inventory check"
+            );
+            let cleanup_result = cleanup_result.unwrap();
             assert!(
                 cleanup_result.is_ok(),
                 "generated project's containers/network should be removed"
