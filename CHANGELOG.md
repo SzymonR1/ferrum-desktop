@@ -43,17 +43,21 @@ All notable project changes are documented here. The project has not published a
   `scale/not_submitted`. Audit excludes
   service, project, count, path, profile, socket, and output data. The ignored
   live smoke uses a unique project with a profile-gated target and same-profile
-  sibling, preflights project/network absence, uses a preinstalled image
-  without mounts/ports/pull/build, and invokes the production project `Stop`
-  and `Start` worker only after verifying exact project ownership. It verifies
-  the sole target reaches `exited` after Stop and `running` after Start while
-  the sibling remains absent, then attempts scoped non-force, non-prune,
-  non-volume cleanup. The expanded smoke passed on 2026-10-14 against Fedora
-  Linux 44 x86_64, Docker Engine 29.9.0/API 1.56, and Compose v5.6.0 via the
-  local `default` Unix-socket context (1 passed, 391 filtered); scoped cleanup
-  succeeded and the generated project's container inventory was empty. The
-  prior 2026-10-13 run covered scaling only. No broader platform support or
-  full Issue #18 completion is claimed.
+  sibling, preflights project/network absence, and uses a preinstalled image
+  without mounts/ports/pull/build. It invokes the production project `Stop`
+  and `Start` worker only after a successful submitted scale-up and fresh
+  inventory confirms the generated target service. It verifies the sole target
+  reaches `exited` after Stop and `running` after Start while the sibling
+  remains absent. Project-scoped `down` cleanup is attempted only when a fresh
+  inventory still contains one or two expected target containers. If scale-up
+  is not confirmed successful/submitted or the inventory is ambiguous or has
+  unexpected resources, cleanup is skipped for manual inspection. Cleanup
+  requests no force, prune, volume removal, or image removal. The expanded
+  smoke passed on 2026-10-14 against Fedora Linux 44 x86_64, Docker Engine
+  29.9.0/API 1.56, and Compose v5.6.0 via the local `default` Unix-socket
+  context (1 passed, 391 filtered); the cleanup succeeded and generated-project
+  container inventory was empty. The prior 2026-10-13 run covered scaling
+  only. No broader platform support or full Issue #18 completion is claimed.
   Compose audit writes use one 32-entry bounded FIFO; operations fail closed
   before submission when a start marker cannot be queued. Cancellation audit
   remains best-effort if the queue or durable store is unavailable, and shutdown

@@ -166,9 +166,13 @@ the `scale-check` profile selected, verifying the sole target container is
 It uses an already-installed `FERRUM_TEST_IMAGE` with `/bin/sleep`, no host
 mounts or published ports, and requests no pull or build. Read-only
 inventory/status and generated-project cleanup may use `--profile '*'`; scale
-mutations never do. A scoped cleanup runs `compose down` only with the
-generated project name, directory, and known Compose file; it does not
-force-remove, prune, or remove volumes:
+mutations never do. The test attempts `compose down` only after a successful,
+submitted scale-up and a fresh inventory showing one or two expected
+`scale-probe` containers with the generated project/service names. If scale-up
+is not confirmed successful/submitted or the fresh inventory is ambiguous or
+contains unexpected resources, cleanup is skipped for manual inspection.
+The command uses only the generated project name, directory, and known Compose
+file; it requests no force, prune, or volume removal:
 
 ```sh
 env -u DOCKER_HOST DOCKER_CONTEXT=default FERRUM_TEST_IMAGE=ghcr.io/catthehacker/ubuntu:rust-latest cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_service_scale_scales_and_cleans_only_verified_project -- --exact --ignored
