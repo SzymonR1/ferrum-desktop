@@ -5901,6 +5901,8 @@ mod log_retry_budget_tests {
 mod event_reconciliation_tests {
     use super::*;
     #[cfg(target_os = "linux")]
+    const TERMINAL_AUDIT_CHILD_ENV: &str = "FERRUM_TERMINAL_AUDIT_CHILD";
+    #[cfg(target_os = "linux")]
     fn terminal_http_request(
         stream: &mut std::os::unix::net::UnixStream,
     ) -> Vec<u8> {
@@ -8123,7 +8125,8 @@ mod event_reconciliation_tests {
                 "sentinel-shell".to_owned(),
                 egui::Context::default(),
             );
-            app.runtime.block_on(async {
+            let runtime = app.runtime.handle().clone();
+            runtime.block_on(async {
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     loop {
                         app.receive_terminal_opened();
@@ -8202,7 +8205,8 @@ mod event_reconciliation_tests {
                 "sentinel-shell".to_owned(),
                 egui::Context::default(),
             );
-            app.runtime.block_on(async {
+            let runtime = app.runtime.handle().clone();
+            runtime.block_on(async {
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     loop {
                         app.receive_terminal_opened();
@@ -8307,7 +8311,8 @@ mod event_reconciliation_tests {
                 "sentinel-shell".to_owned(),
                 egui::Context::default(),
             );
-            app.runtime.block_on(async {
+            let runtime = app.runtime.handle().clone();
+            runtime.block_on(async {
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     loop {
                         app.receive_terminal_opened();
