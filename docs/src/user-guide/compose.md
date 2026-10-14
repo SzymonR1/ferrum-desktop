@@ -454,6 +454,35 @@ snapshot. An opt-in smoke uses the installed Compose CLI and owned temporary
 base, override, and include files with `config --services` only; it does not
 contact an Engine, registry, or user project.
 
+An additional ignored Linux smoke calls Ferrum's production `compose_build`
+worker against the same local Unix socket validated by
+`EngineClient::connect_default()`. It requires Docker CLI with the Compose
+plugin and an accessible local Docker-compatible Engine; it is test-owned image
+mutation, not a read-only test. It creates only a unique temporary Compose
+project, a `FROM scratch` Dockerfile, and a single small `COPY` payload. It does
+not run `RUN`, `pull`, `up`, create containers/networks/volumes, bind ports or
+host mounts, use remote contexts, or supply build args, SSH, or secrets. The
+exact generated image reference must be absent before build. The worker is
+bounded to 120 seconds; timeout requests cancellation and waits at most another
+10 seconds before aborting the worker. After any submitted or uncertain outcome,
+the test inspects image inventory. Cleanup is armed only for one matching image
+with a full SHA-256 ID and exactly the generated tag, and removes by that
+immutable ID through the same socket with `--no-prune`, no force, and a
+five-second child bound. Failed/ambiguous inventory, additional tags, or
+uncertain ownership leave the image untouched for manual inspection; Engine
+builder cache may also be retained. Run it explicitly with:
+
+```sh
+cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_build_uses_production_worker_and_cleans_only_verified_image -- --exact --ignored
+```
+The smoke passed on 2026-10-14 on Fedora Linux 44 x86_64 with Docker Engine
+29.9.0/API 1.56, Compose 5.6.0, and Buildx 0.38.0 through the default local
+Unix context.
+
+This proves one local Compose build path only. It does not test page visuals,
+`down`, registry pulls, Podman, arbitrary Dockerfiles/contexts, or general
+Engine/platform support. Issue #18 remains partial/open.
+
 ## Create and start (local images)
 
 After explicit confirmation, **Create and start (local images)** is available

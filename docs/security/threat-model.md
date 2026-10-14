@@ -329,6 +329,25 @@ store but does not build or change project containers, networks, or volumes.
   leave image state uncertain; no retry occurs. Build audit retains only static
   `compose_build`/`build` start and outcome values. Fake-CLI/temp-fixture tests
   do not mutate Engine resources or contact registries/remote contexts.
+  The ignored Linux integration smoke calls the production worker against
+  `EngineClient::connect_default()`'s validated local Unix socket. This is
+  test-owned image mutation, not a production sandbox: it creates a unique
+  temporary project and generated `FROM scratch` image with one small `COPY`
+  input only, and uses no `RUN`, pull, `up`, containers, networks, volumes,
+  ports, host mounts, remote contexts, build args, SSH, or secrets. It preflights
+  its exact generated reference as absent and bounds the worker to 120 seconds,
+  requests cancellation on timeout, and waits at most 10 additional seconds
+  before aborting. After any submitted or uncertain outcome it inspects image
+  inventory. `DisposableImageTag` arms cleanup only when exactly one matching
+  image has a full SHA-256 ID and that generated reference as its sole tag; it
+  removes by the retained immutable ID through the same socket with
+  `--no-prune`, without force, and a five-second child bound. Failed/ambiguous
+  inventory or extra tags never broaden cleanup and may leave a test-owned
+  image for manual inspection; local builder cache may remain. The smoke
+  passed on 2026-10-14 on Fedora Linux 44 x86_64 with Docker Engine 29.9.0/API
+  1.56, Compose 5.6.0, and Buildx 0.38.0. It does not validate page visuals,
+  `down`, registry pulls, Podman, arbitrary project build instructions, or
+  broader platform support.
 - Allow confirmed Compose `up` only for the current imported selection after
   its ordered files/profiles have been revalidated and a current status query
   has succeeded. Use sealed snapshot descriptors and the selected Linux local
