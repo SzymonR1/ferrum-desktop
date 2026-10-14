@@ -5902,6 +5902,9 @@ mod log_retry_budget_tests {
 #[cfg(test)]
 mod event_reconciliation_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    static TERMINAL_AUDIT_TEST_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
     #[test]
     fn build_engine_source_label_distinguishes_configured_socket_from_discovery() {
         assert_eq!(
@@ -8013,11 +8016,11 @@ mod event_reconciliation_tests {
         use std::{
             io::{Read, Write},
             os::unix::net::{UnixListener, UnixStream},
-            sync::{LazyLock, Mutex},
         };
 
-        static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-        let _env_lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_lock = TERMINAL_AUDIT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         fn read_request(stream: &mut UnixStream) -> Vec<u8> {
             let mut bytes = Vec::new();
             let mut buffer = [0u8; 1024];
@@ -8161,6 +8164,110 @@ mod event_reconciliation_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_exec_is_not_submitted_when_started_audit_cannot_be_saved() {
+        use std::{
+            io::{Read, Write},
+            os::unix::net::UnixListener,
+        };
+
+        let _env_lock = TERMINAL_AUDIT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-terminal-audit-fail-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let blocker = root.join("not-a-directory");
+        std::fs::write(&blocker, b"block").unwrap();
+        let socket = root.join("engine.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let engine_host = format!("unix://{}", socket.display());
+        let saved_host = std::env::var_os("DOCKER_HOST");
+        let saved_context = std::env::var_os("DOCKER_CONTEXT");
+        unsafe {
+            std::env::set_var("DOCKER_HOST", &engine_host);
+            std::env::remove_var("DOCKER_CONTEXT");
+        }
+
+        let engine_thread = std::thread::spawn(move || {
+            let (mut version, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = version.read(&mut request).unwrap();
+            version
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"ApiVersion\":\"1.52\"}")
+                .unwrap();
+            drop(version);
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            loop {
+                match listener.accept() {
+                    Ok(_) => return true,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("fake Engine accept failed: {error}"),
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+
+        let (mut app, _) = app_with_open_inspection();
+        app.engine = Some(
+            app.runtime
+                .block_on(EngineClient::connect_default())
+                .expect("fake local Engine should complete the connection handshake"),
+        );
+        app.audit_store = audit::AuditStore::new(Arc::new(settings::SettingsStore::at(
+            blocker.join("settings.toml"),
+        )));
+        app.start_terminal(
+            "a".repeat(64),
+            "sentinel-shell".to_owned(),
+            egui::Context::default(),
+        );
+        app.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    app.receive_terminal_opened();
+                    if app.terminal_notice.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("static audit failure should be delivered");
+        });
+        assert_eq!(
+            app.terminal_notice.as_deref(),
+            Some("Terminal execution was not started because its audit record could not be saved.")
+        );
+        assert!(
+            !engine_thread.join().unwrap(),
+            "fake Engine must not receive an exec request"
+        );
+        unsafe {
+            if let Some(value) = saved_host {
+                std::env::set_var("DOCKER_HOST", value);
+            } else {
+                std::env::remove_var("DOCKER_HOST");
+            }
+            if let Some(value) = saved_context {
+                std::env::set_var("DOCKER_CONTEXT", value);
+            } else {
+                std::env::remove_var("DOCKER_CONTEXT");
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn context_switch_aborts_a_pending_exec_open() {
