@@ -6059,6 +6059,17 @@ mod event_reconciliation_tests {
             assert!(std::time::Instant::now() < deadline, "{timeout_message}");
         }
     }
+    #[cfg(target_os = "linux")]
+    fn assert_terminal_audit_redacts(audit: &str) {
+        for secret in [
+            "sentinel-shell",
+            "sentinel-engine-error",
+            "sentinel-input",
+            "sentinel-output",
+        ] {
+            assert!(!audit.contains(secret));
+        }
+    }
     #[test]
     fn build_engine_source_label_distinguishes_configured_socket_from_discovery() {
         assert_eq!(
@@ -8179,14 +8190,7 @@ mod event_reconciliation_tests {
             let audit = std::fs::read_to_string(config_home.join("ferrum/audit.jsonl")).unwrap();
             assert!(audit.contains("\"outcome\":\"started\""));
             assert!(audit.contains("\"outcome\":\"request_error\""));
-            for secret in [
-                "sentinel-shell",
-                "sentinel-engine-error",
-                "sentinel-input",
-                "sentinel-output",
-            ] {
-                assert!(!audit.contains(secret));
-            }
+            assert_terminal_audit_redacts(&audit);
             assert!(
                 app.terminal_notice
                     .as_deref()
@@ -8262,14 +8266,7 @@ mod event_reconciliation_tests {
             let audit = std::fs::read_to_string(config_home.join("ferrum/audit.jsonl")).unwrap();
             assert!(audit.contains("\"outcome\":\"started\""));
             assert!(audit.contains("\"outcome\":\"success\""));
-            for secret in [
-                "sentinel-shell",
-                "sentinel-engine-error",
-                "sentinel-input",
-                "sentinel-output",
-            ] {
-                assert!(!audit.contains(secret));
-            }
+            assert_terminal_audit_redacts(&audit);
             app.cancel_terminal_session();
             return;
         }
