@@ -6020,69 +6020,71 @@ mod event_reconciliation_tests {
         let Ok(marker) = std::env::var(TERMINAL_AUDIT_CHILD_ENV) else {
             return false;
         };
-        let Some((case, root_basename)) = marker.split_once(':') else {
-            return false;
-        };
-        if case != expected_case || root_basename.is_empty() || root_basename.contains('/') {
-            return false;
-        }
-        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
-            return false;
-        };
-        if home
-            .file_name()
-            .map(|name| name.to_string_lossy())
-            .as_deref()
-            != Some(root_basename)
-        {
-            return false;
-        }
-        let Ok(home_metadata) = std::fs::metadata(&home) else {
-            return false;
-        };
-        if !home_metadata.is_dir() || home_metadata.permissions().mode() & 0o777 != 0o700 {
-            eprintln!(
-                "terminal child marker rejected: HOME={home:?} is_dir={} mode={:04o}",
-                home_metadata.is_dir(),
-                home_metadata.permissions().mode() & 0o777
-            );
-            return false;
-        }
+        let (case, root_basename) = marker
+            .split_once(':')
+            .expect("terminal audit child marker must include a private root token");
+        assert_eq!(case, expected_case, "terminal audit child case mismatch");
+        assert!(
+            !root_basename.is_empty() && !root_basename.contains('/'),
+            "terminal audit child root token is invalid"
+        );
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("terminal audit child HOME is missing");
+        assert_eq!(
+            home.file_name()
+                .map(|name| name.to_string_lossy())
+                .as_deref(),
+            Some(root_basename),
+            "terminal audit child HOME does not match its private root token"
+        );
+        let home_metadata = std::fs::metadata(&home)
+            .expect("terminal audit child HOME metadata is unavailable");
+        let home_mode = home_metadata.permissions().mode() & 0o777;
+        assert!(
+            home_metadata.is_dir() && home_mode == 0o700,
+            "terminal audit child HOME must be private: path={home:?}, is_dir={}, mode={home_mode:04o}",
+            home_metadata.is_dir()
+        );
 
-        let Some(host) = std::env::var_os("DOCKER_HOST") else {
-            return false;
-        };
+        let host = std::env::var_os("DOCKER_HOST")
+            .expect("terminal audit child DOCKER_HOST is missing");
         let host = host.to_string_lossy();
-        let Some(socket_path) = host.strip_prefix("unix://") else {
-            return false;
-        };
+        let socket_path = host
+            .strip_prefix("unix://")
+            .expect("terminal audit child DOCKER_HOST must use a Unix socket");
         let socket_path = std::path::Path::new(socket_path);
-        if socket_path.parent() != Some(home.as_path())
-            || socket_path.file_name() != Some(std::ffi::OsStr::new("engine.sock"))
-        {
-            return false;
-        }
-        let Ok(socket_metadata) = std::fs::symlink_metadata(socket_path) else {
-            return false;
-        };
-        if !socket_metadata.file_type().is_socket() {
-            return false;
-        }
+        assert!(
+            socket_path.parent() == Some(home.as_path())
+                && socket_path.file_name() == Some(std::ffi::OsStr::new("engine.sock")),
+            "terminal audit child socket must be HOME/engine.sock: {socket_path:?}"
+        );
+        let socket_metadata = std::fs::symlink_metadata(socket_path)
+            .expect("terminal audit child socket path is unavailable");
+        assert!(
+            socket_metadata.file_type().is_socket(),
+            "terminal audit child endpoint is not a Unix socket: {socket_path:?}"
+        );
 
-        let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from)
-        else {
-            return false;
-        };
+        let config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .expect("terminal audit child XDG_CONFIG_HOME is missing");
         let expected_config_home = if expected_case == "audit_failure" {
             home.join("not-a-directory")
         } else {
             home.clone()
         };
-        if config_home != expected_config_home {
-            return false;
+        assert_eq!(
+            config_home, expected_config_home,
+            "terminal audit child XDG_CONFIG_HOME is outside its private root"
+        );
+        if expected_case == "audit_failure" {
+            assert!(
+                std::fs::metadata(&config_home).is_ok_and(|metadata| metadata.is_file()),
+                "terminal audit child fail-closed blocker must be a regular file"
+            );
         }
-        expected_case != "audit_failure"
-            || std::fs::metadata(config_home).is_ok_and(|metadata| metadata.is_file())
+        true
     }
     #[cfg(target_os = "linux")]
     fn run_terminal_audit_child(
