@@ -7,12 +7,9 @@ use ferrum_engine::ContainerLogsOptions;
 
 #[cfg(target_os = "linux")]
 use std::{
-    process::{Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    process::Command,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(target_os = "linux")]
@@ -22,7 +19,7 @@ use ferrum_core::{
 use ferrum_engine::{ContextTransport, DockerContext, EngineClient};
 
 #[cfg(target_os = "linux")]
-use sha2::{Digest, Sha256};
+use ferrum_test_support::{DisposableImageTag, LivePullImageFixture, LoopbackRegistry};
 
 /// Read-only opt-in check: inspects only a caller-specified existing volume.
 ///
@@ -469,14 +466,14 @@ async fn local_engine_lists_inspects_and_reads_history_for_preinstalled_image_re
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "probes a missing loopback manifest, pulls one generated image, and removes only its verified tag"]
+#[ignore = "requires current local Docker Unix context with loopback insecure-registry support; removes only the verified generated tag"]
 async fn local_engine_loopback_registry_pull_reports_progress_and_cleans_only_test_tag() {
     run_loopback_registry_pull(LoopbackRegistryAuth::Anonymous).await;
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "requires local Docker with loopback insecure-registry support; synthetic Basic credential only"]
+#[ignore = "requires current local Docker Unix context with loopback insecure-registry support; synthetic Basic credential only"]
 async fn local_engine_loopback_registry_synthetic_basic_auth_pull_reports_progress() {
     run_loopback_registry_pull(LoopbackRegistryAuth::SyntheticBasic).await;
 }
@@ -533,6 +530,7 @@ async fn run_loopback_registry_pull(auth_mode: LoopbackRegistryAuth) {
     };
     let registry = LoopbackRegistry::start(
         image_repository.clone(),
+        "progress".to_owned(),
         missing_manifest_tag.clone(),
         fixture,
         expected_authorization,
@@ -613,28 +611,30 @@ async fn run_loopback_registry_pull(auth_mode: LoopbackRegistryAuth) {
     let (saw_status_progress, stream_error) =
         progress_result.unwrap_or_else(|error| (false, Some(error)));
     let images = engine.list_images().await.expect("post-pull inventory");
-    let Some(image) = images
+    let mut matching_images = images
         .iter()
-        .find(|image| image.repo_tags.iter().any(|tag| tag == &image_reference))
-    else {
+        .filter(|image| image.repo_tags.iter().any(|tag| tag == &image_reference));
+    let Some(image) = matching_images.next() else {
         panic!(
             "pull should create generated image tag; stream error: {}",
             stream_error.as_deref().unwrap_or("none")
         );
     };
     assert!(
-        image.id.starts_with("sha256:")
-            && image.id.len() == 71
-            && image.id[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
-            && image.repo_tags.len() == 1
-            && image.repo_tags[0] == image_reference,
+        matching_images.next().is_none(),
+        "ambiguous generated tag ownership must not trigger cleanup"
+    );
+    let mut disposable = DisposableImageTag::new(
+        engine.local_socket_path().to_owned(),
+        image_reference.clone(),
+    );
+    assert!(
+        disposable.arm_if_verified(&image.id, &image.repo_tags),
         "generated tag must identify one full-ID test image before cleanup"
     );
-    let mut disposable = DisposableImageTag::new(context_name, image_reference.clone());
-    disposable.arm();
     assert!(
         disposable.remove().is_ok_and(|status| status.success()),
-        "remove generated tag without force"
+        "remove generated image by verified ID without force"
     );
     let remaining = engine.list_images().await.expect("post-cleanup inventory");
     assert!(!image_tag_is_present(&remaining, &image_reference));
@@ -1481,389 +1481,6 @@ impl Drop for DisposableNetwork {
 }
 
 #[cfg(target_os = "linux")]
-const LIVE_PULL_LAYER_DATA_BYTES: usize = 64 * 1024;
-#[cfg(target_os = "linux")]
-const LIVE_PULL_LAYER_BYTES: usize = 512 + LIVE_PULL_LAYER_DATA_BYTES + 1024;
-#[cfg(target_os = "linux")]
-const LOOPBACK_REGISTRY_NOT_FOUND: &[u8] =
-    br#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"fixture reference is intentionally absent"}]}"#;
-
-#[cfg(target_os = "linux")]
-struct LivePullImageFixture {
-    config_digest: String,
-    config: Vec<u8>,
-    layer_digest: String,
-    layer: Vec<u8>,
-    manifest_digest: String,
-    manifest: Vec<u8>,
-}
-
-#[cfg(target_os = "linux")]
-impl LivePullImageFixture {
-    fn new(nonce: &str) -> Self {
-        let layer = live_pull_layer(nonce);
-        let layer_digest = sha256_digest(&layer);
-        let config = serde_json::to_vec(&serde_json::json!({
-            "architecture": "amd64",
-            "os": "linux",
-            "config": {},
-            "rootfs": {
-                "type": "layers",
-                "diff_ids": [layer_digest.clone()],
-            },
-            "history": [{
-                "created_by": format!("Ferrum loopback pull progress fixture {nonce}"),
-            }],
-        }))
-        .expect("the deterministic fixture image config should serialize");
-        let config_digest = sha256_digest(&config);
-        let manifest = serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {
-                "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": config_digest,
-                "size": config.len(),
-            },
-            "layers": [{
-                "mediaType": "application/vnd.oci.image.layer.v1.tar",
-                "digest": layer_digest.clone(),
-                "size": layer.len(),
-            }],
-        }))
-        .expect("the deterministic fixture image manifest should serialize");
-        let manifest_digest = sha256_digest(&manifest);
-
-        Self {
-            config_digest,
-            config,
-            layer_digest,
-            layer,
-            manifest_digest,
-            manifest,
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn sha256_digest(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(71);
-    encoded.push_str("sha256:");
-    for byte in digest.iter() {
-        encoded.push(char::from(HEX[usize::from(*byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(*byte & 0x0f)]));
-    }
-    encoded
-}
-
-#[cfg(target_os = "linux")]
-fn write_tar_octal_field(field: &mut [u8], value: u64) {
-    let encoded = format!("{:0width$o}\0", value, width = field.len() - 1);
-    assert_eq!(encoded.len(), field.len());
-    field.copy_from_slice(encoded.as_bytes());
-}
-
-#[cfg(target_os = "linux")]
-fn live_pull_layer(nonce: &str) -> Vec<u8> {
-    let file_name = format!("ferrum-progress-{nonce}.txt");
-    assert!(file_name.len() < 100);
-    let mut header = [0; 512];
-    header[..file_name.len()].copy_from_slice(file_name.as_bytes());
-    write_tar_octal_field(&mut header[100..108], 0o644);
-    write_tar_octal_field(&mut header[108..116], 0);
-    write_tar_octal_field(&mut header[116..124], 0);
-    write_tar_octal_field(&mut header[124..136], LIVE_PULL_LAYER_DATA_BYTES as u64);
-    write_tar_octal_field(&mut header[136..148], 0);
-    header[148..156].fill(b' ');
-    header[156] = b'0';
-    header[257..263].copy_from_slice(b"ustar\0");
-    header[263..265].copy_from_slice(b"00");
-    let checksum = header.iter().map(|byte| u64::from(*byte)).sum::<u64>();
-    let checksum_field = format!("{checksum:06o}\0 ");
-    header[148..156].copy_from_slice(checksum_field.as_bytes());
-
-    let mut data = vec![b'F'; LIVE_PULL_LAYER_DATA_BYTES];
-    for (target, source) in data.iter_mut().zip(nonce.bytes()) {
-        *target = source;
-    }
-    let padding = (512 - data.len() % 512) % 512;
-    let mut layer = Vec::with_capacity(LIVE_PULL_LAYER_BYTES);
-    layer.extend_from_slice(&header);
-    layer.extend_from_slice(&data);
-    layer.resize(layer.len() + padding, 0);
-    layer.extend_from_slice(&[0; 1024]);
-    assert_eq!(layer.len(), LIVE_PULL_LAYER_BYTES);
-    layer
-}
-
-#[cfg(target_os = "linux")]
-struct LoopbackRegistry {
-    port: u16,
-    task: tokio::task::JoinHandle<()>,
-    missing_manifest_requested: Arc<AtomicBool>,
-    valid_authorization_observed: Arc<AtomicBool>,
-}
-
-#[cfg(target_os = "linux")]
-impl LoopbackRegistry {
-    async fn start(
-        image_repository: String,
-        missing_manifest_tag: String,
-        fixture: LivePullImageFixture,
-        expected_authorization: Option<zeroize::Zeroizing<String>>,
-    ) -> Self {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("the loopback registry should bind an ephemeral local port");
-        let port = listener
-            .local_addr()
-            .expect("bound loopback address")
-            .port();
-        let missing_manifest_requested = Arc::new(AtomicBool::new(false));
-        let valid_authorization_observed = Arc::new(AtomicBool::new(false));
-        let handler_observed_manifest = Arc::clone(&missing_manifest_requested);
-        let handler_observed_auth = Arc::clone(&valid_authorization_observed);
-        let task = tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                serve_loopback_registry_request(
-                    &mut stream,
-                    &image_repository,
-                    &missing_manifest_tag,
-                    &fixture,
-                    &handler_observed_manifest,
-                    &handler_observed_auth,
-                    expected_authorization.as_ref().map(|value| value.as_str()),
-                )
-                .await;
-            }
-        });
-        Self {
-            port,
-            task,
-            missing_manifest_requested,
-            valid_authorization_observed,
-        }
-    }
-
-    fn port(&self) -> u16 {
-        self.port
-    }
-
-    fn missing_manifest_was_requested(&self) -> bool {
-        self.missing_manifest_requested.load(Ordering::Relaxed)
-    }
-
-    fn valid_authorization_was_observed(&self) -> bool {
-        self.valid_authorization_observed.load(Ordering::Relaxed)
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for LoopbackRegistry {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn serve_loopback_registry_request(
-    stream: &mut tokio::net::TcpStream,
-    image_repository: &str,
-    missing_manifest_tag: &str,
-    fixture: &LivePullImageFixture,
-    missing_manifest_requested: &AtomicBool,
-    valid_authorization_observed: &AtomicBool,
-    expected_authorization: Option<&str>,
-) {
-    let Some((method, raw_path, authorization)) = read_loopback_registry_request(stream).await
-    else {
-        return;
-    };
-    if let Some(expected) = expected_authorization {
-        if authorization.as_deref().map(String::as_str) != Some(expected) {
-            write_loopback_registry_unauthorized(stream).await;
-            return;
-        }
-        valid_authorization_observed.store(true, Ordering::Relaxed);
-    }
-    let path = raw_path
-        .split('?')
-        .next()
-        .unwrap_or(&raw_path)
-        .replace("%3A", ":")
-        .replace("%3a", ":");
-    if matches!(path.as_str(), "/v2" | "/v2/") {
-        write_loopback_registry_response(stream, &method, "200 OK", b"", "application/json", None)
-            .await;
-        return;
-    }
-
-    let manifest_prefix = format!("/v2/{image_repository}/manifests/");
-    if let Some(requested_manifest) = path.strip_prefix(&manifest_prefix) {
-        if requested_manifest == missing_manifest_tag {
-            missing_manifest_requested.store(true, Ordering::Relaxed);
-        }
-        if requested_manifest != "progress"
-            && requested_manifest != fixture.manifest_digest.as_str()
-        {
-            write_loopback_registry_response(
-                stream,
-                &method,
-                "404 Not Found",
-                LOOPBACK_REGISTRY_NOT_FOUND,
-                "application/json",
-                None,
-            )
-            .await;
-            return;
-        }
-        write_loopback_registry_response(
-            stream,
-            &method,
-            "200 OK",
-            &fixture.manifest,
-            "application/vnd.oci.image.manifest.v1+json",
-            Some(&fixture.manifest_digest),
-        )
-        .await;
-        return;
-    }
-
-    let config_blob_path = format!("/v2/{image_repository}/blobs/{}", fixture.config_digest);
-    if path == config_blob_path {
-        write_loopback_registry_response(
-            stream,
-            &method,
-            "200 OK",
-            &fixture.config,
-            "application/vnd.oci.image.config.v1+json",
-            Some(&fixture.config_digest),
-        )
-        .await;
-        return;
-    }
-
-    let layer_blob_path = format!("/v2/{image_repository}/blobs/{}", fixture.layer_digest);
-    if path == layer_blob_path {
-        write_loopback_registry_response(
-            stream,
-            &method,
-            "200 OK",
-            &fixture.layer,
-            "application/vnd.oci.image.layer.v1.tar",
-            Some(&fixture.layer_digest),
-        )
-        .await;
-        return;
-    }
-
-    write_loopback_registry_response(
-        stream,
-        &method,
-        "404 Not Found",
-        LOOPBACK_REGISTRY_NOT_FOUND,
-        "application/json",
-        None,
-    )
-    .await;
-}
-
-#[cfg(target_os = "linux")]
-async fn read_loopback_registry_request(
-    stream: &mut tokio::net::TcpStream,
-) -> Option<(String, String, Option<zeroize::Zeroizing<String>>)> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut request = zeroize::Zeroizing::new(Vec::with_capacity(1024));
-    let mut chunk = zeroize::Zeroizing::new([0u8; 1024]);
-    loop {
-        let count = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk[..]))
-            .await
-            .ok()?
-            .ok()?;
-        if count == 0 || request.len().saturating_add(count) > 8192 {
-            return None;
-        }
-        request.extend_from_slice(&chunk[..count]);
-        if !request
-            .first()
-            .is_some_and(|byte| matches!(*byte, b'G' | b'H'))
-        {
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await;
-            return None;
-        }
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-    }
-
-    let header_end = request
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")?;
-    let headers = std::str::from_utf8(&request[..header_end]).ok()?;
-    let mut lines = headers.split("\r\n");
-    let mut fields = lines.next()?.split_ascii_whitespace();
-    let method = fields.next()?.to_owned();
-    let path = fields.next()?.to_owned();
-    let mut authorization = None;
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("authorization")
-        {
-            if authorization.is_some() {
-                authorization = Some(zeroize::Zeroizing::new(String::new()));
-                continue;
-            }
-            authorization = Some(zeroize::Zeroizing::new(value.trim().to_owned()));
-        }
-    }
-    Some((method, path, authorization))
-}
-
-#[cfg(target_os = "linux")]
-async fn write_loopback_registry_unauthorized(stream: &mut tokio::net::TcpStream) {
-    use tokio::io::AsyncWriteExt;
-    let _ = stream.write_all(
-        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Ferrum loopback fixture\"\r\nContent-Length: 0\r\nConnection: close\r\nDocker-Distribution-API-Version: registry/2.0\r\n\r\n",
-    ).await;
-}
-
-#[cfg(target_os = "linux")]
-async fn write_loopback_registry_response(
-    stream: &mut tokio::net::TcpStream,
-    method: &str,
-    status: &str,
-    body: &[u8],
-    content_type: &str,
-    digest: Option<&str>,
-) {
-    use tokio::io::AsyncWriteExt;
-
-    let mut headers = format!(
-        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\nDocker-Distribution-API-Version: registry/2.0\r\nContent-Type: {content_type}\r\n",
-        body.len()
-    );
-    if let Some(digest) = digest {
-        headers.push_str("Docker-Content-Digest: ");
-        headers.push_str(digest);
-        headers.push_str("\r\n");
-    }
-    headers.push_str("\r\n");
-    if stream.write_all(headers.as_bytes()).await.is_err() {
-        return;
-    }
-    if method != "HEAD" {
-        let _ = stream.write_all(body).await;
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn image_tag_is_present(images: &[ImageSummary], reference: &str) -> bool {
     images
         .iter()
@@ -1901,126 +1518,6 @@ async fn drain_pull_progress(
     match drain {
         Ok(result) => result,
         Err(_) => Err("Engine pull progress exceeded the 30-second deadline".to_owned()),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn wait_for_child_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> std::io::Result<std::process::ExitStatus> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) => {}
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        }
-        if Instant::now() >= deadline {
-            let timeout_error = std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "cleanup child exceeded its deadline",
-            );
-            return match child.kill() {
-                Ok(()) => {
-                    let _ = child.wait();
-                    Err(timeout_error)
-                }
-                Err(kill_error) => match child.try_wait() {
-                    Ok(Some(status)) => Ok(status),
-                    Ok(None) | Err(_) => Err(kill_error),
-                },
-            };
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        std::thread::sleep(remaining.min(Duration::from_millis(25)));
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn wait_for_child_with_timeout_kills_a_long_running_process() {
-    let mut child = Command::new("sleep")
-        .arg("60")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the Linux test environment should provide sleep");
-    let started = Instant::now();
-    let result = wait_for_child_with_timeout(&mut child, Duration::from_millis(20));
-
-    assert!(
-        result.is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut),
-        "the child should be reported as timed out"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "the bounded wait should return promptly"
-    );
-    assert!(
-        child.try_wait().is_ok_and(|status| status.is_some()),
-        "the timed-out child should be reaped"
-    );
-}
-
-#[cfg(target_os = "linux")]
-fn docker_remove_disposable_image_tag(
-    context_name: &str,
-    reference: &str,
-) -> std::io::Result<std::process::ExitStatus> {
-    let mut child = Command::new("docker")
-        .args(["--context", context_name, "image", "rm", "--no-prune"])
-        .arg(reference)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    wait_for_child_with_timeout(&mut child, Duration::from_secs(5))
-}
-
-#[cfg(target_os = "linux")]
-struct DisposableImageTag {
-    context_name: String,
-    reference: String,
-    cleanup_required: bool,
-}
-
-#[cfg(target_os = "linux")]
-impl DisposableImageTag {
-    fn new(context_name: String, reference: String) -> Self {
-        Self {
-            context_name,
-            reference,
-            cleanup_required: false,
-        }
-    }
-
-    fn arm(&mut self) {
-        self.cleanup_required = true;
-    }
-
-    fn disarm(&mut self) {
-        self.cleanup_required = false;
-    }
-
-    fn remove(&self) -> std::io::Result<std::process::ExitStatus> {
-        docker_remove_disposable_image_tag(&self.context_name, &self.reference)
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for DisposableImageTag {
-    fn drop(&mut self) {
-        if self.cleanup_required {
-            let context_name = self.context_name.clone();
-            let reference = self.reference.clone();
-            run_cleanup_on_thread(move || {
-                let _ = docker_remove_disposable_image_tag(&context_name, &reference);
-            });
-        }
     }
 }
 

@@ -1,0 +1,14 @@
+[package]
+name = "ferrum-test-support"
+description = "Shared test-only fixtures for Ferrum integration evidence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+sha2 = "0.11.1"
+tokio.workspace = true
+zeroize.workspace = true

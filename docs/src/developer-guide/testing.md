@@ -268,10 +268,13 @@ and leave both references absent. Each Engine progress stream has a 30-second
 total deadline and a 1,024-record cap; the smoke retains only whether a
 non-empty status was observed. On a completed pull, cleanup is armed only after
 inventory confirms a full SHA-256 image ID and exactly the generated tag. It
-removes only that tag using `docker image rm --no-prune` without force. If
-inventory cannot confirm ownership, the test does not attempt removal. Explicit
-cleanup and Drop fallback use a CLI child with a five-second deadline and
-attempt to kill and reap it on timeout.
+pins cleanup to the same validated local Unix socket as the EngineClient and
+removes only the verified full image ID using `docker image rm --no-prune`
+without force. If another tag is added, Docker refuses non-forced ID removal
+and the image may remain for manual cleanup. If inventory cannot confirm
+ownership, the test does not attempt removal. Explicit cleanup and Drop fallback
+use a CLI child with a five-second deadline and attempt to kill and reap it on
+timeout.
 
 The authenticated test creates a nonce username and synthetic secret in memory,
 constructs `RegistryAuth` directly, and authenticates both the missing-manifest
@@ -875,8 +878,13 @@ engine or registry or mutate images.
 
 Pull presentation tests use fixed progress values. Tag, push, and removal tests
 use fake completion events and do not mutate image resources. Separate opt-in
-Engine-level smokes exercise an anonymous pull and a synthetic Basic-auth pull
-with exact-tag cleanup; neither exercises the Ferrum UI or configured helper.
+Engine-level smokes exercise anonymous and synthetic Basic-auth pulls through
+the Engine; the fake-helper app smoke separately validates the helper execution
+seam. All pull cleanup uses the same validated local Unix socket and verified
+full image ID without force or prune, after the generated tag is verified as
+sole; a concurrent additional tag makes Docker refuse removal and may leave the
+generated image for manual cleanup. These smokes do not exercise the Ferrum UI
+or configured production helper/credentials.
 No live Ferrum UI pull, tag/removal, or registry-push operation is claimed.
 Push tests use fake sockets and headless UI state only; they do not mutate
 images or contact a registry. Tests must not pull, tag, push, delete, or
@@ -914,13 +922,33 @@ push, remove, or modify images. The separate live pull smokes documented above
 are the only live image-transfer operations in this guide.
 
 Image pull, push, tag, and removal use the validated local Docker Unix-socket
-endpoint. Pulls and pushes are anonymous by default; fake-helper tests cover the
-helper protocol and fake Unix-engine tests cover authenticated headers without
-invoking real helpers or contacting a registry. One separate synthetic-auth
-live pull uses `RegistryAuth` directly; it does not test helper selection or
-per-pull UI consent. No live helper-authenticated pull or push is claimed.
-Ferrum does not read saved Docker credential entries; Buildx remains
-credential-free.
+endpoint. Pulls and pushes are anonymous by default. Fake-helper tests cover
+helper protocol/response parsing; fake Unix-engine tests cover authenticated
+headers without invoking real helpers or contacting a registry. The ignored
+Engine synthetic-auth smoke constructs `RegistryAuth` directly and does not test
+the helper path. A separate ignored app smoke runs the fake helper through
+`authorization_with_binary`, then passes its result to a real local Engine and
+the shared test-only loopback registry. It passed on 2026-10-14 on Fedora Linux
+44 x86_64 with Docker Engine 29.9.0/API 1.56 through the default local Unix
+context:
+
+```sh
+env -u DOCKER_HOST DOCKER_CONTEXT=default cargo test -p ferrum-app --bin ferrum registry_auth::tests::fake_helper_authenticates_generated_loopback_pull_through_local_engine -- --exact --ignored
+```
+
+The helper binary and Basic username/secret are generated and synthetic. The
+app smoke pulls a generated image into the test Engine and verifies its full
+SHA-256 ID and sole generated tag before arming cleanup. Explicit cleanup and
+Drop use the same validated local Unix socket as the EngineClient and remove
+only the retained full image ID with `docker image rm --no-prune` and no force.
+If another tag is added, Docker refuses non-forced ID removal and the generated
+image may remain for manual cleanup. No user image is intentionally targeted.
+Registry requests stay on `127.0.0.1` and HTTP/insecure-registry only; no TLS,
+saved Docker registry credential config, or external registry is used. The test
+does not exercise Settings enum selection or per-pull UI consent. Both
+helper-auth paths remain narrow evidence only; Issues #16 and #19 remain
+partial/open. Ferrum does not read saved Docker credential entries; Buildx
+remains credential-free.
 
 Manual release-mode performance samples are opt-in and have no timing
 thresholds. See the [performance and accessibility evidence](../performance.md)
