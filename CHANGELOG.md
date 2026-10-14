@@ -3,6 +3,22 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Added an ignored Linux local-Engine Compose build smoke through Ferrum's
+  production `compose_build` worker. It creates a unique temporary Compose
+  project and generated image from `FROM scratch` plus one small `COPY` input,
+  preflights the exact image reference as absent, and pins the Compose CLI to
+  the `EngineClient::connect_default()` local Unix socket. The test has a
+  120-second worker bound, requests cancellation on timeout, and inspects image
+  inventory after any submitted or uncertain outcome. Cleanup is armed only
+  when inventory contains one full SHA-256 image ID whose sole tag is the exact
+  generated reference; `DisposableImageTag` removes by that ID on the same
+  socket using `--no-prune`, without force, with a five-second child bound.
+  Ambiguous inventory or extra tags leave the image untouched for manual
+  inspection. This test-owned image mutation passed on 2026-10-14 on Fedora
+  Linux 44 x86_64 with Docker Engine 29.9.0/API 1.56, Compose 5.6.0, and Buildx
+  0.38.0 through the default local Unix context. It proves one local Compose
+  build path only: it does not test page visuals, `down`, registry pulls, or
+  Podman. Issue #18 remains open/partial.
 - Added confirmed one-service Compose scaling for the current imported,
   explicitly revalidated ordered files/profiles on the selected Linux local
   Docker Unix socket. Validation keeps the selected-profile service list for

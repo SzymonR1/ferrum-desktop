@@ -88,6 +88,39 @@ or user project:
 cargo test -p ferrum-app compose::tests::subprocess::local_compose_validation_reads_the_sealed_operation_snapshot -- --exact --ignored
 ```
 
+## Opt-in production Compose build smoke
+
+`local_compose_build_uses_production_worker_and_cleans_only_verified_image`
+is an ignored Linux integration test that calls Ferrum's production
+`compose_build` worker, not a fake CLI path. It requires Docker CLI/Compose and
+an accessible local Docker-compatible Engine. It creates a unique temporary
+project and generated local image using `FROM scratch` and one small `COPY`
+input; it requests no `RUN`, pull, `up`, container, network, volume, port, host
+mount, remote context, build args, SSH, or secret. Compose is pinned to the same
+validated local Unix socket returned by `EngineClient::connect_default()`.
+
+Before submission, the exact generated image reference must be absent. The
+worker is bounded to 120 seconds; timeout triggers cancellation, a bounded
+10-second join, then task abort if needed. After a submitted or uncertain
+outcome, inventory is inspected before cleanup. `DisposableImageTag` is armed
+only for one exact reference with a full SHA-256 image ID and no other tags; it
+removes only that ID on the same socket, using `--no-prune`, no force, and a
+five-second child bound. Failed inventory, ambiguity, timeout, or additional
+tags do not broaden cleanup; a generated test image may need manual removal.
+Local Engine builder cache may remain. This is a test-owned image mutation, not
+a page-visual test, `down` test, registry-pull test, or Podman test.
+
+Run explicitly, and only where that local Engine mutation is acceptable:
+
+```sh
+cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_build_uses_production_worker_and_cleans_only_verified_image -- --exact --ignored
+```
+
+The smoke passed on 2026-10-14 on Fedora Linux 44 x86_64 against Docker Engine
+29.9.0/API 1.56, Compose 5.6.0, and Buildx 0.38.0 through the default local
+Unix context. It created and cleaned only its generated image; Issue #18
+remains partial/open.
+
 ## Compose service pause/unpause
 
 Controlled fake-CLI and headless tests cover service-scoped `pause SERVICE`
