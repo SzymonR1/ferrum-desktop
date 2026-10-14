@@ -206,6 +206,32 @@ invalidation/re-import. No live mutating integration test ran because no
 disposable Engine is designated; fixtures do not establish live Engine or
 broader platform behavior.
 
+
+## Embedded terminal exec audit
+
+The Linux terminal-open regressions use temporary Unix sockets with a fake
+local Engine API handshake. `terminal_exec_is_audited_before_the_engine_receives_its_request`
+exercises an exec-open rejection: the fake Engine checks that the synced
+`started` JSONL record already exists when its exec request arrives, and the
+test checks the static `request_error` outcome plus absence of shell, daemon
+error, input, and output sentinels from the audit file.
+`successful_terminal_exec_open_persists_only_static_outcomes` covers the
+successful create/start upgrade and the static `success` outcome.
+`terminal_exec_is_not_submitted_when_started_audit_cannot_be_saved` gives the
+temporary SettingsStore an unusable parent path and verifies the fake Engine
+receives no exec request and the UI receives a static failure notice. No live
+Engine is contacted and no container resource is created or changed. Terminal
+content and resize events are not audited. The Engine endpoint is supplied only
+to an exact child-test process; the parent uses the shared subprocess lock, a
+private temporary directory, and bounded fake-server reads/accepts so parallel
+test threads do not observe environment mutation or contact a host Engine. This
+is partial Issue #19 coverage, not full audit completion.
+
+The fake Engine tests do not exercise cancellation during an in-flight open.
+If cancellation or shutdown aborts the worker after the `started` record but
+before a final outcome, that record may be the only durable event and the
+final Engine state is unknown.
+
 Settings tests cover missing/corrupt settings, file-symlink rejection without
 changing target permissions, non-regular and hard-linked file rejection, and
 refusal to chmod or write through symlinked settings directories. The hard-link

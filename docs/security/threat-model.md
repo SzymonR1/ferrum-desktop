@@ -560,21 +560,25 @@ store but does not build or change project containers, networks, or volumes.
   errors, or daemon bodies. A `request_error` does not prove that engine state
   remained unchanged; the durable copy is described below.
 
-- Maintain a Linux-local bounded JSONL copy of Ferrum-originated mutation
-  outcomes for container lifecycle, image pull/push/tag/removal and Buildx
-  image builds, volume create/removal, and network
-  create/removal/connect/disconnect. Lazily create `audit.jsonl` in the
-  descriptor-anchored Ferrum config directory, with directory mode `0700` and
-  file mode `0600`. Schema v1 contains a timestamp, static event/action/outcome,
-  and validated full resource IDs only where existing traces permit. A build
-  record contains only static `image_mutation` / `build` and outcome fields;
+- Maintain a Linux-local bounded JSONL copy of Ferrum-originated audit
+  outcomes for container lifecycle; confirmed Compose start/stop/restart/
+  pause/unpause, one-service scale, `up`, pull, and build; image pull/push/tag/
+  removal and Buildx image builds; volume create/removal; network create/
+  removal/connect/disconnect; and embedded terminal exec opens.
+  `audit.jsonl` is created lazily in the descriptor-anchored Ferrum config
+  directory with mode `0700` and file mode `0600`. Schema v1 contains a
+  timestamp, static event/action/outcome, and validated full resource IDs only
+  where existing traces permit. A build record contains only static
+  `image_mutation` / `build` and outcome fields;
   build output and build-specific metadata are never persisted. Exclude names,
   image references/tags, endpoints, credentials, raw errors, daemon bodies, and
   terminal/log contents. Sync each record; enforce a 16 MiB hard cap without
   automatic truncation or rotation. Use nonblocking interprocess-lock attempts
   with a 250 ms deadline; continued contention counts as a persistence failure.
-  At capacity or on persistence failure, emit a static process warning and do
-  not claim the event is durable; do not change the engine request outcome.
+  At capacity or on persistence failure, emit a structured warning with only a
+  static `audit_error` category; do not log raw storage errors or paths. Failure
+  to persist a required terminal `started` marker blocks exec submission;
+  failures for already-submitted actions do not change their Engine result.
   This is local Ferrum-request history, mutable by the same-UID user, not
   tamper-proof, not proof of final engine state, and does not record external
   engine actions.
@@ -597,6 +601,10 @@ store but does not build or change project containers, networks, or volumes.
   directory creation policy. Extended ACLs and other xattrs are not carried
   forward. Parent-path trust and crash durability are not expanded.
 - Keep the experimental embedded terminal restricted to the selected local Docker-compatible Unix socket on Linux and the negotiated API version. Terminal output is untrusted; cap each raw OSC string at 1024 bytes before feeding vt100. On overflow, stop feeding the parser and discard the string tail until BEL, CAN, SUB, or ESC; pass the actual terminator to the parser to reset its state before resuming. This keeps vte's default-std OSC buffer bounded while the string remains open. Ignore OSC 52 clipboard and title requests, expose clipboard actions only to explicit user controls, and never put terminal bytes or daemon bodies in logs or errors. Closing the exec session closes its connection only; it does not stop or remove the container.
+  Before each exec-open request, persist and sync a static `terminal_exec/exec/started` record in the existing bounded audit file; if this write fails, do not submit the request and show only a static audit-save failure. After open succeeds or fails, persist only `success` or `request_error`; failure to write that outcome does not change the Engine/UI result. The optional full container ID is retained only when it passes the existing 64-hex resource-ID validator. Shell/command values, terminal input/output, raw Engine errors, credentials, paths, socket/endpoints, and daemon response bodies are excluded from audit records. No session-content or resize audit events are emitted. This remains a partial Issue #19 audit slice, not a complete or tamper-proof ledger.
+  If cancellation or shutdown interrupts an in-flight open, only `started` may
+  remain; the absence of a final outcome is unknown and does not prove whether
+  the Engine began a shell.
 - Persist schema v2 settings with backward-compatible defaults, including the
   startup auto-connect preference, registry-helper enum, and an empty-default
   saved Compose registration list. Reject unknown fields, cap serialization and

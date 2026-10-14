@@ -39,6 +39,35 @@ impl AuditRecord {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn record_terminal_exec_started(container_id: &str) -> AuditRecord {
+    AuditRecord::new(
+        "terminal_exec",
+        "exec",
+        "started",
+        valid_resource_id(container_id),
+        None,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn record_terminal_exec_result(
+    container_id: &str,
+    request_succeeded: bool,
+) -> AuditRecord {
+    AuditRecord::new(
+        "terminal_exec",
+        "exec",
+        if request_succeeded {
+            "success"
+        } else {
+            "request_error"
+        },
+        valid_resource_id(container_id),
+        None,
+    )
+}
+
+#[cfg(target_os = "linux")]
 use crate::settings::SettingsStore;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
@@ -62,6 +91,18 @@ pub(super) enum AuditStoreError {
     Write,
     Serialization,
     Worker,
+}
+#[cfg(target_os = "linux")]
+impl AuditStoreError {
+    pub(super) fn category(&self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Unavailable => "unavailable",
+            Self::Write => "write",
+            Self::Serialization => "serialization",
+            Self::Worker => "worker",
+        }
+    }
 }
 
 impl AuditStore {

@@ -90,15 +90,25 @@ helper failure before Engine HTTP submission. Image IDs, references, repository
 tags, endpoints, error text, and daemon response bodies are not included in
 those traces.
 
-Ferrum also maintains a Linux-local, bounded JSONL copy of mutation outcomes
-for container lifecycle, confirmed imported Compose start/stop/service
-restart/pause/unpause and `up`, Compose pulls, image pull/push/tag/removal and
-Buildx image builds, volume create/removal, and network
+Ferrum also maintains a Linux-local, bounded JSONL audit history for
+Ferrum-initiated mutation outcomes and embedded terminal exec opens. Mutation
+records cover container lifecycle, confirmed imported Compose start/stop/service
+restart/pause/unpause, one-service scale, and `up`, Compose pulls, image
+pull/push/tag/removal and Buildx image builds, volume create/removal, and network
 create/removal/connect/disconnect requests. `audit.jsonl` is created lazily in
 Ferrum's descriptor-anchored config directory with directory mode `0700` and
-file mode `0600`. Schema version 1 records a timestamp, static
-event/action/outcome, and validated full resource IDs only where existing
-traces permit.
+file mode `0600`.
+Schema version 1 records a timestamp, static event/action/outcome, and validated
+full resource IDs only where existing traces permit.
+
+Terminal exec-open records use `terminal_exec/exec` with static `started`,
+`success`, and `request_error` outcomes. The synced `started` record is required
+before Engine submission; if it cannot be written, exec is not submitted.
+Shell/command, terminal input/output, raw Engine errors, credentials, paths, and
+endpoints are never recorded.
+If cancellation or shutdown interrupts an in-flight open, only `started` may
+remain; the absence of a final outcome does not prove whether the Engine began
+a shell.
 
 A Compose lifecycle entry contains only the static `compose_mutation` event,
 `start`/`stop`/`restart`/`pause`/`unpause`/`up` action, and `started`,
@@ -128,8 +138,10 @@ endpoints, credentials, raw errors, daemon bodies, and terminal/log contents.
 Each record is synced; the file has a 16 MiB hard cap and is not automatically
 truncated or rotated. Interprocess lock acquisition uses nonblocking retries
 with a 250 ms deadline; continued contention is a persistence failure. When
-full or when persistence fails, Ferrum emits a static process warning and does
-not claim the event was persisted; the engine request outcome is unchanged.
+full or persistence fails, Ferrum logs a structured warning with only a static
+`audit_error` category, never raw storage errors or paths. Failed persistence
+of a final outcome for an already-submitted action does not change its result;
+failure to persist a required terminal `started` marker blocks exec submission.
 This is local Ferrum-request history only, mutable by the same-UID user, not
 tamper-proof, and does not prove final engine state or record external engine
 actions.

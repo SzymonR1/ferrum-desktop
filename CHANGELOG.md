@@ -3,6 +3,21 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Added static local audit records for embedded terminal exec opens. The
+  existing bounded, private JSONL store durably syncs `terminal_exec/exec/started`
+  before an exec request; if that write fails, the request is not submitted and
+  the UI receives a static failure notice. After open success/failure, a static
+  `success`/`request_error` outcome is best-effort; failure to persist that final
+  outcome is logged with a static category and does not change the terminal result.
+  Only a validated full container ID may be included; shell/command, terminal
+  input/output, raw Engine errors, credentials, paths, sockets/endpoints, and
+  daemon bodies are excluded. No session-content or resize audit is added.
+  Deterministic fake-Unix API coverage verifies marker ordering, refusal to
+  submit when the marker cannot be saved, and secret-sentinel exclusion. Issue
+  #19 remains open/partial; no complete or tamper-proof audit claim is made.
+  Cancellation or shutdown during the in-flight open may leave only the
+  `started` marker; this records an attempt, not whether the Engine began a
+  shell.
 - Added an ignored Linux local-Engine Compose build smoke through Ferrum's
   production `compose_build` worker. It creates a unique temporary Compose
   project and generated image from `FROM scratch` plus one small `COPY` input,
