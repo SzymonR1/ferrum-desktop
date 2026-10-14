@@ -1207,10 +1207,37 @@ impl FerrumApp {
         self.terminal_pending = true;
         self.terminal_notice = None;
         let sender = self.terminal_open_sender.clone();
+        let audit_store = self.audit_store.clone();
+        let start_container_id = container_id.clone();
         self.terminal_open_task = Some(self.runtime.spawn(async move {
+            if audit_store
+                .persist(audit::record_terminal_exec_started(&container_id))
+                .await
+                .is_err()
+            {
+                tracing::warn!("Could not persist local audit record");
+                let _ = sender
+                    .send(TerminalOpened::Failed {
+                        attempt_id,
+                        message: "Terminal execution was not started because its audit record could not be saved."
+                            .to_owned(),
+                    })
+                    .await;
+                context.request_repaint();
+                return;
+            }
+
             let size = TerminalSize { rows: 24, columns: 80 };
             let command = [shell];
-            let session = match engine.open_exec_session(&container_id, &command, size).await {
+            let session = engine.open_exec_session(&container_id, &command, size).await;
+            if audit_store
+                .persist(audit::record_terminal_exec_result(&start_container_id, session.is_ok()))
+                .await
+                .is_err()
+            {
+                tracing::warn!("Could not persist local audit record");
+            }
+            let session = match session {
                 Ok(session) => session,
                 Err(error) => {
                     let _ = sender
@@ -1223,8 +1250,6 @@ impl FerrumApp {
                     return;
                 }
             };
-            let resize_handle = session.resize_handle();
-            let resize_worker_handle = resize_handle.clone();
             let resize_failed = Arc::new(AtomicBool::new(false));
             let worker_resize_failed = Arc::clone(&resize_failed);
             let resize_context = context.clone();
@@ -7980,6 +8005,160 @@ mod event_reconciliation_tests {
 
         assert!(!app.container_inventory_fresh);
         assert_eq!(app.containers[0].state, Some(ContainerState::Running));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_exec_is_audited_before_the_engine_receives_its_request() {
+        use std::{
+            io::{Read, Write},
+            os::unix::net::{UnixListener, UnixStream},
+            sync::{LazyLock, Mutex},
+        };
+
+        static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        fn read_request(stream: &mut UnixStream) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let length = stream.read(&mut buffer).unwrap();
+                assert_ne!(length, 0);
+                bytes.extend_from_slice(&buffer[..length]);
+                let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let content_length = String::from_utf8_lossy(&bytes[..header_end])
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= header_end + 4 + content_length {
+                    return bytes;
+                }
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-terminal-audit-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("engine.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let engine_host = format!("unix://{}", socket.display());
+        let saved_host = std::env::var_os("DOCKER_HOST");
+        let saved_context = std::env::var_os("DOCKER_CONTEXT");
+        unsafe {
+            std::env::set_var("DOCKER_HOST", &engine_host);
+            std::env::remove_var("DOCKER_CONTEXT");
+        }
+
+        let (mut app, _) = app_with_open_inspection();
+        let engine = app
+            .runtime
+            .block_on(EngineClient::connect_default())
+            .expect("fake local Engine should complete the connection handshake");
+        app.engine = Some(engine);
+        app.audit_store = audit::AuditStore::new(Arc::new(settings::SettingsStore::at(
+            root.join("settings.toml"),
+        )));
+
+        let server_root = root.clone();
+        let engine_thread = std::thread::spawn(move || {
+            let (mut version, _) = listener.accept().unwrap();
+            let _ = read_request(&mut version);
+            version
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"ApiVersion\":\"1.52\"}")
+                .unwrap();
+            drop(version);
+
+            let (mut exec, _) = listener.accept().unwrap();
+            let bytes = read_request(&mut exec);
+            let request = String::from_utf8_lossy(&bytes);
+            assert!(request.contains("/containers/"));
+            assert!(request.contains("sentinel-shell"));
+            let audit = std::fs::read_to_string(server_root.join("audit.jsonl"))
+                .expect("started audit entry must be durable before exec submission");
+            assert!(audit.contains("\"event\":\"terminal_exec\""));
+            assert!(audit.contains("\"outcome\":\"started\""));
+            assert!(!audit.contains("sentinel-shell"));
+            assert!(!audit.contains("sentinel-engine-error"));
+            exec.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 21\r\nConnection: close\r\n\r\nsentinel-engine-error")
+                .unwrap();
+            exec.flush().unwrap();
+        });
+
+        let context = egui::Context::default();
+        app.start_terminal(
+            "a".repeat(64),
+            "sentinel-shell".to_owned(),
+            context,
+        );
+        app.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if std::fs::read_to_string(root.join("audit.jsonl"))
+                        .is_ok_and(|audit| audit.contains("\"outcome\":\"request_error\""))
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("request outcome should be persisted");
+        });
+        app.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    app.receive_terminal_opened();
+                    if app.terminal_notice.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("safe terminal error should be delivered");
+        });
+        engine_thread.join().unwrap();
+        let audit = std::fs::read_to_string(root.join("audit.jsonl")).unwrap();
+        assert!(audit.contains("\"outcome\":\"request_error\""));
+        for secret in [
+            "sentinel-shell",
+            "sentinel-engine-error",
+            "sentinel-input",
+            "sentinel-output",
+        ] {
+            assert!(!audit.contains(secret));
+        }
+        assert!(
+            app.terminal_notice
+                .as_deref()
+                .is_some_and(|notice| !notice.contains("sentinel-engine-error"))
+        );
+
+        unsafe {
+            if let Some(value) = saved_host {
+                std::env::set_var("DOCKER_HOST", value);
+            } else {
+                std::env::remove_var("DOCKER_HOST");
+            }
+            if let Some(value) = saved_context {
+                std::env::set_var("DOCKER_CONTEXT", value);
+            } else {
+                std::env::remove_var("DOCKER_CONTEXT");
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "linux")]

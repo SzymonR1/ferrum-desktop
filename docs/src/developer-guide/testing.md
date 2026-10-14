@@ -206,6 +206,20 @@ invalidation/re-import. No live mutating integration test ran because no
 disposable Engine is designated; fixtures do not establish live Engine or
 broader platform behavior.
 
+
+## Embedded terminal exec audit
+
+The Linux terminal-open regression
+`terminal_exec_is_audited_before_the_engine_receives_its_request` uses a
+temporary Unix socket with a fake local Engine API version handshake and an
+exec-open rejection. The fake Engine checks that the synced `started` JSONL
+record already exists when the exec request arrives; the test then checks the
+static `request_error` outcome and verifies shell, daemon-error, input, and
+output sentinels are absent from the audit file. No live Engine is contacted
+and no container resource is created or changed. A failed start-record write
+must prevent the exec request and present a static UI failure; terminal
+content and resize events are not audited. This is partial Issue #19 coverage,
+not full audit completion.
 Settings tests cover missing/corrupt settings, file-symlink rejection without
 changing target permissions, non-regular and hard-linked file rejection, and
 refusal to chmod or write through symlinked settings directories. The hard-link
