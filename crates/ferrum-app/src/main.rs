@@ -6038,8 +6038,8 @@ mod event_reconciliation_tests {
             Some(root_basename),
             "terminal audit child HOME does not match its private root token"
         );
-        let home_metadata = std::fs::metadata(&home)
-            .expect("terminal audit child HOME metadata is unavailable");
+        let home_metadata =
+            std::fs::metadata(&home).expect("terminal audit child HOME metadata is unavailable");
         let home_mode = home_metadata.permissions().mode() & 0o777;
         assert!(
             home_metadata.is_dir() && home_mode == 0o700,
@@ -6047,8 +6047,8 @@ mod event_reconciliation_tests {
             home_metadata.is_dir()
         );
 
-        let host = std::env::var_os("DOCKER_HOST")
-            .expect("terminal audit child DOCKER_HOST is missing");
+        let host =
+            std::env::var_os("DOCKER_HOST").expect("terminal audit child DOCKER_HOST is missing");
         let host = host.to_string_lossy();
         let socket_path = host
             .strip_prefix("unix://")
