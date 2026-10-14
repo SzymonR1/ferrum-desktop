@@ -6011,6 +6011,71 @@ mod event_reconciliation_tests {
         terminal_write_version_response(&mut stream);
     }
     #[cfg(target_os = "linux")]
+    fn is_terminal_audit_child(expected_case: &str) -> bool {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+        let Ok(marker) = std::env::var(TERMINAL_AUDIT_CHILD_ENV) else {
+            return false;
+        };
+        let Some((case, root_basename)) = marker.split_once(':') else {
+            return false;
+        };
+        if case != expected_case || root_basename.is_empty() || root_basename.contains('/') {
+            return false;
+        }
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return false;
+        };
+        if home
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .as_deref()
+            != Some(root_basename)
+        {
+            return false;
+        }
+        let Ok(home_metadata) = std::fs::metadata(&home) else {
+            return false;
+        };
+        if !home_metadata.is_dir() || home_metadata.permissions().mode() & 0o777 != 0o700 {
+            return false;
+        }
+
+        let Some(host) = std::env::var_os("DOCKER_HOST") else {
+            return false;
+        };
+        let host = host.to_string_lossy();
+        let Some(socket_path) = host.strip_prefix("unix://") else {
+            return false;
+        };
+        let socket_path = std::path::Path::new(socket_path);
+        if socket_path.parent() != Some(home.as_path())
+            || socket_path.file_name() != Some(std::ffi::OsStr::new("engine.sock"))
+        {
+            return false;
+        }
+        let Ok(socket_metadata) = std::fs::symlink_metadata(socket_path) else {
+            return false;
+        };
+        if !socket_metadata.file_type().is_socket() {
+            return false;
+        }
+
+        let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from)
+        else {
+            return false;
+        };
+        let expected_config_home = if expected_case == "audit_failure" {
+            home.join("not-a-directory")
+        } else {
+            home.clone()
+        };
+        if config_home != expected_config_home {
+            return false;
+        }
+        expected_case != "audit_failure" || std::fs::metadata(config_home).is_ok_and(|m| m.is_file())
+    }
+    #[cfg(target_os = "linux")]
     fn run_terminal_audit_child(
         test_name: &str,
         marker: &str,
@@ -6020,10 +6085,15 @@ mod event_reconciliation_tests {
     ) {
         use std::process::{Command, Stdio};
 
+        let root_basename = root
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("temporary root should have a UTF-8 basename");
+        let child_marker = format!("{marker}:{root_basename}");
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", test_name, "--nocapture"])
-            .env(TERMINAL_AUDIT_CHILD_ENV, marker)
+            .env(TERMINAL_AUDIT_CHILD_ENV, &child_marker)
             .env("DOCKER_HOST", format!("unix://{}", socket.display()))
             .env_remove("DOCKER_CONTEXT")
             .env("XDG_CONFIG_HOME", config_home)
@@ -8205,7 +8275,7 @@ mod event_reconciliation_tests {
     fn terminal_exec_is_audited_before_the_engine_receives_its_request() {
         use std::io::Write;
 
-        if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("request_error") {
+        if is_terminal_audit_child("request_error") {
             let (mut app, config_home) = start_terminal_audit_session();
             pump_terminal_until(
                 &mut app,
@@ -8257,7 +8327,7 @@ mod event_reconciliation_tests {
     fn successful_terminal_exec_open_persists_only_static_outcomes() {
         use std::io::{Read, Write};
 
-        if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("success") {
+        if is_terminal_audit_child("success") {
             let (mut app, config_home) = start_terminal_audit_session();
             pump_terminal_until(
                 &mut app,
@@ -8332,7 +8402,7 @@ mod event_reconciliation_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn terminal_exec_is_not_submitted_when_started_audit_cannot_be_saved() {
-        if std::env::var(TERMINAL_AUDIT_CHILD_ENV).ok().as_deref() == Some("audit_failure") {
+        if is_terminal_audit_child("audit_failure") {
             let (mut app, config_home) = start_terminal_audit_session();
             pump_terminal_until(
                 &mut app,
