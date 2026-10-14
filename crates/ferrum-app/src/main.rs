@@ -8042,7 +8042,7 @@ mod event_reconciliation_tests {
     #[test]
     fn terminal_exec_is_audited_before_the_engine_receives_its_request() {
         use std::{
-            io::{Read, Write},
+            io::Write,
             os::unix::net::UnixListener,
         };
 
