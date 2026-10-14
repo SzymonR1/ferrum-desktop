@@ -6269,6 +6269,279 @@ mod event_reconciliation_tests {
         }
     }
     #[cfg(target_os = "linux")]
+    const MAX_TERMINAL_SMOKE_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+    #[cfg(target_os = "linux")]
+    fn drain_terminal_smoke_pipe<R: std::io::Read>(
+        mut reader: R,
+    ) -> Result<(Vec<u8>, bool), &'static str> {
+        let mut retained = Vec::new();
+        let mut overflowed = false;
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|_| "could not drain Docker CLI output")?;
+            if count == 0 {
+                return Ok((retained, overflowed));
+            }
+            let keep = count.min(MAX_TERMINAL_SMOKE_OUTPUT_BYTES - retained.len());
+            retained.extend_from_slice(&buffer[..keep]);
+            overflowed |= keep < count;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn join_terminal_smoke_reader(
+        reader: std::thread::JoinHandle<Result<(Vec<u8>, bool), &'static str>>,
+    ) -> Result<(Vec<u8>, bool), &'static str> {
+        reader
+            .join()
+            .map_err(|_| "Docker CLI output reader panicked")?
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_terminal_smoke_docker(
+        socket_uri: &str,
+        args: &[&str],
+    ) -> Result<std::process::Output, String> {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("docker")
+            .env_remove("DOCKER_HOST")
+            .env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_TLS")
+            .env_remove("DOCKER_TLS_VERIFY")
+            .env_remove("DOCKER_CERT_PATH")
+            .args(["--host", socket_uri])
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("could not start Docker CLI: {error}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .expect("piped Docker stdout should exist");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("piped Docker stderr should exist");
+        let stdout_reader = std::thread::Builder::new()
+            .spawn(move || drain_terminal_smoke_pipe(stdout))
+            .map_err(|_| {
+                let _ = child.kill();
+                let _ = child.wait();
+                "could not start Docker stdout reader".to_owned()
+            })?;
+        let stderr_reader =
+            match std::thread::Builder::new().spawn(move || drain_terminal_smoke_pipe(stderr)) {
+                Ok(reader) => reader,
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = join_terminal_smoke_reader(stdout_reader);
+                    return Err("could not start Docker stderr reader".to_owned());
+                }
+            };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = join_terminal_smoke_reader(stdout_reader);
+                    let _ = join_terminal_smoke_reader(stderr_reader);
+                    return Err(
+                        "Docker CLI operation timed out; any unverified resource is left untouched"
+                            .to_owned(),
+                    );
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = join_terminal_smoke_reader(stdout_reader);
+                    let _ = join_terminal_smoke_reader(stderr_reader);
+                    return Err(format!("could not wait for Docker CLI operation: {error}"));
+                }
+            }
+        };
+        let (stdout, stdout_overflowed) =
+            join_terminal_smoke_reader(stdout_reader).map_err(str::to_owned)?;
+        let (stderr, stderr_overflowed) =
+            join_terminal_smoke_reader(stderr_reader).map_err(str::to_owned)?;
+        if stdout_overflowed || stderr_overflowed {
+            return Err("Docker CLI output exceeded the bounded capture limit".to_owned());
+        }
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_terminal_smoke_docker(socket_uri: &str, args: &[&str]) -> std::process::Output {
+        try_terminal_smoke_docker(socket_uri, args).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn docker_json_output(output: &std::process::Output, operation: &str) -> serde_json::Value {
+        assert!(
+            output.status.success(),
+            "{operation} failed with Docker CLI status {}",
+            output.status
+        );
+        serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|_| panic!("{operation} returned invalid JSON"))
+    }
+
+    #[cfg(target_os = "linux")]
+    struct TerminalSmokeContainer {
+        socket_uri: String,
+        name: String,
+        id: String,
+        armed: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl TerminalSmokeContainer {
+        async fn cleanup_verified(&mut self, engine: &EngineClient) -> Result<(), &'static str> {
+            let details = engine
+                .inspect_container(&self.id)
+                .await
+                .map_err(|_| "could not re-inspect the verified container")?;
+            if details.id != self.id || details.name.as_deref() != Some(self.name.as_str()) {
+                return Err("container identity changed before cleanup");
+            }
+            match details.state {
+                Some(ContainerState::Running) => {
+                    let stopped = try_terminal_smoke_docker(
+                        &self.socket_uri,
+                        &["stop", "--time", "5", self.id.as_str()],
+                    );
+                    if !stopped.is_ok_and(|output| output.status.success()) {
+                        return Err("bounded stop of the verified container failed");
+                    }
+                }
+                Some(ContainerState::Created | ContainerState::Exited | ContainerState::Dead) => {}
+                _ => return Err("container state is ambiguous before cleanup"),
+            }
+            let removed = try_terminal_smoke_docker(&self.socket_uri, &["rm", self.id.as_str()]);
+            if !removed.is_ok_and(|output| output.status.success()) {
+                return Err("non-force removal of the verified container failed");
+            }
+            let remaining = engine
+                .list_containers()
+                .await
+                .map_err(|_| "could not confirm the container was removed")?;
+            if remaining.iter().any(|container| container.id == self.id) {
+                return Err("the verified container remains in fresh inventory");
+            }
+            self.armed = false;
+            Ok(())
+        }
+    }
+    #[cfg(target_os = "linux")]
+    impl Drop for TerminalSmokeContainer {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            let remove = try_terminal_smoke_docker(&self.socket_uri, &["rm", self.id.as_str()]);
+            if remove.is_ok_and(|output| output.status.success()) {
+                return;
+            }
+            let stop = try_terminal_smoke_docker(
+                &self.socket_uri,
+                &["stop", "--time", "5", self.id.as_str()],
+            );
+            if !stop.is_ok_and(|output| output.status.success()) {
+                eprintln!(
+                    "terminal smoke cleanup could not remove or stop verified container name={} id={}; leaving it for manual inspection",
+                    self.name, self.id
+                );
+                return;
+            }
+            let remove = try_terminal_smoke_docker(&self.socket_uri, &["rm", self.id.as_str()]);
+            if !remove.is_ok_and(|output| output.status.success()) {
+                eprintln!(
+                    "terminal smoke cleanup could not remove verified container name={} id={}; leaving it for manual inspection",
+                    self.name, self.id
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn local_terminal_smoke_engine() -> (EngineClient, String) {
+        let contexts = EngineClient::available_contexts()
+            .await
+            .expect("Docker CLI context discovery should succeed");
+        let context = contexts
+            .iter()
+            .find(|context| context.is_current())
+            .expect("Docker CLI should report its current context");
+        assert_eq!(
+            context.transport(),
+            ContextTransport::LocalUnix,
+            "the terminal smoke requires the current local Unix Docker context"
+        );
+        let engine = EngineClient::connect_context(context.name())
+            .await
+            .expect("the current local Docker context should connect");
+        let socket_uri = format!(
+            "unix://{}",
+            engine
+                .local_socket_path()
+                .to_str()
+                .expect("local Docker socket path should be UTF-8")
+        );
+        (engine, socket_uri)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn terminal_smoke_frame(context: &egui::Context, app: &mut FerrumApp) {
+        let mut output = context.run_ui(Default::default(), |_ui| {
+            app.receive_events(context.clone());
+            if let Some(terminal) = app.terminal.as_mut() {
+                terminal.show(context);
+            }
+        });
+        output.textures_delta.clear();
+    }
+    #[cfg(target_os = "linux")]
+    fn is_full_terminal_smoke_id(id: &str) -> bool {
+        id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+    #[cfg(target_os = "linux")]
+    fn is_full_terminal_smoke_image_id(id: &str) -> bool {
+        id.strip_prefix("sha256:")
+            .is_some_and(is_full_terminal_smoke_id)
+    }
+    #[cfg(target_os = "linux")]
+    fn fail_unverified_terminal_smoke(name: &str, candidate_ids: &[&str], reason: &str) -> ! {
+        let verified_ids: Vec<_> = candidate_ids
+            .iter()
+            .copied()
+            .filter(|id| is_full_terminal_smoke_id(id))
+            .collect();
+        let ids = if verified_ids.is_empty() {
+            "id=unavailable".to_owned()
+        } else {
+            format!("ids={}", verified_ids.join(","))
+        };
+        panic!(
+            "{reason}; name={name}; {ids}; no cleanup was attempted. Inspect manually if Docker created a container."
+        );
+    }
+    #[cfg(target_os = "linux")]
     fn assert_terminal_audit_redacts(audit: &str) {
         for secret in [
             "sentinel-shell",
@@ -8300,6 +8573,360 @@ mod event_reconciliation_tests {
         assert_eq!(app.selected_context, None);
         assert!(app.network_attachment_task.is_some());
         assert!(app.network_create_task.is_none());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires FERRUM_TEST_IMAGE and a disposable current local Docker Unix Engine; creates and safely removes one test-owned container"]
+    fn real_engine_terminal_exec_audit_smoke() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let image = std::env::var("FERRUM_TEST_IMAGE").expect(
+            "set FERRUM_TEST_IMAGE to an already-local image containing /bin/sh and /bin/sleep",
+        );
+        assert!(
+            !image.trim().is_empty(),
+            "FERRUM_TEST_IMAGE must not be empty"
+        );
+        let (mut app, _) = app_with_open_inspection();
+        let (engine, socket_uri) = app.runtime.block_on(local_terminal_smoke_engine());
+        app.engine = Some(engine.clone());
+
+        let settings_root =
+            tempfile::tempdir().expect("private settings directory should be created");
+        let settings_path = settings_root.path().join("settings.toml");
+        app.settings_store = Arc::new(settings::SettingsStore::at(settings_path));
+        app.audit_store = audit::AuditStore::new(Arc::clone(&app.settings_store));
+
+        let inspected_image = docker_json_output(
+            &run_terminal_smoke_docker(&socket_uri, &["image", "inspect", image.as_str()]),
+            "local image preflight",
+        );
+        let image_record = inspected_image
+            .as_array()
+            .and_then(|records| records.first())
+            .expect("image inspect should return one image");
+        let image_id = image_record
+            .get("Id")
+            .and_then(serde_json::Value::as_str)
+            .expect("local image should report its full identity")
+            .to_owned();
+        assert!(
+            is_full_terminal_smoke_image_id(&image_id),
+            "local image identity must be sha256: plus a complete 64-hex ID"
+        );
+        let no_declared_volumes = match image_record.pointer("/Config/Volumes") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Object(volumes)) => volumes.is_empty(),
+            Some(_) => false,
+        };
+        assert!(
+            no_declared_volumes,
+            "the selected image must not declare volumes"
+        );
+        let no_healthcheck = match image_record.pointer("/Config/Healthcheck") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Object(healthcheck)) => healthcheck.is_empty(),
+            Some(_) => false,
+        };
+        assert!(
+            no_healthcheck,
+            "the selected image must not declare a healthcheck"
+        );
+        let engine_image = app
+            .runtime
+            .block_on(engine.inspect_image(&image))
+            .expect("EngineClient should inspect the preinstalled image");
+        assert_eq!(
+            engine_image.id, image_id,
+            "CLI and Engine image identity must match"
+        );
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let name = format!("ferrum-terminal-smoke-{}-{nonce}", std::process::id());
+        let label = format!("com.ferrum.test.terminal-exec-smoke={nonce}");
+        let existing = app
+            .runtime
+            .block_on(engine.list_containers())
+            .expect("container name preflight should succeed");
+        assert!(
+            !existing.iter().any(|container| container.name == name),
+            "generated container name must not already exist"
+        );
+
+        let cid_directory =
+            tempfile::tempdir().expect("private cidfile directory should be created");
+        let cidfile = cid_directory.path().join("container.cid");
+        let create = match try_terminal_smoke_docker(
+            &socket_uri,
+            &[
+                "create",
+                "--name",
+                &name,
+                "--label",
+                &label,
+                "--network",
+                "none",
+                "--pull",
+                "never",
+                "--cidfile",
+                cidfile.to_str().expect("cidfile path should be UTF-8"),
+                "--entrypoint",
+                "/bin/sh",
+                "--",
+                &image_id,
+                "-c",
+                "exec sleep 3600",
+            ],
+        ) {
+            Ok(output) => output,
+            Err(_) => {
+                let cid_id = std::fs::read_to_string(&cidfile).unwrap_or_default();
+                fail_unverified_terminal_smoke(
+                    &name,
+                    &[cid_id.trim()],
+                    "Docker create result was unavailable",
+                );
+            }
+        };
+        let returned_id = String::from_utf8_lossy(&create.stdout).trim().to_owned();
+        let cid_id = std::fs::read_to_string(&cidfile)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if !create.status.success() {
+            fail_unverified_terminal_smoke(
+                &name,
+                &[&returned_id, &cid_id],
+                "Docker create did not report success",
+            );
+        }
+        if !is_full_terminal_smoke_id(&returned_id) || returned_id != cid_id {
+            fail_unverified_terminal_smoke(
+                &name,
+                &[&returned_id, &cid_id],
+                "create output and private cidfile did not identify the same complete container",
+            );
+        }
+
+        let inspect_output =
+            match try_terminal_smoke_docker(&socket_uri, &["inspect", returned_id.as_str()]) {
+                Ok(output) => output,
+                Err(_) => fail_unverified_terminal_smoke(
+                    &name,
+                    &[&returned_id],
+                    "container ownership inspection result was unavailable",
+                ),
+            };
+        if !inspect_output.status.success() {
+            fail_unverified_terminal_smoke(
+                &name,
+                &[&returned_id],
+                "container ownership inspection did not report success",
+            );
+        }
+        let cli_inspect: serde_json::Value = serde_json::from_slice(&inspect_output.stdout)
+            .unwrap_or_else(|_| {
+                fail_unverified_terminal_smoke(
+                    &name,
+                    &[&returned_id],
+                    "container ownership inspection returned invalid JSON",
+                )
+            });
+        let Some(cli_container) = cli_inspect.as_array().and_then(|records| records.first()) else {
+            fail_unverified_terminal_smoke(
+                &name,
+                &[&returned_id],
+                "container ownership inspection returned no container",
+            );
+        };
+        let cli_id = cli_container.get("Id").and_then(serde_json::Value::as_str);
+        let cli_name = cli_container
+            .get("Name")
+            .and_then(serde_json::Value::as_str);
+        let cli_label = cli_container
+            .pointer("/Config/Labels/com.ferrum.test.terminal-exec-smoke")
+            .and_then(serde_json::Value::as_str);
+        let expected_name = format!("/{name}");
+        let expected_label = nonce.to_string();
+        if cli_id != Some(returned_id.as_str())
+            || cli_name != Some(expected_name.as_str())
+            || cli_label != Some(expected_label.as_str())
+        {
+            fail_unverified_terminal_smoke(
+                &name,
+                &[&returned_id, cli_id.unwrap_or_default()],
+                "full ID, generated name, and test label did not verify ownership",
+            );
+        }
+        let mut container_guard = TerminalSmokeContainer {
+            socket_uri: socket_uri.clone(),
+            name: name.clone(),
+            id: returned_id.clone(),
+            armed: true,
+        };
+
+        assert_eq!(
+            cli_container
+                .get("Image")
+                .and_then(serde_json::Value::as_str),
+            Some(image_id.as_str())
+        );
+        assert_eq!(
+            cli_container
+                .pointer("/State/Status")
+                .and_then(serde_json::Value::as_str),
+            Some("created")
+        );
+        assert!(
+            cli_container
+                .get("Mounts")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|mounts| mounts.is_empty()),
+            "the created container must have no mounts"
+        );
+        assert_eq!(
+            cli_container
+                .pointer("/HostConfig/NetworkMode")
+                .and_then(serde_json::Value::as_str),
+            Some("none"),
+            "the created container must use network mode none"
+        );
+        let no_port_bindings = match cli_container.pointer("/HostConfig/PortBindings") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Object(bindings)) => bindings.is_empty(),
+            Some(_) => false,
+        };
+        assert!(
+            no_port_bindings,
+            "the created container must have no host port bindings"
+        );
+
+        let created = app
+            .runtime
+            .block_on(engine.inspect_container(&returned_id))
+            .expect("verified container should be inspectable");
+        assert_eq!(created.id, returned_id);
+        assert_eq!(created.name.as_deref(), Some(name.as_str()));
+        assert_eq!(created.image.as_deref(), Some(image_id.as_str()));
+        assert_eq!(created.state, Some(ContainerState::Created));
+        assert_eq!(created.mounts.as_deref(), Some([].as_slice()));
+
+        let start = run_terminal_smoke_docker(&socket_uri, &["start", returned_id.as_str()]);
+        assert!(
+            start.status.success(),
+            "Docker CLI should start the verified container"
+        );
+        let running = app
+            .runtime
+            .block_on(engine.inspect_container(&returned_id))
+            .expect("started container should remain inspectable");
+        assert_eq!(running.id, returned_id);
+        assert_eq!(running.state, Some(ContainerState::Running));
+        assert_eq!(running.mounts.as_deref(), Some([].as_slice()));
+
+        let context = egui::Context::default();
+        app.start_terminal(returned_id.clone(), "/bin/sh".to_owned(), context.clone());
+        let open_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while app.terminal.is_none() {
+            terminal_smoke_frame(&context, &mut app);
+            assert!(
+                std::time::Instant::now() < open_deadline,
+                "production terminal open should complete"
+            );
+            app.runtime.block_on(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            });
+        }
+
+        let sentinel = format!("FERRUM_TERMINAL_SMOKE_{nonce}");
+        let command = format!("printf '%s%s%s%s\\n' 'FERRUM_' 'TERMINAL_' 'SMOKE_' '{nonce}'\n");
+        app.terminal
+            .as_mut()
+            .expect("terminal view should be open")
+            .send_input(command.as_bytes());
+        let output_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            terminal_smoke_frame(&context, &mut app);
+            let visible = app
+                .terminal
+                .as_ref()
+                .expect("terminal should remain open while checking output")
+                .model
+                .contents();
+            if visible.contains(&sentinel) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < output_deadline,
+                "terminal output parser should display the sentinel"
+            );
+            app.runtime.block_on(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            });
+        }
+
+        let audit_path = settings_root.path().join("audit.jsonl");
+        let audit = std::fs::read_to_string(&audit_path)
+            .expect("terminal exec audit should be durably written");
+        let records: Vec<serde_json::Value> = audit
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("audit line should be JSON"))
+            .collect();
+        assert_eq!(
+            records.len(),
+            2,
+            "audit should contain only start and success"
+        );
+        for (record, outcome) in records.iter().zip(["started", "success"]) {
+            assert_eq!(record["event"], "terminal_exec");
+            assert_eq!(record["action"], "exec");
+            assert_eq!(record["outcome"], outcome);
+            assert_eq!(record["container_id"], returned_id);
+            assert!(
+                record["container_id"]
+                    .as_str()
+                    .is_some_and(is_full_terminal_smoke_id),
+                "audit container ID must be complete and validated"
+            );
+        }
+        for marker in [
+            "/bin/sh",
+            "printf",
+            command.as_str(),
+            "sentinel-shell",
+            "sentinel-input",
+            "sentinel-output",
+            sentinel.as_str(),
+        ] {
+            assert!(!audit.contains(marker), "audit must omit marker {marker}");
+        }
+
+        app.cancel_terminal_session();
+        assert!(
+            app.terminal.is_none(),
+            "production cancellation should close the terminal"
+        );
+        let after_close = app
+            .runtime
+            .block_on(engine.inspect_container(&returned_id))
+            .expect("container should remain inspectable after terminal close");
+        assert_eq!(
+            after_close.state,
+            Some(ContainerState::Running),
+            "closing the embedded terminal must not stop its container"
+        );
+        if let Err(error) = app
+            .runtime
+            .block_on(container_guard.cleanup_verified(&engine))
+        {
+            panic!(
+                "terminal smoke cleanup needs manual inspection: name={} id={} ({error})",
+                name, returned_id
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

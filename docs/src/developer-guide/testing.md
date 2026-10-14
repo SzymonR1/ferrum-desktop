@@ -232,6 +232,46 @@ If cancellation or shutdown aborts the worker after the `started` record but
 before a final outcome, that record may be the only durable event and the
 final Engine state is unknown.
 
+An ignored Linux app-level real-Engine smoke additionally drives FerrumApp's
+production embedded-terminal open, input, output-parser, and cancellation paths,
+then checks the durable audit has exactly the static `terminal_exec/exec`
+`started` and `success` records for the verified full container ID:
+
+```sh
+FERRUM_TEST_IMAGE=busybox:1.37.0 cargo test -p ferrum-app --bin ferrum event_reconciliation_tests::real_engine_terminal_exec_audit_smoke -- --exact --ignored
+```
+
+Choose a trusted, already-local image containing `/bin/sh` and `/bin/sleep`
+with no configured healthcheck, and run only with the current Docker context
+configured as a local Unix socket. The test never pulls or removes an image.
+It rejects non-empty image-declared volumes and any non-empty image healthcheck.
+The create argv uses the inspected immutable `sha256:` image ID rather than the
+supplied tag: `docker --host unix://<pinned-socket> create --pull never` makes
+one uniquely named, labeled container with no mounts, ports, or other resources,
+`--network none`, and an overridden `/bin/sh` entrypoint running
+`exec sleep 3600`. Every Docker CLI operation, including cleanup, is pinned
+to the exact socket selected by EngineClient, so context changes cannot
+redirect the test's resources. Cleanup is armed once the complete
+ID agrees with the private cidfile and the generated name and label verify;
+image identity, created state, empty mounts, `NetworkMode == "none"`, and
+absent/null/empty host port bindings are checked afterward. The successful path
+removes only the verified ID: it removes Created/Exited
+containers directly, stops Running containers first, then confirms the ID is
+absent from fresh Engine inventory. A best-effort Drop fallback tries non-force
+removal first, then bounded stop and non-force removal. Neither path removes
+volumes or the image; ambiguous ownership or cleanup is reported with the
+generated name and ID for manual inspection. The container must be allowed to
+run shell commands from the selected trusted image. This is headless runtime
+evidence only: it does not validate native visuals or complete
+Issue #19.
+
+Observed on 2026-10-14 on Fedora Linux 44 x86_64 with Docker Engine 29.9.0/API
+1.56 using the preinstalled `node:22-bookworm-slim` image and current local Unix
+context, the exact smoke passed (1 passed, 0 failed). It created and removed its
+generated container without pulling or modifying an image; a post-run inventory
+check found no matching `ferrum-terminal-smoke` container. This remains
+headless runtime evidence, not visual or screen-reader validation.
+
 Settings tests cover missing/corrupt settings, file-symlink rejection without
 changing target permissions, non-regular and hard-linked file rejection, and
 refusal to chmod or write through symlinked settings directories. The hard-link
