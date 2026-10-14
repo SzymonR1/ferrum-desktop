@@ -3,6 +3,13 @@
 All notable project changes are documented here. The project has not published a release.
 
 ## Unreleased
+- Added an ignored Linux real-Engine smoke for the production Compose pull
+  worker. It uses an in-process loopback OCI registry, a private temporary
+  one-service project, and a generated image reference; no container is started
+  and no external image or registry is used. Cleanup is pinned to the same local
+  Unix socket and requires a full image ID with the generated reference as its
+  sole tag; no force or prune is used. This verifies one local Docker Compose
+  pull/progress path only; Issue #18 remains open/partial.
 - Added an ignored Linux FerrumApp image-helper/consent live smoke, isolated in
   a child test process pinned to the exact current local Docker Unix socket with
   private HOME/XDG/PATH and cleared Docker context/TLS/cert/config overrides.

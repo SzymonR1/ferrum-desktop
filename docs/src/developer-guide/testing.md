@@ -121,6 +121,43 @@ The smoke passed on 2026-10-14 on Fedora Linux 44 x86_64 against Docker Engine
 Unix context. It created and cleaned only its generated image; Issue #18
 remains partial/open.
 
+## Opt-in production Compose pull smoke
+
+`local_compose_pull_uses_production_worker_and_cleans_only_verified_image` is
+an ignored Linux integration test for Ferrum's production `compose_pull` worker.
+It creates a private one-service Compose file and pulls one generated OCI image
+from an in-process registry bound only to `127.0.0.1`. The worker uses the
+validated local Unix socket returned by `EngineClient::connect_default()` and
+the normal isolated Compose CLI environment. The image reference is preflighted
+as absent before the operation. The test observes recognized bounded pull
+progress; it does not start a service/container, pull an external image, read
+user Docker credentials, or access a user project.
+
+The local Docker Engine must already permit loopback insecure-registry traffic;
+the test does not edit daemon settings. The worker is bounded to 120 seconds;
+timeout triggers cancellation, a bounded 10-second join, then task abort if
+needed. After a submitted or uncertain result, inventory is inspected before
+cleanup. `DisposableImageTag` is armed only for one exact generated reference
+with a full SHA-256 image ID and no other tags; it removes only that ID on the
+same socket, without force or prune, and verifies the reference is absent.
+Failed inventory, ambiguous ownership, timeout, or additional tags do not
+broaden cleanup; a generated image may need manual removal.
+
+Run explicitly, and only where importing and removing one generated local image
+is acceptable:
+
+```sh
+cargo test -p ferrum-app --bin ferrum compose::tests::subprocess::local_compose_pull_uses_production_worker_and_cleans_only_verified_image -- --exact --ignored
+```
+Observed on 2026-10-14 on Fedora Linux 44 x86_64 with Docker Engine 29.9.0/API
+1.56 and Compose 5.6.0, the exact smoke passed (1 test). It observed production
+worker pull progress, imported the generated tag, and verified the tag absent
+after guarded cleanup. No external host or pre-existing image was used.
+
+This is one local Docker worker/progress evidence slice, not a UI visual test,
+credential-authentication test, Podman/remote-engine test, or Issue #18
+completion.
+
 ## Compose service pause/unpause
 
 Controlled fake-CLI and headless tests cover service-scoped `pause SERVICE`
@@ -137,9 +174,10 @@ argv, 30-second bound, and child-process cleanup. Pause suspends processes and
 unpause resumes them; neither operation creates or removes containers,
 networks, or volumes.
 
-No live mutation was run because no disposable Engine is designated. There is
-no native visual validation, and these tests do not establish Podman, remote,
-Windows, or macOS support or full completion of Issues #18/#19.
+No live pause/unpause mutation was run because no disposable Engine is
+designated. There is no native visual validation, and these tests do not
+establish Podman, remote, Windows, or macOS support or full completion of
+Issues #18/#19.
 
 The controlled fake-CLI and headless regressions cover one accessible control
 per all-declared service rather than per replica row; inactive-profile services
@@ -897,18 +935,30 @@ environment. Imports remain session-only unless explicitly saved. Saved
 registrations use bounded SettingsStore metadata, restore unselected/
 unvalidated, and require explicit revalidation; persistence adds no CLI/Engine
 request or project-file access.
-Compose pull and build use fake-CLI/temp-file fixtures only. Pull regressions
-cover exact argv, isolated environment, preflight cancellation, bounded
-progress, and uncertain post-spawn outcomes. Build checks exact fixed argv
-including spaced paths/profiles, private environment/socket selection,
-allowlisted progress, explicit-confirmation cancellation, stale selection,
-preflight cancellation, and uncertain submitted cancellation. Shared image
-command-runner regressions exercise output overflow and short test-injected
-deadline uncertainty. Build audit tests verify static redaction. Neither
-operation contacts a live Engine or registry, executes a user project, mutates
-an image store, or tests remote contexts. Build uses anonymous registry access
-only. Build/up/down, removal, and project-file mutation are not supported except
-the confirmed local build slice.
+The default controlled Compose pull/build regressions use fake-CLI/temp-file
+fixtures only. Pull regressions cover exact argv, isolated environment,
+preflight cancellation, bounded progress, and uncertain post-spawn outcomes.
+Build checks exact fixed argv including spaced paths/profiles, private
+environment/socket selection, allowlisted progress, explicit-confirmation
+cancellation, stale selection, preflight cancellation, and uncertain submitted
+cancellation. Shared image command-runner regressions exercise output overflow
+and short test-injected deadline uncertainty; Build audit tests verify static
+redaction.
+
+The ignored production-worker smokes above are live exceptions, not default
+tests. The Compose pull smoke contacts only its in-process loopback OCI registry
+and selected local Docker Engine; it pulls then removes one generated image
+under full-ID/sole-tag cleanup. The Compose build smoke uses `FROM scratch`,
+does not pull or contact a registry, and removes only its generated image;
+builder cache may remain. Neither starts services, runs a user project, or
+targets remote contexts. Ambiguous image ownership or inventory leaves the
+generated image for manual inspection.
+
+Compose's confirmed local `up` operation has separate controlled tests;
+`down`, project-resource removal, and editing Compose files remain outside this
+partial slice. Compose build and pull remain anonymous-only and add no
+credential support. This does not establish live UI, Podman, remote, or
+cross-platform support; Issue #18 remains open/partial.
 
 Controlled live-follow fixtures cover exact selected-file/profile/socket argv
 and fresh status-before-stream ordering, absent/failed service-membership
